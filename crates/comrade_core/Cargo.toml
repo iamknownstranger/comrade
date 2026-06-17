@@ -1,0 +1,22 @@
+[package]
+name    = "comrade_core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+comrade_state = { path = "../comrade_state" }
+
+tokio         = { workspace = true }
+nostr-sdk     = { workspace = true }
+libp2p        = { workspace = true }
+yrs           = { workspace = true }
+serde         = { workspace = true }
+serde_json    = { workspace = true }
+regex         = { workspace = true }
+thiserror     = { workspace = true }
+tracing       = { workspace = true }
+aes-gcm       = { workspace = true }
+rand          = { workspace = true }
+sha2          = { workspace = true }
+secp256k1     = { workspace = true }
+hex           = { workspace = true }
