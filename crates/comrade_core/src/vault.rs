@@ -69,6 +69,12 @@ pub struct VaultMessage {
 
 // ── Vault Engine ─────────────────────────────────────────────────────────────
 
+/// Callback invoked for every successfully decrypted incoming DM. Used by the
+/// IPC bridge to push `Kind::EncryptedDirectMessage` events across the webview /
+/// JNI boundary as they arrive. Must be `Send + Sync` to live inside the Tokio
+/// notification loop.
+pub type VaultCallback = Box<dyn Fn(VaultMessage) + Send + Sync + 'static>;
+
 pub struct VaultEngine {
     client: Client,
     our_keys: Keys,
@@ -127,8 +133,23 @@ impl VaultEngine {
         Ok(*output.id())
     }
 
-    /// Subscribe to incoming DMs addressed to our public key.
+    /// Subscribe to incoming DMs addressed to our public key, caching each
+    /// decrypted message in the inbox snapshot.
     pub async fn subscribe_inbox(&self) -> Result<(), VaultError> {
+        self.subscribe_inbox_with_callback(Box::new(|_| {})).await
+    }
+
+    /// Subscribe to incoming DMs, invoking `callback` for every decrypted
+    /// message *in addition to* caching it in the inbox snapshot.
+    ///
+    /// The IPC bridge passes a callback here that forwards each `VaultMessage`
+    /// onto the event bus so the desktop webview / Android layer can render new
+    /// encrypted DMs the instant they land — all inside the background Tokio
+    /// task, leaving the UI thread free.
+    pub async fn subscribe_inbox_with_callback(
+        &self,
+        callback: VaultCallback,
+    ) -> Result<(), VaultError> {
         let our_pk = self.our_keys.public_key();
         let filter = Filter::new()
             .kind(Kind::EncryptedDirectMessage)
@@ -145,12 +166,14 @@ impl VaultEngine {
         let our_keys = self.our_keys.clone();
         let pay_regex = self.pay_regex.clone();
         let inbox = self.inbox.clone();
+        let callback = Arc::new(callback);
 
         self.client
             .handle_notifications(move |notification| {
                 let our_keys = our_keys.clone();
                 let pay_regex = pay_regex.clone();
                 let inbox = inbox.clone();
+                let callback = callback.clone();
 
                 async move {
                     if let RelayPoolNotification::Event { event, .. } = notification {
@@ -189,7 +212,8 @@ impl VaultEngine {
                             upi_intents,
                         };
 
-                        inbox.write().await.push(msg);
+                        inbox.write().await.push(msg.clone());
+                        callback(msg);
                     }
                     Ok::<bool, Box<dyn std::error::Error>>(false)
                 }

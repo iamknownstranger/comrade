@@ -1,8 +1,30 @@
 // Comrade desktop frontend. Talks to the Rust backend over Tauri IPC.
 // `withGlobalTauri: true` in tauri.conf.json exposes window.__TAURI__.
 const { invoke } = window.__TAURI__.core;
+const { listen } = window.__TAURI__.event;
 
 const $ = (id) => document.getElementById(id);
+
+// Milestone 2 — receive the async push stream (new Chitthis / DMs) emitted by
+// the Rust Tokio loops over the `comrade://event` window channel. The handler is
+// event-driven, so the render thread is never polled or blocked.
+listen("comrade://event", (e) => {
+  const payload = e.payload;
+  const log = $("event-log");
+  if (!log) return;
+  const row = document.createElement("div");
+  if (payload.type === "incoming_chitthi") {
+    row.className = "rounded bg-indigo-900/40 px-2 py-1";
+    row.textContent = `📨 Chitthi · ${payload.content}`;
+  } else if (payload.type === "incoming_direct_message") {
+    row.className = "rounded bg-fuchsia-900/40 px-2 py-1";
+    row.textContent = `🔒 DM · ${payload.content}`;
+  } else {
+    row.className = "rounded bg-slate-800 px-2 py-1";
+    row.textContent = JSON.stringify(payload);
+  }
+  log.prepend(row);
+});
 
 async function renderWorkspaces() {
   const container = $("workspaces");
