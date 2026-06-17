@@ -1,0 +1,60 @@
+[workspace]
+members = [
+    ".",
+    "crates/comrade_core",
+    "crates/comrade_jni",
+    "crates/comrade_state",
+    "crates/comrade_storage",
+    "crates/comrade_ui",
+]
+# The Tauri desktop shell needs the Tauri toolchain + system webview libs to
+# build, so it is kept out of the workspace to keep `cargo test --workspace`
+# and CI lean. Build it separately from desktop/src-tauri (see desktop/README).
+exclude = ["desktop/src-tauri"]
+resolver = "2"
+
+[workspace.dependencies]
+tokio          = { version = "1",     features = ["full"] }
+nostr-sdk      = { version = "0.44", features = ["nip04"] }
+libp2p         = { version = "0.56",  features = ["tokio", "tcp", "noise", "yamux", "mdns", "gossipsub", "macros"] }
+yrs            = "0.21"
+serde          = { version = "1",     features = ["derive"] }
+serde_json     = "1"
+regex          = "1"
+thiserror      = "2"
+tracing        = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+aes-gcm        = "0.10"
+rand           = "0.8"
+sha2           = "0.10"
+hkdf           = "0.12"
+base64         = "0.22"
+secp256k1      = { version = "0.29",  features = ["hashes", "rand-std"] }
+hex            = "0.4"
+anyhow         = "1"
+jni            = { version = "0.21",  features = ["invocation"] }
+sled           = "0.34"
+argon2         = "0.5"
+zeroize        = { version = "1",      features = ["derive"] }
+tempfile       = "3"
+
+# ── Root binary ─────────────────────────────────────────────────────────────
+[package]
+name    = "comrade"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "comrade"
+path = "src/main.rs"
+
+[dependencies]
+comrade_core    = { path = "crates/comrade_core" }
+comrade_state   = { path = "crates/comrade_state" }
+comrade_storage = { path = "crates/comrade_storage" }
+tokio              = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_json         = { workspace = true }
+anyhow             = { workspace = true }
+nostr-sdk          = { workspace = true }

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Foreground layer for the adaptive launcher icon: stylised "C" lettermark -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,20 A34,34 0 1 0 54,88 L54,76 A22,22 0 1 1 54,32 Z" />
+</vector>

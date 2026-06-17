@@ -1,0 +1,18 @@
+[package]
+name    = "comrade_storage"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sled       = { workspace = true }
+aes-gcm    = { workspace = true }
+argon2     = { workspace = true }
+zeroize    = { workspace = true }
+rand       = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+thiserror  = { workspace = true }
+tracing    = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

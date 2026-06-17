@@ -1,0 +1,7 @@
+# Rust build output
+src-tauri/target/
+
+# Frontend tooling (this scaffold uses a no-build static frontend, but keep
+# these ignored in case a bundler is added later)
+node_modules/
+dist/
