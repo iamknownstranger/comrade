@@ -4,6 +4,7 @@ members = [
     "crates/comrade_core",
     "crates/comrade_jni",
     "crates/comrade_state",
+    "crates/comrade_storage",
 ]
 resolver = "2"
 
@@ -27,6 +28,10 @@ secp256k1      = { version = "0.29",  features = ["hashes", "rand-std"] }
 hex            = "0.4"
 anyhow         = "1"
 jni            = { version = "0.21",  features = ["invocation"] }
+sled           = "0.34"
+argon2         = "0.5"
+zeroize        = { version = "1",      features = ["derive"] }
+tempfile       = "3"
 
 # ── Root binary ─────────────────────────────────────────────────────────────
 [package]
@@ -39,8 +44,9 @@ name = "comrade"
 path = "src/main.rs"
 
 [dependencies]
-comrade_core  = { path = "crates/comrade_core" }
-comrade_state = { path = "crates/comrade_state" }
+comrade_core    = { path = "crates/comrade_core" }
+comrade_state   = { path = "crates/comrade_state" }
+comrade_storage = { path = "crates/comrade_storage" }
 tokio              = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }

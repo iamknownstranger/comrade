@@ -16,9 +16,13 @@ use comrade_core::{
     vault::{build_pay_regex, extract_upi_intents},
 };
 use comrade_state::{AppWorkspace, PairRole, RuntimeContext};
+use comrade_storage::{EncryptedStore, StoredIdentity};
 use tokio::sync::RwLock;
 use tracing::warn;
 use tracing_subscriber::EnvFilter;
+
+/// Default on-disk location for the encrypted store.
+const STORE_PATH: &str = "comrade-data";
 
 // ── Shared application state ─────────────────────────────────────────────────
 
@@ -26,6 +30,8 @@ struct AppState {
     ctx: RuntimeContext,
     profile: KeyProfile,
     partner_profile: Option<KeyProfile>,
+    /// Encrypted local store, present only after `unlock <PIN>`.
+    store: Option<EncryptedStore>,
 }
 
 impl AppState {
@@ -34,6 +40,7 @@ impl AppState {
             ctx: RuntimeContext::new(),
             profile,
             partner_profile: None,
+            store: None,
         }
     }
 }
@@ -79,6 +86,9 @@ fn print_help() {
     println!("  tree       — demo: build a sample NIP-10 thread tree");
     println!("  pay <msg>  — demo: extract UPI /pay intents from text");
     println!("  ledger     — demo: append an entry and show CRDT ledger");
+    println!("  unlock <PIN> — open the encrypted local store with a PIN");
+    println!("  save       — persist current identity to the encrypted store");
+    println!("  load       — load the saved identity from the encrypted store");
     println!("  help       — show this help");
     println!("  exit / q   — quit");
     println!();
@@ -210,7 +220,7 @@ async fn main() -> anyhow::Result<()> {
     // Generate or restore identity
     let profile = KeyProfile::generate().expect("keygen");
     println!("  Identity   : {}", profile.npub);
-    println!("  (nsec kept in memory, never written to disk in this demo)");
+    println!("  (nsec kept in memory; use 'unlock <PIN>' + 'save' to persist it encrypted)");
 
     let state = Arc::new(RwLock::new(AppState::new(profile)));
 
@@ -372,6 +382,69 @@ async fn main() -> anyhow::Result<()> {
             }
 
             "ledger" => demo_ledger(&state).await,
+
+            "unlock" => {
+                if arg.is_empty() {
+                    println!("  Usage: unlock <PIN>");
+                } else {
+                    match EncryptedStore::open(STORE_PATH, arg) {
+                        Ok(store) => {
+                            println!("  Encrypted store unlocked at '{STORE_PATH}'.");
+                            state.write().await.store = Some(store);
+                        }
+                        Err(e) => println!("  Unlock failed: {e}"),
+                    }
+                }
+            }
+
+            "save" => {
+                let guard = state.read().await;
+                match &guard.store {
+                    None => println!("  Run 'unlock <PIN>' first."),
+                    Some(store) => {
+                        let identity = StoredIdentity {
+                            npub: guard.profile.npub.clone(),
+                            nsec: guard.profile.nsec.clone(),
+                            label: Some("primary".into()),
+                        };
+                        match store.save_identity(&identity).and_then(|()| store.flush()) {
+                            Ok(()) => println!("  Identity saved (encrypted at rest)."),
+                            Err(e) => println!("  Save failed: {e}"),
+                        }
+                    }
+                }
+            }
+
+            "load" => {
+                let mut guard = state.write().await;
+                let loaded = match &guard.store {
+                    None => {
+                        println!("  Run 'unlock <PIN>' first.");
+                        None
+                    }
+                    Some(store) => match store.load_identity() {
+                        Ok(Some(id)) => Some(id),
+                        Ok(None) => {
+                            println!("  No saved identity found. Use 'save' first.");
+                            None
+                        }
+                        Err(e) => {
+                            println!("  Load failed: {e}");
+                            None
+                        }
+                    },
+                };
+                if let Some(id) = loaded {
+                    match KeyProfile::from_nsec(&id.nsec) {
+                        Ok(profile) => {
+                            println!("  Identity restored from encrypted store:");
+                            println!("  npub : {}", profile.npub);
+                            guard.profile = profile;
+                        }
+                        Err(e) => println!("  Stored nsec invalid: {e}"),
+                    }
+                }
+            }
 
             unknown => {
                 println!("  Unknown command: '{unknown}'. Type 'help' for available commands.")
