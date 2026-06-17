@@ -8,6 +8,7 @@
  */
 
 use std::io::{self, Write};
+use std::path::Path;
 use std::sync::Arc;
 
 use comrade_core::{
@@ -15,8 +16,8 @@ use comrade_core::{
     sabha::build_chitthi_thread,
     vault::{build_pay_regex, extract_upi_intents},
 };
-use comrade_state::{AppWorkspace, PairRole, RuntimeContext};
-use comrade_storage::{EncryptedStore, StoredIdentity};
+use comrade_state::{AppWorkspace, PairRole, RuntimeContext, StorageStatus};
+use comrade_storage::{Chitthi, EncryptedStore, StorageError, StoredIdentity};
 use tokio::sync::RwLock;
 use tracing::warn;
 use tracing_subscriber::EnvFilter;
@@ -83,7 +84,8 @@ fn print_help() {
     println!("  keys       — display current npub / nsec");
     println!("  partner    — generate a partner keypair (for demo pairing)");
     println!("  dh         — compute DH shared secret with partner");
-    println!("  tree/feed  — demo: build a sample NIP-10 ChitthiThread (Sabha timeline)");
+    println!("  tree/feed  — demo: build a ChitthiThread + cache it (Sabha timeline)");
+    println!("  cache      — render the Chitthi feed from the encrypted store (offline)");
     println!("  pay <msg>  — demo: extract UPI /pay intents from text");
     println!("  ledger     — demo: append an entry and show CRDT ledger");
     println!("  relays     — demo: NIP-65 outbox-model relay routing");
@@ -106,7 +108,18 @@ fn read_line(prompt: &str) -> io::Result<String> {
 
 // ── Demo scenarios ───────────────────────────────────────────────────────────
 
-fn demo_chitthi_feed() {
+/// Map a raw Nostr Kind-1 event into a persistable [`Chitthi`] cache row.
+fn event_to_chitthi(event: &nostr_sdk::Event, reply_to: Option<String>) -> Chitthi {
+    Chitthi {
+        id: event.id.to_hex(),
+        author_npub: event.pubkey.to_hex(),
+        content: event.content.clone(),
+        created_at: event.created_at.as_secs(),
+        reply_to,
+    }
+}
+
+async fn demo_chitthi_feed(state: &Arc<RwLock<AppState>>) {
     use comrade_core::sabha::ChitthiNode;
     use nostr_sdk::prelude::*;
 
@@ -124,6 +137,30 @@ fn demo_chitthi_feed() {
         .tags([reply_tag])
         .sign_with_keys(&keys)
         .expect("sign reply");
+
+    // Persist incoming Chitthis to the encrypted cache if the store is unlocked.
+    // In production this very logic is the body of the SabhaEngine
+    // subscribe_chitthi_feed callback firing inside the Tokio notification loop.
+    {
+        let guard = state.read().await;
+        if let Some(store) = guard.store.as_ref() {
+            let rows = [
+                event_to_chitthi(&root, None),
+                event_to_chitthi(&reply, Some(root_id.clone())),
+            ];
+            let mut saved = 0;
+            for row in &rows {
+                match store.cache_chitthi(row) {
+                    Ok(()) => saved += 1,
+                    Err(e) => println!("  Cache write failed: {e}"),
+                }
+            }
+            let _ = store.flush();
+            println!("  Persisted {saved} Chitthi(s) to the encrypted cache.");
+        } else {
+            println!("  (store locked — run 'unlock <PIN>' to persist this feed offline)");
+        }
+    }
 
     let thread = build_chitthi_thread(vec![root, reply]);
 
@@ -145,6 +182,32 @@ fn demo_chitthi_feed() {
     );
     for root in &thread.roots {
         print_node(root);
+    }
+}
+
+/// Render the Chitthi feed straight from the encrypted on-disk cache — the
+/// offline / cold-start path that needs no relay connection.
+async fn show_cached_feed(state: &Arc<RwLock<AppState>>) {
+    let guard = state.read().await;
+    let Some(store) = guard.store.as_ref() else {
+        println!("  Run 'unlock <PIN>' first to open the encrypted cache.");
+        return;
+    };
+    match store.chitthi_cache() {
+        Ok(feed) if feed.is_empty() => {
+            println!("  Chitthi cache is empty — run 'feed' once to populate it.")
+        }
+        Ok(feed) => {
+            println!(
+                "  ── Cached Sabha Timeline (offline) — {} Chitthi(s) ──────",
+                feed.len()
+            );
+            for c in &feed {
+                let kind = if c.reply_to.is_some() { "reply" } else { "root " };
+                println!("  [{kind}] {}  {}", &c.id[..16.min(c.id.len())], c.content);
+            }
+        }
+        Err(e) => println!("  Failed to read cache: {e}"),
     }
 }
 
@@ -323,6 +386,75 @@ async fn demo_media() {
     println!("  ────────────────────────────────────────────────────────");
 }
 
+// ── Startup identity bootstrap (Milestone 4) ──────────────────────────────────
+
+/// Decide the startup identity.
+///
+/// If an encrypted store already exists on disk we prompt for the passphrase and
+/// restore the saved profile from it, instead of minting a throwaway keypair.
+/// Otherwise we mint a fresh in-memory identity the user can later persist via
+/// `unlock <PIN>` + `save`.
+fn bootstrap_state() -> anyhow::Result<AppState> {
+    if Path::new(STORE_PATH).exists() {
+        println!("  Encrypted profile detected at '{STORE_PATH}'.");
+        return unlock_existing_profile();
+    }
+    let profile = KeyProfile::generate().expect("keygen");
+    println!("  Identity   : {}", profile.npub);
+    println!("  (no encrypted store yet — use 'unlock <PIN>' + 'save' to persist it)");
+    Ok(AppState::new(profile))
+}
+
+/// Prompt for the passphrase (a few attempts) and open the existing store.
+fn unlock_existing_profile() -> anyhow::Result<AppState> {
+    for attempt in 1..=3 {
+        let pin = read_line("  Passphrase to unlock profile: ")?;
+        if pin.is_empty() {
+            println!("  Passphrase cannot be empty.");
+            continue;
+        }
+        match EncryptedStore::open(STORE_PATH, &pin) {
+            Ok(store) => return Ok(restore_or_seed_identity(store)),
+            Err(StorageError::InvalidPin) => println!("  Wrong passphrase ({attempt}/3)."),
+            Err(e) => {
+                println!("  Unlock failed: {e}");
+                break;
+            }
+        }
+    }
+    println!("  Continuing with a non-persistent identity; 'unlock <PIN>' to retry.");
+    Ok(AppState::new(KeyProfile::generate().expect("keygen")))
+}
+
+/// Given an unlocked store, restore the saved profile or seed a new one into it.
+fn restore_or_seed_identity(store: EncryptedStore) -> AppState {
+    let profile = match store.load_identity() {
+        Ok(Some(id)) => match KeyProfile::from_nsec(&id.nsec) {
+            Ok(p) => {
+                println!("  Profile unlocked: {}", p.npub);
+                p
+            }
+            Err(e) => {
+                println!("  Stored nsec invalid ({e}); generating a fresh identity.");
+                KeyProfile::generate().expect("keygen")
+            }
+        },
+        Ok(None) => {
+            let p = KeyProfile::generate().expect("keygen");
+            println!("  Store unlocked but empty; new identity {} (run 'save').", p.npub);
+            p
+        }
+        Err(e) => {
+            println!("  Could not read stored identity ({e}); using a fresh one.");
+            KeyProfile::generate().expect("keygen")
+        }
+    };
+    let mut st = AppState::new(profile);
+    st.ctx.set_storage_status(StorageStatus::Unlocked);
+    st.store = Some(store);
+    st
+}
+
 // ── Main loop ────────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -338,12 +470,8 @@ async fn main() -> anyhow::Result<()> {
 
     print_banner();
 
-    // Generate or restore identity
-    let profile = KeyProfile::generate().expect("keygen");
-    println!("  Identity   : {}", profile.npub);
-    println!("  (nsec kept in memory; use 'unlock <PIN>' + 'save' to persist it encrypted)");
-
-    let state = Arc::new(RwLock::new(AppState::new(profile)));
+    // Detect an existing encrypted profile and unlock it, or mint a fresh one.
+    let state = Arc::new(RwLock::new(bootstrap_state()?));
 
     print_help();
 
@@ -491,7 +619,9 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            "tree" | "feed" | "chitthi" => demo_chitthi_feed(),
+            "tree" | "feed" | "chitthi" => demo_chitthi_feed(&state).await,
+
+            "cache" | "offline" => show_cached_feed(&state).await,
 
             "pay" => {
                 if arg.is_empty() {
@@ -515,7 +645,9 @@ async fn main() -> anyhow::Result<()> {
                     match EncryptedStore::open(STORE_PATH, arg) {
                         Ok(store) => {
                             println!("  Encrypted store unlocked at '{STORE_PATH}'.");
-                            state.write().await.store = Some(store);
+                            let mut guard = state.write().await;
+                            guard.store = Some(store);
+                            guard.ctx.set_storage_status(StorageStatus::Unlocked);
                         }
                         Err(e) => println!("  Unlock failed: {e}"),
                     }

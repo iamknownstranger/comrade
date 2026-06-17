@@ -131,6 +131,40 @@ impl fmt::Display for AppWorkspace {
     }
 }
 
+// ── Persistence awareness (I/O-free marker) ──────────────────────────────────
+
+/// Whether the encrypted local store backing this session is currently unlocked.
+///
+/// `comrade_state` deliberately performs **no I/O** — it never opens `sled` or
+/// touches AES. It only tracks *whether* persistence is available so the UI can
+/// gate "save"/"load" affordances. The actual [`EncryptedStore`] is owned by the
+/// execution harness (`src/main.rs`) / `comrade_ui`.
+///
+/// [`EncryptedStore`]: https://docs.rs/comrade_storage
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum StorageStatus {
+    /// No encrypted store is open; identity lives only in memory.
+    #[default]
+    Locked,
+    /// An encrypted store has been unlocked and may be persisted to.
+    Unlocked,
+}
+
+impl StorageStatus {
+    pub fn is_unlocked(self) -> bool {
+        matches!(self, StorageStatus::Unlocked)
+    }
+}
+
+impl fmt::Display for StorageStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StorageStatus::Locked => write!(f, "Locked"),
+            StorageStatus::Unlocked => write!(f, "Unlocked"),
+        }
+    }
+}
+
 // ── Transition errors ────────────────────────────────────────────────────────
 
 #[derive(Debug, Error)]
@@ -148,6 +182,7 @@ pub enum TransitionError {
 pub struct RuntimeContext {
     workspace: AppWorkspace,
     history: Vec<AppWorkspace>,
+    storage: StorageStatus,
 }
 
 impl RuntimeContext {
@@ -155,11 +190,23 @@ impl RuntimeContext {
         Self {
             workspace: AppWorkspace::Base,
             history: Vec::new(),
+            storage: StorageStatus::Locked,
         }
     }
 
     pub fn current(&self) -> &AppWorkspace {
         &self.workspace
+    }
+
+    /// Whether the encrypted local store is currently unlocked for this session.
+    pub fn storage_status(&self) -> StorageStatus {
+        self.storage
+    }
+
+    /// Record the persistence lock state (set by the harness after opening or
+    /// closing the encrypted store). This performs no I/O.
+    pub fn set_storage_status(&mut self, status: StorageStatus) {
+        self.storage = status;
     }
 
     pub fn transition(&mut self, target: AppWorkspace) -> Result<(), TransitionError> {
@@ -247,6 +294,18 @@ mod tests {
             assert_eq!(AppWorkspace::from_key(key), Some(ws.clone()));
         }
         assert_eq!(AppWorkspace::from_key("nonsense"), None);
+    }
+
+    #[test]
+    fn storage_status_defaults_locked_and_toggles() {
+        let mut ctx = RuntimeContext::new();
+        assert_eq!(ctx.storage_status(), StorageStatus::Locked);
+        assert!(!ctx.storage_status().is_unlocked());
+        ctx.set_storage_status(StorageStatus::Unlocked);
+        assert!(ctx.storage_status().is_unlocked());
+        // Workspace transitions must not disturb the persistence marker.
+        ctx.transition(AppWorkspace::OffGridTravel).unwrap();
+        assert_eq!(ctx.storage_status(), StorageStatus::Unlocked);
     }
 
     #[test]
