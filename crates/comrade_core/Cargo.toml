@@ -22,3 +22,12 @@ hkdf          = { workspace = true }
 base64        = { workspace = true }
 secp256k1     = { workspace = true }
 hex           = { workspace = true }
+
+# Optional: real HTTP uploader for NIP-96 file storage. Off by default so the
+# core stays lean and CI does not build a TLS/HTTP stack; enable with
+# `--features nip96-http`.
+reqwest       = { version = "0.12", default-features = false, features = ["rustls-tls", "multipart", "json"], optional = true }
+
+[features]
+default = []
+nip96-http = ["dep:reqwest"]

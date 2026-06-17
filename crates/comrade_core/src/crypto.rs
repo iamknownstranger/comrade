@@ -8,12 +8,20 @@
  *  • HKDF-SHA256 key stretching for AES-GCM symmetric keys
  */
 
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Key, Nonce,
+};
 use hkdf::Hkdf;
 use nostr_sdk::{Keys, PublicKey, SecretKey, ToBech32};
+use rand::RngCore;
 use sha2::{Digest, Sha256};
 use tracing::instrument;
 
 use crate::error::CryptoError;
+
+/// Length of the AES-256-GCM nonce prepended to sealed buffers.
+const AEAD_NONCE_LEN: usize = 12;
 
 // ── Key profile ──────────────────────────────────────────────────────────────
 
@@ -107,6 +115,49 @@ pub fn derive_symmetric_key(shared_secret: &[u8; 32], label: &str) -> [u8; 32] {
     hk.expand(label.as_bytes(), &mut output)
         .expect("32-byte output is always within HKDF-SHA256 limit");
     output
+}
+
+// ── AEAD helpers (shared across engines) ──────────────────────────────────────
+
+/// Seal `plaintext` with AES-256-GCM. Output is `[nonce (12) | ciphertext+tag]`.
+pub fn aes256gcm_seal(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+    let mut nonce_bytes = [0u8; AEAD_NONCE_LEN];
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    let mut ciphertext = cipher
+        .encrypt(nonce, plaintext)
+        .map_err(|e| CryptoError::Aead(e.to_string()))?;
+
+    let mut out = nonce_bytes.to_vec();
+    out.append(&mut ciphertext);
+    Ok(out)
+}
+
+/// Open an AES-256-GCM `[nonce (12) | ciphertext+tag]` buffer.
+pub fn aes256gcm_open(key: &[u8; 32], sealed: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    if sealed.len() <= AEAD_NONCE_LEN {
+        return Err(CryptoError::Aead("sealed buffer too short".into()));
+    }
+    let (nonce_bytes, ciphertext) = sealed.split_at(AEAD_NONCE_LEN);
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+    let nonce = Nonce::from_slice(nonce_bytes);
+    cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|e| CryptoError::Aead(e.to_string()))
+}
+
+/// Lowercase hex SHA-256 digest of `bytes`.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    let mut s = String::with_capacity(64);
+    for b in digest {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

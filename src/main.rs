@@ -87,6 +87,7 @@ fn print_help() {
     println!("  pay <msg>  — demo: extract UPI /pay intents from text");
     println!("  ledger     — demo: append an entry and show CRDT ledger");
     println!("  relays     — demo: NIP-65 outbox-model relay routing");
+    println!("  media      — demo: NIP-94/96 encrypted media pipeline");
     println!("  unlock <PIN> — open the encrypted local store with a PIN");
     println!("  save       — persist current identity to the encrypted store");
     println!("  load       — load the saved identity from the encrypted store");
@@ -251,6 +252,72 @@ fn demo_relay_routing() {
         "  Unknown user 'carol' falls back to defaults → {:?}",
         router.delivery_relays_for("carol")
     );
+}
+
+async fn demo_media() {
+    use comrade_core::crypto::KeyProfile;
+    use comrade_core::media::{decrypt_media, parse_file_metadata, InMemoryUploader, MediaEngine};
+
+    println!("  Demonstrating encrypted media (NIP-94/96) …");
+
+    let keys = match KeyProfile::generate() {
+        Ok(p) => p.keys,
+        Err(e) => {
+            println!("  Keygen failed: {e}");
+            return;
+        }
+    };
+    let uploader = InMemoryUploader::new("https://blossom.example");
+    let engine = MediaEngine::new(uploader.clone(), keys);
+
+    let photo = b"\xFF\xD8\xFF pretend this is a JPEG \x00\x01\x02";
+    let key = [0x5Au8; 32]; // in practice: DH-derived (couples) or per-file (vault)
+
+    let (event, secret) = match engine
+        .share_encrypted(photo, "image/jpeg", "sunset over the hills", &key)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            println!("  Media share failed: {e}");
+            return;
+        }
+    };
+
+    let meta = match parse_file_metadata(&event) {
+        Ok(m) => m,
+        Err(e) => {
+            println!("  Metadata parse failed: {e}");
+            return;
+        }
+    };
+
+    println!("  ── NIP-94 file event (public) ──────────────────────────");
+    println!("  url     : {}", meta.url);
+    println!("  mime    : {}", meta.mime_type);
+    println!("  x  (enc): {}", meta.sha256_hex);
+    println!(
+        "  ox (orig): {}",
+        meta.original_sha256_hex.as_deref().unwrap_or("-")
+    );
+    println!("  caption : {}", meta.caption);
+    println!("  (decryption key travels out-of-band, NOT in this event)");
+
+    // Recipient side: fetch the opaque blob and decrypt with the out-of-band secret.
+    match uploader.fetch(&meta.url).await {
+        Some(blob) => match decrypt_media(&blob, &secret) {
+            Ok(recovered) => {
+                let ok = recovered == photo;
+                println!(
+                    "  Recipient decrypted {} bytes — matches original: {ok}",
+                    recovered.len()
+                );
+            }
+            Err(e) => println!("  Decrypt failed: {e}"),
+        },
+        None => println!("  Blob not found at URL"),
+    }
+    println!("  ────────────────────────────────────────────────────────");
 }
 
 // ── Main loop ────────────────────────────────────────────────────────────────
@@ -435,6 +502,8 @@ async fn main() -> anyhow::Result<()> {
             "ledger" => demo_ledger(&state).await,
 
             "relays" => demo_relay_routing(),
+
+            "media" => demo_media().await,
 
             "unlock" => {
                 if arg.is_empty() {

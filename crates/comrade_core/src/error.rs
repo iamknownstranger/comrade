@@ -22,6 +22,9 @@ pub enum CoreError {
     #[error("gossip: {0}")]
     Gossip(#[from] GossipError),
 
+    #[error("media: {0}")]
+    Media(#[from] MediaError),
+
     #[error("serialization: {0}")]
     Serde(#[from] serde_json::Error),
 
@@ -47,6 +50,9 @@ pub enum CryptoError {
 
     #[error("key derivation failed: {0}")]
     Derivation(String),
+
+    #[error("AEAD error: {0}")]
+    Aead(String),
 }
 
 // ── Milestone 3: Sabha feed ──────────────────────────────────────────────────
@@ -115,6 +121,26 @@ pub enum GossipError {
 
     #[error("event signing failed: {0}")]
     SigningFailed(String),
+}
+
+// ── Track 3: NIP-94/96 encrypted media ───────────────────────────────────────
+
+#[derive(Debug, Error)]
+pub enum MediaError {
+    #[error("media encryption error: {0}")]
+    Crypto(String),
+
+    #[error("upload failed: {0}")]
+    UploadFailed(String),
+
+    #[error("file metadata parse failed: {0}")]
+    ParseFailed(String),
+
+    #[error("event signing failed: {0}")]
+    SigningFailed(String),
+
+    #[error("http error: {0}")]
+    Http(String),
 }
 
 // ── Milestone 5: Sakha/Sakhi CRDT ledger ────────────────────────────────────
