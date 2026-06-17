@@ -31,4 +31,7 @@ reqwest       = { version = "0.12", default-features = false, features = ["rustl
 
 [features]
 default = []
-nip96-http = ["dep:reqwest"]
+# Real HTTP media pipeline: Blossom upload + fetch-and-decrypt + NIP-96 uploader.
+media-http = ["dep:reqwest"]
+# Back-compat alias; the NIP-96 uploader lives under the same reqwest stack.
+nip96-http = ["media-http"]

@@ -103,6 +103,22 @@ pub fn compute_dh_shared_secret(
     Ok(result)
 }
 
+/// Derive a media-encryption key for a peer in one step: ECDH shared secret →
+/// HKDF-labelled AES-256 key.
+///
+/// Because ECDH is symmetric, the recipient derives the *same* key from their
+/// own secret key and the sender's public key — so the key never has to travel
+/// over the wire. The public NIP-94 event can therefore omit the key entirely;
+/// the encrypted blob is unreadable without one side's private key.
+pub fn derive_media_key(
+    our_secret: &SecretKey,
+    their_pubkey: &PublicKey,
+    label: &str,
+) -> Result<[u8; 32], CryptoError> {
+    let shared = compute_dh_shared_secret(our_secret, their_pubkey)?;
+    Ok(derive_symmetric_key(&shared, label))
+}
+
 /// Derive a labelled AES-256-GCM key from a shared secret using HKDF-SHA256.
 ///
 /// The `label` parameter acts as the HKDF `info` field so that different
@@ -203,5 +219,27 @@ mod tests {
         let k1 = derive_symmetric_key(&secret, "sakha-ledger");
         let k2 = derive_symmetric_key(&secret, "sakha-audit");
         assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn media_key_is_symmetric_between_peers() {
+        // The recipient must derive the same media key from their own secret and
+        // the sender's pubkey — the property that lets us omit the key from the
+        // public event entirely.
+        let alice = KeyProfile::generate().unwrap();
+        let bob = KeyProfile::generate().unwrap();
+        let from_alice = derive_media_key(
+            alice.keys.secret_key(),
+            &bob.public_key(),
+            "comrade-media-v1",
+        )
+        .unwrap();
+        let from_bob = derive_media_key(
+            bob.keys.secret_key(),
+            &alice.public_key(),
+            "comrade-media-v1",
+        )
+        .unwrap();
+        assert_eq!(from_alice, from_bob);
     }
 }

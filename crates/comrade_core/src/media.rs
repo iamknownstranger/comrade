@@ -380,6 +380,170 @@ mod nip96 {
 #[cfg(feature = "nip96-http")]
 pub use nip96::Nip96Uploader;
 
+// ── Blossom upload + fetch-and-decrypt (feature-gated) ───────────────────────────
+
+/// Default Blossom server used by [`upload_encrypted_blob`]. Blossom servers are
+/// content-addressed (blob URL = `<server>/<sha256>`) and accept raw `PUT`s.
+pub const DEFAULT_BLOSSOM_SERVER: &str = "https://cdn.hackers.town";
+
+#[cfg(feature = "media-http")]
+mod http {
+    use super::*;
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Blossom authorization event kind (BUD-01).
+    const BLOSSOM_AUTH_KIND: u16 = 24242;
+
+    fn unix_now() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default()
+    }
+
+    /// Fetch the opaque blob at `url` and AES-256-GCM-decrypt it with `key`.
+    ///
+    /// The inverse of the stage→upload pipeline: the nonce travels prefixed to
+    /// the ciphertext, so only the 32-byte `key` (re-derived from ECDH) is
+    /// needed. Authenticated decryption rejects any tampered blob.
+    pub async fn fetch_and_decrypt_media(url: &str, key: &[u8; 32]) -> Result<Vec<u8>, MediaError> {
+        let resp = reqwest::get(url)
+            .await
+            .map_err(|e| MediaError::Http(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(MediaError::UploadFailed(format!(
+                "fetch status {}",
+                resp.status()
+            )));
+        }
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| MediaError::Http(e.to_string()))?;
+        aes256gcm_open(key, &bytes).map_err(|e| MediaError::Crypto(e.to_string()))
+    }
+
+    /// Anonymous Blossom upload: `PUT <server>/upload` with the raw blob body.
+    /// Returns the download URL. Servers that mandate auth will reject this;
+    /// use [`BlossomUploader`] (signed) for those.
+    pub async fn upload_encrypted_blob_to(
+        server: &str,
+        blob: Vec<u8>,
+        mime_type: &str,
+    ) -> Result<String, MediaError> {
+        let endpoint = format!("{}/upload", server.trim_end_matches('/'));
+        let resp = reqwest::Client::new()
+            .put(&endpoint)
+            .header(reqwest::header::CONTENT_TYPE, mime_type)
+            .body(blob)
+            .send()
+            .await
+            .map_err(|e| MediaError::Http(e.to_string()))?;
+        parse_blob_url(resp).await
+    }
+
+    /// Upload an encrypted blob to [`DEFAULT_BLOSSOM_SERVER`] (anonymous).
+    pub async fn upload_encrypted_blob(
+        blob: Vec<u8>,
+        mime_type: &str,
+    ) -> Result<String, MediaError> {
+        upload_encrypted_blob_to(DEFAULT_BLOSSOM_SERVER, blob, mime_type).await
+    }
+
+    /// Extract the download URL from a Blossom blob-descriptor JSON response.
+    async fn parse_blob_url(resp: reqwest::Response) -> Result<String, MediaError> {
+        if !resp.status().is_success() {
+            return Err(MediaError::UploadFailed(format!(
+                "upload status {}",
+                resp.status()
+            )));
+        }
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| MediaError::Http(e.to_string()))?;
+        body.get("url")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| MediaError::UploadFailed("blob descriptor missing url".into()))
+    }
+
+    /// A Blossom uploader that signs each request with a BUD-01 `kind:24242`
+    /// authorization event, so it works against servers that require auth.
+    pub struct BlossomUploader {
+        client: reqwest::Client,
+        server: String,
+        keys: Keys,
+    }
+
+    impl BlossomUploader {
+        pub fn new(server: impl Into<String>, keys: Keys) -> Self {
+            Self {
+                client: reqwest::Client::new(),
+                server: server.into(),
+                keys,
+            }
+        }
+
+        fn auth_header(&self, blob_sha256: &str) -> Result<String, MediaError> {
+            let expiration = (unix_now() + 3600).to_string();
+            let tags = vec![
+                Tag::parse(["t", "upload"]).map_err(|e| MediaError::Http(e.to_string()))?,
+                Tag::parse(["x", blob_sha256]).map_err(|e| MediaError::Http(e.to_string()))?,
+                Tag::parse(["expiration", &expiration])
+                    .map_err(|e| MediaError::Http(e.to_string()))?,
+            ];
+            let event = EventBuilder::new(Kind::from(BLOSSOM_AUTH_KIND), "Upload encrypted media")
+                .tags(tags)
+                .sign_with_keys(&self.keys)
+                .map_err(|e| MediaError::SigningFailed(e.to_string()))?;
+            let json =
+                serde_json::to_string(&event).map_err(|e| MediaError::Http(e.to_string()))?;
+            Ok(format!("Nostr {}", B64.encode(json)))
+        }
+    }
+
+    impl MediaUploader for BlossomUploader {
+        async fn upload(&self, blob: &[u8], mime_type: &str) -> Result<UploadReceipt, MediaError> {
+            let sha = sha256_hex(blob);
+            let endpoint = format!("{}/upload", self.server.trim_end_matches('/'));
+            let resp = self
+                .client
+                .put(&endpoint)
+                .header(reqwest::header::AUTHORIZATION, self.auth_header(&sha)?)
+                .header(reqwest::header::CONTENT_TYPE, mime_type)
+                .body(blob.to_vec())
+                .send()
+                .await
+                .map_err(|e| MediaError::Http(e.to_string()))?;
+            let url = parse_blob_url(resp).await?;
+            Ok(UploadReceipt { url })
+        }
+    }
+}
+
+#[cfg(feature = "media-http")]
+pub use http::{
+    fetch_and_decrypt_media, upload_encrypted_blob, upload_encrypted_blob_to, BlossomUploader,
+};
+
+// Stubs so the rest of the workspace compiles (and degrades gracefully) when the
+// `media-http` feature is off — the runtime calls these unconditionally.
+#[cfg(not(feature = "media-http"))]
+pub async fn fetch_and_decrypt_media(_url: &str, _key: &[u8; 32]) -> Result<Vec<u8>, MediaError> {
+    Err(MediaError::Http(
+        "media download requires the `media-http` cargo feature".into(),
+    ))
+}
+
+#[cfg(not(feature = "media-http"))]
+pub async fn upload_encrypted_blob(_blob: Vec<u8>, _mime_type: &str) -> Result<String, MediaError> {
+    Err(MediaError::Http(
+        "media upload requires the `media-http` cargo feature".into(),
+    ))
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -439,6 +603,40 @@ mod tests {
         assert_eq!(event.kind, Kind::from(FILE_METADATA_KIND));
         let parsed = parse_file_metadata(&event).unwrap();
         assert_eq!(parsed, meta);
+    }
+
+    #[test]
+    fn zero_knowledge_event_leaks_no_key_or_plaintext_hash() {
+        // The public NIP-94 event must carry only URL + ciphertext hash — never
+        // the AES key (derived via ECDH) nor the plaintext (`ox`) hash.
+        let keys = Keys::generate();
+        let (media, _secret) = encrypt_media(b"secret photo", "image/jpeg", &key()).unwrap();
+        let meta = FileMetadata {
+            url: "https://blob.example/abc".into(),
+            mime_type: "image/jpeg".into(),
+            sha256_hex: media.sha256_hex.clone(),
+            original_sha256_hex: None,
+            size: Some(media.size),
+            caption: String::new(),
+        };
+        let event = build_file_metadata_event(&keys, &meta).unwrap();
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(!json.contains(&hex::encode(key())), "AES key must not leak");
+        let parsed = parse_file_metadata(&event).unwrap();
+        assert_eq!(parsed.original_sha256_hex, None);
+        assert_eq!(parsed.sha256_hex, media.sha256_hex);
+    }
+
+    #[cfg(not(feature = "media-http"))]
+    #[tokio::test]
+    async fn http_paths_degrade_gracefully_without_feature() {
+        // No panics, just typed errors, when the network feature is disabled.
+        assert!(upload_encrypted_blob(vec![1, 2, 3], "image/png")
+            .await
+            .is_err());
+        assert!(fetch_and_decrypt_media("https://x/y", &[0u8; 32])
+            .await
+            .is_err());
     }
 
     #[test]

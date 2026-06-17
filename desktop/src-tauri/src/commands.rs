@@ -14,11 +14,40 @@
 
 use std::sync::Arc;
 
-use comrade_ui::{ChitthiDto, ComradeRuntime, IdentityDto, UpiIntentDto, WorkspaceDto};
+use comrade_ui::{
+    ChitthiDto, ComradeRuntime, IdentityDto, MediaBytesDto, MediaMessageDto, UpiIntentDto,
+    WorkspaceDto,
+};
 use tokio::sync::RwLock;
 
 /// The live IPC runtime context, as referenced by the bridge spec.
 pub type Runtime = Arc<RwLock<ComradeRuntime>>;
+
+/// Hard cap mirrored on the frontend; defends the backend against oversized reads.
+const MAX_MEDIA_BYTES: usize = 10 * 1024 * 1024;
+
+/// Best-effort MIME guess from a file extension.
+fn guess_mime(path: &str) -> String {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "mp3" => "audio/mpeg",
+        "ogg" | "oga" => "audio/ogg",
+        "wav" => "audio/wav",
+        "m4a" | "aac" => "audio/aac",
+        "mp4" => "video/mp4",
+        "pdf" => "application/pdf",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
 
 // ── Milestone 1: vault, timeline, broadcast ──────────────────────────────────
 
@@ -134,4 +163,77 @@ pub async fn extract_payments(
     text: String,
 ) -> Result<Vec<UpiIntentDto>, String> {
     state.read().await.extract_payments(&text).map_err(|e| e.to_string())
+}
+
+// ── Encrypted media pipeline (NIP-94/96 · Blossom) ────────────────────────────
+
+/// Read a file from disk, encrypt + upload it, and deliver the reference to
+/// `target_pubkey`. For path-based callers (e.g. a native file dialog).
+#[tauri::command]
+pub async fn upload_and_send_media(
+    state: tauri::State<'_, Runtime>,
+    file_path: String,
+    target_pubkey: String,
+) -> Result<MediaMessageDto, String> {
+    let bytes = tokio::fs::read(&file_path)
+        .await
+        .map_err(|e| format!("read file: {e}"))?;
+    if bytes.len() > MAX_MEDIA_BYTES {
+        return Err(format!(
+            "file is {:.1} MB; the limit is 10 MB",
+            bytes.len() as f64 / 1_048_576.0
+        ));
+    }
+    let mime = guess_mime(&file_path);
+    let caption = std::path::Path::new(&file_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_string();
+    state
+        .read()
+        .await
+        .upload_and_send_media(&target_pubkey, bytes, &mime, &caption)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Encrypt + upload media supplied as base64 bytes (the webview `<input type=file>`
+/// path, which has no real filesystem path to hand to Rust).
+#[tauri::command]
+pub async fn send_media_bytes(
+    state: tauri::State<'_, Runtime>,
+    target_pubkey: String,
+    mime_type: String,
+    caption: String,
+    base64: String,
+) -> Result<MediaMessageDto, String> {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    let bytes = B64
+        .decode(base64.as_bytes())
+        .map_err(|e| format!("invalid base64: {e}"))?;
+    if bytes.len() > MAX_MEDIA_BYTES {
+        return Err("file exceeds the 10 MB limit".to_string());
+    }
+    state
+        .read()
+        .await
+        .upload_and_send_media(&target_pubkey, bytes, &mime_type, &caption)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Resolve a NIP-94 reference, fetch the encrypted blob, and decrypt it.
+/// Returns `{ mime_type, base64 }` for the frontend to turn into a `Blob`.
+#[tauri::command]
+pub async fn download_and_decrypt_media(
+    state: tauri::State<'_, Runtime>,
+    event_id: String,
+) -> Result<MediaBytesDto, String> {
+    state
+        .read()
+        .await
+        .download_and_decrypt_media(&event_id)
+        .await
+        .map_err(|e| e.to_string())
 }

@@ -18,6 +18,7 @@
 
   const STORE_PATH = "comrade-data";
   const EVENT_CHANNEL = "comrade://event";
+  const MAX_MEDIA_BYTES = 10 * 1024 * 1024; // 10 MB hard limit (Milestone 5)
 
   // ── Backend access (real Tauri, or a dev mock for browser preview) ────────
   const TAURI = window.__TAURI__;
@@ -147,10 +148,38 @@
     workspace: null,
     chitthis: [],
     seenChitthi: new Set(),
-    dms: new Map(), // sender npub -> [{ content, created_at, outgoing, upi }]
+    dms: new Map(), // peer pubkey -> [{ content?, media?, created_at, outgoing, upi }]
     activeContact: null,
     coupleRole: "sakha",
+    partnerNpub: null,
   };
+
+  // ── Media helpers ─────────────────────────────────────────────────────────
+  function fileToBase64(file) {
+    return new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => {
+        const s = String(r.result);
+        resolve(s.slice(s.indexOf(",") + 1)); // strip "data:...;base64,"
+      };
+      r.onerror = () => reject(r.error);
+      r.readAsDataURL(file);
+    });
+  }
+
+  function base64ToBlob(b64, mime) {
+    const bin = atob(b64);
+    const arr = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+    return new Blob([arr], { type: mime || "application/octet-stream" });
+  }
+
+  function renderMediaEl(mime, url) {
+    if (mime.startsWith("image/")) return el("img", { class: "media-img", src: url, alt: "media" });
+    if (mime.startsWith("audio/")) return el("audio", { controls: "", src: url });
+    if (mime.startsWith("video/")) return el("video", { class: "media-img", controls: "", src: url });
+    return el("a", { href: url, download: "comrade-media", text: "Download file" });
+  }
 
   // ── Screen + theme management (progressive disclosure) ────────────────────
   function setScreen(name) {
@@ -195,6 +224,8 @@
 
     if (ws.couple_sandbox) {
       $("#couple-role").textContent = ws.key.endsWith("Sakhi") ? "Sakhi" : "Sakha";
+      $("#couple-attach").disabled = !state.partnerNpub;
+      renderCoupleMedia();
       setScreen("couple");
     } else {
       setScreen("app");
@@ -394,6 +425,7 @@
   function selectContact(key) {
     state.activeContact = key;
     $("#dm-input").disabled = false;
+    $("#dm-attach").disabled = false;
     renderContacts();
     renderConversation();
   }
@@ -410,14 +442,7 @@
     head.textContent = shortNpub(state.activeContact);
     const msgs = state.dms.get(state.activeContact) || [];
     for (const m of msgs) {
-      log.append(
-        el(
-          "div",
-          { class: "bubble " + (m.outgoing ? "out" : "in") },
-          el("span", { text: m.content }),
-          el("span", { class: "bubble-time", text: relTime(m.created_at) }),
-        ),
-      );
+      log.append(m.media ? mediaBubble(m) : textBubble(m));
       if (m.upi && m.upi.length) {
         for (const i of m.upi)
           log.append(
@@ -429,6 +454,122 @@
       }
     }
     log.scrollTop = log.scrollHeight;
+  }
+
+  function textBubble(m) {
+    return el(
+      "div",
+      { class: "bubble " + (m.outgoing ? "out" : "in") },
+      el("span", { text: m.content }),
+      el("span", { class: "bubble-time", text: relTime(m.created_at) }),
+    );
+  }
+
+  // A media bubble: renders inline if we already hold an object URL (our own
+  // sent media), otherwise a Download button that fetches + decrypts on click.
+  function mediaBubble(m) {
+    const wrap = el("div", { class: "bubble " + (m.outgoing ? "out" : "in") });
+    if (m.media.caption) wrap.append(el("div", { class: "media-caption", text: m.media.caption }));
+
+    if (m.media.objectUrl) {
+      wrap.append(renderMediaEl(m.media.mime, m.media.objectUrl));
+    } else {
+      const btn = el("button", { class: "btn btn-ghost btn-sm", text: "⬇ Download & view" });
+      btn.addEventListener("click", async () => {
+        btn.disabled = true;
+        btn.textContent = "Decrypting…";
+        try {
+          const out = await safeInvoke("download_and_decrypt_media", {
+            eventId: m.media.eventId,
+          });
+          const mime = out.mime_type || m.media.mime;
+          const url = URL.createObjectURL(base64ToBlob(out.base64, mime));
+          m.media.objectUrl = url;
+          wrap.replaceChild(renderMediaEl(mime, url), btn);
+        } catch {
+          btn.disabled = false;
+          btn.textContent = "⬇ Retry";
+        }
+      });
+      wrap.append(btn);
+    }
+    wrap.append(el("span", { class: "bubble-time", text: relTime(m.created_at) }));
+    return wrap;
+  }
+
+  function onIncomingMedia(p) {
+    const key = p.sender || "unknown";
+    const list = state.dms.get(key) || [];
+    list.push({
+      created_at: p.created_at,
+      outgoing: false,
+      media: { eventId: p.event_id, mime: p.mime_type, caption: p.caption },
+    });
+    state.dms.set(key, list);
+    renderContacts();
+    if (state.activeContact === key) renderConversation();
+    showToast(`New encrypted media from ${shortNpub(key)}`, "info");
+  }
+
+  // Encrypt + upload a selected file to `targetPubkey`, then render it locally.
+  async function handleAttach(file, targetPubkey) {
+    if (!file) return;
+    if (!targetPubkey) {
+      showToast("No recipient selected", "warn");
+      return;
+    }
+    if (file.size > MAX_MEDIA_BYTES) {
+      showToast(
+        `"${file.name}" is ${(file.size / 1048576).toFixed(1)} MB — over the 10 MB limit`,
+        "warn",
+      );
+      return;
+    }
+    const mime = file.type || "application/octet-stream";
+    let base64;
+    try {
+      base64 = await fileToBase64(file);
+    } catch {
+      showToast("Could not read the file", "error");
+      return;
+    }
+    showToast("Encrypting & uploading…", "info");
+    try {
+      const dto = await safeInvoke("send_media_bytes", {
+        targetPubkey,
+        mimeType: mime,
+        caption: file.name,
+        base64,
+      });
+      // Optimistic local render straight from the picked file — no round-trip.
+      const objectUrl = URL.createObjectURL(file);
+      const list = state.dms.get(targetPubkey) || [];
+      list.push({
+        created_at: dto.created_at || nowSecs(),
+        outgoing: true,
+        media: { eventId: dto.event_id, mime, caption: file.name, objectUrl },
+      });
+      state.dms.set(targetPubkey, list);
+      if (state.activeContact === targetPubkey) {
+        renderContacts();
+        renderConversation();
+      } else if (document.body.dataset.screen === "app") {
+        selectContact(targetPubkey);
+      }
+      renderCoupleMedia();
+      showToast("Encrypted media sent", "success");
+    } catch {
+      /* toasted */
+    }
+  }
+
+  function renderCoupleMedia() {
+    const box = $("#couple-media");
+    if (!box || !state.partnerNpub) return;
+    box.innerHTML = "";
+    const msgs = state.dms.get(state.partnerNpub) || [];
+    for (const m of msgs) if (m.media) box.append(mediaBubble(m));
+    box.scrollTop = box.scrollHeight;
   }
 
   // Live UPI /pay detection in the DM composer (real extract_payments command).
@@ -507,6 +648,8 @@
       const target = role === "sakhi" ? "CoupleSandboxSakhi" : "CoupleSandboxSakha";
       const ws = await safeInvoke("toggle_app_workspace", { target });
       state.coupleRole = role;
+      // Capture the partner's npub for couple media when the payload is one.
+      state.partnerNpub = /^npub1[0-9a-z]+$/i.test(payload) ? payload : null;
       closePartnerModal();
       applyWorkspace(ws);
       showToast("Partner portal unlocked", "success");
@@ -561,6 +704,8 @@
           );
         } else if (p.type === "incoming_direct_message") {
           onIncomingDm(p);
+        } else if (p.type === "incoming_media") {
+          onIncomingMedia(p);
         }
       });
     } catch (e) {
@@ -597,6 +742,20 @@
     $("#dm-send").addEventListener("click", () =>
       showToast("Outbound DM transmission needs a backend send_dm command.", "info"),
     );
+
+    // Media attachments (Vault + Couple sandbox)
+    $("#dm-attach").addEventListener("click", () => $("#dm-file").click());
+    $("#dm-file").addEventListener("change", (e) => {
+      const file = e.target.files && e.target.files[0];
+      handleAttach(file, state.activeContact);
+      e.target.value = "";
+    });
+    $("#couple-attach").addEventListener("click", () => $("#couple-file").click());
+    $("#couple-file").addEventListener("change", (e) => {
+      const file = e.target.files && e.target.files[0];
+      handleAttach(file, state.partnerNpub);
+      e.target.value = "";
+    });
 
     $("#travel-toggle").addEventListener("change", handleTravel);
     $("#partner-btn").addEventListener("click", openPartnerModal);
@@ -667,6 +826,23 @@
         }
         case "sync_ledger":
           throw "no shared secret available — pairing handshake incomplete";
+        case "send_media_bytes":
+          return {
+            event_id: "mockmedia_" + Date.now(),
+            url: "https://cdn.hackers.town/mock",
+            mime_type: args.mimeType,
+            caption: args.caption || "",
+            sender: "npub1mockdev0identity00000000000000000000000000000000",
+            created_at: nowSecs(),
+            size: 0,
+          };
+        case "download_and_decrypt_media":
+          // 1×1 transparent PNG so the preview can render an <img>.
+          return {
+            mime_type: "image/png",
+            base64:
+              "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
+          };
         default:
           throw `mock backend: unknown command '${cmd}'`;
       }

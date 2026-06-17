@@ -700,6 +700,42 @@ code {
   background: var(--panel);
 }
 
+/* Encrypted media in chat bubbles */
+.media-caption {
+  font-size: 12px;
+  opacity: 0.85;
+  margin-bottom: 6px;
+}
+
+.media-img {
+  display: block;
+  max-width: 260px;
+  max-height: 260px;
+  width: auto;
+  height: auto;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+}
+
+.bubble audio {
+  display: block;
+  width: 240px;
+  max-width: 100%;
+}
+
+.btn-sm {
+  padding: 6px 11px;
+  font-size: 12px;
+}
+
+.media-locked {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
 .upi-preview {
   display: flex;
   flex-direction: column;
