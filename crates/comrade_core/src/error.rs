@@ -19,6 +19,9 @@ pub enum CoreError {
     #[error("sakha: {0}")]
     Sakha(#[from] SakhaError),
 
+    #[error("gossip: {0}")]
+    Gossip(#[from] GossipError),
+
     #[error("serialization: {0}")]
     Serde(#[from] serde_json::Error),
 
@@ -95,6 +98,23 @@ pub enum SaathiError {
 
     #[error("message cache overflow")]
     CacheOverflow,
+}
+
+// ── Track 4: NIP-65 relay gossip ─────────────────────────────────────────────
+
+#[derive(Debug, Error)]
+pub enum GossipError {
+    #[error("relay list parse failed: {0}")]
+    ParseFailed(String),
+
+    #[error("relay connection failed: {0}")]
+    RelayError(String),
+
+    #[error("subscription error: {0}")]
+    SubscriptionError(String),
+
+    #[error("event signing failed: {0}")]
+    SigningFailed(String),
 }
 
 // ── Milestone 5: Sakha/Sakhi CRDT ledger ────────────────────────────────────

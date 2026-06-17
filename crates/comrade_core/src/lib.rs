@@ -7,10 +7,12 @@
  *   vault   — NIP-04 E2E DM engine + UPI /pay regex processor
  *   saathi  — Off-grid libp2p mesh (mDNS + Gossipsub)
  *   sakha   — Yrs CRDT shared ledger + DH-encrypted Nostr sync
+ *   relay   — NIP-65 relay-list metadata + outbox-model routing
  */
 
 pub mod crypto;
 pub mod error;
+pub mod relay;
 pub mod saathi;
 pub mod sabha;
 pub mod sakha;

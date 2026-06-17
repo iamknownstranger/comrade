@@ -86,6 +86,7 @@ fn print_help() {
     println!("  tree       — demo: build a sample NIP-10 thread tree");
     println!("  pay <msg>  — demo: extract UPI /pay intents from text");
     println!("  ledger     — demo: append an entry and show CRDT ledger");
+    println!("  relays     — demo: NIP-65 outbox-model relay routing");
     println!("  unlock <PIN> — open the encrypted local store with a PIN");
     println!("  save       — persist current identity to the encrypted store");
     println!("  load       — load the saved identity from the encrypted store");
@@ -200,6 +201,56 @@ async fn demo_ledger(state: &Arc<RwLock<AppState>>) {
         println!("  {line}");
     }
     println!("  ────────────────────────────────────────────────────────");
+}
+
+fn demo_relay_routing() {
+    use comrade_core::relay::{RelayList, RelayListEntry, RelayPolicy, RelayRouter};
+
+    println!("  Demonstrating the NIP-65 outbox model …");
+    let mut router = RelayRouter::new(vec!["wss://relay.damus.io".into()]);
+
+    // Two friends advertise different read/write relays.
+    router.update(
+        "alice",
+        RelayList {
+            entries: vec![
+                RelayListEntry {
+                    url: "wss://alice.write".into(),
+                    policy: RelayPolicy::Write,
+                },
+                RelayListEntry {
+                    url: "wss://alice.read".into(),
+                    policy: RelayPolicy::Read,
+                },
+            ],
+        },
+    );
+    router.update(
+        "bob",
+        RelayList {
+            entries: vec![RelayListEntry {
+                url: "wss://bob.inbox".into(),
+                policy: RelayPolicy::ReadWrite,
+            }],
+        },
+    );
+
+    println!(
+        "  To READ Alice's posts  → {:?}",
+        router.read_relays_for("alice")
+    );
+    println!(
+        "  To DELIVER to Alice    → {:?}",
+        router.delivery_relays_for("alice")
+    );
+    println!(
+        "  Write pool for [Alice, Bob] (where to publish to reach both):\n    {:?}",
+        router.write_pool(&["alice".to_string(), "bob".to_string()])
+    );
+    println!(
+        "  Unknown user 'carol' falls back to defaults → {:?}",
+        router.delivery_relays_for("carol")
+    );
 }
 
 // ── Main loop ────────────────────────────────────────────────────────────────
@@ -382,6 +433,8 @@ async fn main() -> anyhow::Result<()> {
             }
 
             "ledger" => demo_ledger(&state).await,
+
+            "relays" => demo_relay_routing(),
 
             "unlock" => {
                 if arg.is_empty() {
