@@ -7,13 +7,18 @@ view-model layer driving an Android (Kotlin/Compose), desktop (Tauri), or CLI fr
 
 | Engine | Protocol | Feature |
 |--------|----------|---------|
-| **Sabha** | Nostr Kind-1 + NIP-10 | Public microblogging with nested thread trees |
+| **Sabha** | Nostr Kind-1 + NIP-10 | Public microblogging — the **Chitthi Feed**, with nested `ChitthiThread` reply trees |
 | **Vault** | Nostr Kind-4 + NIP-04 | End-to-end encrypted direct messages; `/pay` UPI intent detection |
 | **Saathi** | libp2p mDNS + Gossipsub | Off-grid local mesh — works without internet |
 | **Sakha/Sakhi** | Yrs CRDT + AES-256-GCM | Cryptographically isolated shared ledger for couples |
 | **Relay gossip** | NIP-65 | Dynamic relay discovery + outbox-model routing |
 | **Media** | NIP-94 / NIP-96 | Encrypted file staging + pluggable decentralized upload |
-| **Storage** | sled + Argon2id + AES-256-GCM | Encrypted-at-rest local persistence unlocked by a PIN |
+| **Storage** | sled + Argon2id + AES-256-GCM | Encrypted-at-rest persistence (identity, ChitthiCache, VaultCache, LedgerState) unlocked by a passphrase |
+
+> **Nomenclature.** A public post is a **Chitthi** (Hindi for *letter*) throughout
+> the application layer — `ChitthiNode`/`ChitthiThread`, `broadcast_chitthi`,
+> `subscribe_chitthi_feed`, the `chitthi_cache`. Nostr protocol constants
+> (`Kind::TextNote`, NIP-04) are kept intact at the wire level.
 
 The **Progressive-Disclosure state machine** (`comrade_state`) gates which engines are active:
 
@@ -124,3 +129,4 @@ Without signing secrets the APK is signed with the Android debug key and can be 
 - **DH key agreement** — secp256k1 ECDH with x-coordinate-only SHA-256 hashing for parity-independence; HKDF-SHA256 for label-scoped key derivation.
 - **Off-line resilience** — Saathi caches up to 256 outbound messages and drains them automatically on mDNS peer discovery.
 - **CRDT convergence** — Sakha/Sakhi use Yrs (Yjs port) so concurrent edits on either device merge deterministically; relay sees only AES-256-GCM ciphertext.
+- **Encrypted-at-rest persistence** — every stored value is sealed with AES-256-GCM under an Argon2id-derived key (zeroized in memory, never written to disk); a wrong passphrase fails closed with `StorageError::InvalidPin`. On startup the CLI detects an existing store and prompts for the passphrase to restore the profile rather than minting a throwaway keypair. Durability is verified by `comrade_storage`'s `tests/durability.rs` reboot suite.
