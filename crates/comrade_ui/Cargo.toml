@@ -1,0 +1,19 @@
+[package]
+name    = "comrade_ui"
+version = "0.1.0"
+edition = "2021"
+
+# Framework-agnostic view-model / service layer shared by every frontend
+# (Tauri desktop, Slint/Iced native, Android via JNI). Holds no rendering code.
+
+[dependencies]
+comrade_core    = { path = "../comrade_core" }
+comrade_state   = { path = "../comrade_state" }
+comrade_storage = { path = "../comrade_storage" }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+thiserror  = { workspace = true }
+tracing    = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

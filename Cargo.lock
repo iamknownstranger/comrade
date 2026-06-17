@@ -547,6 +547,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "comrade_ui"
+version = "0.1.0"
+dependencies = [
+ "comrade_core",
+ "comrade_state",
+ "comrade_storage",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "concurrent-queue"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

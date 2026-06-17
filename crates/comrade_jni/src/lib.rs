@@ -13,7 +13,7 @@ use jni::sys::jstring;
 use jni::JNIEnv;
 
 use comrade_core::crypto::KeyProfile;
-use comrade_state::{AppWorkspace, PairRole};
+use comrade_state::AppWorkspace;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -92,12 +92,8 @@ pub extern "C" fn Java_global_auros_comrade_ComradeCore_workspaceLabel<'local>(
         Ok(s) => s.into(),
         Err(_) => return std::ptr::null_mut(),
     };
-    let ws = match ws_str.as_str() {
-        "Base" => AppWorkspace::Base,
-        "OffGridTravel" => AppWorkspace::OffGridTravel,
-        "CoupleSandboxSakha" => AppWorkspace::CoupleSandbox(PairRole::Sakha),
-        "CoupleSandboxSakhi" => AppWorkspace::CoupleSandbox(PairRole::Sakhi),
-        _ => return std::ptr::null_mut(),
+    let Some(ws) = AppWorkspace::from_key(&ws_str) else {
+        return std::ptr::null_mut();
     };
     to_jstring(&mut env, ws.label())
 }
@@ -115,21 +111,9 @@ pub extern "C" fn Java_global_auros_comrade_ComradeCore_allWorkspaces<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> jstring {
-    let items = [
-        ("Base", AppWorkspace::Base),
-        ("OffGridTravel", AppWorkspace::OffGridTravel),
-        (
-            "CoupleSandboxSakha",
-            AppWorkspace::CoupleSandbox(PairRole::Sakha),
-        ),
-        (
-            "CoupleSandboxSakhi",
-            AppWorkspace::CoupleSandbox(PairRole::Sakhi),
-        ),
-    ];
-    let entries: Vec<String> = items
+    let entries: Vec<String> = AppWorkspace::all()
         .iter()
-        .map(|(key, ws)| format!(r#"{{"key":"{}","label":"{}"}}"#, key, ws.label()))
+        .map(|ws| format!(r#"{{"key":"{}","label":"{}"}}"#, ws.key(), ws.label()))
         .collect();
     let json = format!("[{}]", entries.join(","));
     to_jstring(&mut env, &json)

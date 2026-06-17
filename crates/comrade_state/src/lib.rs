@@ -91,6 +91,38 @@ impl AppWorkspace {
     pub fn is_couple_sandbox(&self) -> bool {
         matches!(self, AppWorkspace::CoupleSandbox(_))
     }
+
+    /// Stable string key for serialisation across FFI / IPC boundaries
+    /// (JNI bridge, Tauri commands, etc.). The inverse of [`AppWorkspace::from_key`].
+    pub fn key(&self) -> &'static str {
+        match self {
+            AppWorkspace::Base => "Base",
+            AppWorkspace::OffGridTravel => "OffGridTravel",
+            AppWorkspace::CoupleSandbox(PairRole::Sakha) => "CoupleSandboxSakha",
+            AppWorkspace::CoupleSandbox(PairRole::Sakhi) => "CoupleSandboxSakhi",
+        }
+    }
+
+    /// Parse a workspace from its stable string [`AppWorkspace::key`].
+    pub fn from_key(key: &str) -> Option<Self> {
+        match key {
+            "Base" => Some(AppWorkspace::Base),
+            "OffGridTravel" => Some(AppWorkspace::OffGridTravel),
+            "CoupleSandboxSakha" => Some(AppWorkspace::CoupleSandbox(PairRole::Sakha)),
+            "CoupleSandboxSakhi" => Some(AppWorkspace::CoupleSandbox(PairRole::Sakhi)),
+            _ => None,
+        }
+    }
+
+    /// All workspace variants, in canonical display order.
+    pub fn all() -> [AppWorkspace; 4] {
+        [
+            AppWorkspace::Base,
+            AppWorkspace::OffGridTravel,
+            AppWorkspace::CoupleSandbox(PairRole::Sakha),
+            AppWorkspace::CoupleSandbox(PairRole::Sakhi),
+        ]
+    }
 }
 
 impl fmt::Display for AppWorkspace {
@@ -206,6 +238,15 @@ mod tests {
         let ctx = AppWorkspace::CoupleSandbox(PairRole::Sakhi);
         let result = ctx.transition_to(AppWorkspace::Base);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn key_from_key_roundtrip() {
+        for ws in AppWorkspace::all() {
+            let key = ws.key();
+            assert_eq!(AppWorkspace::from_key(key), Some(ws.clone()));
+        }
+        assert_eq!(AppWorkspace::from_key("nonsense"), None);
     }
 
     #[test]

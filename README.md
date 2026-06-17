@@ -1,6 +1,7 @@
 # Comrade
 
-A privacy-first social client for Android built entirely in Rust with a Kotlin/Compose UI shell.
+A privacy-first, cross-platform social client built entirely in Rust, with a shared
+view-model layer driving an Android (Kotlin/Compose), desktop (Tauri), or CLI frontend.
 
 ## What it does
 
@@ -10,6 +11,9 @@ A privacy-first social client for Android built entirely in Rust with a Kotlin/C
 | **Vault** | Nostr Kind-4 + NIP-04 | End-to-end encrypted direct messages; `/pay` UPI intent detection |
 | **Saathi** | libp2p mDNS + Gossipsub | Off-grid local mesh — works without internet |
 | **Sakha/Sakhi** | Yrs CRDT + AES-256-GCM | Cryptographically isolated shared ledger for couples |
+| **Relay gossip** | NIP-65 | Dynamic relay discovery + outbox-model routing |
+| **Media** | NIP-94 / NIP-96 | Encrypted file staging + pluggable decentralized upload |
+| **Storage** | sled + Argon2id + AES-256-GCM | Encrypted-at-rest local persistence unlocked by a PIN |
 
 The **Progressive-Disclosure state machine** (`comrade_state`) gates which engines are active:
 
@@ -24,12 +28,19 @@ Base ──────── Sabha (public feed) + Vault (E2E DMs)
 ```
 crates/
   comrade_state/   State machine (no I/O dependencies)
-  comrade_core/    Protocol engines (Nostr, libp2p, Yrs, crypto)
+  comrade_core/    Protocol engines: crypto, sabha, vault, saathi, sakha, relay, media
+  comrade_storage/ Encrypted-at-rest persistence (sled + Argon2id + AES-256-GCM)
+  comrade_ui/      Framework-agnostic view-model / service layer (UiService + DTOs)
   comrade_jni/     JNI bridge — compiled to libcomrade_jni.so for Android
 src/main.rs        Interactive CLI harness (development / testing)
 android/           Kotlin + Jetpack Compose Android app
+desktop/           Tauri 2 desktop shell (excluded from the workspace — see desktop/README.md)
 .github/workflows/ CI (test + lint) and manual APK release
 ```
+
+The UI logic lives once in **`comrade_ui`** and is reused by every frontend: the Android
+app (via `comrade_jni`), the desktop app (via `#[tauri::command]` wrappers in `desktop/`),
+and the CLI. This keeps the entire UI contract unit-testable without a display server.
 
 ## Building
 
@@ -65,6 +76,18 @@ cargo ndk \
 cd android
 gradle assembleRelease
 # APK → android/app/build/outputs/apk/release/app-release.apk
+```
+
+### Build the desktop app (Tauri 2)
+
+The desktop shell lives in `desktop/` and is **excluded from the Cargo workspace**
+because it needs the Tauri CLI and system webview libraries. See
+[`desktop/README.md`](desktop/README.md) for full prerequisites. In short:
+
+```sh
+cargo install tauri-cli --version "^2.0.0"
+cd desktop/src-tauri
+cargo tauri dev      # run; or `cargo tauri build` for a distributable bundle
 ```
 
 ## CI / Releases

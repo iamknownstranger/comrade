@@ -1,0 +1,22 @@
+[package]
+name    = "comrade-desktop"
+version = "0.1.0"
+edition = "2021"
+description = "Comrade cross-platform desktop shell (Tauri 2)"
+
+# This crate is intentionally OUTSIDE the Cargo workspace (see root Cargo.toml
+# `exclude`) because Tauri needs the Tauri CLI + system webview libraries
+# (e.g. webkit2gtk on Linux) which are not part of the headless CI image.
+
+[lib]
+name = "comrade_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri      = { version = "2", features = [] }
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+comrade_ui = { path = "../../crates/comrade_ui" }

@@ -5,7 +5,12 @@ members = [
     "crates/comrade_jni",
     "crates/comrade_state",
     "crates/comrade_storage",
+    "crates/comrade_ui",
 ]
+# The Tauri desktop shell needs the Tauri toolchain + system webview libs to
+# build, so it is kept out of the workspace to keep `cargo test --workspace`
+# and CI lean. Build it separately from desktop/src-tauri (see desktop/README).
+exclude = ["desktop/src-tauri"]
 resolver = "2"
 
 [workspace.dependencies]

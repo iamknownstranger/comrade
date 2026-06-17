@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Comrade</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+  </head>
+  <body class="h-full bg-slate-950 text-slate-100 font-sans">
+    <main class="mx-auto max-w-md p-5 space-y-6">
+      <header class="text-center pt-4">
+        <h1 class="text-3xl font-bold tracking-tight">Comrade</h1>
+        <p class="text-slate-400 text-sm">Privacy-first social client</p>
+      </header>
+
+      <!-- Workspaces -->
+      <section>
+        <h2 class="text-xs uppercase tracking-wide text-indigo-400 mb-2">Workspaces</h2>
+        <div id="workspaces" class="space-y-2"></div>
+        <button id="back-btn"
+          class="mt-2 w-full rounded-lg border border-slate-700 py-2 text-sm hover:bg-slate-800">
+          ← Back
+        </button>
+      </section>
+
+      <!-- Identity -->
+      <section>
+        <h2 class="text-xs uppercase tracking-wide text-indigo-400 mb-2">Identity</h2>
+        <button id="gen-btn"
+          class="w-full rounded-lg bg-indigo-600 py-2 text-sm font-medium hover:bg-indigo-500">
+          Generate New Keypair
+        </button>
+        <p id="identity" class="mt-2 break-all text-xs font-mono text-slate-300"></p>
+      </section>
+
+      <!-- Payments -->
+      <section>
+        <h2 class="text-xs uppercase tracking-wide text-indigo-400 mb-2">UPI /pay parser</h2>
+        <input id="pay-input" type="text" placeholder="/pay 250 to friend@upi"
+          class="w-full rounded-lg bg-slate-800 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-indigo-500" />
+        <div id="pay-result" class="mt-2 space-y-1 text-xs"></div>
+      </section>
+    </main>
+
+    <script src="main.js"></script>
+  </body>
+</html>
