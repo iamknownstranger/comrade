@@ -7,14 +7,36 @@ Rust backend driving a lightweight HTML/Tailwind webview frontend.
 
 ```
 desktop/
-  ui/                 Static frontend (no build step — Tailwind via CDN)
-    index.html
-    main.js           Calls the backend via window.__TAURI__ IPC
+  ui/                 Static frontend (no build step, no CDN)
+    index.html        SPA shell: vault door · base workspace · modality overlays
+    styles.css        Dark-mode-first theme; modality re-skins via <body> class
+    main.js           IPC (window.__TAURI__) + live event stream + toasts
   src-tauri/          Rust backend
-    src/lib.rs        #[tauri::command] wrappers over comrade_ui::UiService
+    src/lib.rs        Builder, event-forwarder setup hook, command registry
+    src/commands.rs   async #[tauri::command] wrappers over comrade_ui::ComradeRuntime
     src/main.rs       Entry point
     tauri.conf.json   Window + bundle configuration
 ```
+
+## Frontend (Progressive Disclosure SPA)
+
+`ui/` is a dependency-free vanilla-JS single-page app implementing the three-tier
+workspace model:
+
+1. **Vault Door** — passphrase lock screen → `invoke('unlock_comrade_vault')`.
+   Any passphrase forges/loads the encrypted vault and seeds an identity.
+2. **Base Workspace** — tabbed **Sabha** (compose + broadcast Chitthis, live
+   feed) and **Vault** (contacts + encrypted chat populated by the live DM
+   stream, with on-device UPI `/pay` detection).
+3. **Modality overlays** — a **Travel / Off-Grid** switch and a **Partner
+   Portal** (cryptographic pairing → Couple Sandbox) that re-theme the whole
+   app by swapping a `<body>` class.
+
+Real-time updates arrive over the single `comrade://event` window channel
+(internally-tagged `incoming_chitthi` / `incoming_direct_message`) and are
+prepended to the UI without a refresh. Every `invoke` is funnelled through a
+`safeInvoke` wrapper that renders backend errors as toasts. Running the page
+outside Tauri activates a built-in mock backend for design preview.
 
 All application logic lives in the **`comrade_ui`** crate in the main workspace
 (`crates/comrade_ui`), which is fully unit-tested. This `src-tauri` crate is a
@@ -71,8 +93,13 @@ JNI bridge (`comrade_jni`); the Tauri mobile path is an alternative that reuses
 
 ## Status
 
-The frontend and `#[tauri::command]` layer are complete and the underlying
-`comrade_ui` service is unit-tested in CI. The Tauri build itself was **not**
-compiled in the development sandbox (no webview system libraries available), so
-verify `cargo tauri dev` on a machine with the prerequisites above before
-release.
+The SPA frontend and the async `#[tauri::command]` layer are complete, and the
+underlying `comrade_ui::ComradeRuntime` is unit-tested in CI. The Tauri build
+itself was **not** compiled in the development sandbox (no webview system
+libraries available), so verify `cargo tauri dev` on a machine with the
+prerequisites above before release.
+
+Known frontend gaps (await backend commands, not yet exposed): outbound DM
+send (`send_dm`), persistent contact list, and server-side QR-pairing
+validation. The Vault tab therefore renders live *incoming* DMs and validates
+pairing payloads client-side before committing the workspace transition.

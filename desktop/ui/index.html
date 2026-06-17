@@ -3,50 +3,244 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- CSP is managed centrally in tauri.conf.json (app.security.csp); a strict
+         hand-rolled meta here can block Tauri 2's IPC custom protocol. -->
     <title>Comrade</title>
-    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="styles.css" />
   </head>
-  <body class="h-full bg-slate-950 text-slate-100 font-sans">
-    <main class="mx-auto max-w-md p-5 space-y-6">
-      <header class="text-center pt-4">
-        <h1 class="text-3xl font-bold tracking-tight">Comrade</h1>
-        <p class="text-slate-400 text-sm">Privacy-first social client</p>
+  <body class="theme-base" data-screen="vault">
+    <!-- ───────────────────────── Vault Door (lock screen) ───────────────────────── -->
+    <section id="screen-vault" class="screen screen-vault" aria-label="Vault lock screen">
+      <div class="vault-card">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">⬢</div>
+          <h1 class="brand-name">Comrade</h1>
+          <p class="brand-tag">Privacy-first social client</p>
+        </div>
+
+        <form id="vault-form" class="vault-form" autocomplete="off">
+          <label class="field-label" for="passphrase">Vault passphrase</label>
+          <div class="field-row">
+            <input
+              id="passphrase"
+              type="password"
+              class="input"
+              placeholder="Enter passphrase…"
+              autocomplete="current-password"
+              spellcheck="false"
+              required
+            />
+            <button
+              type="button"
+              id="toggle-reveal"
+              class="icon-btn"
+              title="Show / hide passphrase"
+              aria-label="Show or hide passphrase"
+            >
+              👁
+            </button>
+          </div>
+          <button id="unlock-btn" type="submit" class="btn btn-primary btn-block">
+            <span class="btn-label">Unlock vault</span>
+            <span class="spinner" hidden></span>
+          </button>
+          <p class="hint">
+            First time here? Any passphrase forges a brand-new encrypted vault and
+            identity. The passphrase never leaves this device.
+          </p>
+        </form>
+      </div>
+    </section>
+
+    <!-- ───────────────────────── Base Workspace shell ───────────────────────── -->
+    <section id="screen-app" class="screen screen-app" hidden aria-label="Comrade workspace">
+      <header class="app-header">
+        <div class="header-left">
+          <span class="brand-mark sm" aria-hidden="true">⬢</span>
+          <span class="brand-name sm">Comrade</span>
+          <span id="ws-badge" class="ws-badge">Base</span>
+        </div>
+
+        <div class="header-right">
+          <span class="net-pills" aria-label="Network status">
+            <span id="pill-relays" class="pill" title="Public relays">relays</span>
+            <span id="pill-mesh" class="pill" title="Off-grid mesh">mesh</span>
+          </span>
+
+          <label class="switch" title="Toggle Off-Grid / Travel mode">
+            <input id="travel-toggle" type="checkbox" />
+            <span class="switch-track"><span class="switch-thumb"></span></span>
+            <span class="switch-text">Travel</span>
+          </label>
+
+          <button id="partner-btn" class="icon-btn lg" title="Open Partner Portal" aria-label="Open Partner Portal">
+            🔒
+          </button>
+
+          <button id="identity-chip" class="identity-chip" title="Click to copy your npub">
+            <span class="dot"></span>
+            <span id="identity-npub" class="mono">npub…</span>
+          </button>
+        </div>
       </header>
 
-      <!-- Workspaces -->
-      <section>
-        <h2 class="text-xs uppercase tracking-wide text-indigo-400 mb-2">Workspaces</h2>
-        <div id="workspaces" class="space-y-2"></div>
-        <button id="back-btn"
-          class="mt-2 w-full rounded-lg border border-slate-700 py-2 text-sm hover:bg-slate-800">
-          ← Back
+      <nav class="tabs" role="tablist">
+        <button class="tab is-active" data-tab="sabha" role="tab" aria-selected="true">
+          Sabha <span class="tab-sub">Public Chitthis</span>
         </button>
-      </section>
-
-      <!-- Identity -->
-      <section>
-        <h2 class="text-xs uppercase tracking-wide text-indigo-400 mb-2">Identity</h2>
-        <button id="gen-btn"
-          class="w-full rounded-lg bg-indigo-600 py-2 text-sm font-medium hover:bg-indigo-500">
-          Generate New Keypair
+        <button class="tab" data-tab="vault" role="tab" aria-selected="false">
+          Vault <span class="tab-sub">Encrypted DMs</span>
         </button>
-        <p id="identity" class="mt-2 break-all text-xs font-mono text-slate-300"></p>
-      </section>
+      </nav>
 
-      <!-- Payments -->
-      <section>
-        <h2 class="text-xs uppercase tracking-wide text-indigo-400 mb-2">UPI /pay parser</h2>
-        <input id="pay-input" type="text" placeholder="/pay 250 to friend@upi"
-          class="w-full rounded-lg bg-slate-800 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-indigo-500" />
-        <div id="pay-result" class="mt-2 space-y-1 text-xs"></div>
-      </section>
+      <main class="app-body">
+        <!-- Sabha timeline -->
+        <section id="view-sabha" class="view view-sabha" role="tabpanel">
+          <div class="composer">
+            <textarea
+              id="chitthi-input"
+              class="textarea"
+              rows="3"
+              maxlength="2000"
+              placeholder="Write a Chitthi to the world…"
+            ></textarea>
+            <div class="composer-foot">
+              <span id="chitthi-count" class="muted">0 / 2000</span>
+              <button id="broadcast-btn" class="btn btn-primary">
+                <span class="btn-label">Broadcast</span>
+                <span class="spinner" hidden></span>
+              </button>
+            </div>
+          </div>
 
-      <!-- Live event stream (Chitthis / DMs pushed from the Rust Tokio loops) -->
-      <section>
-        <h2 class="text-xs uppercase tracking-wide text-indigo-400 mb-2">Live stream</h2>
-        <div id="event-log" class="space-y-1 text-xs text-slate-300"></div>
-      </section>
-    </main>
+          <div id="sabha-feed" class="feed" aria-live="polite">
+            <!-- chitthi cards injected here -->
+          </div>
+          <div id="sabha-empty" class="empty" hidden>
+            <p>No Chitthis yet.</p>
+            <p class="muted">New posts from the relays will stream in here live.</p>
+          </div>
+          <div id="sabha-loading" class="loading-rows" hidden>
+            <div class="skeleton"></div>
+            <div class="skeleton"></div>
+            <div class="skeleton"></div>
+          </div>
+        </section>
+
+        <!-- Vault DMs -->
+        <section id="view-vault" class="view view-vault" role="tabpanel" hidden>
+          <aside class="contacts">
+            <div class="contacts-head">Conversations</div>
+            <ul id="contact-list" class="contact-list"></ul>
+            <div id="contacts-empty" class="empty sm">
+              <p>No conversations yet.</p>
+              <p class="muted">Incoming encrypted DMs appear here automatically.</p>
+            </div>
+          </aside>
+
+          <div class="chat">
+            <div id="chat-header" class="chat-header">
+              <span class="muted">Select a conversation</span>
+            </div>
+            <div id="chat-log" class="chat-log" aria-live="polite"></div>
+            <div class="chat-composer">
+              <div id="dm-upi-preview" class="upi-preview" hidden></div>
+              <div class="field-row">
+                <input
+                  id="dm-input"
+                  class="input"
+                  type="text"
+                  placeholder="Message… (try “/pay 250 to friend@upi”)"
+                  disabled
+                />
+                <button id="dm-send" class="btn btn-primary" disabled title="DM sending is pending backend support">
+                  Send
+                </button>
+              </div>
+              <p class="hint sm">
+                Live UPI <code>/pay</code> detection is active. Outbound DM
+                transmission awaits a backend <code>send_dm</code> command.
+              </p>
+            </div>
+          </div>
+        </section>
+      </main>
+    </section>
+
+    <!-- ───────────────────────── Couple Sandbox overlay ───────────────────────── -->
+    <section id="screen-couple" class="screen screen-couple" hidden aria-label="Couple Sandbox">
+      <header class="couple-header">
+        <div class="couple-title">
+          <span class="heart" aria-hidden="true">❤</span>
+          <h2>Couple Sandbox</h2>
+          <span id="couple-role" class="role-badge">Sakha</span>
+        </div>
+        <button id="couple-exit" class="btn btn-ghost">Return to Base</button>
+      </header>
+
+      <div class="couple-body">
+        <div class="ledger-panel">
+          <div class="ledger-head">
+            <h3>Hisab-Kitab — Shared Ledger</h3>
+            <button id="sync-ledger-btn" class="btn btn-primary">
+              <span class="btn-label">Sync ledger</span>
+              <span class="spinner" hidden></span>
+            </button>
+          </div>
+          <p class="muted">
+            A cryptographically isolated CRDT ledger shared only between paired
+            partners. Encrypted end-to-end; relays see opaque ciphertext.
+          </p>
+          <div id="ledger-status" class="ledger-status">Not yet synced.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ───────────────────────── Partner Portal modal ───────────────────────── -->
+    <div id="modal-partner" class="modal-overlay" hidden>
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-partner-title">
+        <div class="modal-head">
+          <h3 id="modal-partner-title">Open the Partner Portal</h3>
+          <button id="partner-cancel" class="icon-btn" aria-label="Close">✕</button>
+        </div>
+        <p class="muted">
+          Scan or paste your partner's cryptographic pairing payload to enter the
+          shared Sakha/Sakhi sandbox.
+        </p>
+
+        <div class="qr-target" aria-hidden="true">
+          <div class="qr-grid"></div>
+          <span class="qr-caption">pairing payload</span>
+        </div>
+
+        <label class="field-label" for="pair-payload">Pairing payload</label>
+        <textarea
+          id="pair-payload"
+          class="textarea"
+          rows="3"
+          placeholder="npub1… or a comrade pairing token"
+        ></textarea>
+
+        <fieldset class="role-picker">
+          <legend class="field-label">Enter as</legend>
+          <label class="radio"><input type="radio" name="pair-role" value="sakha" checked /> Sakha</label>
+          <label class="radio"><input type="radio" name="pair-role" value="sakhi" /> Sakhi</label>
+        </fieldset>
+
+        <button id="pair-submit" class="btn btn-primary btn-block">
+          <span class="btn-label">Validate &amp; enter</span>
+          <span class="spinner" hidden></span>
+        </button>
+      </div>
+    </div>
+
+    <!-- ───────────────────────── Toast notifications ───────────────────────── -->
+    <div id="toasts" class="toasts" aria-live="assertive"></div>
+
+    <!-- Dev banner shown only when running outside the Tauri shell -->
+    <div id="preview-banner" class="preview-banner" hidden>
+      Preview mode — Tauri backend not detected. Using mock data.
+    </div>
 
     <script src="main.js"></script>
   </body>
