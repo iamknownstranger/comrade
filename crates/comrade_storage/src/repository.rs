@@ -15,21 +15,41 @@ use crate::{EncryptedStore, StorageError};
 
 const IDENTITY_TREE: &str = "identity";
 const CONTACTS_TREE: &str = "contacts";
-const MESSAGES_TREE: &str = "messages";
+const CHITTHI_TREE: &str = "chitthi_cache";
+const MESSAGES_TREE: &str = "vault_cache";
 const LEDGER_TREE: &str = "ledger";
 
 const IDENTITY_KEY: &str = "self";
 const LEDGER_SNAPSHOT_KEY: &str = "hisab_kitab";
+const LEDGER_STATE_KEY: &str = "hisab_kitab_state";
 
 // ── Domain types ──────────────────────────────────────────────────────────────
 
-/// The local user's Nostr identity. The `nsec` is the secret key in Bech32 form
-/// and is only ever stored sealed inside the [`EncryptedStore`].
+/// The local user's Nostr identity, plus the relay setup it was last seen with.
+///
+/// The `nsec` is the secret key in Bech32 form and is only ever stored sealed
+/// inside the [`EncryptedStore`]. `relays` carries the user's current NIP-65
+/// relay-list URLs so the outbox model can be reconstructed on a cold start.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredIdentity {
     pub npub: String,
     pub nsec: String,
     pub label: Option<String>,
+    /// Advertised relay URLs (NIP-65). Defaulted for backward-compatible reads.
+    #[serde(default)]
+    pub relays: Vec<String>,
+}
+
+impl StoredIdentity {
+    /// Construct an identity with no relay list yet.
+    pub fn new(npub: impl Into<String>, nsec: impl Into<String>, label: Option<String>) -> Self {
+        Self {
+            npub: npub.into(),
+            nsec: nsec.into(),
+            label,
+            relays: Vec::new(),
+        }
+    }
 }
 
 /// A saved contact with an optional petname and their advertised relays.
@@ -41,7 +61,23 @@ pub struct Contact {
     pub relays: Vec<String>,
 }
 
-/// A cached direct message (incoming or outgoing) for offline reading.
+/// A single cached public Chitthi (Kind-1 note) for instant offline rendering
+/// of the Sabha timeline. Keyed in the store by its event `id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Chitthi {
+    /// Nostr event id (hex).
+    pub id: String,
+    /// Author public key (npub or hex).
+    pub author_npub: String,
+    pub content: String,
+    pub created_at: u64,
+    /// Parent event id if this Chitthi is a reply (NIP-10), else `None`.
+    #[serde(default)]
+    pub reply_to: Option<String>,
+}
+
+/// A cached direct message (incoming or outgoing) for offline reading. One row
+/// of the [`VaultCache`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredMessage {
     pub id: String,
@@ -50,6 +86,21 @@ pub struct StoredMessage {
     pub created_at: u64,
     pub outgoing: bool,
 }
+
+/// A binary CRDT (Yrs) snapshot of the Sakha/Sakhi shared ledger, plus the wall
+/// clock at which it was captured. The bytes are opaque AES-256-GCM ciphertext
+/// once written to disk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LedgerState {
+    pub snapshot: Vec<u8>,
+    pub updated_at: u64,
+}
+
+/// The locally cached slice of the public Sabha timeline (newest first).
+pub type ChitthiCache = Vec<Chitthi>;
+
+/// The locally cached direct-message history across all conversations.
+pub type VaultCache = Vec<StoredMessage>;
 
 // ── Repository methods ────────────────────────────────────────────────────────
 
@@ -88,7 +139,31 @@ impl EncryptedStore {
         self.values(CONTACTS_TREE)
     }
 
-    // Messages ----------------------------------------------------------------
+    // Chitthi cache (public Sabha timeline) -----------------------------------
+
+    /// Cache a public Chitthi, keyed by its event id. Idempotent on re-insert.
+    pub fn cache_chitthi(&self, chitthi: &Chitthi) -> Result<(), StorageError> {
+        self.put(CHITTHI_TREE, &chitthi.id, chitthi)
+    }
+
+    /// Fetch a single cached Chitthi by event id.
+    pub fn get_chitthi(&self, id: &str) -> Result<Option<Chitthi>, StorageError> {
+        self.get(CHITTHI_TREE, id)
+    }
+
+    /// The whole cached Sabha timeline, newest-first, for offline rendering.
+    pub fn chitthi_cache(&self) -> Result<ChitthiCache, StorageError> {
+        let mut feed: ChitthiCache = self.values(CHITTHI_TREE)?;
+        feed.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(feed)
+    }
+
+    /// Remove a cached Chitthi by id. Returns `true` if one was removed.
+    pub fn remove_chitthi(&self, id: &str) -> Result<bool, StorageError> {
+        self.delete(CHITTHI_TREE, id)
+    }
+
+    // Vault cache (encrypted DM history) --------------------------------------
 
     /// Cache a direct message, keyed by its event id.
     pub fn save_message(&self, message: &StoredMessage) -> Result<(), StorageError> {
@@ -106,23 +181,38 @@ impl EncryptedStore {
         Ok(msgs)
     }
 
-    /// All cached messages across every conversation, sorted oldest-first.
-    pub fn all_messages(&self) -> Result<Vec<StoredMessage>, StorageError> {
-        let mut msgs: Vec<StoredMessage> = self.values(MESSAGES_TREE)?;
+    /// The entire [`VaultCache`] across every conversation, sorted oldest-first.
+    pub fn vault_cache(&self) -> Result<VaultCache, StorageError> {
+        let mut msgs: VaultCache = self.values(MESSAGES_TREE)?;
         msgs.sort_by_key(|m| m.created_at);
         Ok(msgs)
     }
 
+    /// Alias for [`Self::vault_cache`] kept for call-site readability.
+    pub fn all_messages(&self) -> Result<VaultCache, StorageError> {
+        self.vault_cache()
+    }
+
     // Ledger ------------------------------------------------------------------
 
-    /// Persist a binary CRDT (Yrs) ledger snapshot.
+    /// Persist a binary CRDT (Yrs) ledger snapshot (raw bytes).
     pub fn save_ledger_snapshot(&self, state: &[u8]) -> Result<(), StorageError> {
         self.put_bytes(LEDGER_TREE, LEDGER_SNAPSHOT_KEY, state)
     }
 
-    /// Load the most recent CRDT ledger snapshot, if any.
+    /// Load the most recent CRDT ledger snapshot, if any (raw bytes).
     pub fn load_ledger_snapshot(&self) -> Result<Option<Vec<u8>>, StorageError> {
         self.get_bytes(LEDGER_TREE, LEDGER_SNAPSHOT_KEY)
+    }
+
+    /// Persist a [`LedgerState`] (binary CRDT chunk + capture timestamp).
+    pub fn save_ledger_state(&self, state: &LedgerState) -> Result<(), StorageError> {
+        self.put(LEDGER_TREE, LEDGER_STATE_KEY, state)
+    }
+
+    /// Load the most recent [`LedgerState`], if one has been captured.
+    pub fn load_ledger_state(&self) -> Result<Option<LedgerState>, StorageError> {
+        self.get(LEDGER_TREE, LEDGER_STATE_KEY)
     }
 }
 
@@ -147,6 +237,7 @@ mod tests {
             npub: "npub1abc".into(),
             nsec: "nsec1xyz".into(),
             label: Some("primary".into()),
+            relays: vec!["wss://relay.damus.io".into()],
         };
         s.save_identity(&id).unwrap();
         assert_eq!(s.load_identity().unwrap(), Some(id));
@@ -215,5 +306,72 @@ mod tests {
         let snap = vec![10u8, 20, 30, 40];
         s.save_ledger_snapshot(&snap).unwrap();
         assert_eq!(s.load_ledger_snapshot().unwrap(), Some(snap));
+    }
+
+    #[test]
+    fn ledger_state_roundtrip() {
+        let (_d, s) = store();
+        assert!(s.load_ledger_state().unwrap().is_none());
+        let state = LedgerState {
+            snapshot: vec![1u8, 2, 3, 4, 5],
+            updated_at: 1_700_000_000,
+        };
+        s.save_ledger_state(&state).unwrap();
+        assert_eq!(s.load_ledger_state().unwrap(), Some(state));
+    }
+
+    #[test]
+    fn chitthi_cache_sorted_newest_first() {
+        let (_d, s) = store();
+        assert!(s.chitthi_cache().unwrap().is_empty());
+
+        s.cache_chitthi(&Chitthi {
+            id: "c1".into(),
+            author_npub: "npub1a".into(),
+            content: "older".into(),
+            created_at: 100,
+            reply_to: None,
+        })
+        .unwrap();
+        s.cache_chitthi(&Chitthi {
+            id: "c2".into(),
+            author_npub: "npub1b".into(),
+            content: "newer".into(),
+            created_at: 200,
+            reply_to: Some("c1".into()),
+        })
+        .unwrap();
+
+        let feed = s.chitthi_cache().unwrap();
+        assert_eq!(feed.len(), 2);
+        assert_eq!(feed[0].content, "newer");
+        assert_eq!(feed[1].content, "older");
+        assert_eq!(s.get_chitthi("c2").unwrap().unwrap().reply_to.as_deref(), Some("c1"));
+        assert!(s.remove_chitthi("c1").unwrap());
+        assert_eq!(s.chitthi_cache().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn vault_cache_returns_all_sorted() {
+        let (_d, s) = store();
+        s.save_message(&StoredMessage {
+            id: "m2".into(),
+            peer_npub: "npub1x".into(),
+            content: "second".into(),
+            created_at: 20,
+            outgoing: true,
+        })
+        .unwrap();
+        s.save_message(&StoredMessage {
+            id: "m1".into(),
+            peer_npub: "npub1y".into(),
+            content: "first".into(),
+            created_at: 10,
+            outgoing: false,
+        })
+        .unwrap();
+        let cache = s.vault_cache().unwrap();
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache[0].content, "first");
     }
 }

@@ -527,11 +527,11 @@ async fn main() -> anyhow::Result<()> {
                 match &guard.store {
                     None => println!("  Run 'unlock <PIN>' first."),
                     Some(store) => {
-                        let identity = StoredIdentity {
-                            npub: guard.profile.npub.clone(),
-                            nsec: guard.profile.nsec.clone(),
-                            label: Some("primary".into()),
-                        };
+                        let identity = StoredIdentity::new(
+                            guard.profile.npub.clone(),
+                            guard.profile.nsec.clone(),
+                            Some("primary".into()),
+                        );
                         match store.save_identity(&identity).and_then(|()| store.flush()) {
                             Ok(()) => println!("  Identity saved (encrypted at rest)."),
                             Err(e) => println!("  Save failed: {e}"),

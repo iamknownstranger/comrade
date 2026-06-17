@@ -41,7 +41,9 @@ use tracing::{debug, info};
 use zeroize::Zeroizing;
 
 pub use error::StorageError;
-pub use repository::{Contact, StoredIdentity, StoredMessage};
+pub use repository::{
+    Chitthi, ChitthiCache, Contact, LedgerState, StoredIdentity, StoredMessage, VaultCache,
+};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 

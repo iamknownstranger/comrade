@@ -182,11 +182,8 @@ impl UiService {
     pub fn save_identity(&self) -> Result<(), UiError> {
         let store = self.store.as_ref().ok_or(UiError::StoreLocked)?;
         let profile = self.identity.as_ref().ok_or(UiError::NoIdentity)?;
-        let identity = StoredIdentity {
-            npub: profile.npub.clone(),
-            nsec: profile.nsec.clone(),
-            label: Some("primary".into()),
-        };
+        let identity =
+            StoredIdentity::new(profile.npub.clone(), profile.nsec.clone(), Some("primary".into()));
         store
             .save_identity(&identity)
             .and_then(|()| store.flush())
