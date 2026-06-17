@@ -1,10 +1,29 @@
 /*!
  * Typed repositories layered over [`EncryptedStore`].
  *
- * These give the rest of the app a domain-shaped API (identity, contacts,
- * messages, ledger snapshots) without every caller hard-coding tree names.
+ * These give the rest of the app a domain-shaped API (identity, Chitthi cache,
+ * vault cache, ledger state) without every caller hard-coding tree names.
  * The storage crate stays free of `comrade_core`/`nostr` dependencies to avoid
  * a dependency cycle, so identities and contacts are represented as plain data.
+ *
+ * # Encryption pipeline (Milestone 3)
+ *
+ * Initialisation is a single secure routine — [`EncryptedStore::open`] — that
+ * accepts a user-defined passphrase from the application thread:
+ *
+ * 1. **Key derivation** — the passphrase is stretched with **Argon2id**
+ *    (memory-hard) over a per-store random salt into a 32-byte AES-256 key that
+ *    lives only in memory ([`Zeroizing`]) and is zeroized on drop.
+ * 2. **Envelope encryption** — every repository write (`save_identity`,
+ *    `save_message`, `cache_chitthi`, `save_ledger_state`, …) serialises to
+ *    JSON and seals it with **AES-256-GCM** (random 96-bit nonce per record)
+ *    before it touches disk. Reads authenticate-then-decrypt.
+ *
+ * The upshot: sensitive profiles, raw direct messages, and private identity
+ * keys (`nsec`) are ciphertext at rest — see the `nsec_never_plaintext_at_rest`
+ * test below, which scans the on-disk files to prove it.
+ *
+ * [`Zeroizing`]: zeroize::Zeroizing
  */
 
 use serde::{Deserialize, Serialize};
@@ -349,6 +368,36 @@ mod tests {
         assert_eq!(s.get_chitthi("c2").unwrap().unwrap().reply_to.as_deref(), Some("c1"));
         assert!(s.remove_chitthi("c1").unwrap());
         assert_eq!(s.chitthi_cache().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn nsec_never_plaintext_at_rest() {
+        // Milestone 3: prove the private key is AES-GCM ciphertext on disk when
+        // persisted through the repository API (not just the raw KV layer).
+        let dir = TempDir::new().unwrap();
+        let secret = "nsec1averysecretprivatekeyvalue000000000000000000000000000000";
+        {
+            let s = EncryptedStore::open(dir.path(), "passphrase").unwrap();
+            s.save_identity(&StoredIdentity::new("npub1pub", secret, Some("primary".into())))
+                .unwrap();
+            s.flush().unwrap();
+        }
+        let mut leaked = false;
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_file() {
+                if let Ok(bytes) = std::fs::read(&path) {
+                    if bytes.windows(secret.len()).any(|w| w == secret.as_bytes()) {
+                        leaked = true;
+                    }
+                }
+            }
+        }
+        assert!(!leaked, "private nsec must never be written in plaintext");
+
+        // And it round-trips correctly through the encryption pipeline.
+        let s = EncryptedStore::open(dir.path(), "passphrase").unwrap();
+        assert_eq!(s.load_identity().unwrap().unwrap().nsec, secret);
     }
 
     #[test]
