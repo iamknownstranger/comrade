@@ -19,6 +19,14 @@ tracing    = { workspace = true }
 # declaring them here lets the bridge own its engines and event bus directly.
 tokio      = { workspace = true }
 nostr-sdk  = { workspace = true }
+base64     = { workspace = true }
+
+[features]
+default = []
+# Enable the real HTTP media pipeline (Blossom upload + fetch-and-decrypt) in
+# the underlying core. Frontends that ship media (e.g. the Tauri desktop) turn
+# this on; the workspace test build leaves it off and exercises the offline path.
+media-http = ["comrade_core/media-http"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

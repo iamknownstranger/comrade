@@ -146,6 +146,8 @@
             <div class="chat-composer">
               <div id="dm-upi-preview" class="upi-preview" hidden></div>
               <div class="field-row">
+                <button id="dm-attach" class="icon-btn" title="Attach encrypted media (max 10 MB)" disabled>📎</button>
+                <input id="dm-file" type="file" accept="image/*,audio/*" hidden />
                 <input
                   id="dm-input"
                   class="input"
@@ -158,8 +160,9 @@
                 </button>
               </div>
               <p class="hint sm">
-                Live UPI <code>/pay</code> detection is active. Outbound DM
-                transmission awaits a backend <code>send_dm</code> command.
+                Live UPI <code>/pay</code> detection is active. The 📎 attaches an
+                end-to-end encrypted photo/audio (max 10 MB). Text DM transmission
+                awaits a backend <code>send_dm</code> command.
               </p>
             </div>
           </div>
@@ -192,6 +195,19 @@
             partners. Encrypted end-to-end; relays see opaque ciphertext.
           </p>
           <div id="ledger-status" class="ledger-status">Not yet synced.</div>
+        </div>
+
+        <div class="ledger-panel">
+          <div class="ledger-head">
+            <h3>Encrypted media</h3>
+            <button id="couple-attach" class="btn btn-primary" disabled>Attach &amp; send</button>
+          </div>
+          <input id="couple-file" type="file" accept="image/*,audio/*" hidden />
+          <p class="muted">
+            Share an end-to-end encrypted photo or audio note with your partner.
+            Encrypted on-device with the couple's Diffie-Hellman secret. Max 10 MB.
+          </p>
+          <div id="couple-media" class="chat-log"></div>
         </div>
       </div>
     </section>

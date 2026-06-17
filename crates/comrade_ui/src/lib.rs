@@ -14,6 +14,7 @@
  */
 
 use std::path::Path;
+use std::sync::Arc;
 
 use comrade_core::crypto::KeyProfile;
 use comrade_core::vault::{build_pay_regex, extract_upi_intents};
@@ -24,7 +25,9 @@ use thiserror::Error;
 
 pub mod runtime;
 
-pub use runtime::{BridgeEvent, ChitthiDto, ComradeRuntime, DirectMessageDto};
+pub use runtime::{
+    BridgeEvent, ChitthiDto, ComradeRuntime, DirectMessageDto, MediaBytesDto, MediaMessageDto,
+};
 
 // ── Errors ──────────────────────────────────────────────────────────────────────
 
@@ -103,7 +106,9 @@ pub struct UpiIntentDto {
 pub struct UiService {
     ctx: RuntimeContext,
     identity: Option<KeyProfile>,
-    store: Option<EncryptedStore>,
+    /// Behind an `Arc` so background Tokio loops (e.g. the media-aware DM
+    /// listener in [`runtime`]) can hold their own handle to the open store.
+    store: Option<Arc<EncryptedStore>>,
 }
 
 impl Default for UiService {
@@ -180,7 +185,7 @@ impl UiService {
     /// Open the encrypted store at `path` with `pin`.
     pub fn unlock_store(&mut self, path: impl AsRef<Path>, pin: &str) -> Result<(), UiError> {
         let store = EncryptedStore::open(path, pin).map_err(|e| UiError::Storage(e.to_string()))?;
-        self.store = Some(store);
+        self.store = Some(Arc::new(store));
         Ok(())
     }
 
@@ -198,7 +203,13 @@ impl UiService {
     /// Crate-internal borrow of the unlocked encrypted store, for cache reads
     /// (e.g. the offline Sabha timeline) performed by the [`runtime`] bridge.
     pub(crate) fn store_ref(&self) -> Option<&EncryptedStore> {
-        self.store.as_ref()
+        self.store.as_deref()
+    }
+
+    /// Crate-internal: a cloned `Arc` handle to the open store, so background
+    /// Tokio tasks (the media-aware DM loop) can persist independently.
+    pub(crate) fn store_arc(&self) -> Option<Arc<EncryptedStore>> {
+        self.store.clone()
     }
 
     /// Persist the current identity to the unlocked store.
