@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use comrade_core::{
     crypto::KeyProfile,
-    sabha::build_thread_tree,
+    sabha::build_chitthi_thread,
     vault::{build_pay_regex, extract_upi_intents},
 };
 use comrade_state::{AppWorkspace, PairRole, RuntimeContext};
@@ -83,7 +83,7 @@ fn print_help() {
     println!("  keys       — display current npub / nsec");
     println!("  partner    — generate a partner keypair (for demo pairing)");
     println!("  dh         — compute DH shared secret with partner");
-    println!("  tree       — demo: build a sample NIP-10 thread tree");
+    println!("  tree/feed  — demo: build a sample NIP-10 ChitthiThread (Sabha timeline)");
     println!("  pay <msg>  — demo: extract UPI /pay intents from text");
     println!("  ledger     — demo: append an entry and show CRDT ledger");
     println!("  relays     — demo: NIP-65 outbox-model relay routing");
@@ -106,28 +106,28 @@ fn read_line(prompt: &str) -> io::Result<String> {
 
 // ── Demo scenarios ───────────────────────────────────────────────────────────
 
-fn demo_thread_tree() {
-    use comrade_core::sabha::ThreadNode;
+fn demo_chitthi_feed() {
+    use comrade_core::sabha::ChitthiNode;
     use nostr_sdk::prelude::*;
 
-    println!("  Building a sample NIP-10 thread tree …");
+    println!("  Building a sample NIP-10 ChitthiThread …");
 
     let keys = Keys::generate();
-    let root = EventBuilder::new(Kind::TextNote, "Root post: Hello from Sabha!")
+    let root = EventBuilder::new(Kind::TextNote, "Root Chitthi: Namaste from Sabha!")
         .sign_with_keys(&keys)
         .expect("sign root");
 
     let root_id = root.id.to_hex();
     let reply_tag = Tag::parse(["e", root_id.as_str(), "", "reply"]).unwrap_or(Tag::event(root.id));
 
-    let reply = EventBuilder::new(Kind::TextNote, "Reply to root")
+    let reply = EventBuilder::new(Kind::TextNote, "Reply Chitthi")
         .tags([reply_tag])
         .sign_with_keys(&keys)
         .expect("sign reply");
 
-    let tree = build_thread_tree(vec![root, reply]);
+    let thread = build_chitthi_thread(vec![root, reply]);
 
-    fn print_node(node: &ThreadNode) {
+    fn print_node(node: &ChitthiNode) {
         println!(
             "  {} [depth {}] {} …",
             "  ".repeat(node.depth),
@@ -139,8 +139,11 @@ fn demo_thread_tree() {
         }
     }
 
-    println!("  Thread tree ({} total nodes):", tree.len());
-    for root in &tree.roots {
+    println!(
+        "  ── Sabha Timeline (Chitthis) — {} total ─────────────────",
+        thread.len()
+    );
+    for root in &thread.roots {
         print_node(root);
     }
 }
@@ -488,7 +491,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            "tree" => demo_thread_tree(),
+            "tree" | "feed" | "chitthi" => demo_chitthi_feed(),
 
             "pay" => {
                 if arg.is_empty() {

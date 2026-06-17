@@ -1,9 +1,14 @@
 /*!
- * Milestone 3a — Sabha: Public Microblogging Engine
+ * Milestone 3a — Sabha: Public Microblogging Engine ("Chitthi Feed")
  *
- * Connects to public Nostr relays, subscribes to Kind-1 text notes, and
- * parses a flat unsorted stream of events into a structured NIP-10 comment
- * tree using recursive parent-child resolution.
+ * Connects to public Nostr relays, subscribes to Kind-1 text notes (each one a
+ * public *Chitthi* — a letter to the world), and parses a flat unsorted stream
+ * of events into a structured NIP-10 `ChitthiThread` using recursive
+ * parent-child resolution.
+ *
+ * Nomenclature: at the application layer a public post is a **Chitthi** and a
+ * reply tree is a **ChitthiThread**. The Nostr protocol constant `Kind::TextNote`
+ * is left untouched — only the execution/timeline layer adopts the Chitthi name.
  */
 
 use std::{collections::HashMap, sync::Arc};
@@ -25,16 +30,16 @@ pub const DEFAULT_RELAYS: &[&str] = &[
 // ── NIP-10 thread-tree structures ────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ThreadNode {
+pub struct ChitthiNode {
     /// The raw Nostr event at this tree position.
     pub event: Event,
     /// Zero-indexed depth from a root node.
     pub depth: usize,
     /// Direct replies to this node, sorted by created_at ascending.
-    pub children: Vec<ThreadNode>,
+    pub children: Vec<ChitthiNode>,
 }
 
-impl ThreadNode {
+impl ChitthiNode {
     fn new(event: Event, depth: usize) -> Self {
         Self {
             event,
@@ -45,15 +50,15 @@ impl ThreadNode {
 }
 
 #[derive(Debug, Default, Clone)]
-pub struct ThreadTree {
+pub struct ChitthiThread {
     /// Top-level events — those that have no parent within the local set.
-    pub roots: Vec<ThreadNode>,
+    pub roots: Vec<ChitthiNode>,
 }
 
-impl ThreadTree {
+impl ChitthiThread {
     /// Total number of events across all levels.
     pub fn len(&self) -> usize {
-        fn count(nodes: &[ThreadNode]) -> usize {
+        fn count(nodes: &[ChitthiNode]) -> usize {
             nodes.iter().map(|n| 1 + count(&n.children)).sum()
         }
         count(&self.roots)
@@ -132,9 +137,9 @@ fn resolve_parent_id(event: &Event) -> Option<String> {
 
 /// Transform a flat, unsorted vector of Kind-1 Nostr events into a structured
 /// NIP-10 comment tree.
-pub fn build_thread_tree(events: Vec<Event>) -> ThreadTree {
+pub fn build_chitthi_thread(events: Vec<Event>) -> ChitthiThread {
     if events.is_empty() {
-        return ThreadTree::default();
+        return ChitthiThread::default();
     }
 
     let event_map: HashMap<String, Event> =
@@ -166,9 +171,9 @@ pub fn build_thread_tree(events: Vec<Event>) -> ThreadTree {
         depth: usize,
         event_map: &HashMap<String, Event>,
         children_of: &HashMap<String, Vec<String>>,
-    ) -> ThreadNode {
+    ) -> ChitthiNode {
         let event = event_map[id].clone();
-        let mut node = ThreadNode::new(event, depth);
+        let mut node = ChitthiNode::new(event, depth);
         if let Some(child_ids) = children_of.get(id) {
             let mut sorted = child_ids.clone();
             sorted.sort_by_key(|cid| event_map[cid].created_at);
@@ -185,14 +190,14 @@ pub fn build_thread_tree(events: Vec<Event>) -> ThreadTree {
         .map(|id| build_node(id, 0, &event_map, &children_of))
         .collect();
 
-    ThreadTree { roots }
+    ChitthiThread { roots }
 }
 
 // ── Sabha Engine ─────────────────────────────────────────────────────────────
 
-pub type SabhaEventCallback = Box<dyn Fn(Event) + Send + Sync + 'static>;
+pub type ChitthiCallback = Box<dyn Fn(Event) + Send + Sync + 'static>;
 
-/// Connects to Nostr relays and streams Kind-1 text notes.
+/// Connects to Nostr relays and streams Kind-1 text notes as public Chitthis.
 pub struct SabhaEngine {
     client: Client,
 }
@@ -226,22 +231,22 @@ impl SabhaEngine {
         self.client.disconnect().await;
     }
 
-    /// Publish a text note to the public relay set.
-    pub async fn publish_note(&self, content: &str) -> Result<EventId, SabhaError> {
+    /// Broadcast a Chitthi (Kind-1 text note) to the public relay set.
+    pub async fn broadcast_chitthi(&self, content: &str) -> Result<EventId, SabhaError> {
         let output = self
             .client
             .send_event_builder(EventBuilder::text_note(content))
             .await
             .map_err(|e| SabhaError::RelayError(e.to_string()))?;
-        info!(event_id = %output.id(), "Sabha note published");
+        info!(event_id = %output.id(), "Chitthi broadcast to Sabha");
         Ok(*output.id())
     }
 
-    /// Subscribe to Kind-1 events since `since_secs` seconds ago.
-    pub async fn subscribe_feed(
+    /// Subscribe to the Chitthi feed (Kind-1 events) since `since_secs` seconds ago.
+    pub async fn subscribe_chitthi_feed(
         &self,
         since_secs: u64,
-        callback: SabhaEventCallback,
+        callback: ChitthiCallback,
     ) -> Result<(), SabhaError> {
         let filter = Filter::new()
             .kind(Kind::TextNote)
@@ -252,7 +257,7 @@ impl SabhaEngine {
             .await
             .map_err(|e| SabhaError::SubscriptionError(e.to_string()))?;
 
-        info!("Sabha feed subscription active");
+        info!("Chitthi feed subscription active");
 
         let callback = Arc::new(callback);
         self.client
@@ -261,7 +266,7 @@ impl SabhaEngine {
                 async move {
                     if let RelayPoolNotification::Event { event, .. } = notification {
                         if event.kind == Kind::TextNote {
-                            debug!(event_id = %event.id, "Sabha event received");
+                            debug!(event_id = %event.id, "Chitthi received");
                             cb(*event);
                         }
                     }
@@ -302,14 +307,14 @@ mod tests {
 
     #[test]
     fn empty_input_gives_empty_tree() {
-        let tree = build_thread_tree(vec![]);
+        let tree = build_chitthi_thread(vec![]);
         assert!(tree.is_empty());
     }
 
     #[test]
     fn single_event_becomes_root() {
         let event = make_bare_event(None, None);
-        let tree = build_thread_tree(vec![event]);
+        let tree = build_chitthi_thread(vec![event]);
         assert_eq!(tree.roots.len(), 1);
         assert_eq!(tree.len(), 1);
     }
@@ -320,7 +325,7 @@ mod tests {
         let root_id = root.id.to_hex();
 
         let child = make_bare_event(Some(&root_id), Some("reply"));
-        let tree = build_thread_tree(vec![child, root]);
+        let tree = build_chitthi_thread(vec![child, root]);
 
         assert_eq!(tree.roots.len(), 1);
         assert_eq!(tree.roots[0].children.len(), 1);
@@ -332,7 +337,7 @@ mod tests {
     fn orphan_events_become_independent_roots() {
         let orphan_id = "a".repeat(64);
         let child = make_bare_event(Some(&orphan_id), Some("reply"));
-        let tree = build_thread_tree(vec![child]);
+        let tree = build_chitthi_thread(vec![child]);
         assert_eq!(tree.roots.len(), 1);
     }
 }
