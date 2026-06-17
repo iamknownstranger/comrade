@@ -173,7 +173,7 @@ impl EncryptedStore {
     /// The whole cached Sabha timeline, newest-first, for offline rendering.
     pub fn chitthi_cache(&self) -> Result<ChitthiCache, StorageError> {
         let mut feed: ChitthiCache = self.values(CHITTHI_TREE)?;
-        feed.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        feed.sort_by_key(|b| std::cmp::Reverse(b.created_at));
         Ok(feed)
     }
 
