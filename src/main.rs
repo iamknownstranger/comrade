@@ -23,8 +23,8 @@ use tracing_subscriber::EnvFilter;
 // ── Shared application state ─────────────────────────────────────────────────
 
 struct AppState {
-    ctx:            RuntimeContext,
-    profile:        KeyProfile,
+    ctx: RuntimeContext,
+    profile: KeyProfile,
     partner_profile: Option<KeyProfile>,
 }
 
@@ -53,10 +53,11 @@ fn print_workspace_header(ws: &AppWorkspace) {
     println!();
     println!("┌─────────────────────────────────────────────────────────┐");
     println!("│  Workspace: {:45}│", ws.label());
-    println!("│  Relays: {:2}  |  Mesh: {:3}  |  Sandbox: {:3}            │",
+    println!(
+        "│  Relays: {:2}  |  Mesh: {:3}  |  Sandbox: {:3}            │",
         if ws.is_relay_connected() { "ON" } else { "OFF" },
-        if ws.is_mesh_active()     { "ON" } else { "OFF" },
-        if ws.is_couple_sandbox()  { "ON" } else { "OFF" },
+        if ws.is_mesh_active() { "ON" } else { "OFF" },
+        if ws.is_couple_sandbox() { "ON" } else { "OFF" },
     );
     println!("└─────────────────────────────────────────────────────────┘");
 }
@@ -115,7 +116,8 @@ fn demo_thread_tree() {
     let tree = build_thread_tree(vec![root, reply]);
 
     fn print_node(node: &ThreadNode) {
-        println!("  {} [depth {}] {} …",
+        println!(
+            "  {} [depth {}] {} …",
             "  ".repeat(node.depth),
             node.depth,
             &node.event.id.to_hex()[..16],
@@ -133,8 +135,11 @@ fn demo_thread_tree() {
 
 fn demo_pay_extraction(text: &str) {
     let re = match build_pay_regex() {
-        Ok(r)  => r,
-        Err(e) => { println!("  Regex error: {e}"); return; }
+        Ok(r) => r,
+        Err(e) => {
+            println!("  Regex error: {e}");
+            return;
+        }
     };
     let intents = extract_upi_intents(text, &re);
     if intents.is_empty() {
@@ -156,13 +161,16 @@ async fn demo_ledger(state: &Arc<RwLock<AppState>>) {
         println!("  Run 'partner' first to generate a demo partner keypair.");
         return;
     }
-    let our_keys     = guard.profile.keys.clone();
+    let our_keys = guard.profile.keys.clone();
     let partner_keys = guard.partner_profile.as_ref().unwrap().keys.clone();
     drop(guard);
 
     let mut engine = match SakhaEngine::new(&our_keys, vec![]).await {
-        Ok(e)  => e,
-        Err(e) => { println!("  Sakha engine init failed: {e}"); return; }
+        Ok(e) => e,
+        Err(e) => {
+            println!("  Sakha engine init failed: {e}");
+            return;
+        }
     };
 
     if let Err(e) = engine.pair_with(partner_keys.public_key()) {
@@ -214,16 +222,22 @@ async fn main() -> anyhow::Result<()> {
             guard.ctx.current().clone()
         };
 
-        let prompt = format!("[{}]> ", match &current_ws {
-            AppWorkspace::Base                             => "Base",
-            AppWorkspace::OffGridTravel                    => "Saathi",
-            AppWorkspace::CoupleSandbox(PairRole::Sakha)   => "Sakha",
-            AppWorkspace::CoupleSandbox(PairRole::Sakhi)   => "Sakhi",
-        });
+        let prompt = format!(
+            "[{}]> ",
+            match &current_ws {
+                AppWorkspace::Base => "Base",
+                AppWorkspace::OffGridTravel => "Saathi",
+                AppWorkspace::CoupleSandbox(PairRole::Sakha) => "Sakha",
+                AppWorkspace::CoupleSandbox(PairRole::Sakhi) => "Sakhi",
+            }
+        );
 
         let line = match read_line(&prompt) {
-            Ok(l)  => l,
-            Err(e) => { warn!("read error: {e}"); break; }
+            Ok(l) => l,
+            Err(e) => {
+                warn!("read error: {e}");
+                break;
+            }
         };
 
         if line.is_empty() {
@@ -250,19 +264,21 @@ async fn main() -> anyhow::Result<()> {
             "base" => {
                 let mut guard = state.write().await;
                 match guard.ctx.transition(AppWorkspace::Base) {
-                    Ok(())  => print_workspace_header(guard.ctx.current()),
-                    Err(e)  => println!("  Transition error: {e}"),
+                    Ok(()) => print_workspace_header(guard.ctx.current()),
+                    Err(e) => println!("  Transition error: {e}"),
                 }
             }
 
             "travel" => {
                 let mut guard = state.write().await;
                 match guard.ctx.transition(AppWorkspace::OffGridTravel) {
-                    Ok(())  => {
+                    Ok(()) => {
                         print_workspace_header(guard.ctx.current());
-                        println!("  Saathi mesh would spin up here (run 'saathi' binary in production)");
+                        println!(
+                            "  Saathi mesh would spin up here (run 'saathi' binary in production)"
+                        );
                     }
-                    Err(e)  => println!("  Transition error: {e}"),
+                    Err(e) => println!("  Transition error: {e}"),
                 }
             }
 
@@ -270,15 +286,15 @@ async fn main() -> anyhow::Result<()> {
                 let role = match arg.to_lowercase().as_str() {
                     "sakha" => PairRole::Sakha,
                     "sakhi" => PairRole::Sakhi,
-                    other   => {
+                    other => {
                         println!("  Unknown role: '{other}'. Use 'pair sakha' or 'pair sakhi'.");
                         continue;
                     }
                 };
                 let mut guard = state.write().await;
                 match guard.ctx.transition(AppWorkspace::CoupleSandbox(role)) {
-                    Ok(())  => print_workspace_header(guard.ctx.current()),
-                    Err(e)  => println!("  Transition error: {e}"),
+                    Ok(()) => print_workspace_header(guard.ctx.current()),
+                    Err(e) => println!("  Transition error: {e}"),
                 }
             }
 
@@ -293,34 +309,33 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            "keygen" => {
-                match KeyProfile::generate() {
-                    Ok(profile) => {
-                        println!("  New identity:");
-                        println!("  npub : {}", profile.npub);
-                        println!("  nsec : {}…", &profile.nsec[..20]);
-                        state.write().await.profile = profile;
-                    }
-                    Err(e) => println!("  Keygen failed: {e}"),
+            "keygen" => match KeyProfile::generate() {
+                Ok(profile) => {
+                    println!("  New identity:");
+                    println!("  npub : {}", profile.npub);
+                    println!("  nsec : {}…", &profile.nsec[..20]);
+                    state.write().await.profile = profile;
                 }
-            }
+                Err(e) => println!("  Keygen failed: {e}"),
+            },
 
             "keys" => {
                 let guard = state.read().await;
                 println!("  npub : {}", guard.profile.npub);
-                println!("  nsec : {}… (truncated for display)", &guard.profile.nsec[..20]);
+                println!(
+                    "  nsec : {}… (truncated for display)",
+                    &guard.profile.nsec[..20]
+                );
             }
 
-            "partner" => {
-                match KeyProfile::generate() {
-                    Ok(partner) => {
-                        println!("  Partner identity generated:");
-                        println!("  npub : {}", partner.npub);
-                        state.write().await.partner_profile = Some(partner);
-                    }
-                    Err(e) => println!("  Partner keygen failed: {e}"),
+            "partner" => match KeyProfile::generate() {
+                Ok(partner) => {
+                    println!("  Partner identity generated:");
+                    println!("  npub : {}", partner.npub);
+                    state.write().await.partner_profile = Some(partner);
                 }
-            }
+                Err(e) => println!("  Partner keygen failed: {e}"),
+            },
 
             "dh" => {
                 use comrade_core::crypto::compute_dh_shared_secret;
@@ -333,7 +348,10 @@ async fn main() -> anyhow::Result<()> {
                             &partner.public_key(),
                         ) {
                             Ok(secret) => {
-                                println!("  DH shared secret (first 16 bytes): {:?}", &secret[..16]);
+                                println!(
+                                    "  DH shared secret (first 16 bytes): {:?}",
+                                    &secret[..16]
+                                );
                                 println!("  (Both sides produce the same 32-byte value)");
                             }
                             Err(e) => println!("  DH failed: {e}"),
@@ -355,7 +373,9 @@ async fn main() -> anyhow::Result<()> {
 
             "ledger" => demo_ledger(&state).await,
 
-            unknown => println!("  Unknown command: '{unknown}'. Type 'help' for available commands."),
+            unknown => {
+                println!("  Unknown command: '{unknown}'. Type 'help' for available commands.")
+            }
         }
     }
 

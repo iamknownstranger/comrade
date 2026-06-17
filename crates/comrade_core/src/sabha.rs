@@ -27,16 +27,20 @@ pub const DEFAULT_RELAYS: &[&str] = &[
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadNode {
     /// The raw Nostr event at this tree position.
-    pub event:    Event,
+    pub event: Event,
     /// Zero-indexed depth from a root node.
-    pub depth:    usize,
+    pub depth: usize,
     /// Direct replies to this node, sorted by created_at ascending.
     pub children: Vec<ThreadNode>,
 }
 
 impl ThreadNode {
     fn new(event: Event, depth: usize) -> Self {
-        Self { event, depth, children: Vec::new() }
+        Self {
+            event,
+            depth,
+            children: Vec::new(),
+        }
     }
 }
 
@@ -68,7 +72,7 @@ impl ThreadTree {
 /// is one of "root", "reply", "mention", or "" (positional).
 fn extract_e_tags(event: &Event) -> Vec<(String, String, String)> {
     let val = match serde_json::to_value(event) {
-        Ok(v)  => v,
+        Ok(v) => v,
         Err(e) => {
             warn!("failed to serialise event for tag extraction: {e}");
             return Vec::new();
@@ -86,9 +90,21 @@ fn extract_e_tags(event: &Event) -> Vec<(String, String, String)> {
         if kind != "e" {
             continue;
         }
-        let event_id  = arr.get(1).and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let relay_url = arr.get(2).and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let marker    = arr.get(3).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let event_id = arr
+            .get(1)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let relay_url = arr
+            .get(2)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let marker = arr
+            .get(3)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
 
         if !event_id.is_empty() {
             out.push((event_id, relay_url, marker));
@@ -121,15 +137,13 @@ pub fn build_thread_tree(events: Vec<Event>) -> ThreadTree {
         return ThreadTree::default();
     }
 
-    let event_map: HashMap<String, Event> = events
-        .iter()
-        .map(|e| (e.id.to_hex(), e.clone()))
-        .collect();
+    let event_map: HashMap<String, Event> =
+        events.iter().map(|e| (e.id.to_hex(), e.clone())).collect();
 
     let parent_of: HashMap<String, Option<String>> = event_map
         .keys()
         .map(|id| {
-            let event  = &event_map[id];
+            let event = &event_map[id];
             let parent = resolve_parent_id(event).filter(|pid| event_map.contains_key(pid));
             (id.clone(), parent)
         })
@@ -141,7 +155,7 @@ pub fn build_thread_tree(events: Vec<Event>) -> ThreadTree {
     for (id, maybe_parent) in &parent_of {
         match maybe_parent {
             Some(pid) => children_of.entry(pid.clone()).or_default().push(id.clone()),
-            None      => root_ids.push(id.clone()),
+            None => root_ids.push(id.clone()),
         }
     }
 
@@ -159,7 +173,8 @@ pub fn build_thread_tree(events: Vec<Event>) -> ThreadTree {
             let mut sorted = child_ids.clone();
             sorted.sort_by_key(|cid| event_map[cid].created_at);
             for child_id in &sorted {
-                node.children.push(build_node(child_id, depth + 1, event_map, children_of));
+                node.children
+                    .push(build_node(child_id, depth + 1, event_map, children_of));
             }
         }
         node
@@ -272,12 +287,7 @@ mod tests {
             let eid = EventId::from_hex(pid).unwrap();
             if let Some(m) = marker {
                 // Build a tagged event: ["e", "<pid>", "", "<marker>"]
-                if let Ok(t) = Tag::parse([
-                    "e",
-                    pid,
-                    "",
-                    m,
-                ]) {
+                if let Ok(t) = Tag::parse(["e", pid, "", m]) {
                     builder = builder.tag(t);
                 } else {
                     builder = builder.tag(Tag::event(eid));
@@ -299,18 +309,18 @@ mod tests {
     #[test]
     fn single_event_becomes_root() {
         let event = make_bare_event(None, None);
-        let tree  = build_thread_tree(vec![event]);
+        let tree = build_thread_tree(vec![event]);
         assert_eq!(tree.roots.len(), 1);
         assert_eq!(tree.len(), 1);
     }
 
     #[test]
     fn parent_child_depth_is_correct() {
-        let root  = make_bare_event(None, None);
+        let root = make_bare_event(None, None);
         let root_id = root.id.to_hex();
 
         let child = make_bare_event(Some(&root_id), Some("reply"));
-        let tree  = build_thread_tree(vec![child, root]);
+        let tree = build_thread_tree(vec![child, root]);
 
         assert_eq!(tree.roots.len(), 1);
         assert_eq!(tree.roots[0].children.len(), 1);
@@ -321,8 +331,8 @@ mod tests {
     #[test]
     fn orphan_events_become_independent_roots() {
         let orphan_id = "a".repeat(64);
-        let child     = make_bare_event(Some(&orphan_id), Some("reply"));
-        let tree      = build_thread_tree(vec![child]);
+        let child = make_bare_event(Some(&orphan_id), Some("reply"));
+        let tree = build_thread_tree(vec![child]);
         assert_eq!(tree.roots.len(), 1);
     }
 }

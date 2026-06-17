@@ -1,0 +1,14 @@
+[package]
+name    = "comrade_jni"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+# cdylib = shared library (.so) loaded at runtime by the Android JVM via System.loadLibrary
+crate-type = ["cdylib"]
+
+[dependencies]
+comrade_core  = { path = "../comrade_core" }
+comrade_state = { path = "../comrade_state" }
+jni           = { workspace = true }
+serde_json    = { workspace = true }

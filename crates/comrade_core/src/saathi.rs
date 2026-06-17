@@ -34,15 +34,15 @@ use crate::error::SaathiError;
 // ── Gossipsub topic ──────────────────────────────────────────────────────────
 
 const TOPIC_NAME: &str = "comrade/saathi/v1";
-const MAX_CACHE:  usize = 256;
+const MAX_CACHE: usize = 256;
 
 // ── Wire message format ──────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MeshMessage {
-    pub sender:     String,
-    pub content:    String,
-    pub timestamp:  u64,
+    pub sender: String,
+    pub content: String,
+    pub timestamp: u64,
 }
 
 impl MeshMessage {
@@ -64,7 +64,7 @@ impl MeshMessage {
 #[derive(NetworkBehaviour)]
 struct ComradeBehaviour {
     gossipsub: gossipsub::Behaviour,
-    mdns:      mdns::tokio::Behaviour,
+    mdns: mdns::tokio::Behaviour,
 }
 
 // ── Saathi engine ────────────────────────────────────────────────────────────
@@ -72,17 +72,17 @@ struct ComradeBehaviour {
 /// Shared state accessed from both the swarm driver task and callers.
 struct SaathiShared {
     #[allow(dead_code)]
-    peer_id:       PeerId,
-    outbox_cache:  VecDeque<MeshMessage>,
-    received:      Vec<MeshMessage>,
+    peer_id: PeerId,
+    outbox_cache: VecDeque<MeshMessage>,
+    received: Vec<MeshMessage>,
 }
 
 pub struct SaathiEngine {
     /// Sender half of the command channel into the swarm driver task.
-    cmd_tx:   mpsc::Sender<SaathiCmd>,
+    cmd_tx: mpsc::Sender<SaathiCmd>,
     /// Received messages stream.
-    msg_rx:   Arc<Mutex<mpsc::Receiver<MeshMessage>>>,
-    shared:   Arc<Mutex<SaathiShared>>,
+    msg_rx: Arc<Mutex<mpsc::Receiver<MeshMessage>>>,
+    shared: Arc<Mutex<SaathiShared>>,
     local_id: String,
 }
 
@@ -110,36 +110,31 @@ impl SaathiEngine {
             .build()
             .map_err(|e| SaathiError::SwarmInit(e.to_string()))?;
 
-        let mut swarm: Swarm<ComradeBehaviour> =
-            libp2p::SwarmBuilder::with_new_identity()
-                .with_tokio()
-                .with_tcp(
-                    libp2p::tcp::Config::default(),
-                    libp2p::noise::Config::new,
-                    libp2p::yamux::Config::default,
+        let mut swarm: Swarm<ComradeBehaviour> = libp2p::SwarmBuilder::with_new_identity()
+            .with_tokio()
+            .with_tcp(
+                libp2p::tcp::Config::default(),
+                libp2p::noise::Config::new,
+                libp2p::yamux::Config::default,
+            )
+            .map_err(|e| SaathiError::SwarmInit(e.to_string()))?
+            .with_behaviour(|key| {
+                let gossipsub = gossipsub::Behaviour::new(
+                    gossipsub::MessageAuthenticity::Signed(key.clone()),
+                    gossipsub_config,
                 )
-                .map_err(|e| SaathiError::SwarmInit(e.to_string()))?
-                .with_behaviour(|key| {
-                    let gossipsub = gossipsub::Behaviour::new(
-                        gossipsub::MessageAuthenticity::Signed(key.clone()),
-                        gossipsub_config,
-                    )
-                    .map_err(|e| {
-                        std::io::Error::new(std::io::ErrorKind::Other, e)
-                    })?;
+                .map_err(std::io::Error::other)?;
 
-                    let mdns = mdns::tokio::Behaviour::new(
-                        mdns::Config::default(),
-                        key.public().to_peer_id(),
-                    )?;
+                let mdns = mdns::tokio::Behaviour::new(
+                    mdns::Config::default(),
+                    key.public().to_peer_id(),
+                )?;
 
-                    Ok(ComradeBehaviour { gossipsub, mdns })
-                })
-                .map_err(|e| SaathiError::SwarmInit(e.to_string()))?
-                .with_swarm_config(|c| {
-                    c.with_idle_connection_timeout(Duration::from_secs(60))
-                })
-                .build();
+                Ok(ComradeBehaviour { gossipsub, mdns })
+            })
+            .map_err(|e| SaathiError::SwarmInit(e.to_string()))?
+            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+            .build();
 
         let local_peer_id = *swarm.local_peer_id();
         info!(peer_id = %local_peer_id, "Saathi swarm identity");
@@ -163,9 +158,9 @@ impl SaathiEngine {
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<SaathiCmd>(64);
 
         let shared = Arc::new(Mutex::new(SaathiShared {
-            peer_id:      local_peer_id,
+            peer_id: local_peer_id,
             outbox_cache: VecDeque::new(),
-            received:     Vec::new(),
+            received: Vec::new(),
         }));
 
         let shared_clone = shared.clone();

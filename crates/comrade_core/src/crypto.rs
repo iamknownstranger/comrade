@@ -8,6 +8,7 @@
  *  • HKDF-SHA256 key stretching for AES-GCM symmetric keys
  */
 
+use hkdf::Hkdf;
 use nostr_sdk::{Keys, PublicKey, SecretKey, ToBech32};
 use sha2::{Digest, Sha256};
 use tracing::instrument;
@@ -18,9 +19,9 @@ use crate::error::CryptoError;
 
 #[derive(Debug, Clone)]
 pub struct KeyProfile {
-    pub keys:  Keys,
-    pub npub:  String,
-    pub nsec:  String,
+    pub keys: Keys,
+    pub npub: String,
+    pub nsec: String,
 }
 
 impl KeyProfile {
@@ -47,8 +48,7 @@ impl KeyProfile {
 
     /// Load a profile from a raw nsec Bech32 string.
     pub fn from_nsec(nsec: &str) -> Result<Self, CryptoError> {
-        let secret_key = SecretKey::parse(nsec)
-            .map_err(|e| CryptoError::Bech32(e.to_string()))?;
+        let secret_key = SecretKey::parse(nsec).map_err(|e| CryptoError::Bech32(e.to_string()))?;
         let keys = Keys::new(secret_key);
         Self::from_keys(keys)
     }
@@ -98,12 +98,15 @@ pub fn compute_dh_shared_secret(
 /// Derive a labelled AES-256-GCM key from a shared secret using HKDF-SHA256.
 ///
 /// The `label` parameter acts as the HKDF `info` field so that different
-/// applications of the same shared secret produce independent keys.
+/// applications of the same shared secret produce cryptographically independent keys.
+/// 32-byte output is always within HKDF-SHA256's maximum (8160 bytes), so expand
+/// cannot fail.
 pub fn derive_symmetric_key(shared_secret: &[u8; 32], label: &str) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(shared_secret);
-    hasher.update(label.as_bytes());
-    hasher.finalize().into()
+    let hk = Hkdf::<Sha256>::new(None, shared_secret);
+    let mut output = [0u8; 32];
+    hk.expand(label.as_bytes(), &mut output)
+        .expect("32-byte output is always within HKDF-SHA256 limit");
+    output
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -122,26 +125,20 @@ mod tests {
     #[test]
     fn roundtrip_from_nsec() {
         let original = KeyProfile::generate().expect("keygen");
-        let restored  = KeyProfile::from_nsec(&original.nsec).expect("restore");
+        let restored = KeyProfile::from_nsec(&original.nsec).expect("restore");
         assert_eq!(original.npub, restored.npub);
     }
 
     #[test]
     fn dh_is_symmetric() {
         let alice = KeyProfile::generate().expect("alice keygen");
-        let bob   = KeyProfile::generate().expect("bob keygen");
+        let bob = KeyProfile::generate().expect("bob keygen");
 
-        let alice_shared = compute_dh_shared_secret(
-            alice.keys.secret_key(),
-            &bob.public_key(),
-        )
-        .expect("alice DH");
+        let alice_shared =
+            compute_dh_shared_secret(alice.keys.secret_key(), &bob.public_key()).expect("alice DH");
 
-        let bob_shared = compute_dh_shared_secret(
-            bob.keys.secret_key(),
-            &alice.public_key(),
-        )
-        .expect("bob DH");
+        let bob_shared =
+            compute_dh_shared_secret(bob.keys.secret_key(), &alice.public_key()).expect("bob DH");
 
         assert_eq!(
             alice_shared, bob_shared,

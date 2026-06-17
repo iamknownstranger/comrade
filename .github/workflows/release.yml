@@ -1,0 +1,198 @@
+name: Release APK
+
+# Trigger manually from the GitHub Actions UI.
+# Go to Actions → "Release APK" → "Run workflow", enter a version string,
+# and the workflow builds the APK and creates a GitHub Release automatically.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. 1.2.0)"
+        required: true
+        type: string
+      pre_release:
+        description: "Mark as pre-release"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+# ── Job 1: Run Rust tests before spending time on the Android build ────────────
+jobs:
+  test:
+    name: Rust Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - run: cargo test --workspace
+
+# ── Job 2: Cross-compile Rust → Android .so libraries ─────────────────────────
+  build-rust:
+    name: Build JNI libs (${{ matrix.abi }})
+    runs-on: ubuntu-latest
+    needs: test
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-linux-android
+            abi: arm64-v8a
+          - target: armv7-linux-androideabi
+            abi: armeabi-v7a
+          - target: x86_64-linux-android
+            abi: x86_64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable + Android target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-${{ matrix.target }}-
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Set up Android NDK
+        uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r27c
+          local-cache: true
+
+      - name: Build comrade_jni for ${{ matrix.abi }}
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          cargo ndk \
+            --target ${{ matrix.target }} \
+            --output-dir android/app/src/main/jniLibs \
+            -- build --release -p comrade_jni
+
+      - name: Upload JNI .so artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jniLibs-${{ matrix.abi }}
+          path: android/app/src/main/jniLibs/${{ matrix.abi }}/
+
+# ── Job 3: Build the Android APK ──────────────────────────────────────────────
+  build-apk:
+    name: Build APK
+    runs-on: ubuntu-latest
+    needs: build-rust
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all JNI libs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: jniLibs-*
+          merge-multiple: true
+          path: android/app/src/main/jniLibs/
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: temurin
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: "8.5"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install build-tools & platform
+        run: |
+          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Decode signing keystore (optional)
+        # Set SIGNING_STORE_B64, SIGNING_KEY_ALIAS, SIGNING_KEY_PASSWORD,
+        # and SIGNING_STORE_PASSWORD as repository secrets to get a
+        # production-signed APK.  Without them the debug key is used.
+        if: ${{ env.SIGNING_STORE_B64 != '' }}
+        env:
+          SIGNING_STORE_B64: ${{ secrets.SIGNING_STORE_B64 }}
+        run: |
+          echo "$SIGNING_STORE_B64" | base64 --decode \
+            > android/app/keystore.jks
+
+      - name: Build release APK
+        working-directory: android
+        env:
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_STORE_FILE: "app/keystore.jks"
+        run: |
+          gradle assembleRelease \
+            -PversionCode=${{ github.run_number }} \
+            -PversionName=${{ inputs.version }} \
+            --no-daemon
+
+      - name: Rename APK
+        run: |
+          mv android/app/build/outputs/apk/release/app-release.apk \
+             android/app/build/outputs/apk/release/comrade-${{ inputs.version }}.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: comrade-apk-${{ inputs.version }}
+          path: android/app/build/outputs/apk/release/comrade-${{ inputs.version }}.apk
+
+# ── Job 4: Create GitHub Release ──────────────────────────────────────────────
+  release:
+    name: GitHub Release
+    runs-on: ubuntu-latest
+    needs: build-apk
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download APK
+        uses: actions/download-artifact@v4
+        with:
+          name: comrade-apk-${{ inputs.version }}
+          path: dist/
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ inputs.version }}
+          name: "Comrade v${{ inputs.version }}"
+          prerelease: ${{ inputs.pre_release == 'true' }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: dist/comrade-${{ inputs.version }}.apk

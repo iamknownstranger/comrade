@@ -9,8 +9,8 @@
 
 use std::sync::Arc;
 
-use nostr_sdk::prelude::*;
 use nostr_sdk::nips::nip04;
+use nostr_sdk::prelude::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -23,8 +23,8 @@ use crate::error::VaultError;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UpiPaymentIntent {
     pub amount_inr: f64,
-    pub vpa:        String,
-    pub uri:        String,
+    pub vpa: String,
+    pub uri: String,
 }
 
 fn build_upi_uri(amount: f64, vpa: &str) -> String {
@@ -35,9 +35,11 @@ pub fn extract_upi_intents(content: &str, re: &Regex) -> Vec<UpiPaymentIntent> {
     re.captures_iter(content)
         .filter_map(|caps| {
             let amount_str = caps.name("amount")?.as_str();
-            let vpa        = caps.name("vpa")?.as_str();
+            let vpa = caps.name("vpa")?.as_str();
             let amount: f64 = amount_str.parse().ok()?;
-            if amount <= 0.0 { return None; }
+            if amount <= 0.0 {
+                return None;
+            }
             Some(UpiPaymentIntent {
                 amount_inr: amount,
                 vpa: vpa.to_string(),
@@ -49,7 +51,7 @@ pub fn extract_upi_intents(content: &str, re: &Regex) -> Vec<UpiPaymentIntent> {
 
 pub fn build_pay_regex() -> Result<Regex, VaultError> {
     Regex::new(
-        r"(?i)/pay\s+(?P<amount>\d+(?:\.\d{1,2})?)\s+to\s+(?P<vpa>[a-zA-Z0-9.\-_]+@[a-zA-Z0-9]+)"
+        r"(?i)/pay\s+(?P<amount>\d+(?:\.\d{1,2})?)\s+to\s+(?P<vpa>[a-zA-Z0-9.\-_]+@[a-zA-Z0-9]+)",
     )
     .map_err(|e| VaultError::UpiParseFailed(e.to_string()))
 }
@@ -58,27 +60,24 @@ pub fn build_pay_regex() -> Result<Regex, VaultError> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultMessage {
-    pub event_id:      String,
+    pub event_id: String,
     pub sender_pubkey: String,
-    pub content:       String,
-    pub created_at:    u64,
-    pub upi_intents:   Vec<UpiPaymentIntent>,
+    pub content: String,
+    pub created_at: u64,
+    pub upi_intents: Vec<UpiPaymentIntent>,
 }
 
 // ── Vault Engine ─────────────────────────────────────────────────────────────
 
 pub struct VaultEngine {
-    client:    Client,
-    our_keys:  Keys,
+    client: Client,
+    our_keys: Keys,
     pay_regex: Arc<Regex>,
-    inbox:     Arc<RwLock<Vec<VaultMessage>>>,
+    inbox: Arc<RwLock<Vec<VaultMessage>>>,
 }
 
 impl VaultEngine {
-    pub async fn new(
-        keys: &Keys,
-        relay_urls: Vec<String>,
-    ) -> Result<Self, VaultError> {
+    pub async fn new(keys: &Keys, relay_urls: Vec<String>) -> Result<Self, VaultError> {
         let client = Client::new(keys.clone());
         for url in &relay_urls {
             client
@@ -110,12 +109,8 @@ impl VaultEngine {
         recipient: &PublicKey,
         plaintext: &str,
     ) -> Result<EventId, VaultError> {
-        let encrypted = nip04::encrypt(
-            self.our_keys.secret_key(),
-            recipient,
-            plaintext.as_bytes(),
-        )
-        .map_err(|e| VaultError::EncryptionFailed(e.to_string()))?;
+        let encrypted = nip04::encrypt(self.our_keys.secret_key(), recipient, plaintext.as_bytes())
+            .map_err(|e| VaultError::EncryptionFailed(e.to_string()))?;
 
         let event = EventBuilder::new(Kind::EncryptedDirectMessage, encrypted)
             .tag(Tag::public_key(*recipient))
@@ -147,15 +142,15 @@ impl VaultEngine {
 
         info!("Vault inbox subscription active");
 
-        let our_keys  = self.our_keys.clone();
+        let our_keys = self.our_keys.clone();
         let pay_regex = self.pay_regex.clone();
-        let inbox     = self.inbox.clone();
+        let inbox = self.inbox.clone();
 
         self.client
             .handle_notifications(move |notification| {
-                let our_keys  = our_keys.clone();
+                let our_keys = our_keys.clone();
                 let pay_regex = pay_regex.clone();
-                let inbox     = inbox.clone();
+                let inbox = inbox.clone();
 
                 async move {
                     if let RelayPoolNotification::Event { event, .. } = notification {
@@ -169,7 +164,7 @@ impl VaultEngine {
                             &sender_pk,
                             event.content.clone(),
                         ) {
-                            Ok(d)  => d,
+                            Ok(d) => d,
                             Err(e) => {
                                 warn!(event_id = %event.id, "Vault: failed to decrypt DM: {e}");
                                 return Ok::<bool, Box<dyn std::error::Error>>(false);
@@ -180,14 +175,17 @@ impl VaultEngine {
 
                         let upi_intents = extract_upi_intents(&decrypted, &pay_regex);
                         if !upi_intents.is_empty() {
-                            info!(count = upi_intents.len(), "Vault: UPI payment intents detected");
+                            info!(
+                                count = upi_intents.len(),
+                                "Vault: UPI payment intents detected"
+                            );
                         }
 
                         let msg = VaultMessage {
-                            event_id:      event.id.to_hex(),
+                            event_id: event.id.to_hex(),
                             sender_pubkey: sender_pk.to_hex(),
-                            content:       decrypted,
-                            created_at:    event.created_at.as_secs(),
+                            content: decrypted,
+                            created_at: event.created_at.as_secs(),
                             upi_intents,
                         };
 
@@ -217,7 +215,7 @@ mod tests {
 
     #[test]
     fn detects_pay_command() {
-        let re     = regex();
+        let re = regex();
         let result = extract_upi_intents("/pay 500 to user@upi", &re);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].amount_inr, 500.0);
@@ -229,7 +227,7 @@ mod tests {
 
     #[test]
     fn detects_decimal_amount() {
-        let re     = regex();
+        let re = regex();
         let result = extract_upi_intents("/PAY 12.50 to merchant@okaxis", &re);
         assert_eq!(result.len(), 1);
         assert!((result[0].amount_inr - 12.5).abs() < f64::EPSILON);
@@ -237,31 +235,31 @@ mod tests {
 
     #[test]
     fn no_false_positive_on_plain_text() {
-        let re     = regex();
+        let re = regex();
         let result = extract_upi_intents("just a normal message", &re);
         assert!(result.is_empty());
     }
 
     #[test]
     fn multiple_pay_commands_in_one_message() {
-        let re     = regex();
-        let msg    = "/pay 100 to a@b  and also /pay 200 to c@d";
+        let re = regex();
+        let msg = "/pay 100 to a@b  and also /pay 200 to c@d";
         let result = extract_upi_intents(msg, &re);
         assert_eq!(result.len(), 2);
     }
 
     #[test]
     fn zero_amount_is_rejected() {
-        let re     = regex();
+        let re = regex();
         let result = extract_upi_intents("/pay 0 to user@upi", &re);
         assert!(result.is_empty());
     }
 
     #[test]
     fn upi_uri_format_is_correct() {
-        let re     = regex();
+        let re = regex();
         let result = extract_upi_intents("/pay 999 to test@paytm", &re);
-        let uri    = &result[0].uri;
+        let uri = &result[0].uri;
         assert!(uri.starts_with("upi://pay?"), "scheme present: {uri}");
         assert!(uri.contains("cu=INR"), "currency present: {uri}");
     }
@@ -269,22 +267,14 @@ mod tests {
     #[test]
     fn nip04_roundtrip_encrypts_and_decrypts() {
         let alice = Keys::generate();
-        let bob   = Keys::generate();
+        let bob = Keys::generate();
         let plaintext = "Hello from Alice to Bob";
 
-        let encrypted = nip04::encrypt(
-            alice.secret_key(),
-            &bob.public_key(),
-            plaintext.as_bytes(),
-        )
-        .expect("encrypt");
+        let encrypted = nip04::encrypt(alice.secret_key(), &bob.public_key(), plaintext.as_bytes())
+            .expect("encrypt");
 
-        let decrypted = nip04::decrypt(
-            bob.secret_key(),
-            &alice.public_key(),
-            encrypted,
-        )
-        .expect("decrypt");
+        let decrypted =
+            nip04::decrypt(bob.secret_key(), &alice.public_key(), encrypted).expect("decrypt");
 
         assert_eq!(decrypted, plaintext);
     }

@@ -2,6 +2,7 @@
 members = [
     ".",
     "crates/comrade_core",
+    "crates/comrade_jni",
     "crates/comrade_state",
 ]
 resolver = "2"
@@ -20,9 +21,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 aes-gcm        = "0.10"
 rand           = "0.8"
 sha2           = "0.10"
+hkdf           = "0.12"
+base64         = "0.22"
 secp256k1      = { version = "0.29",  features = ["hashes", "rand-std"] }
 hex            = "0.4"
 anyhow         = "1"
+jni            = { version = "0.21",  features = ["invocation"] }
 
 # ── Root binary ─────────────────────────────────────────────────────────────
 [package]

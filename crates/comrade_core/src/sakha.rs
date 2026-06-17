@@ -21,10 +21,9 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
-use yrs::{
-    updates::decoder::Decode,
-    Doc, GetString, ReadTxn, StateVector, Text, Transact, Update,
-};
+use yrs::{updates::decoder::Decode, Doc, GetString, ReadTxn, StateVector, Text, Transact, Update};
+
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 
 use crate::{
     crypto::{compute_dh_shared_secret, derive_symmetric_key},
@@ -59,7 +58,7 @@ fn aes_decrypt(key: &[u8; 32], nonce_then_ciphertext: &[u8]) -> Result<Vec<u8>, 
     }
     let (nonce_bytes, ciphertext) = nonce_then_ciphertext.split_at(NONCE_LEN);
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
-    let nonce  = Nonce::from_slice(nonce_bytes);
+    let nonce = Nonce::from_slice(nonce_bytes);
     cipher
         .decrypt(nonce, ciphertext)
         .map_err(|e| SakhaError::EncryptionError(e.to_string()))
@@ -70,13 +69,17 @@ fn aes_decrypt(key: &[u8; 32], nonce_then_ciphertext: &[u8]) -> Result<Vec<u8>, 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LedgerEntry {
     pub description: String,
-    pub amount_inr:  f64,
-    pub paid_by:     String,
-    pub timestamp:   u64,
+    pub amount_inr: f64,
+    pub paid_by: String,
+    pub timestamp: u64,
 }
 
 impl LedgerEntry {
-    pub fn new(description: impl Into<String>, amount_inr: f64, paid_by: impl Into<String>) -> Self {
+    pub fn new(
+        description: impl Into<String>,
+        amount_inr: f64,
+        paid_by: impl Into<String>,
+    ) -> Self {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -100,11 +103,11 @@ impl LedgerEntry {
 // ── Sakha engine ─────────────────────────────────────────────────────────────
 
 pub struct SakhaEngine {
-    our_keys:      Keys,
-    partner_pk:    Option<PublicKey>,
+    our_keys: Keys,
+    partner_pk: Option<PublicKey>,
     symmetric_key: Option<[u8; 32]>,
-    pub doc:       Arc<RwLock<Doc>>,
-    client:        Client,
+    pub doc: Arc<RwLock<Doc>>,
+    client: Client,
 }
 
 impl SakhaEngine {
@@ -117,10 +120,10 @@ impl SakhaEngine {
                 .map_err(|e| SakhaError::RelayError(e.to_string()))?;
         }
         Ok(Self {
-            our_keys:      our_keys.clone(),
-            partner_pk:    None,
+            our_keys: our_keys.clone(),
+            partner_pk: None,
             symmetric_key: None,
-            doc:           Arc::new(RwLock::new(Doc::new())),
+            doc: Arc::new(RwLock::new(Doc::new())),
             client,
         })
     }
@@ -131,21 +134,18 @@ impl SakhaEngine {
     }
 
     pub fn pair_with(&mut self, partner_pk: PublicKey) -> Result<(), SakhaError> {
-        let shared_secret = compute_dh_shared_secret(
-            self.our_keys.secret_key(),
-            &partner_pk,
-        )
-        .map_err(|e| SakhaError::EncryptionError(e.to_string()))?;
+        let shared_secret = compute_dh_shared_secret(self.our_keys.secret_key(), &partner_pk)
+            .map_err(|e| SakhaError::EncryptionError(e.to_string()))?;
 
         self.symmetric_key = Some(derive_symmetric_key(&shared_secret, "sakha-hisab-kitab-v1"));
-        self.partner_pk    = Some(partner_pk);
+        self.partner_pk = Some(partner_pk);
         info!("Sakha pairing handshake complete");
         Ok(())
     }
 
     pub async fn add_entry(&self, entry: LedgerEntry) -> Result<(), SakhaError> {
         let line = entry.to_line();
-        let doc  = self.doc.write().await;
+        let doc = self.doc.write().await;
         let text = doc.get_or_insert_text("hisab_kitab");
         let mut txn = doc.transact_mut();
         let current = text.get_string(&txn);
@@ -161,9 +161,9 @@ impl SakhaEngine {
     }
 
     pub async fn read_ledger(&self) -> String {
-        let doc  = self.doc.read().await;
+        let doc = self.doc.read().await;
         let text = doc.get_or_insert_text("hisab_kitab");
-        let txn  = doc.transact();
+        let txn = doc.transact();
         text.get_string(&txn)
     }
 
@@ -178,7 +178,7 @@ impl SakhaEngine {
             txn.encode_diff_v1(&StateVector::default())
         };
 
-        let ciphertext  = aes_encrypt(&key, &update_bytes)?;
+        let ciphertext = aes_encrypt(&key, &update_bytes)?;
         let content_b64 = base64_encode(&ciphertext);
 
         let event = EventBuilder::new(Kind::Custom(LEDGER_SYNC_KIND), content_b64)
@@ -198,7 +198,7 @@ impl SakhaEngine {
     /// Subscribe to incoming sync events from the partner and CRDT-merge them.
     pub async fn subscribe_sync(&self) -> Result<(), SakhaError> {
         let partner_pk = self.partner_pk.ok_or(SakhaError::NoSharedSecret)?;
-        let key        = self.symmetric_key.ok_or(SakhaError::NoSharedSecret)?;
+        let key = self.symmetric_key.ok_or(SakhaError::NoSharedSecret)?;
 
         let filter = Filter::new()
             .kind(Kind::Custom(LEDGER_SYNC_KIND))
@@ -224,7 +224,7 @@ impl SakhaEngine {
                         }
 
                         let ciphertext = match base64_decode(&event.content) {
-                            Ok(b)  => b,
+                            Ok(b) => b,
                             Err(e) => {
                                 warn!(event_id = %event.id, "Sakha: base64 decode failed: {e}");
                                 return Ok::<bool, Box<dyn std::error::Error>>(false);
@@ -232,7 +232,7 @@ impl SakhaEngine {
                         };
 
                         let plaintext = match aes_decrypt(&key, &ciphertext) {
-                            Ok(p)  => p,
+                            Ok(p) => p,
                             Err(e) => {
                                 warn!(event_id = %event.id, "Sakha: decrypt failed: {e}");
                                 return Ok::<bool, Box<dyn std::error::Error>>(false);
@@ -240,7 +240,7 @@ impl SakhaEngine {
                         };
 
                         let update = match Update::decode_v1(&plaintext) {
-                            Ok(u)  => u,
+                            Ok(u) => u,
                             Err(e) => {
                                 warn!(event_id = %event.id, "Sakha: Yrs decode failed: {e}");
                                 return Ok::<bool, Box<dyn std::error::Error>>(false);
@@ -248,7 +248,7 @@ impl SakhaEngine {
                         };
 
                         let doc_guard = doc.write().await;
-                        let mut txn   = doc_guard.transact_mut();
+                        let mut txn = doc_guard.transact_mut();
                         if let Err(e) = txn.apply_update(update) {
                             warn!(event_id = %event.id, "Sakha: Yrs apply failed: {e}");
                         } else {
@@ -271,53 +271,13 @@ impl SakhaEngine {
     }
 }
 
-// ── Minimal base64 helpers ───────────────────────────────────────────────────
-
 fn base64_encode(bytes: &[u8]) -> String {
-    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0] as usize;
-        let b1 = if chunk.len() > 1 { chunk[1] as usize } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as usize } else { 0 };
-        out.push(CHARS[b0 >> 2] as char);
-        out.push(CHARS[((b0 & 3) << 4) | (b1 >> 4)] as char);
-        if chunk.len() > 1 { out.push(CHARS[((b1 & 0xf) << 2) | (b2 >> 6)] as char); }
-        else                { out.push('='); }
-        if chunk.len() > 2 { out.push(CHARS[b2 & 0x3f] as char); }
-        else                { out.push('='); }
-    }
-    out
+    B64.encode(bytes)
 }
 
 fn base64_decode(s: &str) -> Result<Vec<u8>, SakhaError> {
-    let s = s.trim();
-    let mut table = [255u8; 128];
-    for (i, &c) in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".iter().enumerate() {
-        table[c as usize] = i as u8;
-    }
-    let mut out = Vec::with_capacity(s.len() / 4 * 3);
-    let chars: Vec<u8> = s
-        .bytes()
-        .filter(|&b| b != b'=')
-        .map(|b| {
-            if b < 128 && table[b as usize] != 255 {
-                Ok(table[b as usize])
-            } else {
-                Err(SakhaError::SyncDecodeFailed(format!("invalid base64 char: {b}")))
-            }
-        })
-        .collect::<Result<_, _>>()?;
-    for chunk in chars.chunks(4) {
-        let v0 = chunk[0] as usize;
-        let v1 = if chunk.len() > 1 { chunk[1] as usize } else { 0 };
-        let v2 = if chunk.len() > 2 { chunk[2] as usize } else { 0 };
-        let v3 = if chunk.len() > 3 { chunk[3] as usize } else { 0 };
-        out.push(((v0 << 2) | (v1 >> 4)) as u8);
-        if chunk.len() > 2 { out.push(((v1 << 4) | (v2 >> 2)) as u8); }
-        if chunk.len() > 3 { out.push(((v2 << 6) | v3) as u8); }
-    }
-    Ok(out)
+    B64.decode(s.trim())
+        .map_err(|e| SakhaError::SyncDecodeFailed(format!("base64: {e}")))
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -330,17 +290,17 @@ mod tests {
     #[test]
     fn base64_roundtrip() {
         let data = b"Hello Comrade \x00\xFF\xAB";
-        let enc  = base64_encode(data);
-        let dec  = base64_decode(&enc).unwrap();
+        let enc = base64_encode(data);
+        let dec = base64_decode(&enc).unwrap();
         assert_eq!(data.as_slice(), dec.as_slice());
     }
 
     #[test]
     fn aes_roundtrip() {
-        let key       = [0x42u8; 32];
+        let key = [0x42u8; 32];
         let plaintext = b"hisab-kitab entry: Rs 500 dinner";
-        let ct        = aes_encrypt(&key, plaintext).unwrap();
-        let pt        = aes_decrypt(&key, &ct).unwrap();
+        let ct = aes_encrypt(&key, plaintext).unwrap();
+        let pt = aes_decrypt(&key, &ct).unwrap();
         assert_eq!(pt, plaintext);
     }
 
@@ -348,15 +308,18 @@ mod tests {
     fn aes_wrong_key_fails() {
         let key1 = [0x01u8; 32];
         let key2 = [0x02u8; 32];
-        let ct   = aes_encrypt(&key1, b"secret").unwrap();
+        let ct = aes_encrypt(&key1, b"secret").unwrap();
         assert!(aes_decrypt(&key2, &ct).is_err());
     }
 
     #[tokio::test]
     async fn ledger_append_and_read() {
-        let keys   = Keys::generate();
+        let keys = Keys::generate();
         let engine = SakhaEngine::new(&keys, vec![]).await.unwrap();
-        engine.add_entry(LedgerEntry::new("Coffee", 150.0, "Sakha")).await.unwrap();
+        engine
+            .add_entry(LedgerEntry::new("Coffee", 150.0, "Sakha"))
+            .await
+            .unwrap();
         let ledger = engine.read_ledger().await;
         assert!(ledger.contains("Coffee"), "entry must appear: {ledger}");
         assert!(ledger.contains("150.00"), "amount must appear: {ledger}");
@@ -365,7 +328,7 @@ mod tests {
     #[tokio::test]
     async fn paired_keys_crdt_sync_roundtrip() {
         let alice = KeyProfile::generate().unwrap();
-        let bob   = KeyProfile::generate().unwrap();
+        let bob = KeyProfile::generate().unwrap();
 
         let mut engine_alice = SakhaEngine::new(&alice.keys, vec![]).await.unwrap();
         engine_alice.pair_with(bob.public_key()).unwrap();
@@ -390,14 +353,14 @@ mod tests {
         let bob_key = engine_bob.symmetric_key.unwrap();
 
         let plaintext = aes_decrypt(&bob_key, &ciphertext).unwrap();
-        let update    = Update::decode_v1(&plaintext).unwrap();
+        let update = Update::decode_v1(&plaintext).unwrap();
 
         let doc_guard = engine_bob.doc.write().await;
-        let mut txn   = doc_guard.transact_mut();
+        let mut txn = doc_guard.transact_mut();
         txn.apply_update(update).unwrap();
         drop(txn);
 
-        let text    = doc_guard.get_or_insert_text("hisab_kitab");
+        let text = doc_guard.get_or_insert_text("hisab_kitab");
         let read_tx = doc_guard.transact();
         let content = text.get_string(&read_tx);
         assert!(

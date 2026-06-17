@@ -11,9 +11,9 @@
 
 pub mod crypto;
 pub mod error;
+pub mod saathi;
 pub mod sabha;
 pub mod sakha;
-pub mod saathi;
 pub mod vault;
 
 pub use error::CoreError;
