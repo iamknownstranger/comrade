@@ -10,5 +10,9 @@ crate-type = ["cdylib"]
 [dependencies]
 comrade_core  = { path = "../comrade_core" }
 comrade_state = { path = "../comrade_state" }
+comrade_ui    = { path = "../comrade_ui" }
 jni           = { workspace = true }
 serde_json    = { workspace = true }
+# A multi-thread Tokio runtime, owned by a process-global, keeps the async core
+# alive across JNI call boundaries (JNI invocations are synchronous from Java).
+tokio         = { workspace = true }

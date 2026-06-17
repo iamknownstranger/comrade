@@ -22,6 +22,10 @@ use comrade_storage::{EncryptedStore, StoredIdentity};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod runtime;
+
+pub use runtime::{BridgeEvent, ChitthiDto, ComradeRuntime, DirectMessageDto};
+
 // ── Errors ──────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Error)]
@@ -43,6 +47,12 @@ pub enum UiError {
 
     #[error("storage error: {0}")]
     Storage(String),
+
+    #[error("vault is locked — call unlock_vault first")]
+    VaultLocked,
+
+    #[error("engine error: {0}")]
+    Engine(String),
 }
 
 // ── DTOs (serializable across any IPC/FFI boundary) ──────────────────────────────
@@ -176,6 +186,19 @@ impl UiService {
 
     pub fn is_store_unlocked(&self) -> bool {
         self.store.is_some()
+    }
+
+    /// Crate-internal: clone the live keypair for engine construction. Kept
+    /// `pub(crate)` so the secret never leaks into the public UI surface — only
+    /// the [`runtime`] bridge, which builds the Nostr engines, can reach it.
+    pub(crate) fn identity_keys(&self) -> Option<nostr_sdk::Keys> {
+        self.identity.as_ref().map(|p| p.keys.clone())
+    }
+
+    /// Crate-internal borrow of the unlocked encrypted store, for cache reads
+    /// (e.g. the offline Sabha timeline) performed by the [`runtime`] bridge.
+    pub(crate) fn store_ref(&self) -> Option<&EncryptedStore> {
+        self.store.as_ref()
     }
 
     /// Persist the current identity to the unlocked store.

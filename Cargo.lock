@@ -517,8 +517,10 @@ version = "0.1.0"
 dependencies = [
  "comrade_core",
  "comrade_state",
+ "comrade_ui",
  "jni",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -553,10 +555,12 @@ dependencies = [
  "comrade_core",
  "comrade_state",
  "comrade_storage",
+ "nostr-sdk",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
 ]
 

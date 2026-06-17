@@ -233,12 +233,31 @@ impl SabhaEngine {
 
     /// Broadcast a Chitthi (Kind-1 text note) to the public relay set.
     pub async fn broadcast_chitthi(&self, content: &str) -> Result<EventId, SabhaError> {
+        self.broadcast_chitthi_reply(content, None).await
+    }
+
+    /// Broadcast a Chitthi, optionally as a NIP-10 reply to `reply_to`.
+    ///
+    /// When `reply_to` is `Some`, an `["e", <id>, "", "reply"]` tag is attached so
+    /// relays and clients can thread the response under its parent. This is the
+    /// engine entry point behind the IPC bridge's `broadcast_chitthi` command.
+    pub async fn broadcast_chitthi_reply(
+        &self,
+        content: &str,
+        reply_to: Option<EventId>,
+    ) -> Result<EventId, SabhaError> {
+        let mut builder = EventBuilder::text_note(content);
+        if let Some(parent) = reply_to {
+            let tag = Tag::parse(["e", parent.to_hex().as_str(), "", "reply"])
+                .map_err(|e| SabhaError::ParseError(e.to_string()))?;
+            builder = builder.tags([tag]);
+        }
         let output = self
             .client
-            .send_event_builder(EventBuilder::text_note(content))
+            .send_event_builder(builder)
             .await
             .map_err(|e| SabhaError::RelayError(e.to_string()))?;
-        info!(event_id = %output.id(), "Chitthi broadcast to Sabha");
+        info!(event_id = %output.id(), reply = reply_to.is_some(), "Chitthi broadcast to Sabha");
         Ok(*output.id())
     }
 

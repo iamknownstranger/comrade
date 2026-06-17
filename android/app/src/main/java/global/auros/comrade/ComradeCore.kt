@@ -2,6 +2,7 @@ package global.auros.comrade
 
 import org.json.JSONArray
 import org.json.JSONObject
+import org.json.JSONTokener
 
 /**
  * JNI bridge to the Rust comrade_core library.
@@ -47,6 +48,40 @@ object ComradeCore {
      */
     external fun allWorkspaces(): String
 
+    // ── IPC bridge: vault, timeline, broadcast, workspace, events ────────────
+
+    /**
+     * Unlock the encrypted vault at [path] with [passphrase] and start the
+     * background relay/DM loops.
+     * @return JSON `{"npub":"npub1…","has_secret":true}` or `{"error":"…"}`.
+     */
+    external fun unlockVault(path: String, passphrase: String): String
+
+    /**
+     * Broadcast a Chitthi to the public relays, optionally as a reply.
+     * @param replyTo parent event id (hex), or empty/`""` for a top-level post.
+     * @return JSON `{"event_id":"…"}` or `{"error":"…"}`.
+     */
+    external fun broadcastChitthi(content: String, replyTo: String): String
+
+    /**
+     * Load the Sabha timeline from the encrypted offline cache.
+     * @return JSON array of Chitthis, or `{"error":"…"}`.
+     */
+    external fun fetchSabhaTimeline(): String
+
+    /**
+     * Toggle the active workspace, enforcing the transition state machine.
+     * @return the new workspace JSON, or a typed `{"error":"…"}`.
+     */
+    external fun toggleWorkspace(target: String): String
+
+    /**
+     * Non-blocking drain of the next bridge event (incoming Chitthi / DM).
+     * @return event JSON, `{"empty":true}` when idle, or `{"error":"…"}`.
+     */
+    external fun pollEvent(): String
+
     // ── Kotlin convenience wrappers ──────────────────────────────────────────
 
     data class Keypair(val npub: String, val nsec: String)
@@ -71,6 +106,51 @@ object ComradeCore {
         return (0 until arr.length()).map { i ->
             val obj = arr.getJSONObject(i)
             WorkspaceInfo(key = obj.getString("key"), label = obj.getString("label"))
+        }
+    }
+
+    /**
+     * Unlock the vault, returning the active identity npub or throwing the
+     * backend's error message.
+     */
+    fun unlockVaultTyped(path: String, passphrase: String): String {
+        val json = JSONObject(unlockVault(path, passphrase))
+        if (json.has("error")) error("Vault unlock failed: ${json.getString("error")}")
+        return json.getString("npub")
+    }
+
+    /** Broadcast a Chitthi, returning the new event id or throwing on error. */
+    fun broadcastChitthiTyped(content: String, replyTo: String = ""): String {
+        val json = JSONObject(broadcastChitthi(content, replyTo))
+        if (json.has("error")) error("Broadcast failed: ${json.getString("error")}")
+        return json.getString("event_id")
+    }
+
+    data class ChitthiInfo(
+        val id: String,
+        val author: String,
+        val content: String,
+        val createdAt: Long,
+        val replyTo: String?,
+    )
+
+    /** The cached Sabha timeline as a list of [ChitthiInfo]. */
+    fun sabhaTimeline(): List<ChitthiInfo> {
+        val raw = fetchSabhaTimeline()
+        val parsed = JSONTokener(raw).nextValue()
+        if (parsed is JSONObject && parsed.has("error")) {
+            error("Timeline fetch failed: ${parsed.getString("error")}")
+        }
+        val arr = parsed as JSONArray
+        return (0 until arr.length()).map { i ->
+            val obj = arr.getJSONObject(i)
+            ChitthiInfo(
+                id = obj.getString("id"),
+                author = obj.getString("author"),
+                content = obj.getString("content"),
+                createdAt = obj.getLong("created_at"),
+                replyTo = if (obj.isNull("reply_to")) null else obj.optString("reply_to"),
+            )
         }
     }
 }
