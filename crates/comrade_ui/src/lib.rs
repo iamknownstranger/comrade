@@ -182,8 +182,11 @@ impl UiService {
     pub fn save_identity(&self) -> Result<(), UiError> {
         let store = self.store.as_ref().ok_or(UiError::StoreLocked)?;
         let profile = self.identity.as_ref().ok_or(UiError::NoIdentity)?;
-        let identity =
-            StoredIdentity::new(profile.npub.clone(), profile.nsec.clone(), Some("primary".into()));
+        let identity = StoredIdentity::new(
+            profile.npub.clone(),
+            profile.nsec.clone(),
+            Some("primary".into()),
+        );
         store
             .save_identity(&identity)
             .and_then(|()| store.flush())
@@ -327,5 +330,20 @@ mod tests {
         assert_eq!(intents[0].amount_inr, 250.0);
         assert_eq!(intents[0].vpa, "friend@upi");
         assert!(intents[0].uri.starts_with("upi://pay"));
+    }
+
+    #[test]
+    fn wrong_pin_maps_to_ui_storage_error() {
+        // A storage-layer failure must surface as a UiError, not a panic, so the
+        // frontend thread keeps running. (Unified error architecture, M5.)
+        let dir = TempDir::new().unwrap();
+        {
+            let mut svc = UiService::new();
+            svc.unlock_store(dir.path(), "correct").unwrap();
+        }
+        let mut svc = UiService::new();
+        let err = svc.unlock_store(dir.path(), "incorrect");
+        assert!(matches!(err, Err(UiError::Storage(_))));
+        assert!(!svc.is_store_unlocked());
     }
 }

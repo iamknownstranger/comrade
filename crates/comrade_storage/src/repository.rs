@@ -365,7 +365,10 @@ mod tests {
         assert_eq!(feed.len(), 2);
         assert_eq!(feed[0].content, "newer");
         assert_eq!(feed[1].content, "older");
-        assert_eq!(s.get_chitthi("c2").unwrap().unwrap().reply_to.as_deref(), Some("c1"));
+        assert_eq!(
+            s.get_chitthi("c2").unwrap().unwrap().reply_to.as_deref(),
+            Some("c1")
+        );
         assert!(s.remove_chitthi("c1").unwrap());
         assert_eq!(s.chitthi_cache().unwrap().len(), 1);
     }
@@ -378,8 +381,12 @@ mod tests {
         let secret = "nsec1averysecretprivatekeyvalue000000000000000000000000000000";
         {
             let s = EncryptedStore::open(dir.path(), "passphrase").unwrap();
-            s.save_identity(&StoredIdentity::new("npub1pub", secret, Some("primary".into())))
-                .unwrap();
+            s.save_identity(&StoredIdentity::new(
+                "npub1pub",
+                secret,
+                Some("primary".into()),
+            ))
+            .unwrap();
             s.flush().unwrap();
         }
         let mut leaked = false;

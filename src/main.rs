@@ -203,7 +203,11 @@ async fn show_cached_feed(state: &Arc<RwLock<AppState>>) {
                 feed.len()
             );
             for c in &feed {
-                let kind = if c.reply_to.is_some() { "reply" } else { "root " };
+                let kind = if c.reply_to.is_some() {
+                    "reply"
+                } else {
+                    "root "
+                };
                 println!("  [{kind}] {}  {}", &c.id[..16.min(c.id.len())], c.content);
             }
         }
@@ -441,7 +445,10 @@ fn restore_or_seed_identity(store: EncryptedStore) -> AppState {
         },
         Ok(None) => {
             let p = KeyProfile::generate().expect("keygen");
-            println!("  Store unlocked but empty; new identity {} (run 'save').", p.npub);
+            println!(
+                "  Store unlocked but empty; new identity {} (run 'save').",
+                p.npub
+            );
             p
         }
         Err(e) => {
