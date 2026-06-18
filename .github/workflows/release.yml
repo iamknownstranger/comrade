@@ -84,11 +84,36 @@ jobs:
         id: ndk
         with:
           ndk-version: r27c
-          local-cache: true
+          # local-cache:true can report an ndk-path whose toolchain lives one
+          # directory deeper (the r27c archive nests), which breaks cargo-ndk's
+          # linker lookup. Disable it and resolve the real path below.
+          local-cache: false
+
+      - name: Resolve NDK toolchain path
+        # cargo-ndk spawns $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/<host>/bin/clang.
+        # Confirm clang is actually there; if setup-ndk nested it, locate it and
+        # re-point ANDROID_NDK_HOME/ROOT. Fail fast with a clear message otherwise.
+        run: |
+          set -euo pipefail
+          host="linux-x86_64"
+          ndk="${{ steps.ndk.outputs.ndk-path }}"
+          echo "setup-ndk reported ndk-path: '$ndk'"
+          clang="$ndk/toolchains/llvm/prebuilt/$host/bin/clang"
+          if [ ! -x "$clang" ]; then
+            echo "clang not at '$clang'; searching under '$ndk' …"
+            found="$(find "$ndk" -type f -name clang -path "*/prebuilt/$host/bin/clang" 2>/dev/null | head -n1 || true)"
+            if [ -z "$found" ]; then
+              echo "::error::NDK clang not found under '$ndk' — setup-ndk layout unexpected."
+              exit 1
+            fi
+            ndk="${found%/toolchains/*}"
+            echo "resolved real NDK home: '$ndk'"
+          fi
+          echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ndk" >> "$GITHUB_ENV"
+          echo "Using NDK at: $ndk"
 
       - name: Build comrade_jni for ${{ matrix.abi }}
-        env:
-          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
         run: |
           cargo ndk \
             --target ${{ matrix.target }} \
