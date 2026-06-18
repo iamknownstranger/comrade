@@ -167,15 +167,22 @@ jobs:
           sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
 
       - name: Decode signing keystore (optional)
-        # Set SIGNING_STORE_B64, SIGNING_KEY_ALIAS, SIGNING_KEY_PASSWORD,
-        # and SIGNING_STORE_PASSWORD as repository secrets to get a
-        # production-signed APK.  Without them the debug key is used.
-        if: ${{ env.SIGNING_STORE_B64 != '' }}
+        # Set SIGNING_STORE_B64, SIGNING_KEY_ALIAS, SIGNING_KEY_PASSWORD, and
+        # SIGNING_STORE_PASSWORD as repository secrets to get a production-signed
+        # APK. Without them the build falls back to the debug key.
+        #
+        # The conditional lives in the script (not in `if:`) because secrets are
+        # only available via `env`/`run`, and a step's own `env` is not visible
+        # to its `if:` expression.
         env:
           SIGNING_STORE_B64: ${{ secrets.SIGNING_STORE_B64 }}
         run: |
-          echo "$SIGNING_STORE_B64" | base64 --decode \
-            > android/app/keystore.jks
+          if [ -n "$SIGNING_STORE_B64" ]; then
+            echo "$SIGNING_STORE_B64" | base64 --decode > android/app/keystore.jks
+            echo "Decoded release keystore."
+          else
+            echo "No signing secrets set — building a debug-signed APK."
+          fi
 
       - name: Build release APK
         working-directory: android

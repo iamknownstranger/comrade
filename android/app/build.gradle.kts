@@ -18,8 +18,10 @@ android {
 
     signingConfigs {
         // Release signing via environment variables — set these in CI secrets or local keystore.
-        // If SIGNING_KEY_ALIAS is absent the build falls back to the debug key (sideload-ready).
-        if (System.getenv("SIGNING_KEY_ALIAS") != null) {
+        // If SIGNING_KEY_ALIAS is absent *or empty* the build falls back to the
+        // debug key (sideload-ready). CI passes unset secrets as "", so guard on
+        // blank, not just null, to avoid a phantom release config with no keystore.
+        if (!System.getenv("SIGNING_KEY_ALIAS").isNullOrBlank()) {
             create("release") {
                 keyAlias = System.getenv("SIGNING_KEY_ALIAS")
                 keyPassword = System.getenv("SIGNING_KEY_PASSWORD")
