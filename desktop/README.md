@@ -27,10 +27,24 @@ workspace model:
    Any passphrase forges/loads the encrypted vault and seeds an identity.
 2. **Base Workspace** — tabbed **Sabha** (compose + broadcast Chitthis, live
    feed) and **Vault** (contacts + encrypted chat populated by the live DM
-   stream, with on-device UPI `/pay` detection).
+   stream, with on-device UPI `/pay` detection and a 📎 **encrypted media**
+   attachment).
 3. **Modality overlays** — a **Travel / Off-Grid** switch and a **Partner
-   Portal** (cryptographic pairing → Couple Sandbox) that re-theme the whole
-   app by swapping a `<body>` class.
+   Portal** (cryptographic pairing → Couple Sandbox, which also offers encrypted
+   media sharing) that re-theme the whole app by swapping a `<body>` class.
+
+### Encrypted media pipeline (NIP-94/96 · Blossom)
+
+Attaching a photo/audio reads the file (≤ 10 MB, enforced on both sides),
+encrypts it on-device with AES-256-GCM under a key derived from the **ECDH
+shared secret** (`derive_media_key`), uploads only the opaque ciphertext to a
+Blossom server (`send_media_bytes` → `BlossomUploader`), and delivers a
+zero-knowledge NIP-94 reference privately over the E2E DM channel. The public
+event and the host blob carry **no key** — the recipient re-derives it from
+their own private key. Incoming media (`incoming_media` events) render a
+**Download & view** control that calls `download_and_decrypt_media(event_id)`,
+rebuilds a `Blob`, and shows the `<img>`/`<audio>` inline. The real HTTP path is
+behind the `media-http` cargo feature (enabled for this desktop build).
 
 Real-time updates arrive over the single `comrade://event` window channel
 (internally-tagged `incoming_chitthi` / `incoming_direct_message`) and are
@@ -99,7 +113,14 @@ itself was **not** compiled in the development sandbox (no webview system
 libraries available), so verify `cargo tauri dev` on a machine with the
 prerequisites above before release.
 
-Known frontend gaps (await backend commands, not yet exposed): outbound DM
-send (`send_dm`), persistent contact list, and server-side QR-pairing
+Known frontend gaps (await backend commands, not yet exposed): outbound *text*
+DM send (`send_dm`), persistent contact list, and server-side QR-pairing
 validation. The Vault tab therefore renders live *incoming* DMs and validates
 pairing payloads client-side before committing the workspace transition.
+(Encrypted *media* send is implemented — it rides the existing NIP-04 channel.)
+
+The desktop crate's webview build needs system GTK/webkit libs absent from the
+CI sandbox, so the media commands compile-check via the workspace crates
+(`comrade_core`/`comrade_ui` with `--features media-http`) but the end-to-end
+Blossom upload was not exercised here — verify with `cargo tauri dev` against a
+live Blossom server before release.

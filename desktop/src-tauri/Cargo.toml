@@ -22,7 +22,9 @@ tauri-build = { version = "2", features = [] }
 tauri      = { version = "2", features = [] }
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
-comrade_ui = { path = "../../crates/comrade_ui" }
-# Shared multi-thread runtime + the async sync primitives the bridge state uses.
-tokio      = { version = "1", features = ["sync", "rt-multi-thread", "macros"] }
+# media-http turns on the real Blossom upload + fetch-and-decrypt pipeline.
+comrade_ui = { path = "../../crates/comrade_ui", features = ["media-http"] }
+# Shared multi-thread runtime + async sync/fs primitives the bridge state uses.
+tokio      = { version = "1", features = ["sync", "rt-multi-thread", "macros", "fs"] }
 tracing    = "0.1"
+base64     = "0.22"

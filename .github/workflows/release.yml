@@ -29,7 +29,7 @@ jobs:
     name: Rust Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/cache@v4
         with:
@@ -58,7 +58,7 @@ jobs:
             abi: x86_64
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust stable + Android target
         uses: dtolnay/rust-toolchain@stable
@@ -84,11 +84,36 @@ jobs:
         id: ndk
         with:
           ndk-version: r27c
-          local-cache: true
+          # local-cache:true can report an ndk-path whose toolchain lives one
+          # directory deeper (the r27c archive nests), which breaks cargo-ndk's
+          # linker lookup. Disable it and resolve the real path below.
+          local-cache: false
+
+      - name: Resolve NDK toolchain path
+        # cargo-ndk spawns $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/<host>/bin/clang.
+        # Confirm clang is actually there; if setup-ndk nested it, locate it and
+        # re-point ANDROID_NDK_HOME/ROOT. Fail fast with a clear message otherwise.
+        run: |
+          set -euo pipefail
+          host="linux-x86_64"
+          ndk="${{ steps.ndk.outputs.ndk-path }}"
+          echo "setup-ndk reported ndk-path: '$ndk'"
+          clang="$ndk/toolchains/llvm/prebuilt/$host/bin/clang"
+          if [ ! -x "$clang" ]; then
+            echo "clang not at '$clang'; searching under '$ndk' …"
+            found="$(find "$ndk" -type f -name clang -path "*/prebuilt/$host/bin/clang" 2>/dev/null | head -n1 || true)"
+            if [ -z "$found" ]; then
+              echo "::error::NDK clang not found under '$ndk' — setup-ndk layout unexpected."
+              exit 1
+            fi
+            ndk="${found%/toolchains/*}"
+            echo "resolved real NDK home: '$ndk'"
+          fi
+          echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ndk" >> "$GITHUB_ENV"
+          echo "Using NDK at: $ndk"
 
       - name: Build comrade_jni for ${{ matrix.abi }}
-        env:
-          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
         run: |
           cargo ndk \
             --target ${{ matrix.target }} \
@@ -99,7 +124,13 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: jniLibs-${{ matrix.abi }}
-          path: android/app/src/main/jniLibs/${{ matrix.abi }}/
+          # Upload the jniLibs *parent* so the artifact keeps its <abi>/ folder
+          # (cargo-ndk wrote libcomrade_jni.so into jniLibs/${{ matrix.abi }}/).
+          # Pointing at the abi dir itself would strip it, and the later
+          # merge-multiple download would flatten every .so into jniLibs/ with no
+          # ABI — which Gradle's mergeReleaseNativeLibs rejects ("is not an ABI").
+          path: android/app/src/main/jniLibs/
+          if-no-files-found: error
 
 # ── Job 3: Build the Android APK ──────────────────────────────────────────────
   build-apk:
@@ -108,7 +139,7 @@ jobs:
     needs: build-rust
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download all JNI libs
         uses: actions/download-artifact@v4
@@ -118,33 +149,40 @@ jobs:
           path: android/app/src/main/jniLibs/
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           java-version: "17"
           distribution: temurin
 
       - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v3
+        uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.5"
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
 
       - name: Install build-tools & platform
         run: |
           sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
 
       - name: Decode signing keystore (optional)
-        # Set SIGNING_STORE_B64, SIGNING_KEY_ALIAS, SIGNING_KEY_PASSWORD,
-        # and SIGNING_STORE_PASSWORD as repository secrets to get a
-        # production-signed APK.  Without them the debug key is used.
-        if: ${{ env.SIGNING_STORE_B64 != '' }}
+        # Set SIGNING_STORE_B64, SIGNING_KEY_ALIAS, SIGNING_KEY_PASSWORD, and
+        # SIGNING_STORE_PASSWORD as repository secrets to get a production-signed
+        # APK. Without them the build falls back to the debug key.
+        #
+        # The conditional lives in the script (not in `if:`) because secrets are
+        # only available via `env`/`run`, and a step's own `env` is not visible
+        # to its `if:` expression.
         env:
           SIGNING_STORE_B64: ${{ secrets.SIGNING_STORE_B64 }}
         run: |
-          echo "$SIGNING_STORE_B64" | base64 --decode \
-            > android/app/keystore.jks
+          if [ -n "$SIGNING_STORE_B64" ]; then
+            echo "$SIGNING_STORE_B64" | base64 --decode > android/app/keystore.jks
+            echo "Decoded release keystore."
+          else
+            echo "No signing secrets set — building a debug-signed APK."
+          fi
 
       - name: Build release APK
         working-directory: android
@@ -179,7 +217,7 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download APK
         uses: actions/download-artifact@v4
@@ -188,7 +226,7 @@ jobs:
           path: dist/
 
       - name: Create release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ inputs.version }}
           name: "Comrade v${{ inputs.version }}"
