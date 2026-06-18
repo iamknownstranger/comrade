@@ -124,7 +124,13 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: jniLibs-${{ matrix.abi }}
-          path: android/app/src/main/jniLibs/${{ matrix.abi }}/
+          # Upload the jniLibs *parent* so the artifact keeps its <abi>/ folder
+          # (cargo-ndk wrote libcomrade_jni.so into jniLibs/${{ matrix.abi }}/).
+          # Pointing at the abi dir itself would strip it, and the later
+          # merge-multiple download would flatten every .so into jniLibs/ with no
+          # ABI — which Gradle's mergeReleaseNativeLibs rejects ("is not an ABI").
+          path: android/app/src/main/jniLibs/
+          if-no-files-found: error
 
 # ── Job 3: Build the Android APK ──────────────────────────────────────────────
   build-apk:
