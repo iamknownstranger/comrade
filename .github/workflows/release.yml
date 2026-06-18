@@ -131,6 +131,7 @@ jobs:
           # Each matrix job builds exactly one target, so the root only
           # contains this job's ABI folder.
           path: android/app/src/main/jniLibs/
+          if-no-files-found: error
 
 # ── Job 3: Build the Android APK ──────────────────────────────────────────────
   build-apk:
