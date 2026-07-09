@@ -14,6 +14,7 @@ view-model layer driving an Android (Kotlin/Compose), desktop (Tauri), or CLI fr
 | **Relay gossip** | NIP-65 | Dynamic relay discovery + outbox-model routing |
 | **Media** | NIP-94 / NIP-96 | Encrypted file staging + pluggable decentralized upload |
 | **Storage** | sled + Argon2id + AES-256-GCM | Encrypted-at-rest persistence (identity, ChitthiCache, VaultCache, LedgerState) unlocked by a passphrase |
+| **Voice** | Vosk (offline) + Android TTS | "Hey Comrade" wake word, tap-to-talk, and assist-app role — all on-device, no cloud |
 
 > **Nomenclature.** A public post is a **Chitthi** (Hindi for *letter*) throughout
 > the application layer — `ChitthiNode`/`ChitthiThread`, `broadcast_chitthi`,
@@ -121,6 +122,45 @@ Add these repository secrets (**Settings → Secrets → Actions**) for a produc
 | `SIGNING_STORE_PASSWORD` | Keystore password |
 
 Without signing secrets the APK is signed with the Android debug key and can be sideloaded for testing.
+
+## Voice — "Hey Comrade" (Android)
+
+The Android app can respond to a spoken **"Hey Comrade"** wake word, take a
+tap-to-talk command, and register as the device's assist app. Everything runs
+**on-device** with the offline [Vosk](https://alphacephei.com/vosk/) recogniser
+and Android's built-in text-to-speech — no audio ever leaves the phone, keeping
+with Comrade's privacy-first design.
+
+| Layer | What it is | Entry point |
+|-------|-----------|-------------|
+| **Wake word** | A foreground `Service` keeps the mic open, listens for "Hey Comrade", then routes the following utterance as a command. Shows a persistent notification; costs battery. | `voice/WakeWordService` |
+| **Tap-to-talk** | One-shot capture from a mic button in the app UI, no always-on service. | `voice/OneShotRecognizer` + `MainActivity` |
+| **Assist app** | Register Comrade as the default digital assistant so the assist gesture (long-press power) opens it. | `voice/ComradeInteractionService` |
+
+Recognised commands (see `voice/VoiceCommand`): **post** _&lt;message&gt;_ ·
+**read my timeline** · **switch to** _base / off-grid / sakha / sakhi_ ·
+**new identity** · **help**. Parsing and command dispatch are Android-free and
+unit-tested (`VoiceCommandTest`, `CommandDispatcherTest`).
+
+> **Honest scope.** This is an *app-scoped* wake word, not the OS-level
+> "Hey Google" hotword. Stock (non-rooted) Pixels reserve the always-on,
+> screen-off DSP hotword pipeline for Google's own keyphrases — a third-party
+> app cannot inject a custom phrase there. So "Hey Comrade" works only while the
+> foreground service is running (persistent notification, mic open), and the
+> assist-app role responds to the assist *gesture*, not a spoken phrase.
+
+### Voice setup
+
+The Vosk model (~40 MB) is **not** committed. Fetch it before building an APK
+with voice support:
+
+```sh
+./scripts/fetch-vosk-model.sh   # → android/app/src/main/assets/model-en-us/
+```
+
+Without the model the app still builds and runs; voice features report
+"Voice model missing" and stay inert. On first use the app requests the
+`RECORD_AUDIO` (and, on Android 13+, `POST_NOTIFICATIONS`) runtime permissions.
 
 ## Architecture notes
 
