@@ -13,6 +13,12 @@ sealed interface VoiceCommand {
     /** Broadcast a public Chitthi with [text] as its body. */
     data class Post(val text: String) : VoiceCommand
 
+    /**
+     * Write an anonymous companion entry — the "write down anything" path.
+     * [mode] is a `CompanionMode` key ("journal"/"vent"/"brainstorm"/"reflect").
+     */
+    data class Journal(val mode: String, val text: String) : VoiceCommand
+
     /** Read the cached Sabha timeline aloud. */
     data object ReadTimeline : VoiceCommand
 
@@ -45,6 +51,20 @@ sealed interface VoiceCommand {
             "new identity", "create identity",
         )
         private val HELP_PHRASES = listOf("help", "what can you do", "what can i say", "commands")
+
+        // Companion journaling verbs → CompanionMode key, longest phrase first so
+        // "write down" wins over any shorter overlap.
+        private val JOURNAL_PREFIXES: List<Pair<String, String>> = listOf(
+            "write down" to "journal",
+            "journal" to "journal",
+            "diary" to "journal",
+            "note" to "journal",
+            "brainstorm" to "brainstorm",
+            "reflect on" to "reflect",
+            "reflect" to "reflect",
+            "vent" to "vent",
+            "unload" to "vent",
+        )
 
         // Spoken workspace names → ComradeCore workspace keys, longest phrase first
         // so "couple sakhi" wins over the bare "couple" prefix.
@@ -97,6 +117,8 @@ sealed interface VoiceCommand {
                 if (text == phrase) return GenerateKeypair
             }
 
+            parseJournal(text)?.let { return it }
+
             parseSwitch(text)?.let { return it }
 
             for (prefix in POST_PREFIXES) {
@@ -109,6 +131,17 @@ sealed interface VoiceCommand {
             }
 
             return Unknown(text)
+        }
+
+        private fun parseJournal(text: String): VoiceCommand? {
+            for ((prefix, mode) in JOURNAL_PREFIXES) {
+                if (text == prefix) return Empty // verb with no body — needs content
+                if (text.startsWith("$prefix ")) {
+                    val body = text.removePrefix("$prefix ").trim()
+                    return if (body.isEmpty()) Empty else Journal(mode, body)
+                }
+            }
+            return null
         }
 
         private fun parseSwitch(text: String): VoiceCommand? {

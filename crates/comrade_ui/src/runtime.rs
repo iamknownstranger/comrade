@@ -372,6 +372,47 @@ impl ComradeRuntime {
     pub fn is_store_unlocked(&self) -> bool {
         self.ui.is_store_unlocked()
     }
+
+    // ── Companion (private, anonymous journal) ───────────────────────────────
+
+    /// A supportive prompt for the given companion mode.
+    pub fn companion_prompt(&self, mode: &str) -> Result<String, UiError> {
+        self.ui.companion_prompt(mode)
+    }
+
+    /// Offline crisis-signal scan (no persistence, no network).
+    pub fn scan_companion_text(&self, text: &str) -> comrade_core::companion::SafetyAssessment {
+        self.ui.scan_companion_text(text)
+    }
+
+    /// Write an anonymous journal entry (typed or voice) into the encrypted
+    /// store; returns the entry, a safety assessment, and the next prompt.
+    pub fn write_journal_entry(
+        &self,
+        mode: &str,
+        voice: bool,
+        body: &str,
+        mood: Option<i8>,
+    ) -> Result<crate::CompanionResponse, UiError> {
+        self.ui.write_journal_entry(mode, voice, body, mood)
+    }
+
+    /// All journal entries, newest first.
+    pub fn list_journal_entries(
+        &self,
+    ) -> Result<Vec<comrade_core::companion::JournalEntry>, UiError> {
+        self.ui.list_journal_entries()
+    }
+
+    /// Delete a journal entry by id.
+    pub fn delete_journal_entry(&self, id: &str) -> Result<bool, UiError> {
+        self.ui.delete_journal_entry(id)
+    }
+
+    /// On-device journaling insights.
+    pub fn journal_insights(&self) -> Result<comrade_core::companion::Insights, UiError> {
+        self.ui.journal_insights()
+    }
 }
 
 fn now_secs() -> u64 {

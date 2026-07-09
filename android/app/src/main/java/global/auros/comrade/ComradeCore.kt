@@ -82,7 +82,62 @@ object ComradeCore {
      */
     external fun pollEvent(): String
 
+    // ── Companion: private, anonymous journal ────────────────────────────────
+
+    /**
+     * Write an anonymous companion entry into the encrypted store.
+     * @param mode one of "journal", "vent", "brainstorm", "reflect".
+     * @param voice `true` if this came from a voice recording (transcribed).
+     * @param body the entry text (may be empty for a mood-only check-in).
+     * @param mood -2..2, or [NO_MOOD] for no rating.
+     * @return JSON `{entry, safety, prompt}` or `{"error":"…"}`.
+     */
+    external fun journalEntry(mode: String, voice: Boolean, body: String, mood: Int): String
+
+    /** The private journal, newest first, as a JSON array (or `{"error":…}`). */
+    external fun fetchJournal(): String
+
+    /** On-device journaling insights as JSON (or `{"error":…}`). */
+    external fun journalInsights(): String
+
+    /** A supportive prompt for `mode`: JSON `{"prompt":"…"}` or `{"error":…}`. */
+    external fun companionPrompt(mode: String): String
+
     // ── Kotlin convenience wrappers ──────────────────────────────────────────
+
+    /** Sentinel meaning "no mood recorded" — mirrors `NO_MOOD` on the Rust side. */
+    const val NO_MOOD: Int = Int.MIN_VALUE
+
+    /**
+     * The outcome of writing a companion entry: the mode it was filed under, a
+     * fresh supportive prompt, and whether the text tripped the offline crisis
+     * safety scan (so the UI can gently surface helpline resources).
+     */
+    data class CompanionOutcome(
+        val mode: String,
+        val prompt: String,
+        val concerning: Boolean,
+    )
+
+    /**
+     * Write an anonymous journal entry and return a typed [CompanionOutcome],
+     * throwing on a backend error.
+     */
+    fun writeJournal(
+        mode: String,
+        voice: Boolean,
+        body: String,
+        mood: Int = NO_MOOD,
+    ): CompanionOutcome {
+        val json = JSONObject(journalEntry(mode, voice, body, mood))
+        if (json.has("error")) error("Journal write failed: ${json.getString("error")}")
+        val safety = json.optJSONObject("safety")
+        return CompanionOutcome(
+            mode = json.optJSONObject("entry")?.optString("mode") ?: mode,
+            prompt = json.optString("prompt"),
+            concerning = safety?.optBoolean("concerning") ?: false,
+        )
+    }
 
     data class Keypair(val npub: String, val nsec: String)
 

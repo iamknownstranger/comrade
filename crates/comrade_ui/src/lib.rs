@@ -14,13 +14,21 @@
  */
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use comrade_core::companion::{
+    prompt_for, scan_safety, CompanionMode, EntrySource, Insights, JournalEntry, SafetyAssessment,
+};
 use comrade_core::crypto::KeyProfile;
 use comrade_core::vault::{build_pay_regex, extract_upi_intents};
 use comrade_state::{AppWorkspace, RuntimeContext};
 use comrade_storage::{EncryptedStore, StoredIdentity};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+/// sled tree holding the companion journal (anonymous, encrypted at rest).
+const JOURNAL_TREE: &str = "companion_journal";
 
 pub mod runtime;
 
@@ -53,6 +61,9 @@ pub enum UiError {
 
     #[error("engine error: {0}")]
     Engine(String),
+
+    #[error("unknown companion mode: {0}")]
+    UnknownMode(String),
 }
 
 // ── DTOs (serializable across any IPC/FFI boundary) ──────────────────────────────
@@ -94,6 +105,16 @@ pub struct UpiIntentDto {
     pub amount_inr: f64,
     pub vpa: String,
     pub uri: String,
+}
+
+/// The outcome of writing a companion entry: the stored (anonymous) entry, an
+/// offline safety assessment of what was written, and a fresh supportive prompt
+/// for the next step. Everything here stays on-device.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompanionResponse {
+    pub entry: JournalEntry,
+    pub safety: SafetyAssessment,
+    pub prompt: String,
 }
 
 // ── Service ─────────────────────────────────────────────────────────────────────
@@ -251,6 +272,124 @@ impl UiService {
             })
             .collect())
     }
+
+    // Companion — private, anonymous journal ---------------------------------
+
+    /// A supportive prompt for `mode` ("journal" / "vent" / "brainstorm" /
+    /// "reflect"), seeded by how many entries already exist so it rotates
+    /// naturally. Works whether or not the store is unlocked.
+    pub fn companion_prompt(&self, mode: &str) -> Result<String, UiError> {
+        let m =
+            CompanionMode::from_key(mode).ok_or_else(|| UiError::UnknownMode(mode.to_string()))?;
+        Ok(prompt_for(m, self.journal_count()).to_string())
+    }
+
+    /// Offline crisis-signal scan of arbitrary text. No persistence, no network
+    /// — the words never leave the device. See [`comrade_core::companion`].
+    pub fn scan_companion_text(&self, text: &str) -> SafetyAssessment {
+        scan_safety(text)
+    }
+
+    /// Write an anonymous journal entry into the encrypted store, returning it
+    /// with a safety assessment and the next supportive prompt.
+    pub fn write_journal_entry(
+        &self,
+        mode: &str,
+        voice: bool,
+        body: &str,
+        mood: Option<i8>,
+    ) -> Result<CompanionResponse, UiError> {
+        let m =
+            CompanionMode::from_key(mode).ok_or_else(|| UiError::UnknownMode(mode.to_string()))?;
+        let store = self.store_ref().ok_or(UiError::StoreLocked)?;
+
+        let source = if voice {
+            EntrySource::Voice
+        } else {
+            EntrySource::Typed
+        };
+        let mut entry = JournalEntry::new(next_id(), now_secs(), m, source, body);
+        if let Some(v) = mood {
+            entry = entry.with_mood(v);
+        }
+
+        store
+            .put(JOURNAL_TREE, &entry.id, &entry)
+            .and_then(|()| store.flush())
+            .map_err(|e| UiError::Storage(e.to_string()))?;
+
+        let safety = scan_safety(body);
+        let prompt = prompt_for(m, self.journal_count()).to_string();
+        Ok(CompanionResponse {
+            entry,
+            safety,
+            prompt,
+        })
+    }
+
+    /// All journal entries, newest first. Requires an unlocked store.
+    pub fn list_journal_entries(&self) -> Result<Vec<JournalEntry>, UiError> {
+        let store = self.store_ref().ok_or(UiError::StoreLocked)?;
+        let mut entries: Vec<JournalEntry> = store
+            .values(JOURNAL_TREE)
+            .map_err(|e| UiError::Storage(e.to_string()))?;
+        // Newest first. `created_at` is second-granular, so entries written in
+        // the same second are tie-broken by the monotonic id (`<nanos>-<seq>`).
+        entries.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        Ok(entries)
+    }
+
+    /// Delete an entry by id. Returns whether one was removed.
+    pub fn delete_journal_entry(&self, id: &str) -> Result<bool, UiError> {
+        let store = self.store_ref().ok_or(UiError::StoreLocked)?;
+        let removed = store
+            .delete(JOURNAL_TREE, id)
+            .map_err(|e| UiError::Storage(e.to_string()))?;
+        if removed {
+            store.flush().map_err(|e| UiError::Storage(e.to_string()))?;
+        }
+        Ok(removed)
+    }
+
+    /// On-device insights (streak, momentum, mood trend, top tags).
+    pub fn journal_insights(&self) -> Result<Insights, UiError> {
+        let entries = self.list_journal_entries()?;
+        Ok(Insights::from_entries(&entries, now_secs()))
+    }
+
+    /// Number of stored entries, or 0 if the store is locked (used as a prompt
+    /// rotation seed).
+    fn journal_count(&self) -> u64 {
+        self.store_ref()
+            .and_then(|s| s.keys(JOURNAL_TREE).ok())
+            .map(|k| k.len() as u64)
+            .unwrap_or(0)
+    }
+}
+
+// ── Local time / id helpers ───────────────────────────────────────────────────
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
+}
+
+/// A locally-unique, identity-free entry id: `<unix_nanos>-<seq>`. Carries no
+/// link to the user's Nostr key — the journal is deliberately anonymous.
+fn next_id() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{nanos}-{seq}")
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -353,6 +492,136 @@ mod tests {
         assert_eq!(intents[0].amount_inr, 250.0);
         assert_eq!(intents[0].vpa, "friend@upi");
         assert!(intents[0].uri.starts_with("upi://pay"));
+    }
+
+    #[test]
+    fn journal_requires_unlocked_store() {
+        let svc = UiService::new();
+        assert!(matches!(
+            svc.write_journal_entry("journal", false, "hi", None),
+            Err(UiError::StoreLocked)
+        ));
+        assert!(matches!(
+            svc.list_journal_entries(),
+            Err(UiError::StoreLocked)
+        ));
+    }
+
+    #[test]
+    fn journal_unknown_mode_is_typed_error() {
+        let dir = TempDir::new().unwrap();
+        let mut svc = UiService::new();
+        svc.unlock_store(dir.path(), "pin").unwrap();
+        assert!(matches!(
+            svc.write_journal_entry("astrology", false, "x", None),
+            Err(UiError::UnknownMode(_))
+        ));
+    }
+
+    #[test]
+    fn journal_write_persists_and_lists_newest_first() {
+        let dir = TempDir::new().unwrap();
+        let mut svc = UiService::new();
+        svc.unlock_store(dir.path(), "pin").unwrap();
+
+        svc.write_journal_entry("journal", false, "first entry #calm", Some(1))
+            .unwrap();
+        svc.write_journal_entry("vent", true, "second, dictated", None)
+            .unwrap();
+
+        let entries = svc.list_journal_entries().unwrap();
+        assert_eq!(entries.len(), 2);
+        // Newest first; the voice vent was written last.
+        assert_eq!(entries[0].body, "second, dictated");
+        assert_eq!(entries[0].source, EntrySource::Voice);
+        assert_eq!(entries[1].tags, vec!["calm".to_string()]);
+        assert_eq!(entries[1].mood, Some(1));
+    }
+
+    #[test]
+    fn journal_survives_reopen_and_stays_encrypted() {
+        let dir = TempDir::new().unwrap();
+        let secret_words = "the-very-private-thing-i-wrote";
+        {
+            let mut svc = UiService::new();
+            svc.unlock_store(dir.path(), "pin").unwrap();
+            svc.write_journal_entry("reflect", false, secret_words, None)
+                .unwrap();
+        }
+        // Plaintext must never hit disk.
+        let mut leaked = false;
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_file() {
+                if let Ok(bytes) = std::fs::read(&path) {
+                    if bytes
+                        .windows(secret_words.len())
+                        .any(|w| w == secret_words.as_bytes())
+                    {
+                        leaked = true;
+                    }
+                }
+            }
+        }
+        assert!(!leaked, "journal body must be ciphertext at rest");
+
+        // And it round-trips after reopening with the right PIN.
+        let mut svc2 = UiService::new();
+        svc2.unlock_store(dir.path(), "pin").unwrap();
+        let entries = svc2.list_journal_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].body, secret_words);
+    }
+
+    #[test]
+    fn journal_delete_and_insights() {
+        let dir = TempDir::new().unwrap();
+        let mut svc = UiService::new();
+        svc.unlock_store(dir.path(), "pin").unwrap();
+
+        let r = svc
+            .write_journal_entry("journal", false, "keep #focus", None)
+            .unwrap();
+        svc.write_journal_entry("journal", false, "drop this", None)
+            .unwrap();
+
+        let insights = svc.journal_insights().unwrap();
+        assert_eq!(insights.total, 2);
+        assert!(insights.current_streak_days >= 1);
+
+        // Delete one and confirm the count drops.
+        assert!(svc.delete_journal_entry(&r.entry.id).unwrap());
+        assert!(!svc.delete_journal_entry(&r.entry.id).unwrap());
+        assert_eq!(svc.list_journal_entries().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn companion_prompt_and_safety_do_not_need_store() {
+        let svc = UiService::new();
+        let prompt = svc.companion_prompt("reflect").unwrap();
+        assert!(!prompt.is_empty());
+        assert!(matches!(
+            svc.companion_prompt("bogus"),
+            Err(UiError::UnknownMode(_))
+        ));
+
+        // Safety scan works with no store and flags crisis language.
+        assert!(!svc.scan_companion_text("nice quiet evening").concerning);
+        assert!(svc.scan_companion_text("i want to die").concerning);
+    }
+
+    #[test]
+    fn write_returns_safety_assessment_for_concerning_entry() {
+        let dir = TempDir::new().unwrap();
+        let mut svc = UiService::new();
+        svc.unlock_store(dir.path(), "pin").unwrap();
+        let r = svc
+            .write_journal_entry("vent", false, "i can't go on like this", None)
+            .unwrap();
+        assert!(r.safety.concerning);
+        assert!(!r.safety.resources.is_empty());
+        // The entry is still saved — we never block the person from writing.
+        assert_eq!(svc.list_journal_entries().unwrap().len(), 1);
     }
 
     #[test]

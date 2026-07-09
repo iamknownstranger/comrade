@@ -9,9 +9,12 @@
 
 use std::io::{self, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use comrade_core::{
+    companion::{prompt_for, scan_safety, CompanionMode, EntrySource, Insights, JournalEntry},
     crypto::KeyProfile,
     sabha::build_chitthi_thread,
     vault::{build_pay_regex, extract_upi_intents},
@@ -24,6 +27,9 @@ use tracing_subscriber::EnvFilter;
 
 /// Default on-disk location for the encrypted store.
 const STORE_PATH: &str = "comrade-data";
+
+/// sled tree holding the private companion journal (anonymous, encrypted).
+const JOURNAL_TREE: &str = "companion_journal";
 
 // ── Shared application state ─────────────────────────────────────────────────
 
@@ -51,8 +57,8 @@ impl AppState {
 fn print_banner() {
     println!();
     println!("╔══════════════════════════════════════════════════════════╗");
-    println!("║              C O M R A D E  —  Unified Client            ║");
-    println!("║   Sabha · Vault · Saathi · Sakha/Sakhi                   ║");
+    println!("║          C O M R A D E  —  your quiet companion          ║");
+    println!("║   Journal · Vent · Reflect · Brainstorm — private & local ║");
     println!("╚══════════════════════════════════════════════════════════╝");
     println!();
 }
@@ -73,6 +79,15 @@ fn print_workspace_header(ws: &AppWorkspace) {
 fn print_help() {
     println!();
     println!("  Commands:");
+    println!("  ─────────────────────────────────────────────────────────");
+    println!("  Companion (private, anonymous, on-device):");
+    println!("  journal <text> — write anything to your private journal");
+    println!("  vent <text>    — unload; the companion just listens");
+    println!("  brainstorm [t] — idea prompts (writes if you add text)");
+    println!("  reflect [text] — gentle reflection prompt / entry");
+    println!("  mood <-2..2> [text] — log how you feel (optionally note it)");
+    println!("  entries        — read your journal (newest first)");
+    println!("  insights       — streaks, mood trend, top tags");
     println!("  ─────────────────────────────────────────────────────────");
     println!("  ws         — show current workspace");
     println!("  base       — switch to Base mode (Sabha + Vault)");
@@ -390,6 +405,192 @@ async fn demo_media() {
     println!("  ────────────────────────────────────────────────────────");
 }
 
+// ── Companion: private, anonymous journal ─────────────────────────────────────
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
+}
+
+/// A locally-unique, identity-free entry id (`<unix_nanos>-<seq>`).
+fn companion_id() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    format!("{nanos}-{}", SEQ.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Print a crisis-safety notice with resources when an entry looks concerning.
+/// We never block writing — we just make sure help is one glance away.
+fn print_safety_if_concerning(body: &str) {
+    let assessment = scan_safety(body);
+    if !assessment.concerning {
+        return;
+    }
+    println!();
+    println!("  ┌─ You are not alone ────────────────────────────────────┐");
+    if let Some(msg) = &assessment.message {
+        for line in wrap(msg, 54) {
+            println!("  │ {line:54} │");
+        }
+    }
+    println!("  ├────────────────────────────────────────────────────────┤");
+    for r in &assessment.resources {
+        for line in wrap(&format!("{} — {} ({})", r.region, r.name, r.contact), 54) {
+            println!("  │ {line:54} │");
+        }
+    }
+    println!("  └────────────────────────────────────────────────────────┘");
+    println!("  (Comrade is not a clinician — please reach out to a person.)");
+}
+
+/// Naive word-wrap for the fixed-width safety box.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        if cur.is_empty() {
+            cur = word.to_string();
+        } else if cur.len() + 1 + word.len() <= width {
+            cur.push(' ');
+            cur.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut cur));
+            cur = word.to_string();
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    lines
+}
+
+/// Write an anonymous journal entry into the encrypted store.
+async fn companion_write(
+    state: &Arc<RwLock<AppState>>,
+    mode: CompanionMode,
+    body: &str,
+    mood: Option<i8>,
+) {
+    if body.trim().is_empty() && mood.is_none() {
+        println!("  Nothing to save — type something after the command.");
+        return;
+    }
+    let guard = state.read().await;
+    let Some(store) = guard.store.as_ref() else {
+        println!("  Run 'unlock <PIN>' first — your journal is encrypted at rest.");
+        return;
+    };
+
+    let mut entry = JournalEntry::new(companion_id(), now_secs(), mode, EntrySource::Typed, body);
+    if let Some(m) = mood {
+        entry = entry.with_mood(m);
+    }
+
+    match store
+        .put(JOURNAL_TREE, &entry.id, &entry)
+        .and_then(|()| store.flush())
+    {
+        Ok(()) => {
+            println!(
+                "  Saved to your {} (anonymous, on-device only).",
+                mode.label()
+            );
+            let seed = store
+                .keys(JOURNAL_TREE)
+                .map(|k| k.len() as u64)
+                .unwrap_or(0);
+            println!("  Prompt: {}", prompt_for(mode, seed));
+        }
+        Err(e) => println!("  Could not save entry: {e}"),
+    }
+    drop(guard);
+    print_safety_if_concerning(body);
+}
+
+/// Show a supportive prompt for a mode without writing anything.
+async fn companion_prompt(state: &Arc<RwLock<AppState>>, mode: CompanionMode) {
+    let guard = state.read().await;
+    let seed = guard
+        .store
+        .as_ref()
+        .and_then(|s| s.keys(JOURNAL_TREE).ok())
+        .map(|k| k.len() as u64)
+        .unwrap_or(0);
+    println!("  [{}] {}", mode.label(), prompt_for(mode, seed));
+}
+
+/// List the private journal, newest first.
+async fn companion_entries(state: &Arc<RwLock<AppState>>) {
+    let guard = state.read().await;
+    let Some(store) = guard.store.as_ref() else {
+        println!("  Run 'unlock <PIN>' first to open your encrypted journal.");
+        return;
+    };
+    let mut entries: Vec<JournalEntry> = match store.values(JOURNAL_TREE) {
+        Ok(e) => e,
+        Err(e) => {
+            println!("  Could not read journal: {e}");
+            return;
+        }
+    };
+    if entries.is_empty() {
+        println!("  Your journal is empty. Try 'journal <anything on your mind>'.");
+        return;
+    }
+    entries.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| b.id.cmp(&a.id))
+    });
+    println!(
+        "  ── Your Journal — {} entry(ies) ─────────────────────────",
+        entries.len()
+    );
+    for e in &entries {
+        let mood = e.mood.map(|m| format!(" mood:{m:+}")).unwrap_or_default();
+        let tags = if e.tags.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", e.tags.join(", "))
+        };
+        println!("  · {:<10}{mood}{tags}", e.mode.label());
+        println!("    {}", e.body);
+    }
+}
+
+/// Print on-device journaling insights.
+async fn companion_insights(state: &Arc<RwLock<AppState>>) {
+    let guard = state.read().await;
+    let Some(store) = guard.store.as_ref() else {
+        println!("  Run 'unlock <PIN>' first.");
+        return;
+    };
+    let entries: Vec<JournalEntry> = store.values(JOURNAL_TREE).unwrap_or_default();
+    let i = Insights::from_entries(&entries, now_secs());
+    println!("  ── Companion Insights ───────────────────────────────────");
+    println!("  Entries total     : {}", i.total);
+    println!("  Current streak    : {} day(s)", i.current_streak_days);
+    println!("  This week         : {}", i.entries_this_week);
+    match i.avg_mood_recent {
+        Some(m) => println!("  Mood (7-day avg)  : {m:+.1}  (−2 low … +2 good)"),
+        None => println!("  Mood (7-day avg)  : —"),
+    }
+    if !i.top_tags.is_empty() {
+        let tags: Vec<String> = i
+            .top_tags
+            .iter()
+            .take(5)
+            .map(|(t, n)| format!("#{t}×{n}"))
+            .collect();
+        println!("  Top tags          : {}", tags.join("  "));
+    }
+}
+
 // ── Startup identity bootstrap (Milestone 4) ──────────────────────────────────
 
 /// Decide the startup identity.
@@ -625,6 +826,46 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+
+            // ── Companion: private journal / vent / reflect / brainstorm ─────
+            "journal" | "write" | "diary" => {
+                companion_write(&state, CompanionMode::Journal, arg, None).await
+            }
+
+            "vent" => companion_write(&state, CompanionMode::Vent, arg, None).await,
+
+            "brainstorm" | "ideas" => {
+                if arg.is_empty() {
+                    companion_prompt(&state, CompanionMode::Brainstorm).await;
+                } else {
+                    companion_write(&state, CompanionMode::Brainstorm, arg, None).await;
+                }
+            }
+
+            "reflect" | "reflection" => {
+                if arg.is_empty() {
+                    companion_prompt(&state, CompanionMode::Reflect).await;
+                } else {
+                    companion_write(&state, CompanionMode::Reflect, arg, None).await;
+                }
+            }
+
+            "mood" => {
+                let mut it = arg.splitn(2, ' ');
+                match it.next().and_then(|v| v.parse::<i8>().ok()) {
+                    Some(m) => {
+                        let note = it.next().unwrap_or("").trim();
+                        companion_write(&state, CompanionMode::Journal, note, Some(m)).await;
+                    }
+                    None => {
+                        println!("  Usage: mood <-2..2> [optional note]  (e.g. 'mood -1 tired')")
+                    }
+                }
+            }
+
+            "entries" | "journalfeed" => companion_entries(&state).await,
+
+            "insights" => companion_insights(&state).await,
 
             "tree" | "feed" | "chitthi" => demo_chitthi_feed(&state).await,
 

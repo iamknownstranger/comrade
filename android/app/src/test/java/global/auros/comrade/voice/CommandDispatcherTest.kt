@@ -11,15 +11,21 @@ class CommandDispatcherTest {
         var timelineResult: Result<List<String>> = Result.success(emptyList()),
         var switchResult: Result<String> = Result.success("Off-Grid Travel"),
         var identityResult: Result<String> = Result.success("npub1abc"),
+        var journalResult: Result<JournalOutcome> = Result.success(JournalOutcome("journal", false)),
     ) : ComradeBackend {
         var lastPost: String? = null
         var lastSwitchKey: String? = null
+        var lastJournalMode: String? = null
+        var lastJournalText: String? = null
         override fun post(text: String): Result<String> { lastPost = text; return postResult }
         override fun timeline(): Result<List<String>> = timelineResult
         override fun switchWorkspace(key: String): Result<String> {
             lastSwitchKey = key; return switchResult
         }
         override fun generateIdentity(): Result<String> = identityResult
+        override fun journal(mode: String, text: String): Result<JournalOutcome> {
+            lastJournalMode = mode; lastJournalText = text; return journalResult
+        }
     }
 
     @Test
@@ -76,5 +82,33 @@ class CommandDispatcherTest {
     fun `unknown command points at help`() {
         val reply = CommandDispatcher(FakeBackend()).handle(VoiceCommand.Unknown("order pizza"))
         assertTrue(reply.contains("help", ignoreCase = true))
+    }
+
+    @Test
+    fun `journal forwards mode and text and confirms privacy`() {
+        val backend = FakeBackend()
+        val reply = CommandDispatcher(backend).handle(VoiceCommand.Journal("vent", "so tired"))
+        assertEquals("vent", backend.lastJournalMode)
+        assertEquals("so tired", backend.lastJournalText)
+        assertTrue(reply.contains("vent", ignoreCase = true))
+        assertTrue(reply.contains("private", ignoreCase = true))
+    }
+
+    @Test
+    fun `concerning journal entry surfaces support without blocking`() {
+        val backend = FakeBackend(
+            journalResult = Result.success(JournalOutcome("journal", concerning = true)),
+        )
+        val reply = CommandDispatcher(backend).handle(VoiceCommand.Journal("journal", "i want to die"))
+        assertTrue(reply.contains("saved", ignoreCase = true))
+        assertTrue(reply.contains("not alone", ignoreCase = true))
+    }
+
+    @Test
+    fun `journal failure is spoken back`() {
+        val backend = FakeBackend(journalResult = Result.failure(RuntimeException("store locked")))
+        val reply = CommandDispatcher(backend).handle(VoiceCommand.Journal("journal", "hi"))
+        assertTrue(reply.contains("couldn't save", ignoreCase = true))
+        assertTrue(reply.contains("store locked"))
     }
 }

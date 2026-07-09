@@ -68,6 +68,36 @@ class VoiceCommandTest {
     }
 
     @Test
+    fun `journaling verbs map to companion modes`() {
+        assertEquals(
+            VoiceCommand.Journal("journal", "i feel invisible today"),
+            VoiceCommand.parse("hey comrade journal i feel invisible today"),
+        )
+        assertEquals(
+            VoiceCommand.Journal("vent", "work was awful"),
+            VoiceCommand.parse("vent work was awful"),
+        )
+        assertEquals(
+            VoiceCommand.Journal("journal", "call mum tomorrow"),
+            VoiceCommand.parse("write down call mum tomorrow"),
+        )
+        assertEquals(
+            VoiceCommand.Journal("reflect", "why am i so anxious"),
+            VoiceCommand.parse("reflect on why am i so anxious"),
+        )
+        assertEquals(
+            VoiceCommand.Journal("brainstorm", "weekend plans"),
+            VoiceCommand.parse("brainstorm weekend plans"),
+        )
+    }
+
+    @Test
+    fun `journaling verb with no body is Empty`() {
+        assertEquals(VoiceCommand.Empty, VoiceCommand.parse("vent"))
+        assertEquals(VoiceCommand.Empty, VoiceCommand.parse("journal"))
+    }
+
+    @Test
     fun `empty or wake-only utterance is Empty`() {
         assertEquals(VoiceCommand.Empty, VoiceCommand.parse("hey comrade"))
         assertEquals(VoiceCommand.Empty, VoiceCommand.parse(""))

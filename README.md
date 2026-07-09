@@ -1,12 +1,21 @@
 # Comrade
 
-A privacy-first, cross-platform social client built entirely in Rust, with a shared
+**A privacy-first loneliness companion** built entirely in Rust, with a shared
 view-model layer driving an Android (Kotlin/Compose), desktop (Tauri), or CLI frontend.
+
+Comrade is a quiet place to *write down anything* — journal, vent, brainstorm, or
+reflect — by typing or by voice ("Hey Comrade"). Every entry is **anonymous and
+encrypted on your own device**; nothing is broadcast, uploaded, or sent to a cloud
+model. When you're ready to be social, the same app is also a full decentralised
+(Nostr) social client. The companion never pretends to be a therapist, and when
+someone writes something that sounds like a crisis it gently surfaces real
+helplines (see [Companion](#companion--your-private-space)).
 
 ## What it does
 
 | Engine | Protocol | Feature |
 |--------|----------|---------|
+| **Companion** | Local-only, encrypted | Anonymous **journal / vent / brainstorm / reflect** entries (typed or voice), supportive prompts, mood + streak insights, and offline crisis-signal safety with helpline resources |
 | **Sabha** | Nostr Kind-1 + NIP-10 | Public microblogging — the **Chitthi Feed**, with nested `ChitthiThread` reply trees |
 | **Vault** | Nostr Kind-4 + NIP-04 | End-to-end encrypted direct messages; `/pay` UPI intent detection |
 | **Saathi** | libp2p mDNS + Gossipsub | Off-grid local mesh — works without internet |
@@ -34,7 +43,7 @@ Base ──────── Sabha (public feed) + Vault (E2E DMs)
 ```
 crates/
   comrade_state/   State machine (no I/O dependencies)
-  comrade_core/    Protocol engines: crypto, sabha, vault, saathi, sakha, relay, media
+  comrade_core/    Engines: companion (journal/safety), crypto, sabha, vault, saathi, sakha, relay, media
   comrade_storage/ Encrypted-at-rest persistence (sled + Argon2id + AES-256-GCM)
   comrade_ui/      Framework-agnostic view-model / service layer (UiService + DTOs)
   comrade_jni/     JNI bridge — compiled to libcomrade_jni.so for Android
@@ -122,6 +131,42 @@ Add these repository secrets (**Settings → Secrets → Actions**) for a produc
 | `SIGNING_STORE_PASSWORD` | Keystore password |
 
 Without signing secrets the APK is signed with the Android debug key and can be sideloaded for testing.
+
+## Companion — your private space
+
+The companion turns Comrade into a safe place to offload whatever is on your mind.
+It lives in [`comrade_core::companion`](crates/comrade_core/src/companion.rs) as
+pure, I/O-free domain logic (fully unit-tested), with persistence wired through
+the existing encrypted store in `comrade_ui` and the CLI.
+
+| Mode | What it's for |
+|------|---------------|
+| **Journal** | Free-form — write down anything, no structure required |
+| **Vent** | Unload feelings; the companion listens and validates, it doesn't "fix" |
+| **Brainstorm** | Divergent prompts to help you think something through |
+| **Reflect** | Gentle, CBT-flavoured reflection prompts — *reflection, not therapy* |
+
+- **Anonymous by design.** A `JournalEntry` has **no author field** — it can't be
+  tied back to your Nostr identity. Entries are sealed with AES-256-GCM under your
+  passphrase and never leave the device.
+- **Typed or voice.** Say *"Hey Comrade, vent…"* or *"journal…"* and the offline
+  Vosk transcript is saved as an anonymous entry (`EntrySource::Voice`); or type it.
+- **It notices, gently.** `#hashtags` become tags automatically; mood (−2…+2),
+  streaks, weekly momentum and top tags are computed on-device (`Insights`).
+- **Supportive prompts** rotate per mode to help you keep going.
+
+### Safety, stated honestly
+
+A companion that invites "write down any shit" will sometimes receive words about
+self-harm. `scan_safety()` runs a **best-effort, offline** keyword scan; when it
+matches, Comrade shows a warm message and real helplines (KIRAN `1800-599-0019`,
+iCall, 988, Samaritans, Befrienders) — it **never blocks** you from writing, and it
+**never sends** your words anywhere. It is **not** a diagnostic tool and **not** a
+substitute for a human or a professional. That limitation is shown to the user, not
+hidden.
+
+Try it in the CLI (`cargo run`): `unlock <PIN>`, then `journal …`, `vent …`,
+`reflect`, `mood -1 tired`, `entries`, `insights`.
 
 ## Voice — "Hey Comrade" (Android)
 

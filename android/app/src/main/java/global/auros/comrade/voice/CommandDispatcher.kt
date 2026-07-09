@@ -18,7 +18,17 @@ interface ComradeBackend {
 
     /** Mint a fresh identity; returns the public `npub` (never the nsec). */
     fun generateIdentity(): Result<String>
+
+    /**
+     * Write an anonymous companion entry (the "write down anything" path).
+     * [mode] is a CompanionMode key; entries captured by voice are marked as
+     * such on the backend. Returns the outcome (mode + crisis-safety flag).
+     */
+    fun journal(mode: String, text: String): Result<JournalOutcome>
 }
+
+/** The result of a voice-driven journal write. */
+data class JournalOutcome(val mode: String, val concerning: Boolean)
 
 /**
  * Turns a parsed [VoiceCommand] into a backend action plus the sentence the
@@ -31,6 +41,19 @@ class CommandDispatcher(private val backend: ComradeBackend) {
         is VoiceCommand.Post -> backend.post(command.text).fold(
             onSuccess = { "Posted your Chitthi." },
             onFailure = { "I couldn't post that. ${it.message ?: "Unknown error"}." },
+        )
+
+        is VoiceCommand.Journal -> backend.journal(command.mode, command.text).fold(
+            onSuccess = { outcome ->
+                val saved = "I've saved that to your ${outcome.mode}. It stays private on your phone."
+                if (outcome.concerning) {
+                    "$saved It sounds like you're carrying something heavy — " +
+                        "I've put some people you can talk to on your screen. You're not alone."
+                } else {
+                    saved
+                }
+            },
+            onFailure = { "I couldn't save that. ${it.message ?: "Unknown error"}." },
         )
 
         is VoiceCommand.ReadTimeline -> backend.timeline().fold(

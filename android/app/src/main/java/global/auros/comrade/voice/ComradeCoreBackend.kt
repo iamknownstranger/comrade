@@ -27,4 +27,10 @@ class ComradeCoreBackend : ComradeBackend {
 
     override fun generateIdentity(): Result<String> =
         runCatching { ComradeCore.generateKeypairTyped().npub }
+
+    override fun journal(mode: String, text: String): Result<JournalOutcome> = runCatching {
+        // Voice-driven entries are always dictated, so mark them as voice-sourced.
+        val outcome = ComradeCore.writeJournal(mode, voice = true, body = text)
+        JournalOutcome(mode = outcome.mode, concerning = outcome.concerning)
+    }
 }

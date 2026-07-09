@@ -12,7 +12,7 @@ use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use jni::objects::{JClass, JString};
-use jni::sys::jstring;
+use jni::sys::{jboolean, jint, jstring};
 use jni::JNIEnv;
 
 use serde_json::{json, Value};
@@ -293,6 +293,107 @@ pub extern "C" fn Java_global_auros_comrade_ComradeCore_toggleWorkspace<'local>(
         let mut guard = state.blocking_write();
         let ws = guard.toggle_workspace(&target).map_err(|e| e.to_string())?;
         serde_json::to_value(ws).map_err(|e| e.to_string())
+    });
+    to_jstring(&mut env, &out)
+}
+
+// ── Companion: private, anonymous journal ─────────────────────────────────────
+
+/// Sentinel passed from Kotlin for "no mood recorded" (see `ComradeCore.kt`).
+const NO_MOOD: jint = jint::MIN;
+
+/// Write an anonymous journal entry (typed or voice-dictated) into the encrypted
+/// store. `mode` is one of "journal"/"vent"/"brainstorm"/"reflect"; `voice` marks
+/// a dictated entry; `mood` uses [`NO_MOOD`] to mean unset. Returns the stored
+/// entry plus an offline safety assessment and next prompt, or `{"error":"…"}`.
+#[no_mangle]
+pub extern "C" fn Java_global_auros_comrade_ComradeCore_journalEntry<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    mode: JString<'local>,
+    voice: jboolean,
+    body: JString<'local>,
+    mood: jint,
+) -> jstring {
+    let Some(mode) = jni_string(&mut env, &mode) else {
+        return to_jstring(
+            &mut env,
+            &json!({"error":"invalid mode argument"}).to_string(),
+        );
+    };
+    let Some(body) = jni_string(&mut env, &body) else {
+        return to_jstring(
+            &mut env,
+            &json!({"error":"invalid body argument"}).to_string(),
+        );
+    };
+    let mood_opt: Option<i8> = if mood == NO_MOOD {
+        None
+    } else {
+        Some(mood.clamp(-2, 2) as i8)
+    };
+    let is_voice = voice != 0;
+
+    let out = guard_json(move || {
+        let state = state();
+        let guard = state.blocking_read();
+        let response = guard
+            .write_journal_entry(&mode, is_voice, &body, mood_opt)
+            .map_err(|e| e.to_string())?;
+        serde_json::to_value(response).map_err(|e| e.to_string())
+    });
+    to_jstring(&mut env, &out)
+}
+
+/// Load the private journal (newest first). Returns a JSON array of entries or
+/// `{"error":"…"}`.
+#[no_mangle]
+pub extern "C" fn Java_global_auros_comrade_ComradeCore_fetchJournal<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jstring {
+    let out = guard_json(move || {
+        let state = state();
+        let guard = state.blocking_read();
+        let entries = guard.list_journal_entries().map_err(|e| e.to_string())?;
+        serde_json::to_value(entries).map_err(|e| e.to_string())
+    });
+    to_jstring(&mut env, &out)
+}
+
+/// On-device journaling insights (streak, momentum, mood trend, top tags).
+#[no_mangle]
+pub extern "C" fn Java_global_auros_comrade_ComradeCore_journalInsights<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jstring {
+    let out = guard_json(move || {
+        let state = state();
+        let guard = state.blocking_read();
+        let insights = guard.journal_insights().map_err(|e| e.to_string())?;
+        serde_json::to_value(insights).map_err(|e| e.to_string())
+    });
+    to_jstring(&mut env, &out)
+}
+
+/// A supportive companion prompt for `mode`. Returns `{"prompt":"…"}` or an error.
+#[no_mangle]
+pub extern "C" fn Java_global_auros_comrade_ComradeCore_companionPrompt<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    mode: JString<'local>,
+) -> jstring {
+    let Some(mode) = jni_string(&mut env, &mode) else {
+        return to_jstring(
+            &mut env,
+            &json!({"error":"invalid mode argument"}).to_string(),
+        );
+    };
+    let out = guard_json(move || {
+        let state = state();
+        let guard = state.blocking_read();
+        let prompt = guard.companion_prompt(&mode).map_err(|e| e.to_string())?;
+        Ok(json!({ "prompt": prompt }))
     });
     to_jstring(&mut env, &out)
 }
