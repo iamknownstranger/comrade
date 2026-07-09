@@ -78,6 +78,9 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
 
+    // Offline "Hey Comrade" wake word + speech recognition (Apache-2.0, no cloud)
+    implementation("com.alphacephei:vosk-android:0.3.47")
+
     debugImplementation("androidx.compose.ui:ui-tooling")
 
     testImplementation("junit:junit:4.13.2")

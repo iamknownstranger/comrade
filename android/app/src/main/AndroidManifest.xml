@@ -7,6 +7,12 @@
     <!-- Local network access for Saathi mDNS peer discovery -->
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
 
+    <!-- "Hey Comrade" voice assistant: microphone + always-listening service -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <application
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"
@@ -24,6 +30,43 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Always-listening "Hey Comrade" wake-word foreground service -->
+        <service
+            android:name=".voice.WakeWordService"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
+
+        <!-- Assist app: the assist gesture (long-press power) opens Comrade -->
+        <service
+            android:name=".voice.ComradeInteractionService"
+            android:exported="true"
+            android:permission="android.permission.BIND_VOICE_INTERACTION">
+            <intent-filter>
+                <action android:name="android.service.voice.VoiceInteractionService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.voice_interaction"
+                android:resource="@xml/interaction_service" />
+        </service>
+
+        <service
+            android:name=".voice.ComradeInteractionSessionService"
+            android:exported="true"
+            android:permission="android.permission.BIND_VOICE_INTERACTION" />
+
+        <!-- Offline recognition service backing the assist registration -->
+        <service
+            android:name=".voice.ComradeRecognitionService"
+            android:exported="true"
+            android:permission="android.permission.RECORD_AUDIO">
+            <intent-filter>
+                <action android:name="android.speech.RecognitionService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.speech"
+                android:resource="@xml/recognition_service" />
+        </service>
     </application>
 
 </manifest>

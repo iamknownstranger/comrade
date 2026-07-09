@@ -1,4 +1,19 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Comrade</string>
+
+    <!-- Voice assistant -->
+    <string name="voice_notification_title">Comrade voice</string>
+    <string name="voice_channel_name">Voice assistant</string>
+    <string name="voice_listening">Listening for \"Hey Comrade\"</string>
+    <string name="voice_go_ahead">Go ahead…</string>
+    <string name="voice_model_missing">Voice model missing — see setup</string>
+    <string name="voice_mic_error">Microphone unavailable</string>
+    <string name="voice_stop">Stop</string>
+    <string name="voice_section_title">Voice Assistant</string>
+    <string name="voice_wake_enable">Enable \"Hey Comrade\"</string>
+    <string name="voice_wake_disable">Disable \"Hey Comrade\"</string>
+    <string name="voice_tap_to_talk">Tap to talk</string>
+    <string name="voice_set_default_assistant">Set Comrade as assist app</string>
+    <string name="voice_permission_needed">Microphone permission is required for voice.</string>
 </resources>
