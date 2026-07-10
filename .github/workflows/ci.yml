@@ -48,6 +48,12 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --locked --verbose
 
+      # The desktop ships the media pipeline with the `media-http` feature on,
+      # so its guards (HTTPS-only fetch, size cap, ciphertext-hash verify) live
+      # behind that feature. Exercise them here or they never run in CI.
+      - name: cargo test (media-http)
+        run: cargo test -p comrade_core -p comrade_ui --features comrade_ui/media-http --locked
+
   # The desktop Tauri crate is excluded from the workspace (needs system
   # webview libs), so it gets its own compile+lint lane — without this it is
   # never built by any automated process (audit T2/O1).

@@ -573,6 +573,7 @@ dependencies = [
 name = "comrade_ui"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "comrade_core",
  "comrade_state",
  "comrade_storage",

@@ -26,10 +26,16 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use comrade_core::crypto::derive_media_key;
+use comrade_core::media::{
+    build_file_metadata_event, encrypt_media, fetch_and_decrypt_media, FileMetadata,
+    MAX_MEDIA_BYTES,
+};
 use comrade_core::sabha::{ChitthiCallback, SabhaEngine, DEFAULT_RELAYS};
 use comrade_core::sakha::SakhaEngine;
 use comrade_core::vault::{VaultCallback, VaultEngine, VaultMessage};
-use nostr_sdk::{EventId, ToBech32};
+use nostr_sdk::{EventId, PublicKey, ToBech32};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tracing::warn;
@@ -39,6 +45,11 @@ use crate::{IdentityDto, UiError, UiService, UpiIntentDto, WorkspaceDto};
 /// Capacity of the event bus. Slow consumers lag rather than block producers —
 /// the relay loop never stalls waiting on the webview.
 const EVENT_BUS_CAPACITY: usize = 256;
+
+/// HKDF label binding the ECDH shared secret to media encryption.
+const MEDIA_LABEL: &str = "comrade-media-v1";
+/// Encrypted-store tree mapping a NIP-94 event id → local [`MediaRef`].
+const MEDIA_REFS_TREE: &str = "comrade_media_refs";
 
 // ── Event DTOs (serialised across the IPC / FFI boundary) ────────────────────
 
@@ -94,7 +105,7 @@ impl From<VaultMessage> for DirectMessageDto {
     fn from(m: VaultMessage) -> Self {
         Self {
             id: m.event_id,
-            sender: m.sender_pubkey,
+            sender: to_npub(&m.sender_pubkey),
             content: m.content,
             created_at: m.created_at,
             upi_intents: m
@@ -110,6 +121,85 @@ impl From<VaultMessage> for DirectMessageDto {
     }
 }
 
+/// A NIP-94 encrypted-media reference as the frontend sees it (no key material).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaMessageDto {
+    /// NIP-94 event id — the handle passed back to `download_and_decrypt_media`.
+    pub event_id: String,
+    pub url: String,
+    pub mime_type: String,
+    pub caption: String,
+    /// Bech32/hex pubkey of the counterpart (sender for incoming).
+    pub sender: String,
+    pub created_at: u64,
+    /// Size of the encrypted blob in bytes.
+    pub size: u64,
+}
+
+/// Decrypted media handed back to the frontend. Bytes are base64-encoded so the
+/// IPC payload stays compact (the webview rebuilds a `Blob` from it).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaBytesDto {
+    pub mime_type: String,
+    pub base64: String,
+}
+
+/// Locally persisted pointer to an encrypted blob, keyed by NIP-94 event id.
+/// Holds everything needed to *re-derive* the key — but never the key itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MediaRef {
+    url: String,
+    /// Hex pubkey of the other party (recipient if outgoing, sender if incoming).
+    peer_pubkey: String,
+    mime_type: String,
+    caption: String,
+    size: u64,
+    /// SHA-256 of the *ciphertext* blob (NIP-94 `x`), verified before decrypt.
+    /// Defaulted so refs written before this field are still readable.
+    #[serde(default)]
+    sha256_hex: String,
+    outgoing: bool,
+    created_at: u64,
+}
+
+/// The private envelope carried inside the E2E DM that points at the blob.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MediaEnvelope {
+    /// Format marker / version; must equal 1.
+    comrade_media: u8,
+    event_id: String,
+    url: String,
+    mime: String,
+    caption: String,
+    size: u64,
+    /// SHA-256 of the ciphertext (NIP-94 `x`) so the recipient can fail fast on
+    /// a wrong/tampered blob. Defaulted for envelopes sent before this field.
+    #[serde(default)]
+    sha256_hex: String,
+}
+
+/// Detect and parse a Comrade media envelope out of a decrypted DM body.
+fn parse_media_envelope(content: &str) -> Option<MediaEnvelope> {
+    let env: MediaEnvelope = serde_json::from_str(content).ok()?;
+    (env.comrade_media == 1).then_some(env)
+}
+
+/// Parse an npub (bech32) or hex public key.
+fn parse_pubkey(s: &str) -> Result<PublicKey, UiError> {
+    PublicKey::parse(s).map_err(|e| UiError::Engine(format!("invalid pubkey: {e}")))
+}
+
+/// Normalise a hex or bech32 public key to a canonical bech32 `npub` for the
+/// frontend. Both the incoming and outgoing sides emit the same form, so the UI
+/// can key conversations (and the couple panel, which is keyed by the pasted
+/// npub) consistently. Falls back to the input unchanged if it cannot be parsed.
+fn to_npub(pubkey: &str) -> String {
+    PublicKey::parse(pubkey)
+        .ok()
+        .and_then(|pk| pk.to_bech32().ok())
+        .unwrap_or_else(|| pubkey.to_string())
+}
+
 /// A push event emitted by the background Tokio loops and forwarded across the
 /// webview boundary (`window.emit`) or polled over JNI. Internally tagged so the
 /// frontend can `switch (evt.type)`.
@@ -120,6 +210,8 @@ pub enum BridgeEvent {
     IncomingChitthi(ChitthiDto),
     /// A new encrypted DM (Kind-4) was decrypted in the Vault inbox.
     IncomingDirectMessage(DirectMessageDto),
+    /// A new encrypted-media reference (NIP-94) arrived over the DM channel.
+    IncomingMedia(MediaMessageDto),
 }
 
 // ── Runtime ───────────────────────────────────────────────────────────────────
@@ -248,12 +340,49 @@ impl ComradeRuntime {
 
         if let Some(vault) = self.vault.clone() {
             let tx = self.events.clone();
+            let store = self.ui.store_arc();
             tokio::spawn(async move {
                 vault.connect().await;
                 let cb: VaultCallback = Box::new(move |msg| {
-                    let _ = tx.send(BridgeEvent::IncomingDirectMessage(DirectMessageDto::from(
-                        msg,
-                    )));
+                    // A media envelope rides inside an ordinary E2E DM. Surface it
+                    // as a media event (and persist the ref so it can later be
+                    // decrypted by event id); everything else is a plain DM.
+                    if let Some(env) = parse_media_envelope(&msg.content) {
+                        if let Some(store) = store.as_ref() {
+                            let reff = MediaRef {
+                                url: env.url.clone(),
+                                peer_pubkey: msg.sender_pubkey.clone(),
+                                mime_type: env.mime.clone(),
+                                caption: env.caption.clone(),
+                                size: env.size,
+                                sha256_hex: env.sha256_hex.clone(),
+                                outgoing: false,
+                                created_at: msg.created_at,
+                            };
+                            // A dropped ref means download_and_decrypt_media
+                            // later can't resolve this event — surface it rather
+                            // than silently losing the media.
+                            if let Err(e) = store
+                                .put(MEDIA_REFS_TREE, &env.event_id, &reff)
+                                .and_then(|()| store.flush())
+                            {
+                                warn!("failed to persist incoming media ref: {e}");
+                            }
+                        }
+                        let _ = tx.send(BridgeEvent::IncomingMedia(MediaMessageDto {
+                            event_id: env.event_id,
+                            url: env.url,
+                            mime_type: env.mime,
+                            caption: env.caption,
+                            sender: to_npub(&msg.sender_pubkey),
+                            created_at: msg.created_at,
+                            size: env.size,
+                        }));
+                    } else {
+                        let _ = tx.send(BridgeEvent::IncomingDirectMessage(
+                            DirectMessageDto::from(msg),
+                        ));
+                    }
                 });
                 if let Err(e) = vault.subscribe_inbox_with_callback(cb).await {
                     warn!("vault inbox loop ended: {e}");
@@ -316,6 +445,162 @@ impl ComradeRuntime {
         }
 
         Ok(id.to_hex())
+    }
+
+    // ── Encrypted media pipeline (NIP-94/96 · Blossom) ───────────────────────
+
+    /// Encrypt `bytes` for `target_pubkey`, upload the opaque blob to Blossom,
+    /// build a zero-knowledge NIP-94 reference, persist it locally, and deliver
+    /// the reference privately over the E2E DM channel. Returns the media DTO.
+    ///
+    /// The AES key is derived from the ECDH shared secret, so it is never
+    /// uploaded and never placed in the public event — the recipient re-derives
+    /// it from their own private key and our pubkey.
+    pub async fn upload_and_send_media(
+        &self,
+        target_pubkey: &str,
+        bytes: Vec<u8>,
+        mime_type: &str,
+        caption: &str,
+    ) -> Result<MediaMessageDto, UiError> {
+        if bytes.len() > MAX_MEDIA_BYTES {
+            return Err(UiError::Engine(format!(
+                "media is {} bytes; the limit is {MAX_MEDIA_BYTES}",
+                bytes.len()
+            )));
+        }
+        let keys = self.ui.identity_keys().ok_or(UiError::NoIdentity)?;
+        let peer = parse_pubkey(target_pubkey)?;
+        let key = derive_media_key(keys.secret_key(), &peer, MEDIA_LABEL)
+            .map_err(|e| UiError::Engine(e.to_string()))?;
+
+        let (media, _secret) =
+            encrypt_media(&bytes, mime_type, &key).map_err(|e| UiError::Engine(e.to_string()))?;
+        let size = media.size as u64;
+        let sha256_hex = media.sha256_hex.clone();
+
+        // Upload ciphertext only — the host sees opaque bytes.
+        let url = self.upload_blob(media.ciphertext, mime_type).await?;
+
+        // Zero-knowledge NIP-94 event: URL + ciphertext hash, no key, no `ox`.
+        let meta = FileMetadata {
+            url: url.clone(),
+            mime_type: mime_type.to_string(),
+            sha256_hex,
+            original_sha256_hex: None,
+            size: Some(media.size),
+            caption: caption.to_string(),
+        };
+        let event =
+            build_file_metadata_event(&keys, &meta).map_err(|e| UiError::Engine(e.to_string()))?;
+        let event_id = event.id.to_hex();
+        let created_at = now_secs();
+
+        // Persist a local ref so download_and_decrypt_media(event_id) resolves.
+        let reff = MediaRef {
+            url: url.clone(),
+            peer_pubkey: peer.to_hex(),
+            mime_type: mime_type.to_string(),
+            caption: caption.to_string(),
+            size,
+            sha256_hex: media.sha256_hex.clone(),
+            outgoing: true,
+            created_at,
+        };
+        if let Some(store) = self.ui.store_ref() {
+            store
+                .put(MEDIA_REFS_TREE, &event_id, &reff)
+                .and_then(|()| store.flush())
+                .map_err(|e| UiError::Storage(e.to_string()))?;
+        }
+
+        // Privately deliver the reference to the recipient over NIP-04.
+        let envelope = MediaEnvelope {
+            comrade_media: 1,
+            event_id: event_id.clone(),
+            url: url.clone(),
+            mime: mime_type.to_string(),
+            caption: caption.to_string(),
+            size,
+            sha256_hex: media.sha256_hex.clone(),
+        };
+        let envelope_json =
+            serde_json::to_string(&envelope).map_err(|e| UiError::Engine(e.to_string()))?;
+        let vault = self.vault.clone().ok_or(UiError::VaultLocked)?;
+        vault
+            .send_dm(&peer, &envelope_json)
+            .await
+            .map_err(|e| UiError::Engine(e.to_string()))?;
+
+        let sender = keys
+            .public_key()
+            .to_bech32()
+            .unwrap_or_else(|_| keys.public_key().to_hex());
+        Ok(MediaMessageDto {
+            event_id,
+            url,
+            mime_type: mime_type.to_string(),
+            caption: caption.to_string(),
+            sender,
+            created_at,
+            size,
+        })
+    }
+
+    /// Resolve a NIP-94 reference by event id, fetch the encrypted blob, and
+    /// decrypt it with the re-derived ECDH key. Returns base64 bytes + MIME.
+    pub async fn download_and_decrypt_media(
+        &self,
+        event_id: &str,
+    ) -> Result<MediaBytesDto, UiError> {
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        let reff: MediaRef = store
+            .get(MEDIA_REFS_TREE, event_id)
+            .map_err(|e| UiError::Storage(e.to_string()))?
+            .ok_or_else(|| UiError::Engine(format!("unknown media event {event_id}")))?;
+
+        let keys = self.ui.identity_keys().ok_or(UiError::NoIdentity)?;
+        let peer = parse_pubkey(&reff.peer_pubkey)?;
+        let key = derive_media_key(keys.secret_key(), &peer, MEDIA_LABEL)
+            .map_err(|e| UiError::Engine(e.to_string()))?;
+
+        // Verify the ciphertext hash when we recorded one (fail fast on a
+        // wrong/tampered blob; older refs without it fall back to the AES-GCM
+        // tag alone, which still rejects tampering).
+        let expected = (!reff.sha256_hex.is_empty()).then_some(reff.sha256_hex.as_str());
+        let bytes = fetch_and_decrypt_media(&reff.url, &key, expected)
+            .await
+            .map_err(|e| UiError::Engine(e.to_string()))?;
+
+        Ok(MediaBytesDto {
+            mime_type: reff.mime_type,
+            base64: B64.encode(&bytes),
+        })
+    }
+
+    /// Upload an encrypted blob to Blossom, signed with a BUD-01 auth event.
+    /// Gated on the `media-http` feature; degrades to a typed error otherwise.
+    ///
+    /// The BUD-01 auth event is signed with a **fresh ephemeral key**, never the
+    /// user's chat identity: the blob is already zero-knowledge, and signing
+    /// with the identity key would let the host link "npub X uploaded blob Y at
+    /// time T from IP Z" — a metadata leak at odds with the privacy model.
+    #[cfg(feature = "media-http")]
+    async fn upload_blob(&self, blob: Vec<u8>, mime: &str) -> Result<String, UiError> {
+        use comrade_core::media::{BlossomUploader, MediaUploader, DEFAULT_BLOSSOM_SERVER};
+        let uploader = BlossomUploader::new(DEFAULT_BLOSSOM_SERVER, nostr_sdk::Keys::generate());
+        let receipt = uploader
+            .upload(&blob, mime)
+            .await
+            .map_err(|e| UiError::Engine(e.to_string()))?;
+        Ok(receipt.url)
+    }
+
+    #[cfg(not(feature = "media-http"))]
+    async fn upload_blob(&self, _blob: Vec<u8>, _mime: &str) -> Result<String, UiError> {
+        Err(UiError::Engine(
+            "media upload requires the `media-http` feature".into(),
+        ))
     }
 
     // ── Milestone 3: progressive-disclosure workspace controller ─────────────
@@ -507,5 +792,121 @@ mod tests {
         assert!(json.contains("\"type\":\"incoming_chitthi\""));
         let back: BridgeEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(back, event);
+    }
+
+    #[test]
+    fn media_envelope_detection() {
+        let env = MediaEnvelope {
+            comrade_media: 1,
+            event_id: "e1".into(),
+            url: "https://blob/x".into(),
+            mime: "image/png".into(),
+            caption: "hi".into(),
+            size: 10,
+            sha256_hex: "a".repeat(64),
+        };
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(parse_media_envelope(&json).is_some());
+        // A plain DM is not mistaken for a media envelope.
+        assert!(parse_media_envelope("just a normal message").is_none());
+        assert!(parse_media_envelope(r#"{"hello":"world"}"#).is_none());
+        // An envelope written before the sha256_hex field still parses (the
+        // field is #[serde(default)]) — back-compat for already-sent media.
+        assert!(parse_media_envelope(
+            r#"{"comrade_media":1,"event_id":"e","url":"https://b/x","mime":"image/png","caption":"","size":1}"#
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn to_npub_canonicalises_incoming_and_outgoing_to_the_same_key() {
+        // Regression guard: incoming media/DM senders arrive as hex, outgoing
+        // DTOs emit bech32. Both must normalise to the identical npub so the
+        // frontend keys one conversation (and the couple panel) per peer.
+        let keys = nostr_sdk::Keys::generate();
+        let hex = keys.public_key().to_hex();
+        let npub = keys.public_key().to_bech32().unwrap();
+        assert_eq!(to_npub(&hex), npub, "hex must normalise to npub");
+        assert_eq!(to_npub(&npub), npub, "npub is already canonical");
+        // Unparseable input falls back unchanged rather than panicking.
+        assert_eq!(to_npub("not-a-key"), "not-a-key");
+    }
+
+    #[test]
+    fn incoming_media_event_serialises_with_tag() {
+        let ev = BridgeEvent::IncomingMedia(MediaMessageDto {
+            event_id: "e".into(),
+            url: "https://blob/x".into(),
+            mime_type: "image/jpeg".into(),
+            caption: "pic".into(),
+            sender: "npub1x".into(),
+            created_at: 1,
+            size: 42,
+        });
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("\"type\":\"incoming_media\""));
+        let back: BridgeEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ev);
+    }
+
+    #[tokio::test]
+    async fn media_send_rejects_when_locked() {
+        // No identity/engines yet → graceful typed error, no panic.
+        let rt = ComradeRuntime::new();
+        let err = rt
+            .upload_and_send_media("npub1xxx", vec![1, 2, 3], "image/png", "")
+            .await;
+        assert!(err.is_err());
+        let err = rt.download_and_decrypt_media("deadbeef").await;
+        assert!(matches!(err, Err(UiError::VaultLocked)));
+    }
+
+    #[tokio::test]
+    async fn media_send_pipeline_to_self_without_http_feature() {
+        // Exercises identity + ECDH key derivation + encrypt + local-ref logic
+        // up to the network boundary. With `media-http` off, the upload step
+        // returns a typed error (no panic); the run never touches a relay.
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+        let id = rt.unlock_vault(dir.path(), "pin").await.unwrap();
+        let res = rt
+            .upload_and_send_media(&id.npub, vec![9, 8, 7, 6], "image/png", "selfie")
+            .await;
+        #[cfg(not(feature = "media-http"))]
+        assert!(matches!(res, Err(UiError::Engine(_))));
+        // (With the feature on this would attempt a real Blossom upload.)
+        let _ = res;
+    }
+
+    #[tokio::test]
+    async fn download_resolves_persisted_ref() {
+        // A persisted ref is resolved and key-derivation runs; only the final
+        // network fetch is gated by the feature.
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+        let id = rt.unlock_vault(dir.path(), "pin").await.unwrap();
+        let peer_hex = nostr_sdk::PublicKey::parse(&id.npub).unwrap().to_hex();
+        let reff = MediaRef {
+            url: "https://blob.example/abc".into(),
+            peer_pubkey: peer_hex,
+            mime_type: "image/png".into(),
+            caption: "x".into(),
+            size: 3,
+            sha256_hex: String::new(),
+            outgoing: false,
+            created_at: 1,
+        };
+        rt.ui
+            .store_ref()
+            .unwrap()
+            .put(MEDIA_REFS_TREE, "evt1", &reff)
+            .unwrap();
+
+        let out = rt.download_and_decrypt_media("evt1").await;
+        // Unknown id is a clean error; known id reaches the (gated) fetch step.
+        assert!(rt.download_and_decrypt_media("nope").await.is_err());
+        #[cfg(not(feature = "media-http"))]
+        assert!(matches!(out, Err(UiError::Engine(_))));
+        let _ = out;
     }
 }

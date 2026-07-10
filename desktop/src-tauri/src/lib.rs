@@ -64,6 +64,10 @@ pub fn run() {
             commands::broadcast_chitthi,
             commands::sync_ledger,
             commands::toggle_app_workspace,
+            // Encrypted media pipeline
+            commands::upload_and_send_media,
+            commands::send_media_bytes,
+            commands::download_and_decrypt_media,
             // View-model commands (existing frontend)
             commands::workspaces,
             commands::current_workspace,
