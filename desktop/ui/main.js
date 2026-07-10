@@ -416,7 +416,13 @@
             onClick: () => selectContact(k),
           },
           el("span", { class: "contact-name", text: shortNpub(k) }),
-          el("span", { class: "contact-last", text: last ? last.content : "" }),
+          el("span", {
+            class: "contact-last",
+            text: last
+              ? last.content ||
+                (last.media ? `📎 ${last.media.caption || "media"}` : "")
+              : "",
+          }),
         ),
       );
     }
@@ -476,6 +482,11 @@
     } else {
       const btn = el("button", { class: "btn btn-ghost btn-sm", text: "⬇ Download & view" });
       btn.addEventListener("click", async () => {
+        // Dedupe: a re-render can hand out a fresh button for the same message
+        // while a download is in flight — guard so we never fetch (and mint an
+        // object URL) twice for one blob.
+        if (m.media.objectUrl || m.media.loading) return;
+        m.media.loading = true;
         btn.disabled = true;
         btn.textContent = "Decrypting…";
         try {
@@ -483,12 +494,18 @@
             eventId: m.media.eventId,
           });
           const mime = out.mime_type || m.media.mime;
-          const url = URL.createObjectURL(base64ToBlob(out.base64, mime));
-          m.media.objectUrl = url;
-          wrap.replaceChild(renderMediaEl(mime, url), btn);
+          if (!m.media.objectUrl) {
+            m.media.objectUrl = URL.createObjectURL(base64ToBlob(out.base64, mime));
+          }
+          // Re-render from state (not replaceChild on a possibly-detached node)
+          // so the inline media lands in the live DOM for whichever screen shows it.
+          renderConversation();
+          renderCoupleMedia();
         } catch {
           btn.disabled = false;
           btn.textContent = "⬇ Retry";
+        } finally {
+          m.media.loading = false;
         }
       });
       wrap.append(btn);
@@ -508,6 +525,9 @@
     state.dms.set(key, list);
     renderContacts();
     if (state.activeContact === key) renderConversation();
+    // The backend normalises the sender to bech32 npub, matching the partner
+    // npub the couple panel is keyed by — repaint it when partner media lands.
+    if (key === state.partnerNpub) renderCoupleMedia();
     showToast(`New encrypted media from ${shortNpub(key)}`, "info");
   }
 

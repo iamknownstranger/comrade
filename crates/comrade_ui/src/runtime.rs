@@ -105,7 +105,7 @@ impl From<VaultMessage> for DirectMessageDto {
     fn from(m: VaultMessage) -> Self {
         Self {
             id: m.event_id,
-            sender: m.sender_pubkey,
+            sender: to_npub(&m.sender_pubkey),
             content: m.content,
             created_at: m.created_at,
             upi_intents: m
@@ -187,6 +187,17 @@ fn parse_media_envelope(content: &str) -> Option<MediaEnvelope> {
 /// Parse an npub (bech32) or hex public key.
 fn parse_pubkey(s: &str) -> Result<PublicKey, UiError> {
     PublicKey::parse(s).map_err(|e| UiError::Engine(format!("invalid pubkey: {e}")))
+}
+
+/// Normalise a hex or bech32 public key to a canonical bech32 `npub` for the
+/// frontend. Both the incoming and outgoing sides emit the same form, so the UI
+/// can key conversations (and the couple panel, which is keyed by the pasted
+/// npub) consistently. Falls back to the input unchanged if it cannot be parsed.
+fn to_npub(pubkey: &str) -> String {
+    PublicKey::parse(pubkey)
+        .ok()
+        .and_then(|pk| pk.to_bech32().ok())
+        .unwrap_or_else(|| pubkey.to_string())
 }
 
 /// A push event emitted by the background Tokio loops and forwarded across the
@@ -363,7 +374,7 @@ impl ComradeRuntime {
                             url: env.url,
                             mime_type: env.mime,
                             caption: env.caption,
-                            sender: msg.sender_pubkey,
+                            sender: to_npub(&msg.sender_pubkey),
                             created_at: msg.created_at,
                             size: env.size,
                         }));
@@ -805,6 +816,20 @@ mod tests {
             r#"{"comrade_media":1,"event_id":"e","url":"https://b/x","mime":"image/png","caption":"","size":1}"#
         )
         .is_some());
+    }
+
+    #[test]
+    fn to_npub_canonicalises_incoming_and_outgoing_to_the_same_key() {
+        // Regression guard: incoming media/DM senders arrive as hex, outgoing
+        // DTOs emit bech32. Both must normalise to the identical npub so the
+        // frontend keys one conversation (and the couple panel) per peer.
+        let keys = nostr_sdk::Keys::generate();
+        let hex = keys.public_key().to_hex();
+        let npub = keys.public_key().to_bech32().unwrap();
+        assert_eq!(to_npub(&hex), npub, "hex must normalise to npub");
+        assert_eq!(to_npub(&npub), npub, "npub is already canonical");
+        // Unparseable input falls back unchanged rather than panicking.
+        assert_eq!(to_npub("not-a-key"), "not-a-key");
     }
 
     #[test]

@@ -430,7 +430,12 @@ mod http {
         key: &[u8; 32],
         expected_sha256: Option<&str>,
     ) -> Result<Vec<u8>, MediaError> {
-        if !url.starts_with("https://") {
+        // URL schemes are case-insensitive; accept HTTPS in any case but keep
+        // the fail-closed default for every other (or missing) scheme.
+        let is_https = url
+            .split_once("://")
+            .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("https"));
+        if !is_https {
             return Err(MediaError::Http(
                 "refusing to fetch a non-HTTPS media URL".into(),
             ));

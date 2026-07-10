@@ -47,7 +47,8 @@ rebuilds a `Blob`, and shows the `<img>`/`<audio>` inline. The real HTTP path is
 behind the `media-http` cargo feature (enabled for this desktop build).
 
 Real-time updates arrive over the single `comrade://event` window channel
-(internally-tagged `incoming_chitthi` / `incoming_direct_message`) and are
+(internally-tagged `incoming_chitthi` / `incoming_direct_message` /
+`incoming_media`) and are
 prepended to the UI without a refresh. Every `invoke` is funnelled through a
 `safeInvoke` wrapper that renders backend errors as toasts. Running the page
 outside Tauri activates a built-in mock backend for design preview.

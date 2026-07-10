@@ -175,14 +175,21 @@ pub async fn upload_and_send_media(
     file_path: String,
     target_pubkey: String,
 ) -> Result<MediaMessageDto, String> {
+    // Reject oversized files by their metadata before reading them into memory.
+    let meta = tokio::fs::metadata(&file_path)
+        .await
+        .map_err(|e| format!("stat file: {e}"))?;
+    if meta.len() > MAX_MEDIA_BYTES as u64 {
+        return Err(format!(
+            "file is {:.1} MB; the limit is 10 MB",
+            meta.len() as f64 / 1_048_576.0
+        ));
+    }
     let bytes = tokio::fs::read(&file_path)
         .await
         .map_err(|e| format!("read file: {e}"))?;
     if bytes.len() > MAX_MEDIA_BYTES {
-        return Err(format!(
-            "file is {:.1} MB; the limit is 10 MB",
-            bytes.len() as f64 / 1_048_576.0
-        ));
+        return Err("file exceeds the 10 MB limit".to_string());
     }
     let mime = guess_mime(&file_path);
     let caption = std::path::Path::new(&file_path)
@@ -209,6 +216,11 @@ pub async fn send_media_bytes(
     base64: String,
 ) -> Result<MediaMessageDto, String> {
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    // Bound the encoded string before decoding so a huge payload can't force a
+    // large transient allocation: base64 inflates 4/3, so cap the string length.
+    if base64.len() > (MAX_MEDIA_BYTES / 3 + 1) * 4 {
+        return Err("file exceeds the 10 MB limit".to_string());
+    }
     let bytes = B64
         .decode(base64.as_bytes())
         .map_err(|e| format!("invalid base64: {e}"))?;

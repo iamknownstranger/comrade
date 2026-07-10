@@ -187,13 +187,44 @@ jobs:
         # to its `if:` expression.
         env:
           SIGNING_STORE_B64: ${{ secrets.SIGNING_STORE_B64 }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
         run: |
-          if [ -n "$SIGNING_STORE_B64" ]; then
+          set -euo pipefail
+          # Count how many of the four signing secrets are set. Release signing
+          # needs all four together; a partial set is a misconfiguration (e.g.
+          # an alias with no keystore makes Gradle try to sign against a missing
+          # file), so fail fast instead of half-configuring.
+          set_count=0
+          for v in "$SIGNING_STORE_B64" "$SIGNING_KEY_ALIAS" "$SIGNING_KEY_PASSWORD" "$SIGNING_STORE_PASSWORD"; do
+            [ -n "$v" ] && set_count=$((set_count + 1))
+          done
+          if [ "$set_count" -eq 4 ]; then
             echo "$SIGNING_STORE_B64" | base64 --decode > android/app/keystore.jks
-            echo "Decoded release keystore."
-          else
+            echo "Decoded release keystore (production signing)."
+          elif [ "$set_count" -eq 0 ]; then
             echo "No signing secrets set — building a debug-signed APK."
+          else
+            echo "::error::$set_count/4 signing secrets set — provide all four (SIGNING_STORE_B64, SIGNING_KEY_ALIAS, SIGNING_KEY_PASSWORD, SIGNING_STORE_PASSWORD) or none."
+            exit 1
           fi
+
+      - name: Validate & normalize version
+        # The version comes from workflow_dispatch input. Validate it and expose
+        # a sanitized $VERSION so it is never interpolated raw into a shell/tag/
+        # filename (a value with spaces or shell metacharacters would break — or
+        # inject into — the run steps below).
+        env:
+          RAW_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          v="${RAW_VERSION#v}"
+          if ! printf '%s' "$v" | grep -Eq '^[0-9A-Za-z.-]+$'; then
+            echo "::error::invalid version '$RAW_VERSION' — allowed characters: [0-9A-Za-z.-]"
+            exit 1
+          fi
+          echo "VERSION=$v" >> "$GITHUB_ENV"
 
       - name: Build release APK
         working-directory: android
@@ -204,20 +235,20 @@ jobs:
           SIGNING_STORE_FILE: "app/keystore.jks"
         run: |
           ./gradlew assembleRelease \
-            -PversionCode=${{ github.run_number }} \
-            -PversionName=${{ inputs.version }} \
+            -PversionCode="${{ github.run_number }}" \
+            -PversionName="$VERSION" \
             --no-daemon
 
       - name: Rename APK
         run: |
           mv android/app/build/outputs/apk/release/app-release.apk \
-             android/app/build/outputs/apk/release/comrade-${{ inputs.version }}.apk
+             "android/app/build/outputs/apk/release/comrade-$VERSION.apk"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: comrade-apk-${{ inputs.version }}
-          path: android/app/build/outputs/apk/release/comrade-${{ inputs.version }}.apk
+          name: comrade-apk-${{ env.VERSION }}
+          path: android/app/build/outputs/apk/release/comrade-${{ env.VERSION }}.apk
 
 # ── Job 4: Create GitHub Release ──────────────────────────────────────────────
   release:
@@ -230,18 +261,33 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Validate & normalize version
+        # Re-validate here: this job takes the raw workflow_dispatch input
+        # independently of build-apk, and the sanitized value feeds the git tag,
+        # the release name, and the artifact/file names.
+        env:
+          RAW_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          v="${RAW_VERSION#v}"
+          if ! printf '%s' "$v" | grep -Eq '^[0-9A-Za-z.-]+$'; then
+            echo "::error::invalid version '$RAW_VERSION' — allowed characters: [0-9A-Za-z.-]"
+            exit 1
+          fi
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+
       - name: Download APK
         uses: actions/download-artifact@v4
         with:
-          name: comrade-apk-${{ inputs.version }}
+          name: comrade-apk-${{ env.VERSION }}
           path: dist/
 
       - name: Create release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: v${{ inputs.version }}
-          name: "Comrade v${{ inputs.version }}"
+          tag_name: v${{ env.VERSION }}
+          name: "Comrade v${{ env.VERSION }}"
           prerelease: ${{ inputs.pre_release == 'true' }}
           generate_release_notes: true
           fail_on_unmatched_files: true
-          files: dist/comrade-${{ inputs.version }}.apk
+          files: dist/comrade-${{ env.VERSION }}.apk
