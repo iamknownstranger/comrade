@@ -1,0 +1,299 @@
+# Comrade — Repository Audit & Improvement Plan
+
+_Audit date: 2026-07-10._
+_Method: full manual read of every Rust crate, the CLI, the Tauri shell + desktop JS, and the Android app, cross-checked by an 8-dimension parallel agent sweep. Architecture findings were additionally adversarially verified (all CONFIRMED); every other finding below was verified by direct file reads unless explicitly flagged otherwise._
+
+---
+
+## 1. Executive Summary
+
+**Overall health: C+ (prototype grade: promising core, credibility gaps at the edges).**
+The Rust workspace shows genuinely strong engineering discipline for a prototype — clean crate layering, typed errors everywhere, ~90 behavior-asserting unit tests, an encrypted-at-rest store with adversarial "scan the disk for plaintext" tests, and CI that gates fmt/clippy/test. The problem is the distance between what the README promises and what is actually wired: three of the seven advertised engines (Saathi mesh, NIP-65 gossip routing, encrypted media) are never invoked by any frontend; the Android app cannot unlock the vault at all, so its voice "post"/"timeline" commands can never succeed; and DMs use the deprecated, unauthenticated NIP-04 scheme in a product whose entire identity is "privacy-first."
+
+**Top 3 risks:** (1) NIP-04 (AES-CBC, no authentication, metadata-leaking) for E2E DMs while NIP-44 is available in the already-pinned nostr-sdk; (2) Off-Grid mode is a *false privacy assurance* — the UI tells the user "public relays paused, Saathi mesh active" while relay websockets stay connected and no engine is ever disconnected; (3) `change_pin` re-encrypts the store non-atomically — a crash mid-way permanently corrupts user data.
+
+**Top 3 opportunities:** (1) close the honesty gap — wire engine lifecycle to the state machine (or mark features experimental) and make the README match reality; (2) close the CI and release blind spots — Android tests and the Tauri crate are never built in CI, and official release APKs ship debug-signed with ephemeral keys and without the voice model; (3) scope the Sabha feed subscription (currently the global Kind-1 firehose) to a follow set, which fixes performance, UX, and privacy in one change.
+
+---
+
+## Decision log
+
+- **2026-07-10 (owner):** Proceed on the current Rust stack; framework maturity risk (sled 0.34, yrs pre-1.0, libp2p/nostr-sdk churn) is *accepted* on the assumption these mature over time. Consequences: D1's sled migration is **out of scope** (document in SECURITY.md instead); unmaintained transitive-dep advisories from these frameworks are ignored with reasons + exit conditions in `deny.toml`; the hickory-proto DNS advisories wait on a libp2p release against hickory ≥ 0.26.
+- **2026-07-10:** M0 executed (wrapper, CI lanes, cargo-deny gate, desktop lockfile, change_pin crash-safety regression test) plus M1 quick wins (M1-3 README truth pass, M1-6 backup/FLAG_SECURE/nsec masking, M1-7 checksum logic — pin pending network access, M1-8 CSP). MSRV measured from the lock: **rustc ≥ 1.88** (supersedes the sweep's 1.83 estimate in N3).
+
+---
+
+## 2. Repo Map
+
+**Purpose.** "Comrade" — a privacy-first, cross-platform social client over Nostr, with an off-grid libp2p mesh mode and an encrypted couple's shared ledger. Hindi-derived nomenclature: public post = *Chitthi*, engines = *Sabha* (public feed), *Vault* (E2E DMs), *Saathi* (mesh), *Sakha/Sakhi* (couple CRDT ledger).
+
+**Stack.** Rust 2021 workspace (tokio, nostr-sdk 0.44, libp2p 0.56, yrs 0.21, sled 0.34, aes-gcm/argon2/secp256k1) · Kotlin + Jetpack Compose Android app with an offline Vosk voice assistant · Tauri 2 desktop shell with a no-build vanilla-JS SPA · interactive CLI harness. ~11k lines total. Built through a series of AI-assisted PRs (milestone-labeled commits), no releases yet.
+
+**Architecture sketch.**
+
+```
+                    ┌────────────── frontends ──────────────┐
+   CLI (src/main.rs)   Android (Kotlin ⇄ comrade_jni)   Desktop (JS ⇄ Tauri commands)
+                    └───────────────┬────────────────────────┘
+                          comrade_ui (UiService + ComradeRuntime + event bus)
+                    ┌───────────────┴────────────────────────┐
+        comrade_core (crypto, sabha, vault, sakha, saathi*, relay*, media*)
+        comrade_state (pure workspace state machine)
+        comrade_storage (sled + Argon2id + AES-256-GCM)
+                                          * = built & tested but never wired to a frontend
+```
+
+**Key directories.**
+
+| Path | What it is |
+|---|---|
+| `crates/comrade_core/` | Protocol engines; the real product logic (crypto, feed, DMs, CRDT ledger, mesh, relay routing, media) |
+| `crates/comrade_state/` | I/O-free progressive-disclosure state machine (Base / OffGridTravel / CoupleSandbox) |
+| `crates/comrade_storage/` | Encrypted-at-rest KV store + typed repositories; the best-tested crate |
+| `crates/comrade_ui/` | Framework-agnostic view-model (`UiService`) + async bridge orchestrator (`ComradeRuntime`) |
+| `crates/comrade_jni/` | Android JNI exports (panic-guarded, JSON-string protocol) |
+| `src/main.rs` | 720-line interactive CLI harness; mostly demo commands |
+| `desktop/` | Tauri 2 shell (excluded from workspace) + vanilla JS SPA (`desktop/ui/`) |
+| `android/` | Compose app: workspace list, keygen, "Hey Comrade" voice assistant |
+| `.github/workflows/` | CI (Rust-only) + manual APK release |
+
+**Surprising things.** The desktop JS contains a full mock backend for browser preview (`desktop/ui/main.js:621`); the Android app displays the raw `nsec` on screen; the "Couple Sandbox" pairing dialog on desktop validates a token client-side but never sends it to the backend; the Tauri bundle references icons that don't exist; there is no LICENSE file anywhere.
+
+---
+
+## 3. Audit Report
+
+Severity: **C**ritical / **H**igh / **M**edium / **L**ow. Each finding is labeled **[fact]** (verifiable in code) or **[judgment]** (design opinion).
+
+### 3.1 Security & Cryptography
+
+| # | Sev | Finding |
+|---|---|---|
+| S1 | **H** | **[fact] DMs use deprecated NIP-04.** `crates/comrade_core/src/vault.rs:112-134` encrypts DMs with `nip04::encrypt` (Kind 4). NIP-04 is AES-256-CBC without authentication (malleable ciphertext), leaks recipient metadata in plaintext `p` tags, and is formally deprecated in favor of NIP-44/gift-wrap — which nostr-sdk 0.44 already ships. For a product whose README leads with "privacy-first," this is the headline gap. The README (`README.md:11`) presents NIP-04 as a feature, so this is a deliberate-looking choice that needs revisiting, not an accident. |
+| S2 | **H** | **[fact] `change_pin` is not crash-safe.** `crates/comrade_storage/src/lib.rs:207-238` re-encrypts every value in place under the new key (lines 214-227) and only afterwards rewrites the salt + verification token (230-233). A crash mid-loop leaves a store whose meta says "old key" but whose values are a mix of old- and new-key ciphertexts — the mixed values are permanently undecryptable under either PIN. No test simulates this. (Latent today — `change_pin` has no non-test callers — but it is the published re-key API.) |
+| S3 | **M** | **[fact] Weak-PIN reality vs. "encrypted at rest" promise.** The unlock secret is called a "PIN" throughout (`EncryptedStore::open(path, pin)`, CLI `unlock <PIN>`); nothing enforces minimum entropy (desktop `main.js:207` only checks non-empty). Argon2 uses library defaults (`lib.rs:255`, argon2 0.5 ⇒ m=19 MiB, t=2, p=1 — OWASP minimum). A 4-6 digit PIN over a 10⁴–10⁶ keyspace is offline-brute-forceable in seconds regardless of Argon2. The at-rest encryption is only as strong as the passphrase policy that doesn't exist. |
+| S4 | **M** | **[fact] Social graph stored in plaintext keys.** `comrade_storage` encrypts values only; tree keys are plaintext by design (`lib.rs:23-25`). Contacts are keyed by npub (`repository.rs:143`), so a device-level attacker reads the full contact list without the PIN. The header note says "callers that need key confidentiality should hash keys" — no caller does. |
+| S5 | **M** | **[fact] Secret-key exposure surfaces.** Android `KeygenSection` renders the full `nsec` on screen with no masking and no `FLAG_SECURE` (`MainActivity.kt:284-290`); the CLI prints the first 20 chars of the nsec (`src/main.rs:592-594`) and 16 bytes of a DH shared secret (`src/main.rs:617-621`); the nsec crosses the JNI boundary inside a hand-rolled JSON Java `String` (`comrade_jni/src/lib.rs:113-117`), which is immutable and unzeroizable. `KeyProfile.nsec` / `StoredIdentity.nsec` are plain `String`s — the README's zeroization claim (`README.md:171`) is true only for the storage key. |
+| S6 | **M** | **[fact] Tauri CSP disabled.** `desktop/src-tauri/tauri.conf.json:20` sets `"csp": null` in a webview that renders content from public relays. Mitigation: `desktop/ui/main.js` is disciplined — all dynamic text goes through `textContent` (`el()` helper, `main.js:35-51`), and `innerHTML` is only used for clearing. CSP is the missing second layer, cheap to add. |
+| S7 | **M** | **[fact] `allowBackup="true"`** (`AndroidManifest.xml:17`). ADB/cloud backup can exfiltrate the app's data dir. Values are encrypted, but combined with S3 (weak PIN) a backup is an offline brute-force target; privacy-focused apps conventionally set `allowBackup=false`. |
+| S8 | **M** | **[judgment] Sakha has no forward secrecy.** Pairing derives one static symmetric key from static-static ECDH (`sakha.rs:136-144`, `crypto.rs:78-104`) and publishes ciphertext to public relays as Kind-30078. Compromise of either partner's nsec at any future time decrypts the couple's entire ledger history retained by relays. Acceptable for a prototype only if documented as a known limitation; there is no threat-model doc (see N2). |
+| S9 | L | **[fact] Sakha sync handler trusts the relay's author filter.** `sakha.rs:217-260` never checks `event.pubkey == partner_pk`; authenticity rests entirely on AES-GCM decryption succeeding. AEAD makes forgery infeasible, but replayed/reflected updates are accepted (mostly harmless — Yrs updates are idempotent). Cheap defense-in-depth check missing. |
+| S10 | L/M | **[fact] Vosk model fetched without integrity pinning.** `scripts/fetch-vosk-model.sh:12,29` downloads a zip over HTTPS with no checksum; the bytes are baked into the APK. One `sha256sum -c` line fixes it. |
+| S11 | M | **[judgment] Saathi mesh is plaintext broadcast with spoofable sender.** Mesh messages are unencrypted application-layer JSON visible to every LAN peer, and `MeshMessage.sender` is a free-text self-declared label (`saathi.rs:41-59,289-291`) not bound to the libp2p identity. Fine for a demo; incompatible with the README's privacy framing if ever wired up (currently it is not — see A1). |
+| S12 | M | **[judgment] Untrusted DMs auto-compile to payment URIs.** Any inbound DM containing `/pay …` becomes a rendered UPI chip with a ready-made `upi://pay` URI (`vault.rs:34-50`, `desktop/ui/main.js:421-429`). Amount/VPA are shown, so the user does see what they'd approve, but money-adjacent parsing of attacker-controlled text deserves explicit confirm-flow design, and amounts are `f64` (see Q3). |
+
+**Healthy:** AES-GCM usage is correct throughout (fresh random 96-bit nonce per seal, prepended; auth failure surfaces as typed errors) — `crypto.rs:123-149`, `storage/lib.rs:264-290`, `sakha.rs:39-65`. The ECDH x-only lift + SHA-256(x) + HKDF-labels construction (`crypto.rs:78-118`) composes standard primitives sensibly and is symmetric-verified by test. Storage's PIN verification fails closed (`StorageError::InvalidPin`), proven by tests including on-disk plaintext scans (`storage/lib.rs:346-370`, `repository.rs:377-408`).
+
+### 3.2 Architecture & Design
+
+| # | Sev | Finding |
+|---|---|---|
+| A1 | **H** | **[fact, adversarially confirmed] Off-Grid mode is a false privacy assurance — engines are never disconnected.** `toggle_workspace` (`runtime.rs:326-328`) only flips the pure state enum; a repo-wide grep shows `SabhaEngine::disconnect` / `VaultEngine::disconnect` / `SakhaEngine::disconnect` have **zero call sites**, and `SaathiEngine` is never constructed anywhere. Yet the desktop toasts "Off-Grid / Travel mode — public relays paused, Saathi mesh active" (`desktop/ui/main.js:470-474`) while the relay websockets stay live, `broadcast_chitthi` has no workspace guard, and the compose UI stays active. `GossipEngine` and `MediaEngine` are likewise unwired (call sites only in CLI demos/tests); the CLI even prints "Saathi mesh would spin up here (run 'saathi' binary in production)" (`src/main.rs:544`) — no such binary exists. The README's engine table (`README.md:8-17`) presents all of these as product features. |
+| A2 | **H** | **[fact, adversarially confirmed] The Android app cannot reach any networked feature.** No Kotlin code ever calls `unlockVault`/`pollEvent` (`ComradeCore.unlockVaultTyped` has no caller; `MainActivity.kt` has no passphrase UI), so engines are never constructed on Android. Voice "post …" and "read my timeline" route to `broadcast_chitthi`/`fetch_sabha_timeline`, which always return `VaultLocked` (`runtime.rs:284,269`). The advertised assistant (`README.md:140-143`) can only ever answer "I couldn't post that. vault is locked…" — on the one platform the release workflow ships. |
+| A3 | **H** | **[fact, adversarially confirmed] Couple pairing is foreclosed by the ownership design, not just unwired.** `SakhaEngine::pair_with` takes `&mut self` with no interior mutability (`sakha.rs:136`), but `ComradeRuntime` Arc-wraps the engine un-paired with an empty relay list at construction (`runtime.rs:211-214`) — pairing can never be called through that handle, no bridge command exposes it, and `subscribe_sync` has no callers. The desktop "Partner Portal" validates the pairing token client-side, throws it away, and toasts "Partner portal unlocked" with no key agreement having occurred (`desktop/ui/main.js:490-516`); `sync_ledger` then always fails with `NoSharedSecret` (`sakha.rs:173`). The desktop DM composer's Send button is likewise a stub (`main.js:595-597`) even though `VaultEngine::send_dm` exists. |
+| A4 | M | **[judgment] The layering itself is good — the gap is lifecycle ownership.** `comrade_state` (pure) → `comrade_core` (engines) → `comrade_ui` (view-model) → thin bridges is the right shape, and the three bridge layers are appropriately thin duplicates. What's missing is one owner that maps workspace transitions to engine start/stop (the thing A1/A3 need) and one owner for relay configuration — today Sabha hardcodes `DEFAULT_RELAYS`, Vault receives them as a parameter, Sakha gets an empty list, and the NIP-65 `RelayRouter` is an unintegrated island. Placing both in `ComradeRuntime` is the natural evolution. |
+| A5 | M | **[fact] Voice "new identity" is a disconnected code path.** The JNI `generateKeypair` calls `KeyProfile::generate()` standalone (`comrade_jni/src/lib.rs:109-118`) and never touches the shared `ComradeRuntime`, so the voice assistant's "Created a new identity" (`CommandDispatcher.kt:60-63` via `ComradeCoreBackend.kt:28-29`) succeeds without changing the identity any engine signs with. Two identity paths, one of them cosmetic. |
+| A6 | L | **[fact] JNI event delivery is poll-based and lossy-by-design.** A single process-global broadcast receiver is created lazily at first `pollEvent` (`comrade_jni/src/lib.rs:69-72`); events emitted before that are silently dropped, and lag drops surface as `{"lagged":n}`. Currently moot (no Kotlin caller — A2), but the contract should be documented or replaced with a callback when Android wiring lands. |
+| A7 | L | **[fact] `comrade_core` declares an unused dependency on `comrade_state`** (`crates/comrade_core/Cargo.toml:7`; zero use sites in `comrade_core/src/`) — muddies the otherwise-clean layering story. |
+
+**Healthy:** crate dependency direction is clean (storage has no core/nostr deps to avoid cycles — `repository.rs:6-7`; state is I/O-free by doc and by fact); DTO/event contracts are serde-typed and round-trip tested (`runtime.rs:489-510`); the JNI boundary is panic-guarded (`guard_json`, `lib.rs:77-86`) so no unwinding crosses `extern "C"`; the Android voice layer is cleanly abstracted behind the `ComradeBackend` interface so dispatcher logic is JVM-unit-testable without the native library (`CommandDispatcher.kt:9-28`).
+
+### 3.3 Performance & Concurrency
+
+| # | Sev | Finding |
+|---|---|---|
+| P1 | **H** | **[fact] Sabha subscribes to the global Kind-1 firehose.** `sabha.rs:270-272` filters only by kind + since (no authors, no limit); `runtime.rs:243` requests the last **3600 seconds of every public text note on damus/nostr.band/nos.lol**. Every event is pushed onto the bus and prepended to the desktop DOM with no cap (`main.js:298-306`, `state.chitthis` grows forever). On real relays this floods the UI within seconds and grows memory unboundedly. This is simultaneously a perf, UX, and privacy problem (you render arbitrary global content). |
+| P2 | M | **[fact] Blocking work on async threads and locks held across I/O.** `unlock_vault` runs Argon2id (19 MiB memory-hard KDF) + sled open inline while holding the runtime's `RwLock` write guard on a Tokio thread (`comrade_ui/src/lib.rs:181-185` via `runtime.rs:185`; `commands.rs:32-40`). Tauri commands also hold the read guard across relay network awaits (`commands.rs:57-68`), so one slow broadcast stalls every write command (unlock, workspace toggle). On Android, JNI `block_on`s network/KDF on the calling thread (`comrade_jni/src/lib.rs:209-221,243-254`), and the tap-to-talk path dispatches from a Vosk callback on the main looper (`MainActivity.kt:122-137`) — a latent ANR once unlock is wired. Wants `spawn_blocking` + narrower lock scopes. |
+| P3 | M | **[fact] Unbounded in-memory growth in engines.** Vault inbox `Vec<VaultMessage>` grows forever and `inbox_snapshot` clones it all (`vault.rs:82,215,225-227`); Saathi `received: Vec` unbounded (`saathi.rs:77,257`) while its outbox is capped at 256. |
+| P4 | L | **[fact] Sakha sync payload grows without bound.** Every `publish_sync` encodes the full doc state from `StateVector::default()` (`sakha.rs:175-179`), so event size grows with ledger history for the life of the pairing. |
+| P5 | L | **[judgment] Triple websocket pools.** Sabha, Vault, and Sakha each construct their own `nostr_sdk::Client` (`runtime.rs:201-215`), tripling connections to the same relays; nostr-sdk supports a shared client/pool. |
+| P6 | L | **[fact] Timeline reads decrypt the whole cache.** `chitthi_cache()` iterates, decrypts, and sorts every cached row per fetch with no pagination or eviction (`repository.rs:174-178`); fine at prototype scale, a cliff once incoming posts are persisted (Q2). |
+
+**Healthy:** the event bus is a bounded `broadcast::channel(256)` where slow consumers lag rather than block producers (`runtime.rs:41`); heavy relay/decrypt work runs in spawned Tokio tasks off the UI thread (`runtime.rs:233-263`); JNI owns one process-global multi-thread runtime rather than per-call runtimes (`comrade_jni/src/lib.rs:47-55`).
+
+### 3.4 Code Quality & Correctness
+
+| # | Sev | Finding |
+|---|---|---|
+| Q1 | **H** | **[fact] Saathi's offline cache drops messages on drain failure.** On mDNS discovery the outbox is drained by `pop_front` → publish; a publish error only logs — the message is not re-queued (`saathi.rs:216-231`). Worse, drain fires immediately on discovery, before the gossipsub mesh has formed (mesh formation needs a heartbeat exchange), so `InsufficientPeers` failures are the *expected* case — the advertised store-and-forward behavior (`README.md:170`) likely loses most cached messages in practice. Zero tests exist for this module. Currently unreachable from any frontend (A1), which contains the blast radius but also means it's never been exercised. |
+| Q2 | M | **[fact] The offline-first storage layer is built but barely used.** Incoming chitthis and DMs are never persisted — the event-loop callbacks only forward to the broadcast bus (`runtime.rs:238-245, 253-257`); only *outgoing* chitthis are cached (`runtime.rs:301-315`). The contacts, vault-cache, and ledger-persistence repository APIs (`repository.rs:142-235`) have zero production callers. Compounding it, the Vault subscription filters `.since(Timestamp::now())` (`vault.rs:157`) with no history backfill, so DMs received while the app is closed are silently lost. The "offline-first" story the storage crate was built for effectively exists only for one's own posts. |
+| Q3 | M | **[fact] Money as `f64`.** `UpiPaymentIntent.amount_inr` (`vault.rs:25`) and `LedgerEntry.amount_inr` (`sakha.rs:72`) are floats, formatted with `{:.2}` into payment URIs. Classic representation risk for a feature that constructs real payment intents; should be integer paise. |
+| Q4 | M | **[fact] Live feed discards threading it already knows how to parse.** `ChitthiDto::from_event` hardcodes `reply_to: None` (`runtime.rs:57-69`) even though `sabha.rs:122-134` implements NIP-10 parent resolution — so live chitthis lose reply structure, and the `build_chitthi_thread` tree builder is reachable only from the CLI demo. |
+| Q5 | M | **[fact] Background event loops fail silently.** If a feed/inbox subscription errors, the spawned task `warn!`s and exits (`runtime.rs:243-246, 258-261`); no status/error event reaches any frontend, so the app looks unlocked and healthy while live updates are permanently dead for the session. |
+| Q6 | L | **[fact] Misleading error taxonomy in Vault.** Relay add, subscription, and send failures are all mapped to `VaultError::EncryptionFailed` (`vault.rs:92,119,130,162,222`) — a connection refusal reports as "encryption failed" in every frontend. `DecryptionFailed`/`InvalidRecipient` variants exist but are never constructed (`error.rs:79-83`). Similarly, `sakha.rs:64` labels a decrypt failure `EncryptionError`. |
+| Q7 | L | **[fact] AES-256-GCM seal/open is implemented three times** — `crypto.rs:123-149`, `storage/lib.rs:264-290`, `sakha.rs:39-65` — identical `[nonce | ct+tag]` envelopes with per-module error types. One shared helper (crypto.rs's) would do. |
+| Q8 | L | **[fact] Hand-rolled JSON at the JNI boundary.** `generateKeypair` formats JSON with `format!` (`comrade_jni/src/lib.rs:113-117`) — an error message containing `"` would produce invalid JSON. Fine for the current messages; trivially replaced with the `json!` macro already used elsewhere in the same file. |
+| Q9 | L | **[fact] NIP-10 tree builder recurses to reply-chain depth** over relay-supplied events (`sabha.rs:169-186`; `ChitthiThread::len` likewise, `sabha.rs:60-65`) — a maliciously deep chain overflows the stack. Only demo-reachable today; matters when Q4 is fixed. Also: the CLI claims "Persisted N Chitthi(s)" then discards the flush result (`src/main.rs:158`, `let _ = store.flush()`). |
+| Q10 | L | **[fact] README's "zero unwrap in network/parsing paths" is nearly true.** Counterexamples are all benign-but-notable: infallible-by-construction `.expect` in `derive_symmetric_key` (`crypto.rs:116`) and listen-addr parse (`saathi.rs:152`), plus `expect("keygen")` on the CLI bootstrap path (`src/main.rs:406,430,443,447`). Engine network/parse paths hold the claim. |
+
+**Healthy:** error handling is consistently typed (`thiserror` domain enums per engine, `error.rs`), notification loops degrade gracefully on bad input (warn-and-continue on undecryptable DM / bad base64 / bad CRDT update — `vault.rs:185-195`, `sakha.rs:226-248`), swallowed-error patterns (`let _ =`) appear only where correct (event-bus send with no subscribers, `runtime.rs:241`). No dead `pub` surface beyond the intentionally-unwired engines (A1).
+
+### 3.5 Testing
+
+| # | Sev | Finding |
+|---|---|---|
+| T1 | **H** | **[fact] CI never runs the Android unit tests.** `VoiceCommandTest`/`CommandDispatcherTest` exist and are meaningful, but `.github/workflows/ci.yml` runs only cargo; no `gradle test` anywhere (release.yml builds the APK without running Kotlin tests either, `release.yml:149-160`). The Kotlin voice grammar can regress silently. |
+| T2 | **H** | **[fact] The desktop crate is never compiled by CI (or anyone).** `desktop/src-tauri` is excluded from the workspace (`Cargo.toml:13`) and no CI job builds it — `#[tauri::command]` signature drift vs. `main.js` invocations, or a plain compile error, ships undetected. `desktop/ui/main.js` (687 lines of real logic) has zero tests and no linting. |
+| T3 | M | **[fact] Zero tests for `saathi.rs`** — the module with the audit's worst correctness bug (Q1). Its design (spawned swarm task, no injectable transport) resists testing; the command-channel seam exists and could be exercised with two in-process engines. |
+| T4 | M | **[judgment] No cross-engine integration test and no known-answer crypto tests.** Nothing exercises unlock → engine build → broadcast → event-bus delivery against a mock/local relay; crypto tests are all self-round-trips with no fixed vectors (e.g., NIP-04 reference vectors, HKDF/AES KATs). The Rust↔Kotlin JSON contract is pinned by no test on either side, and the `nip96-http` feature is never compiled in CI (`cargo test --workspace` uses default features), so the real uploader can rot silently. |
+
+**Healthy — and worth saying loudly:** this is a genuinely well-tested prototype where tests exist: `comrade_state` (transition graph, history), `comrade_storage` (13 unit + 6 durability tests incl. reboot cycles, wrong-PIN fail-closed, and adversarial scans proving no plaintext ever hits disk), relay router (10 pure-logic tests), media (full pipeline round-trip), `comrade_ui` (lock-gating, Send/Sync compile guarantees, serde round-trips), Kotlin voice parsing. Tests assert behavior, not execution. Roughly: storage/state/relay/media/ui ≈ well covered; vault/sakha ≈ partial (pure parts only); sabha engine, saathi, JNI, desktop JS ≈ uncovered.
+
+### 3.6 Dependencies
+
+| # | Sev | Finding |
+|---|---|---|
+| D1 | M | **[fact] `sled 0.34.7`** (`Cargo.lock`) — last stable release 2021; the project has been in a years-long 1.0-alpha limbo with known unresolved crash-recovery and memory issues. As the foundation of the encrypted store this is a real liability; `redb` (maintained, stable format) is the drop-in-shaped alternative. The README's encrypted-at-rest story never mentions this. |
+| D2 | M | **[fact] No LICENSE file and no `license` field in any Cargo.toml** (verified by search). Legally "all rights reserved" — blocks any external contribution or reuse decision, and violates the org's new-repo standard. The APK build also strips upstream license notices (`build.gradle.kts:66` excludes `META-INF/{AL2.0,LGPL2.1}`) with no NOTICE strategy. |
+| D3 | M | **[fact] Reproducibility gaps.** No Gradle wrapper committed (builds need a hand-matched system Gradle 8.5, `README.md:58`); `desktop/src-tauri` has **no Cargo.lock at all** (excluded from the workspace, never built); CI's cargo steps run without `--locked`. |
+| D4 | L | **[fact] Minor version hygiene.** Duplicate `rand 0.8.6` + `0.9.4` in the lock (transitive); loose `"1"`-style version reqs (acceptable with a committed lockfile); Android toolchain a generation behind (Kotlin 1.9.22, Compose BOM 2024.02 — dated, not risky). No cargo-audit/cargo-deny gate exists (see O2). |
+
+**Healthy:** the dependency set is lean and purposeful — every crypto crate is a RustCrypto/rust-bitcoin standard, no `openssl`, no unnecessary frameworks; the workspace `Cargo.lock` is committed; nostr-sdk 0.44 / libp2p 0.56 / yrs 0.21 are current-generation.
+
+### 3.7 DevEx & Operations
+
+| # | Sev | Finding |
+|---|---|---|
+| O1 | **H** | **[fact] CI coverage stops at the workspace boundary.** `ci.yml` is Rust-workspace-only: Android compile+test, desktop crate compile, and JS lint are all absent (details in T1/T2). One broken frontend commit is undetectable. |
+| O2 | M | **[fact] No dependency/security scanning in CI** (no cargo-audit/cargo-deny job) for a crypto-heavy project, and the release workflow that handles signing secrets uses tag-pinned (not SHA-pinned) third-party actions (`release.yml:83,127,191`). |
+| O3 | M | **[fact] Release APKs are debug-signed with *ephemeral per-runner keys* and ship without the voice model.** Without signing secrets, each CI runner mints its own debug keystore, so every release is signed by a *different* key — sideloaded upgrades fail on signature mismatch. And `release.yml` never runs `fetch-vosk-model.sh`, so the flagship "Hey Comrade" feature is inert ("Voice model missing") in every official APK. The debug fallback itself is documented (`README.md:124`), the upgrade-breaking key rotation and missing model are not. |
+| O4 | M | **[fact] No observability story on any shipping frontend.** `tracing` is used well inside the crates, but neither the JNI library nor the desktop shell installs a subscriber (no `tracing_subscriber` in `comrade_jni` or `desktop/src-tauri/src/lib.rs`) — on Android and desktop every `info!/warn!` (including decrypt failures and dead event loops, Q5) is dropped silently. Only the CLI initializes logging (`src/main.rs:470-476`). |
+| O5 | L | **[fact] The documented desktop build cannot complete.** `tauri.conf.json:26-31` references `icons/32x32.png` etc., but `desktop/src-tauri/icons/` contains only a README — `cargo tauri build` fails; the README quick-start (`README.md:93-97`) omits icon generation. |
+| O6 | L | **[fact] CI friction items.** Unpinned `stable` toolchain + `-D warnings` means new clippy releases break CI spontaneously; `ci.yml:3-6` triggers on both `push: ["**"]` and `pull_request`, running everything twice per PR; the release `version` input is interpolated unvalidated into shell commands and the git tag (`release.yml:157-165,193`); `cargo install cargo-ndk` is uncached per matrix job. |
+| O7 | L | **[judgment] Setup friction is honest but manual** — Rust + NDK r27c + cargo-ndk + JDK17 + system Gradle + optional Vosk model for Android; tauri-cli + system webview for desktop. A `justfile` codifying the README's command blocks would cut onboarding errors. |
+
+**Healthy:** the Rust CI lane is exactly right for this maturity: fmt-check, `clippy --workspace --all-targets -D warnings`, full test run, with cargo caching (`ci.yml:25-43`). The release pipeline's structure (test → cross-compile 3 ABIs → assemble → GitHub Release) is sound. `.gitignore` correctly excludes the Vosk model, jniLibs, and stores; `rustfmt.toml` pins style.
+
+### 3.8 Documentation
+
+| # | Sev | Finding |
+|---|---|---|
+| N1 | **H** | **[fact] README materially oversells the product.** The engine table (`README.md:8-17`) lists Saathi ("works without internet"), NIP-65 routing, and encrypted media as features of the client — none is reachable from any frontend (A1). "The UI logic lives once in comrade_ui and is reused by every frontend" (`README.md:47-49`) is false for the CLI, which does not even depend on `comrade_ui` (root `Cargo.toml:52-60`) and duplicates identity/store handling; Android uses ~4 of 10 bridge functions; the desktop carries its own mock/logic layer. For a repo whose next developers will trust the README, this is the most expensive doc bug. |
+| N2 | M | **[fact] No threat model or security document** for a product whose value proposition is a security property. S3/S4/S8/S11 and D1 are all "fine if documented, damning if discovered" items. |
+| N3 | M | **[fact] Build-instruction drift.** The README's "Rust ≥ 1.75" prerequisite is stale — the agent sweep reports the locked dependency tree needs rustc ≈1.83 (**not independently re-verified**; confirm with `cargo +1.75 check` before relying); the Tauri quick-start fails on missing icons (O5); Gradle 8.5 must be hand-installed (D3). |
+| N4 | L | **[fact] Small doc/reality mismatches.** `desktop/README.md:3-4` calls the frontend "HTML/Tailwind" and then correctly says "dependency-free vanilla-JS" 20 lines later — no Tailwind exists. The Architecture-notes bullets are mostly accurate (thread-safety ✓, 256-message Saathi cache ✓, fail-closed ✓, zero-unwrap ≈ Q10, zeroization partial S5). No CONTRIBUTING, no ADRs, no CLAUDE.md despite an AI-assisted-PR workflow; per-crate rustdoc module headers (`//!`) are genuinely good, which softens this. |
+
+**Healthy:** module-level rustdoc is a real strength — every crate opens with an accurate design essay (e.g. `storage/lib.rs:1-26`, `runtime.rs:1-24`); the voice feature's "Honest scope" README section (`README.md:145-151`) is exemplary self-aware documentation — the same candor applied to the engine table would resolve N1.
+
+---
+
+## 4. Improvement Strategy
+
+### Theme 1 — Close the promise/reality gap (drives N1, A1, A2, A3, A5, Q4)
+**Target state:** every feature the README claims is either reachable from at least one frontend or explicitly labeled *experimental / not yet wired*. The state machine owns engine lifecycle: entering OffGridTravel disconnects relay engines (and, if product says so, starts Saathi); pairing actually calls `pair_with`; identity has one code path.
+**Principle:** in a privacy product, credibility is the product. An honest smaller claim beats an aspirational bigger one — the false "relays paused" toast is worse than not having the feature.
+**Trade-off:** wiring Saathi/media properly is weeks of work; re-scoping the README is an afternoon. Do the README first (M1), wire features by product priority later (M2+). **Do NOT** try to wire all three dormant engines at once.
+**Done signals:** README table has an explicit status column; the Off-Grid toggle really disconnects (verifiable with `netstat`); Android can unlock + post + read timeline end-to-end; `sync_ledger` succeeds after a real pairing flow; engines with no non-test call sites are flagged experimental and out of the feature table.
+
+### Theme 2 — Make the crypto match the marketing (S1, S2, S3, S8, N2)
+**Target state:** DMs on NIP-44 (send + receive; NIP-04 kept read-only for backward compat), crash-safe re-keying, a passphrase policy with strength feedback, and a `SECURITY.md` threat model that states plainly what is and isn't protected (plaintext keys in sled trees, no forward secrecy for Sakha, LAN-visible mesh).
+**Principle:** composing audited primitives (which this codebase already does well) is necessary but not sufficient — protocol choice and key-management lifecycle are where privacy products actually fail.
+**Trade-off:** skip a Sakha ratchet (Signal-style forward secrecy) for now — document it instead; it's XL work with low prototype payoff. **Do NOT** raise Argon2 params before profiling on the low-end Android target (unlock latency is UX-visible).
+**Done signals:** new DMs are NIP-44-encrypted (gift-wrap decision recorded); a kill-the-process-mid-`change_pin` test passes; passphrase < 8 chars rejected at every frontend; `SECURITY.md` exists and matches the code.
+
+### Theme 3 — CI and releases cover what can break (T1, T2, O1, O2, O3, D2, D3)
+**Target state:** one PR gate that compiles/tests all three frontends: cargo lane (exists) + `gradle test` lane + `cargo check` of `desktop/src-tauri` + cargo-audit; wrapper committed; LICENSE decided; releases signed with a stable key and shipping the voice model (or explicitly labeled voice-less).
+**Principle:** the safety net comes before the refactors it protects (this is milestone M0 for a reason); a release pipeline that produces non-upgradeable artifacts is worse than none.
+**Trade-off:** don't build APKs or run emulator tests on PRs — JVM unit tests and compile checks give 90% of the signal at 10% of the cost. **Do NOT** add coverage-percentage gates yet; the test culture is already good, and gates on a moving prototype create ceremony.
+**Done signals:** a deliberately broken Kotlin test fails CI; a deliberately broken Tauri command signature fails CI; CI fails on a crate with a known RUSTSEC advisory; two consecutive releases install as an upgrade on the same device.
+
+### Theme 4 — Feed, persistence, and memory discipline (P1, P2, P3, Q2, Q4)
+**Target state:** the Sabha subscription is scoped (follow set + limit, never author-unbounded), in-memory caches are ring buffers, incoming chitthis/DMs are persisted to the already-built repositories with backfill since last-seen, and blocking work is off the async threads.
+**Principle:** unbounded anything (subscription, Vec, DOM) is a latent outage; the repository layer for persistence already exists and is the best-tested code in the repo — use it.
+**Done signals:** desktop stays responsive against a live relay for 10 minutes; `state.chitthis` and Vault inbox have hard caps; killing and restarting the desktop app shows DMs received while it was closed (or the limitation is documented); no lock is held across a KDF or network await.
+
+### What NOT to fix (explicit)
+- **The three thin bridge layers** (CLI/JNI/Tauri command shims) — they duplicate marshalling, not logic; unifying them buys nothing. (Making the CLI depend on `comrade_ui` is worthwhile only as part of M2 wiring work, not as its own project.)
+- **Sled → redb migration** — queue behind M1; the durability tests make a later swap safe, and prototype data is disposable. Document the sled risk in `SECURITY.md` instead (D1/N2).
+- **UPI feature hardening beyond f64 → paise** — product direction is unclear (see Open Questions); don't invest until it is.
+- **Gendered `PairRole` naming, Hindi nomenclature** — product/brand decisions, not engineering defects; flagged in Open Questions only.
+- **Triple nostr clients (P5), AES helper triplication (Q7), `comrade_state` history growth** — real but cheap debt; batch them into M3 or into adjacent M2 work, don't schedule standalone.
+
+---
+
+## 5. Task Plan
+
+Effort: **S** < 2h · **M** ≈ half-day · **L** 1–2 days · **XL** needs breakdown. Risk = risk *of making the change*.
+
+### M0 — Safety net
+
+| ID | Task | Files | Acceptance criteria | Effort | Risk | Deps |
+|---|---|---|---|---|---|---|
+| M0-1 | Commit Gradle wrapper (8.5) | `android/gradle/`, `android/gradlew*` | `./gradlew test` runs from a clean checkout with no system Gradle | S | none | — |
+| M0-2 | Android test lane in CI | `.github/workflows/ci.yml` | CI job runs `./gradlew test` (JVM unit tests only); a broken `VoiceCommandTest` fails the PR | S | low | M0-1 |
+| M0-3 | Desktop compile lane in CI + commit its lockfile | `.github/workflows/ci.yml`, `desktop/src-tauri/Cargo.lock` | `cargo check` (or `clippy -D warnings`) of `desktop/src-tauri` on ubuntu w/ webkit deps; lockfile committed; a bad command signature fails the PR | M | low | — |
+| M0-4 | cargo-audit/deny gate + `--locked` + SHA-pin actions | `.github/workflows/*.yml`, `deny.toml` | CI fails on RUSTSEC advisories; cargo runs `--locked`; third-party actions pinned by SHA in release.yml; single trigger per PR | S | low | — |
+| M0-5 | Crash-safety regression test for `change_pin` (test first, fix in M1-2) | `crates/comrade_storage/tests/` | A test that interrupts re-keying demonstrates the corruption (initially an `#[ignore]`d xfail documenting the bug) | M | none | — |
+
+### M1 — Critical security & correctness
+
+| ID | Task | Files | Acceptance criteria | Effort | Risk | Deps |
+|---|---|---|---|---|---|---|
+| M1-1 | Migrate DMs to NIP-44 (send + decrypt both, NIP-04 decrypt-only legacy) | `crates/comrade_core/src/vault.rs`, `error.rs`, tests | New DMs use NIP-44; old NIP-04 DMs still decrypt; round-trip + fixed-vector tests; README table updated | L | medium | — |
+| M1-2 | Make `change_pin` atomic | `crates/comrade_storage/src/lib.rs` | Re-key into staging trees + single meta swap (or versioned dual-read); M0-5 test now passes; documented recovery semantics | M | medium | M0-5 |
+| M1-3 | README truth pass (status column, wired vs experimental) + remove false Off-Grid toast | `README.md`, `desktop/ui/main.js` | Every table row states its wiring status; comrade_ui claim corrected; the "relays paused" toast is gone or true | S | none | — |
+| M1-4 | Passphrase policy + terminology | `desktop/ui/main.js`, `src/main.rs`, `comrade_ui/src/lib.rs` | Min-length (≥8) enforced at unlock creation everywhere; "PIN" renamed passphrase in user-facing text; CLI stops echoing passphrase (rpassword) | M | low | — |
+| M1-5 | Scope the Sabha feed + cap client memory | `crates/comrade_core/src/sabha.rs`, `comrade_ui/src/runtime.rs`, `desktop/ui/main.js` | Subscription takes authors/limit (default: own + follows, `limit(200)`); `state.chitthis` ring-capped; Vault inbox capped; desktop survives live relay soak | M | medium | — |
+| M1-6 | Android privacy hygiene | `AndroidManifest.xml`, `MainActivity.kt` | `allowBackup=false`; nsec masked behind a reveal tap; `FLAG_SECURE` on key screen | S | low | — |
+| M1-7 | Pin Vosk model checksum | `scripts/fetch-vosk-model.sh` | Download verified against a committed sha256; mismatch aborts | S | none | — |
+| M1-8 | Tauri CSP | `desktop/src-tauri/tauri.conf.json` | Strict CSP (`default-src 'self'`) set; app functions normally | S | low | — |
+| M1-9 | Saathi drain re-queues on failure | `crates/comrade_core/src/saathi.rs` + new tests | Failed drain publishes return the message to the cache front; two-engine in-process test proves store-and-forward | M | low | — |
+| M1-10 | Release APK integrity | `.github/workflows/release.yml` | Releases require signing secrets (or use one stable committed debug keystore for pre-releases); Vosk model fetched (with M1-7 checksum) before assemble, or release notes state voice is absent; version input validated (`^[0-9]+\.[0-9]+\.[0-9]+$`) | M | low | M1-7 |
+
+### M2 — High-leverage improvements
+
+| ID | Task | Files | Acceptance criteria | Effort | Risk | Deps |
+|---|---|---|---|---|---|---|
+| M2-1 | Android vault flow: unlock screen, timeline list, post composer over existing JNI | `android/.../MainActivity.kt`, new Compose screens | Unlock → voice "post hello" succeeds → timeline reads it back; JNI calls run off the main looper (fixes the P2 ANR); voice "new identity" routes through the runtime (fixes A5) | L | medium | M1-4 |
+| M2-2 | Desktop DM send + real pairing | `commands.rs`, `runtime.rs`, `sakha.rs`, `vault.rs`, `main.js` | `send_dm` command exists; pairing state moves behind interior mutability (or pair-before-Arc) so `pair_with` is reachable through the bridge; pair token reaches `pair_with`; `sync_ledger` succeeds when paired and fails honestly when not | L | medium | M1-1 |
+| M2-3 | Persist + backfill Vault inbox; persist incoming chitthis | `vault.rs`, `runtime.rs` (use existing repositories) | DMs and received chitthis survive restart; subscription backfills since last-seen timestamp | M | medium | M1-1 |
+| M2-4 | Engine lifecycle owner in `ComradeRuntime` | `runtime.rs`, `comrade_state` | OffGridTravel transition disconnects Nostr engines (and starts Saathi only if product says so — OQ2); state doc updated; `netstat`-visible | L | medium | M1-9, OQ2 |
+| M2-5 | Money as integer paise | `vault.rs`, `sakha.rs`, DTOs, `main.js` | `amount_paise: u64` end-to-end; URI formatting from integers; tests updated | M | low | — |
+| M2-6 | `spawn_blocking` for KDF/sled + narrow lock scopes | `comrade_ui/src/lib.rs`, `runtime.rs`, `commands.rs` | Unlock no longer stalls the runtime; no guard held across KDF or relay awaits | M | low | — |
+| M2-7 | Thread the live feed | `runtime.rs`, `sabha.rs` | `ChitthiDto::from_event` populates `reply_to` via the existing NIP-10 resolver; tree builder gets an iterative implementation or depth cap | S | low | M1-5 |
+
+### M3 — Quality & polish
+
+| ID | Task | Files | Acceptance criteria | Effort | Risk | Deps |
+|---|---|---|---|---|---|---|
+| M3-1 | `SECURITY.md` threat model | new file | States protections + explicit non-goals (S3/S4/S8/S11, sled status D1); linked from README | M | none | M1-* |
+| M3-2 | Error taxonomy + surfaced loop failures | `vault.rs`, `sakha.rs`, `error.rs`, `runtime.rs` | Relay/subscription failures use accurate variants; a `BridgeEvent::EngineStatus` (or similar) tells frontends when a feed/inbox loop dies (Q5) | M | low | — |
+| M3-3 | JS lint + smoke tests for `main.js` | `desktop/ui/`, CI | Biome/ESLint gate; a DOM-free unit harness for the pure logic | M | low | M0-3 |
+| M3-4 | On-device logging | `comrade_jni/src/lib.rs`, desktop `lib.rs` | JNI init installs an android-logger tracing subscriber; desktop initializes tracing; decrypt failures visible in logcat | S | low | — |
+| M3-5 | LICENSE + Cargo license fields + NOTICE handling | root, all Cargo.toml, `build.gradle.kts` | License chosen (needs owner decision, OQ5) and applied; META-INF exclusion revisited | S | none | OQ5 |
+| M3-6 | `justfile` + desktop icons + MSRV truth | root, `desktop/src-tauri/icons/` | `just android-apk`, `just desktop-dev`, `just test-all` work; `cargo tauri build` succeeds (icons generated via `tauri icon`); README states the real MSRV (verify the sweep's 1.83 claim with `cargo +1.75 check`) | M | none | — |
+| M3-7 | Sakha defense-in-depth: sender check + incremental sync | `sakha.rs` | Handler verifies `event.pubkey == partner_pk`; sync encodes diff vs. peer state vector | M | medium | M2-2 |
+| M3-8 | Dedup AES helpers; drop unused `comrade_state` dep from core; JNI `json!` everywhere | `crypto.rs`, `storage/lib.rs`, `sakha.rs`, `comrade_core/Cargo.toml`, `comrade_jni/src/lib.rs` | One shared seal/open; `cargo udeps` clean; no hand-rolled JSON | S | low | — |
+
+### Quick wins (high impact ÷ effort, all S)
+**M0-1** (wrapper) · **M0-4** (cargo-audit + SHA-pins) · **M1-3** (README truth pass + false toast) · **M1-6** (allowBackup/FLAG_SECURE) · **M1-7** (model checksum) · **M1-8** (CSP) · **M2-7** (live-feed threading) · **M3-4** (device logging).
+
+### Top-3 implementation sketches
+
+**M1-1 · NIP-44 migration.**
+Approach: nostr-sdk 0.44 exposes `nip44::encrypt/decrypt` and gift-wrap helpers. Replace `send_dm`'s `nip04::encrypt` (`vault.rs:118`) with NIP-44 payload encryption; ideally wrap in NIP-59 gift wrap (Kind 1059) so recipient metadata is also hidden — that changes the inbox filter from Kind 4 to Kind 1059. In the notification handler, branch on kind: 1059 → unwrap+NIP-44; 4 → legacy `nip04::decrypt` (read-only). Keys: gift-wrap uses ephemeral keys per message — nostr-sdk handles this. Steps: (1) add `send_dm_nip44`, migrate `send_dm` to it; (2) extend subscription filter to both kinds; (3) split decrypt paths; (4) tests: NIP-44 round-trip, official NIP-44 test vectors, legacy NIP-04 still readable; (5) update README row and error variants (fixes Q6 partially). Gotchas: gift-wrap timestamps are randomized (spec) — don't assert `created_at` ordering in tests; interop with other clients only works if they also do 1059 — decide plain-NIP-44-in-Kind-4 vs full gift-wrap in review (OQ4); `.since(now)` interacts with gift-wrap randomized timestamps (subscribe with a ~2-day skew window per spec).
+
+**M1-2 · Atomic `change_pin`.**
+Approach: staged re-encryption with a version marker. Steps: (1) write `rekey_state = {new_salt, new_verify_token, status: "in-progress"}` to META under a *new* key slot while keeping old salt/token valid; (2) copy every tree's values re-encrypted into `<tree>__rekey` siblings; (3) single meta write flips `active_salt` → new + `status: done`; (4) swap trees (rename or read-indirection) and drop old ones; (5) on `open`, detect stale `in-progress` → discard `__rekey` trees and open with the old key (rollback semantics). Convert M0-5's xfail test into: kill after each phase (inject a failpoint closure between steps), reopen, assert either fully-old or fully-new, never mixed. Gotchas: sled has no cross-tree transactions — the single-key meta flip is the linearization point, so the flip must be one `insert` of one composite value (not two); `Zeroizing` the old key after the flip; document that concurrent writers must be excluded during rekey (take `&mut self` — already the case).
+
+**M1-5 · Scoped Sabha feed.**
+Approach: make the filter an explicit input instead of a hardcoded firehose. Steps: (1) `subscribe_chitthi_feed(filter_spec, cb)` where `FilterSpec { authors: Vec<PublicKey>, since_secs, limit }`; default from stored contacts + own key (the `Contact` repository already exists, `repository.rs:142-159` — this also gives it its first production caller); fall back to `limit(100)` + own-key-only when contacts are empty — never author-unbounded; (2) in `runtime.rs:243` build the spec from the store at unlock; (3) cap `state.chitthis` in `main.js` (e.g. 500, drop tail on prepend) and cap the Vault inbox Vec symmetrically (P3); (4) soak-test against a live relay behind an `--ignored` integration test. Gotchas: an empty-follow cold start means an empty feed — product may want a curated bootstrap list instead (flag at review); the `since` replay on reconnect can double-deliver — the desktop's `seenChitthi` set already dedups, keep server-side `limit` modest so replay is cheap.
+
+---
+
+## 6. Open Questions (need a human decision)
+
+1. **What is Comrade's actual near-term product scope?** The audit found three tiers: working (Sabha/Vault/storage on desktop), stubbed (couple pairing, DM send, Android vault), dormant (Saathi, gossip routing, media). M2 sequencing depends entirely on which tier-2/3 items are real goals vs. exploration. (Drives M2-1/2/4, N1.)
+2. **Should OffGridTravel actually start the Saathi mesh** (with its plaintext-on-LAN semantics, S11), or is off-grid mode "relays off, local cache only" for now? The honest cheap answer may be the latter — but either way the current false "relays paused" claim must go (M1-3/M2-4).
+3. **UPI payments: feature or demo?** Auto-parsing attacker-controlled DMs into payment URIs (S12) plus `f64` money (Q3) is fine for a demo and unacceptable for a shipped payments flow. If it's a feature, it needs a confirm-flow design and possibly compliance review.
+4. **NIP-04 compatibility window** — after M1-1, how long must old NIP-04 DMs stay readable, and is plain NIP-44 (interop with more clients) or full gift-wrap (better metadata privacy) the target?
+5. **License** — none exists (D2). Owner must choose (MIT/Apache-2.0 dual is the Rust default) before any external sharing.
+6. **Org-standard alignment** — repo uses GitHub Actions (org standard says GitLab CI for new repos) and public registries (org mandates Auros registries for new projects; unclear whether that policy covers crates.io/Maven Central for Rust/Android). Needs a platform-owner ruling; not adjudicated as a defect here.
+7. **Gendered pairing roles** — `PairRole::Sakha/Sakhi` are documented as "Boyfriend/Male partner" / "Girlfriend/Female partner" (`comrade_state/src/lib.rs:15-20`) and desktop themes key off them. Product/inclusivity call, flagged for awareness.
+8. **Passphrase UX floor** (S3) — what unlock friction is acceptable on the target low-end Android hardware? Determines both the policy (M1-4) and whether Argon2 params can be raised.
+
+---
+
+## Appendix — Review coverage
+
+Every Rust source file, the CLI, all Tauri/desktop sources, the Android manifest/gradle files, and all primary Kotlin files were read in full. Lighter review: `desktop/ui/styles.css` and `index.html` (styling only), the Android interaction-session service files, `Theme.kt`, and resource XML (covered by the agent sweep only). The workflow's per-finding adversarial verification completed for the architecture dimension (all findings CONFIRMED); remaining dimensions were verified manually against source. One claim could not be independently re-verified and is flagged inline (N3: MSRV 1.83).

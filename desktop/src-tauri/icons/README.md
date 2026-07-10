@@ -1,13 +1,14 @@
 # App icons
 
-Tauri's bundler expects icons referenced in `tauri.conf.json`
-(`32x32.png`, `128x128.png`, `icon.png`, `icon.ico`).
+Tauri references these icons in `tauri.conf.json` (`32x32.png`, `128x128.png`,
+`icon.png`, `icon.ico`). They are needed at **compile time** — the
+`tauri::generate_context!()` macro embeds the window icon, so the crate does
+not build without them (not just the bundler).
 
-Generate them from a single source image with the Tauri CLI:
+The committed files are deliberate **placeholders** (indigo squares) so the
+shell compiles and CI can lint it. Replace them with the real logo via the
+Tauri CLI, which regenerates every size from one source image:
 
 ```sh
 cargo tauri icon path/to/logo.png
 ```
-
-This populates this directory automatically. The placeholder is intentionally
-empty in version control so a real logo can be dropped in at packaging time.

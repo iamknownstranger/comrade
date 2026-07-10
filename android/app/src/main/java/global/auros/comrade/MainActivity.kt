@@ -7,6 +7,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -34,6 +35,12 @@ import global.auros.comrade.voice.WakeWordService
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // This screen can display an nsec — block screenshots and screen
+        // recording for the whole activity (AUDIT S5 / M1-6).
+        window.setFlags(
+            WindowManager.LayoutParams.FLAG_SECURE,
+            WindowManager.LayoutParams.FLAG_SECURE,
+        )
         setContent {
             ComradeTheme {
                 Surface(
@@ -249,6 +256,8 @@ fun WorkspaceCard(info: ComradeCore.WorkspaceInfo) {
 fun KeygenSection() {
     var keypair by remember { mutableStateOf<ComradeCore.Keypair?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
+    // The nsec is masked by default and only shown on an explicit reveal tap.
+    var revealNsec by remember { mutableStateOf(false) }
 
     Column(
         modifier = Modifier.fillMaxWidth(),
@@ -263,7 +272,7 @@ fun KeygenSection() {
         Button(
             onClick = {
                 runCatching { ComradeCore.generateKeypairTyped() }
-                    .onSuccess { keypair = it; error = null }
+                    .onSuccess { keypair = it; error = null; revealNsec = false }
                     .onFailure { error = it.message }
             },
             modifier = Modifier.fillMaxWidth(),
@@ -284,10 +293,13 @@ fun KeygenSection() {
                     Text("nsec (keep secret!)", style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.error)
                     Text(
-                        kp.nsec,
+                        if (revealNsec) kp.nsec else "••••••••••••  (hidden)",
                         style = MaterialTheme.typography.bodySmall,
                         fontFamily = FontFamily.Monospace,
                     )
+                    TextButton(onClick = { revealNsec = !revealNsec }) {
+                        Text(if (revealNsec) "Hide secret key" else "Reveal secret key")
+                    }
                 }
             }
         }

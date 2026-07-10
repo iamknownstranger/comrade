@@ -43,6 +43,7 @@ tempfile       = "3"
 name    = "comrade"
 version = "0.1.0"
 edition = "2021"
+publish = false
 
 [[bin]]
 name = "comrade"

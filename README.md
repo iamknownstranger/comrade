@@ -5,16 +5,20 @@ view-model layer driving an Android (Kotlin/Compose), desktop (Tauri), or CLI fr
 
 ## What it does
 
-| Engine | Protocol | Feature |
-|--------|----------|---------|
-| **Sabha** | Nostr Kind-1 + NIP-10 | Public microblogging — the **Chitthi Feed**, with nested `ChitthiThread` reply trees |
-| **Vault** | Nostr Kind-4 + NIP-04 | End-to-end encrypted direct messages; `/pay` UPI intent detection |
-| **Saathi** | libp2p mDNS + Gossipsub | Off-grid local mesh — works without internet |
-| **Sakha/Sakhi** | Yrs CRDT + AES-256-GCM | Cryptographically isolated shared ledger for couples |
-| **Relay gossip** | NIP-65 | Dynamic relay discovery + outbox-model routing |
-| **Media** | NIP-94 / NIP-96 | Encrypted file staging + pluggable decentralized upload |
-| **Storage** | sled + Argon2id + AES-256-GCM | Encrypted-at-rest persistence (identity, ChitthiCache, VaultCache, LedgerState) unlocked by a passphrase |
-| **Voice** | Vosk (offline) + Android TTS | "Hey Comrade" wake word, tap-to-talk, and assist-app role — all on-device, no cloud |
+| Engine | Protocol | Feature | Status |
+|--------|----------|---------|--------|
+| **Sabha** | Nostr Kind-1 + NIP-10 | Public microblogging — the **Chitthi Feed**, with nested `ChitthiThread` reply trees | ✅ Wired (desktop: broadcast + live feed; reply threading in live feed pending) |
+| **Vault** | Nostr Kind-4 + NIP-04 | End-to-end encrypted direct messages; `/pay` UPI intent detection | ⚠️ Receive wired (desktop); sending not yet exposed in any UI; NIP-44 migration planned |
+| **Saathi** | libp2p mDNS + Gossipsub | Off-grid local mesh — works without internet | 🧪 Experimental — engine + tests only, not started by any frontend |
+| **Sakha/Sakhi** | Yrs CRDT + AES-256-GCM | Cryptographically isolated shared ledger for couples | 🧪 Engine built; pairing handshake not yet reachable from any UI |
+| **Relay gossip** | NIP-65 | Dynamic relay discovery + outbox-model routing | 🧪 Experimental — routing library + CLI demo only |
+| **Media** | NIP-94 / NIP-96 | Encrypted file staging + pluggable decentralized upload | 🧪 Experimental — library + CLI demo only |
+| **Storage** | sled + Argon2id + AES-256-GCM | Encrypted-at-rest persistence (identity, ChitthiCache, VaultCache, LedgerState) unlocked by a passphrase | ✅ Wired (identity + own posts; incoming-message persistence planned) |
+| **Voice** | Vosk (offline) + Android TTS | "Hey Comrade" wake word, tap-to-talk, and assist-app role — all on-device, no cloud | ⚠️ Recognition/dispatch work; `post`/`read timeline` need a vault-unlock screen the Android UI doesn't have yet |
+
+> **Status honesty.** 🧪 rows are working, unit-tested library code that no
+> frontend invokes yet — they describe the architecture's direction, not
+> shipped behavior. The full gap analysis lives in [`AUDIT.md`](AUDIT.md).
 
 > **Nomenclature.** A public post is a **Chitthi** (Hindi for *letter*) throughout
 > the application layer — `ChitthiNode`/`ChitthiThread`, `broadcast_chitthi`,
@@ -44,18 +48,20 @@ desktop/           Tauri 2 desktop shell (excluded from the workspace — see de
 .github/workflows/ CI (test + lint) and manual APK release
 ```
 
-The UI logic lives once in **`comrade_ui`** and is reused by every frontend: the Android
-app (via `comrade_jni`), the desktop app (via `#[tauri::command]` wrappers in `desktop/`),
-and the CLI. This keeps the entire UI contract unit-testable without a display server.
+The bridge logic lives once in **`comrade_ui`** and backs the Android app (via
+`comrade_jni`) and the desktop app (via `#[tauri::command]` wrappers in `desktop/`).
+This keeps the bridged UI contract unit-testable without a display server.
+The CLI harness currently drives the core crates directly rather than going
+through `comrade_ui`; unifying it is tracked in `AUDIT.md`.
 
 ## Building
 
 ### Prerequisites
 
-- Rust stable (≥ 1.75) — [rustup.rs](https://rustup.rs)
+- Rust stable — the committed `Cargo.lock` currently requires **rustc ≥ 1.88** — [rustup.rs](https://rustup.rs)
 - Android NDK r27c — via Android Studio or `sdkmanager "ndk;27.2.12479018"`
 - `cargo-ndk` — `cargo install cargo-ndk --locked`
-- JDK 17 and Gradle 8.5 (for the Android build)
+- JDK 17 (for the Android build; Gradle comes from the committed wrapper)
 
 ### Run the CLI harness
 
@@ -78,9 +84,9 @@ cargo ndk \
   --output-dir android/app/src/main/jniLibs \
   -- build --release -p comrade_jni
 
-# 2. Build the APK (requires Gradle 8.5 on PATH)
+# 2. Build the APK (the committed Gradle wrapper fetches Gradle 8.5)
 cd android
-gradle assembleRelease
+./gradlew assembleRelease
 # APK → android/app/build/outputs/apk/release/app-release.apk
 ```
 
@@ -100,7 +106,7 @@ cargo tauri dev      # run; or `cargo tauri build` for a distributable bundle
 
 | Workflow | Trigger | What it does |
 |----------|---------|--------------|
-| **CI** | Every push / PR | `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test --workspace` |
+| **CI** | Every push | Rust lane (`cargo fmt --check`, `clippy -D warnings`, `cargo test --workspace --locked`) · Desktop lane (`clippy` on `desktop/src-tauri`) · Android lane (`./gradlew test`) · Supply-chain lane (`cargo-deny`: advisories, bans, sources, licenses) |
 | **Release APK** | Manual — Actions → "Release APK" → Run workflow | Builds `.so` libs for arm64-v8a / armeabi-v7a / x86_64, assembles APK, creates GitHub Release |
 
 ### Creating a release from the GitHub UI
@@ -142,6 +148,11 @@ Recognised commands (see `voice/VoiceCommand`): **post** _&lt;message&gt;_ ·
 **new identity** · **help**. Parsing and command dispatch are Android-free and
 unit-tested (`VoiceCommandTest`, `CommandDispatcherTest`).
 
+> **Current limitation.** `post` and `read my timeline` require an unlocked
+> vault, and the Android UI does not yet expose an unlock screen — those two
+> commands currently answer with a "vault is locked" error. The unlock flow is
+> tracked as task M2-1 in [`AUDIT.md`](AUDIT.md).
+
 > **Honest scope.** This is an *app-scoped* wake word, not the OS-level
 > "Hey Google" hotword. Stock (non-rooted) Pixels reserve the always-on,
 > screen-off DSP hotword pipeline for Google's own keyphrases — a third-party
@@ -167,6 +178,6 @@ Without the model the app still builds and runs; voice features report
 - **Zero `.unwrap()`/`.expect()` in network or parsing paths** — all fallible I/O returns `Result<T, E>` with `thiserror`-derived domain errors.
 - **Thread safety** — shared state uses `Arc<RwLock<T>>` or `Arc<Mutex<T>>` across async tasks.
 - **DH key agreement** — secp256k1 ECDH with x-coordinate-only SHA-256 hashing for parity-independence; HKDF-SHA256 for label-scoped key derivation.
-- **Off-line resilience** — Saathi caches up to 256 outbound messages and drains them automatically on mDNS peer discovery.
+- **Off-line resilience** — Saathi caches up to 256 outbound messages and drains them automatically on mDNS peer discovery. (Engine-level behavior; Saathi is not yet started by any frontend.)
 - **CRDT convergence** — Sakha/Sakhi use Yrs (Yjs port) so concurrent edits on either device merge deterministically; relay sees only AES-256-GCM ciphertext.
 - **Encrypted-at-rest persistence** — every stored value is sealed with AES-256-GCM under an Argon2id-derived key (zeroized in memory, never written to disk); a wrong passphrase fails closed with `StorageError::InvalidPin`. On startup the CLI detects an existing store and prompts for the passphrase to restore the profile rather than minting a throwaway keypair. Durability is verified by `comrade_storage`'s `tests/durability.rs` reboot suite.
