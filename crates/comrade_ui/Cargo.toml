@@ -2,6 +2,7 @@
 name    = "comrade_ui"
 version = "0.1.0"
 edition = "2021"
+publish = false
 
 # Framework-agnostic view-model / service layer shared by every frontend
 # (Tauri desktop, Slint/Iced native, Android via JNI). Holds no rendering code.

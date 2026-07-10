@@ -2,6 +2,7 @@
 name    = "comrade_jni"
 version = "0.1.0"
 edition = "2021"
+publish = false
 
 [lib]
 # cdylib = shared library (.so) loaded at runtime by the Android JVM via System.loadLibrary

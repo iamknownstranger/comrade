@@ -204,13 +204,30 @@ impl EncryptedStore {
     /// re-sealed with a freshly derived key over a new salt, then the salt and
     /// verification token are rewritten. After this returns, only `new_pin`
     /// unlocks the store.
+    ///
+    /// # Known limitation (crash safety)
+    ///
+    /// Re-keying is **not atomic**: a crash mid-way leaves some values sealed
+    /// under the new key while the on-disk salt still derives the old one, and
+    /// those values become unreadable under either PIN. See the ignored
+    /// `interrupted_change_pin_*` regression test below; the fix is tracked as
+    /// AUDIT.md task M1-2.
     pub fn change_pin(&mut self, new_pin: &str) -> Result<(), StorageError> {
+        self.change_pin_impl(new_pin, usize::MAX)
+    }
+
+    /// Body of [`Self::change_pin`] with a crash-injection seam for tests:
+    /// stops dead (as if the process were killed) after re-sealing
+    /// `abort_after` values, before the salt/verification token are rewritten.
+    /// Production callers pass `usize::MAX`.
+    fn change_pin_impl(&mut self, new_pin: &str, abort_after: usize) -> Result<(), StorageError> {
         // Derive the new key over a fresh salt.
         let mut new_salt = vec![0u8; SALT_LEN];
         rand::thread_rng().fill_bytes(&mut new_salt);
         let new_key = derive_key(new_pin.as_bytes(), &new_salt)?;
 
         // Re-seal every value in every user tree.
+        let mut resealed_count = 0usize;
         for tree_name in self.db.tree_names() {
             if tree_name.as_ref() == META_TREE.as_bytes()
                 || tree_name.as_ref() == b"__sled__default"
@@ -219,10 +236,19 @@ impl EncryptedStore {
             }
             let tree = self.db.open_tree(&tree_name)?;
             for item in tree.iter() {
+                if resealed_count >= abort_after {
+                    // Test failpoint: flush what was already re-sealed and
+                    // bail, simulating a power loss mid-rekey.
+                    self.db.flush()?;
+                    return Err(StorageError::Corrupt(
+                        "rekey aborted by test failpoint".into(),
+                    ));
+                }
                 let (k, sealed) = item?;
                 let plaintext = self.unseal(&sealed)?;
                 let resealed = aes_encrypt(&new_key, &plaintext)?;
                 tree.insert(k, resealed)?;
+                resealed_count += 1;
             }
         }
 
@@ -399,6 +425,42 @@ mod tests {
         store.put_bytes("ledger", "snapshot", &blob).unwrap();
         let got = store.get_bytes("ledger", "snapshot").unwrap();
         assert_eq!(got, Some(blob));
+    }
+
+    /// Regression test for AUDIT.md finding S2 / task M1-2 (crash-safe rekey).
+    ///
+    /// Asserts the *desired* atomic semantics: if the process dies mid-rekey,
+    /// the interrupted `change_pin` must behave as if it never happened — the
+    /// old PIN unlocks the store and every value still decrypts.
+    ///
+    /// Today `change_pin` re-seals values in place before switching the salt,
+    /// so an interruption leaves a mixed-key store and this test fails on the
+    /// `values()` read. It is `#[ignore]`d until the M1-2 fix lands; run it
+    /// explicitly with `cargo test -p comrade_storage -- --ignored`.
+    #[test]
+    #[ignore = "known bug: change_pin is not crash-safe (AUDIT S2, fix tracked as M1-2)"]
+    fn interrupted_change_pin_leaves_store_fully_readable_with_old_pin() {
+        let dir = TempDir::new().unwrap();
+        {
+            let mut store = EncryptedStore::open(dir.path(), "old-pin").unwrap();
+            for i in 0..4u32 {
+                store
+                    .put("contacts", &format!("k{i}"), &format!("v{i}"))
+                    .unwrap();
+            }
+            store.flush().unwrap();
+            // Simulate a crash after 2 of the 4 values were re-sealed: the
+            // failpoint flushes and aborts before the salt/token rewrite.
+            let err = store.change_pin_impl("new-pin", 2);
+            assert!(err.is_err(), "failpoint must abort the rekey");
+        } // process "dies" here
+
+        // Atomic semantics: the aborted rekey never happened.
+        let store = EncryptedStore::open(dir.path(), "old-pin").expect("old PIN must still unlock");
+        let vals: Vec<String> = store
+            .values("contacts")
+            .expect("every value must still decrypt under the old key");
+        assert_eq!(vals.len(), 4, "no value may be lost to a torn rekey");
     }
 
     #[test]
