@@ -1,4 +1,4 @@
-package global.auros.comrade
+package mullu.comrade
 
 import org.json.JSONArray
 import org.json.JSONObject

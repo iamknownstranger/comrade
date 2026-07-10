@@ -1,4 +1,4 @@
-package global.auros.comrade.ui.theme
+package mullu.comrade.ui.theme
 
 import android.app.Activity
 import android.os.Build

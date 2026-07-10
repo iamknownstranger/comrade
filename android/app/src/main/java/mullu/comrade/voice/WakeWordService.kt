@@ -1,4 +1,4 @@
-package global.auros.comrade.voice
+package mullu.comrade.voice
 
 import android.app.Notification
 import android.app.NotificationChannel
@@ -13,8 +13,8 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.util.Log
-import global.auros.comrade.MainActivity
-import global.auros.comrade.R
+import mullu.comrade.MainActivity
+import mullu.comrade.R
 import org.json.JSONObject
 import org.vosk.Model
 import org.vosk.Recognizer
@@ -240,8 +240,8 @@ class WakeWordService : Service(), RecognitionListener {
 
     companion object {
         private const val TAG = "WakeWordService"
-        const val ACTION_START = "global.auros.comrade.voice.START"
-        const val ACTION_STOP = "global.auros.comrade.voice.STOP"
+        const val ACTION_START = "mullu.comrade.voice.START"
+        const val ACTION_STOP = "mullu.comrade.voice.STOP"
 
         private const val CHANNEL_ID = "comrade_voice"
         private const val NOTIFICATION_ID = 0x0C0DE

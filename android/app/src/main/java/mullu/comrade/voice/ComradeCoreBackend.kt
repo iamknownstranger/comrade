@@ -1,6 +1,6 @@
-package global.auros.comrade.voice
+package mullu.comrade.voice
 
-import global.auros.comrade.ComradeCore
+import mullu.comrade.ComradeCore
 import org.json.JSONObject
 
 /**

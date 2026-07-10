@@ -1,4 +1,4 @@
-package global.auros.comrade.voice
+package mullu.comrade.voice
 
 /**
  * Pure, Android-free parsing of a recognised utterance into a [VoiceCommand].
@@ -6,7 +6,7 @@ package global.auros.comrade.voice
  * Kept deliberately free of any Android or JNI dependency so the whole
  * command grammar is unit-testable on a plain JVM (see `VoiceCommandTest`).
  * The [WakeWordService] / assist session layers are the only things that
- * actually touch the microphone, TTS, or [global.auros.comrade.ComradeCore].
+ * actually touch the microphone, TTS, or [mullu.comrade.ComradeCore].
  */
 sealed interface VoiceCommand {
 
