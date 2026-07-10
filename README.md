@@ -107,7 +107,7 @@ cargo tauri dev      # run; or `cargo tauri build` for a distributable bundle
 | Workflow | Trigger | What it does |
 |----------|---------|--------------|
 | **CI** | Every push | Rust lane (`cargo fmt --check`, `clippy -D warnings`, `cargo test --workspace --locked`) · Desktop lane (`clippy` on `desktop/src-tauri`) · Android lane (`./gradlew test`) · Supply-chain lane (`cargo-deny`: advisories, bans, sources, licenses) |
-| **Android APK** | Push touching `android/`, `crates/`, `Cargo.*` · manual | Cross-compiles `libcomrade_jni.so` (arm64-v8a for handsets, x86_64 for emulators), assembles a sideloadable debug APK artifact, and runs the on-device smoke suite (`connectedDebugAndroidTest`) on two emulator lanes — Pixel 9 (API 35) and a Moto Edge 60 Pro-class profile (API 34) |
+| **Android APK** | Push touching `android/`, `crates/`, `Cargo.*` · manual | Cross-compiles `libcomrade_jni.so` (arm64-v8a for handsets, x86_64 for emulators), assembles a sideloadable debug APK artifact, and runs the on-device smoke suite (`connectedDebugAndroidTest`) on two emulator lanes — Pixel 9 and Pixel 9 Pro XL (Android 15 / API 35) |
 | **Release APK** | Manual — Actions → "Release APK" → Run workflow | Builds `.so` libs for arm64-v8a / armeabi-v7a / x86_64, assembles APK, creates GitHub Release |
 
 ### On-device APK testing
@@ -121,12 +121,12 @@ Rust crypto, workspaces come back labelled, and `MainActivity` reaches
 | Lane | AVD profile | Android |
 |------|-------------|---------|
 | Google Pixel 9 | `pixel_9` (falls back to `pixel_7` on older SDK tools) | 15 (API 35) |
-| Moto Edge 60 Pro | `pixel_6_pro` stand-in — no Motorola AVD profile exists | 14 (API 34, the app's `targetSdk`) |
+| Google Pixel 9 Pro XL | `pixel_9_pro_xl` (falls back to `pixel_7_pro`) | 15 (API 35) |
 
 Honest limits: GitHub-hosted runners have no physical phones — real-hardware
 runs need a device farm such as Firebase Test Lab (paid, service-account
 secrets). For manual testing, download the `comrade-debug-apk` artifact from
-any run and sideload it (both lanes' handsets are arm64-v8a, which the APK
+any run and sideload it (real handsets are arm64-v8a, which the APK
 includes). **iOS is out of scope**: an APK is an Android package and cannot
 run on an iPhone, and Comrade currently has no iOS frontend — the non-Android
 frontends are the Tauri desktop shell and the CLI.

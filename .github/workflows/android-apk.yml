@@ -2,13 +2,11 @@
 #
 # Scope honesty:
 #   * GitHub-hosted runners have no physical phones. The "device" lanes are
-#     Android emulators (x86_64, KVM-accelerated): one uses the Pixel 9 AVD
-#     hardware profile on Android 15 (API 35), and one stands in for the
-#     Moto Edge 60 Pro — no Motorola AVD profile exists, so a similar
-#     6.7-inch profile on API 34 is used, which also keeps the app's
-#     targetSdk (34) runtime covered. Testing on real Pixel/Moto hardware
-#     requires a device farm (e.g. Firebase Test Lab), which needs a paid
-#     account + service-account secrets and is intentionally not wired here.
+#     Android emulators (x86_64, KVM-accelerated) using Google's official
+#     Pixel 9 and Pixel 9 Pro XL AVD hardware profiles on Android 15
+#     (API 35). Testing on real hardware requires a device farm (e.g.
+#     Firebase Test Lab), which needs a paid account + service-account
+#     secrets and is intentionally not wired here.
 #   * There is no iOS lane: an APK is an Android package and cannot run on
 #     an iPhone, and this repository has no iOS frontend.
 name: Android APK
@@ -193,20 +191,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Google Pixel 9 — real AVD hardware profile, Android 15 (API 35),
-          # matching what the handset ships with.
+          # Real AVD hardware profiles for both handsets, on Android 15
+          # (API 35) — the OS they ship with.
           - device: pixel-9
             api-level: 35
             preferred-profile: pixel_9
             fallback-profile: pixel_7
-          # Moto Edge 60 Pro — no Motorola AVD profile exists, so approximate
-          # with a similar 6.7" class profile. Runs API 34 so the matrix covers
-          # the app's targetSdk runtime as well as Android 15 (Pixel lane),
-          # instead of testing the same OS twice.
-          - device: moto-edge-60-pro
-            api-level: 34
-            preferred-profile: pixel_6_pro
-            fallback-profile: pixel_6
+          - device: pixel-9-pro-xl
+            api-level: 35
+            preferred-profile: pixel_9_pro_xl
+            fallback-profile: pixel_7_pro
 
     steps:
       - uses: actions/checkout@v5
