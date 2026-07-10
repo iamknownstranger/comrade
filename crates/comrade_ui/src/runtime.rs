@@ -30,11 +30,12 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use comrade_core::crypto::derive_media_key;
 use comrade_core::media::{
     build_file_metadata_event, encrypt_media, fetch_and_decrypt_media, FileMetadata,
+    MAX_MEDIA_BYTES,
 };
 use comrade_core::sabha::{ChitthiCallback, SabhaEngine, DEFAULT_RELAYS};
 use comrade_core::sakha::SakhaEngine;
 use comrade_core::vault::{VaultCallback, VaultEngine, VaultMessage};
-use nostr_sdk::{EventId, Keys, PublicKey, ToBech32};
+use nostr_sdk::{EventId, PublicKey, ToBech32};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tracing::warn;
@@ -153,6 +154,10 @@ struct MediaRef {
     mime_type: String,
     caption: String,
     size: u64,
+    /// SHA-256 of the *ciphertext* blob (NIP-94 `x`), verified before decrypt.
+    /// Defaulted so refs written before this field are still readable.
+    #[serde(default)]
+    sha256_hex: String,
     outgoing: bool,
     created_at: u64,
 }
@@ -167,6 +172,10 @@ struct MediaEnvelope {
     mime: String,
     caption: String,
     size: u64,
+    /// SHA-256 of the ciphertext (NIP-94 `x`) so the recipient can fail fast on
+    /// a wrong/tampered blob. Defaulted for envelopes sent before this field.
+    #[serde(default)]
+    sha256_hex: String,
 }
 
 /// Detect and parse a Comrade media envelope out of a decrypted DM body.
@@ -335,12 +344,19 @@ impl ComradeRuntime {
                                 mime_type: env.mime.clone(),
                                 caption: env.caption.clone(),
                                 size: env.size,
+                                sha256_hex: env.sha256_hex.clone(),
                                 outgoing: false,
                                 created_at: msg.created_at,
                             };
-                            let _ = store
+                            // A dropped ref means download_and_decrypt_media
+                            // later can't resolve this event — surface it rather
+                            // than silently losing the media.
+                            if let Err(e) = store
                                 .put(MEDIA_REFS_TREE, &env.event_id, &reff)
-                                .and_then(|()| store.flush());
+                                .and_then(|()| store.flush())
+                            {
+                                warn!("failed to persist incoming media ref: {e}");
+                            }
                         }
                         let _ = tx.send(BridgeEvent::IncomingMedia(MediaMessageDto {
                             event_id: env.event_id,
@@ -436,6 +452,12 @@ impl ComradeRuntime {
         mime_type: &str,
         caption: &str,
     ) -> Result<MediaMessageDto, UiError> {
+        if bytes.len() > MAX_MEDIA_BYTES {
+            return Err(UiError::Engine(format!(
+                "media is {} bytes; the limit is {MAX_MEDIA_BYTES}",
+                bytes.len()
+            )));
+        }
         let keys = self.ui.identity_keys().ok_or(UiError::NoIdentity)?;
         let peer = parse_pubkey(target_pubkey)?;
         let key = derive_media_key(keys.secret_key(), &peer, MEDIA_LABEL)
@@ -447,7 +469,7 @@ impl ComradeRuntime {
         let sha256_hex = media.sha256_hex.clone();
 
         // Upload ciphertext only — the host sees opaque bytes.
-        let url = self.upload_blob(media.ciphertext, mime_type, &keys).await?;
+        let url = self.upload_blob(media.ciphertext, mime_type).await?;
 
         // Zero-knowledge NIP-94 event: URL + ciphertext hash, no key, no `ox`.
         let meta = FileMetadata {
@@ -470,6 +492,7 @@ impl ComradeRuntime {
             mime_type: mime_type.to_string(),
             caption: caption.to_string(),
             size,
+            sha256_hex: media.sha256_hex.clone(),
             outgoing: true,
             created_at,
         };
@@ -488,6 +511,7 @@ impl ComradeRuntime {
             mime: mime_type.to_string(),
             caption: caption.to_string(),
             size,
+            sha256_hex: media.sha256_hex.clone(),
         };
         let envelope_json =
             serde_json::to_string(&envelope).map_err(|e| UiError::Engine(e.to_string()))?;
@@ -529,7 +553,11 @@ impl ComradeRuntime {
         let key = derive_media_key(keys.secret_key(), &peer, MEDIA_LABEL)
             .map_err(|e| UiError::Engine(e.to_string()))?;
 
-        let bytes = fetch_and_decrypt_media(&reff.url, &key)
+        // Verify the ciphertext hash when we recorded one (fail fast on a
+        // wrong/tampered blob; older refs without it fall back to the AES-GCM
+        // tag alone, which still rejects tampering).
+        let expected = (!reff.sha256_hex.is_empty()).then_some(reff.sha256_hex.as_str());
+        let bytes = fetch_and_decrypt_media(&reff.url, &key, expected)
             .await
             .map_err(|e| UiError::Engine(e.to_string()))?;
 
@@ -541,10 +569,15 @@ impl ComradeRuntime {
 
     /// Upload an encrypted blob to Blossom, signed with a BUD-01 auth event.
     /// Gated on the `media-http` feature; degrades to a typed error otherwise.
+    ///
+    /// The BUD-01 auth event is signed with a **fresh ephemeral key**, never the
+    /// user's chat identity: the blob is already zero-knowledge, and signing
+    /// with the identity key would let the host link "npub X uploaded blob Y at
+    /// time T from IP Z" — a metadata leak at odds with the privacy model.
     #[cfg(feature = "media-http")]
-    async fn upload_blob(&self, blob: Vec<u8>, mime: &str, keys: &Keys) -> Result<String, UiError> {
+    async fn upload_blob(&self, blob: Vec<u8>, mime: &str) -> Result<String, UiError> {
         use comrade_core::media::{BlossomUploader, MediaUploader, DEFAULT_BLOSSOM_SERVER};
-        let uploader = BlossomUploader::new(DEFAULT_BLOSSOM_SERVER, keys.clone());
+        let uploader = BlossomUploader::new(DEFAULT_BLOSSOM_SERVER, nostr_sdk::Keys::generate());
         let receipt = uploader
             .upload(&blob, mime)
             .await
@@ -553,12 +586,7 @@ impl ComradeRuntime {
     }
 
     #[cfg(not(feature = "media-http"))]
-    async fn upload_blob(
-        &self,
-        _blob: Vec<u8>,
-        _mime: &str,
-        _keys: &Keys,
-    ) -> Result<String, UiError> {
+    async fn upload_blob(&self, _blob: Vec<u8>, _mime: &str) -> Result<String, UiError> {
         Err(UiError::Engine(
             "media upload requires the `media-http` feature".into(),
         ))
@@ -764,12 +792,19 @@ mod tests {
             mime: "image/png".into(),
             caption: "hi".into(),
             size: 10,
+            sha256_hex: "a".repeat(64),
         };
         let json = serde_json::to_string(&env).unwrap();
         assert!(parse_media_envelope(&json).is_some());
         // A plain DM is not mistaken for a media envelope.
         assert!(parse_media_envelope("just a normal message").is_none());
         assert!(parse_media_envelope(r#"{"hello":"world"}"#).is_none());
+        // An envelope written before the sha256_hex field still parses (the
+        // field is #[serde(default)]) — back-compat for already-sent media.
+        assert!(parse_media_envelope(
+            r#"{"comrade_media":1,"event_id":"e","url":"https://b/x","mime":"image/png","caption":"","size":1}"#
+        )
+        .is_some());
     }
 
     #[test]
@@ -832,6 +867,7 @@ mod tests {
             mime_type: "image/png".into(),
             caption: "x".into(),
             size: 3,
+            sha256_hex: String::new(),
             outgoing: false,
             created_at: 1,
         };

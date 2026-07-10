@@ -386,6 +386,15 @@ pub use nip96::Nip96Uploader;
 /// content-addressed (blob URL = `<server>/<sha256>`) and accept raw `PUT`s.
 pub const DEFAULT_BLOSSOM_SERVER: &str = "https://cdn.hackers.town";
 
+/// Hard cap on a decrypted media payload (10 MB). Mirrors the frontend limit;
+/// enforced in the core so *every* caller (desktop, JNI/Android) is protected,
+/// not just the ones that happen to pre-check.
+pub const MAX_MEDIA_BYTES: usize = 10 * 1024 * 1024;
+
+/// Cap on the encrypted blob we will buffer from the network, allowing for the
+/// 12-byte nonce + 16-byte GCM tag envelope on top of [`MAX_MEDIA_BYTES`].
+pub const MAX_ENCRYPTED_MEDIA_BYTES: usize = MAX_MEDIA_BYTES + 64;
+
 #[cfg(feature = "media-http")]
 mod http {
     use super::*;
@@ -407,8 +416,32 @@ mod http {
     /// The inverse of the stage→upload pipeline: the nonce travels prefixed to
     /// the ciphertext, so only the 32-byte `key` (re-derived from ECDH) is
     /// needed. Authenticated decryption rejects any tampered blob.
-    pub async fn fetch_and_decrypt_media(url: &str, key: &[u8; 32]) -> Result<Vec<u8>, MediaError> {
-        let resp = reqwest::get(url)
+    ///
+    /// The `url` comes from a peer's DM envelope and is therefore attacker
+    /// influenced, so this hardens the fetch: HTTPS only, redirects disabled
+    /// (an `http://` or redirected target could leak the client IP or probe
+    /// internal addresses), and the body is capped at
+    /// [`MAX_ENCRYPTED_MEDIA_BYTES`] — checked against `Content-Length` up front
+    /// and again while streaming, since the header may be absent or lie. When
+    /// `expected_sha256` is supplied the ciphertext hash is verified before
+    /// decryption for a cheap fail-fast on the wrong/tampered blob.
+    pub async fn fetch_and_decrypt_media(
+        url: &str,
+        key: &[u8; 32],
+        expected_sha256: Option<&str>,
+    ) -> Result<Vec<u8>, MediaError> {
+        if !url.starts_with("https://") {
+            return Err(MediaError::Http(
+                "refusing to fetch a non-HTTPS media URL".into(),
+            ));
+        }
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| MediaError::Http(e.to_string()))?;
+        let mut resp = client
+            .get(url)
+            .send()
             .await
             .map_err(|e| MediaError::Http(e.to_string()))?;
         if !resp.status().is_success() {
@@ -417,10 +450,36 @@ mod http {
                 resp.status()
             )));
         }
-        let bytes = resp
-            .bytes()
+        if let Some(len) = resp.content_length() {
+            if len > MAX_ENCRYPTED_MEDIA_BYTES as u64 {
+                return Err(MediaError::UploadFailed(format!(
+                    "blob too large: {len} bytes (limit {MAX_ENCRYPTED_MEDIA_BYTES})"
+                )));
+            }
+        }
+        // Bounded streaming read — never buffer more than the cap even if the
+        // server omits or understates Content-Length.
+        let mut bytes: Vec<u8> = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
             .await
-            .map_err(|e| MediaError::Http(e.to_string()))?;
+            .map_err(|e| MediaError::Http(e.to_string()))?
+        {
+            if bytes.len() + chunk.len() > MAX_ENCRYPTED_MEDIA_BYTES {
+                return Err(MediaError::UploadFailed(format!(
+                    "blob exceeds the {MAX_ENCRYPTED_MEDIA_BYTES}-byte limit"
+                )));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if let Some(expected) = expected_sha256 {
+            let actual = sha256_hex(&bytes);
+            if actual != expected {
+                return Err(MediaError::Crypto(format!(
+                    "ciphertext hash mismatch: expected {expected}, got {actual}"
+                )));
+            }
+        }
         aes256gcm_open(key, &bytes).map_err(|e| MediaError::Crypto(e.to_string()))
     }
 
@@ -531,7 +590,11 @@ pub use http::{
 // Stubs so the rest of the workspace compiles (and degrades gracefully) when the
 // `media-http` feature is off — the runtime calls these unconditionally.
 #[cfg(not(feature = "media-http"))]
-pub async fn fetch_and_decrypt_media(_url: &str, _key: &[u8; 32]) -> Result<Vec<u8>, MediaError> {
+pub async fn fetch_and_decrypt_media(
+    _url: &str,
+    _key: &[u8; 32],
+    _expected_sha256: Option<&str>,
+) -> Result<Vec<u8>, MediaError> {
     Err(MediaError::Http(
         "media download requires the `media-http` cargo feature".into(),
     ))
@@ -634,9 +697,25 @@ mod tests {
         assert!(upload_encrypted_blob(vec![1, 2, 3], "image/png")
             .await
             .is_err());
-        assert!(fetch_and_decrypt_media("https://x/y", &[0u8; 32])
+        assert!(fetch_and_decrypt_media("https://x/y", &[0u8; 32], None)
             .await
             .is_err());
+    }
+
+    #[cfg(feature = "media-http")]
+    #[tokio::test]
+    async fn fetch_rejects_non_https_url_before_any_request() {
+        // A peer-supplied http:// (or other-scheme) URL must be refused up
+        // front — no request is issued, so this returns without touching the
+        // network (SSRF/IP-leak hardening).
+        for url in [
+            "http://169.254.169.254/latest",
+            "file:///etc/passwd",
+            "ftp://x/y",
+        ] {
+            let err = fetch_and_decrypt_media(url, &[0u8; 32], None).await;
+            assert!(matches!(err, Err(MediaError::Http(_))), "must reject {url}");
+        }
     }
 
     #[test]
