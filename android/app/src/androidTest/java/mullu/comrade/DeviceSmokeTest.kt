@@ -1,4 +1,4 @@
-package global.auros.comrade
+package mullu.comrade
 
 import androidx.lifecycle.Lifecycle
 import androidx.test.core.app.ActivityScenario
