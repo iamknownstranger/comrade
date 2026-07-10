@@ -225,6 +225,9 @@ pub struct ComradeRuntime {
     vault: Option<Arc<VaultEngine>>,
     sakha: Option<Arc<SakhaEngine>>,
     events: broadcast::Sender<BridgeEvent>,
+    /// Guards [`spawn_event_loops`] against re-spawning the feed/DM tasks if it
+    /// is called more than once. [`spawn_event_loops`]: ComradeRuntime::spawn_event_loops
+    loops_spawned: bool,
 }
 
 impl Default for ComradeRuntime {
@@ -242,6 +245,7 @@ impl ComradeRuntime {
             vault: None,
             sakha: None,
             events,
+            loops_spawned: false,
         }
     }
 
@@ -274,6 +278,14 @@ impl ComradeRuntime {
         path: impl AsRef<std::path::Path>,
         passphrase: &str,
     ) -> Result<IdentityDto, UiError> {
+        // Idempotent: a second unlock (both bridges call this at startup) must
+        // not rebuild the engines — that would orphan the running ones and,
+        // with spawn_event_loops, duplicate the relay connections and event
+        // loops. Return the already-loaded identity instead.
+        if self.is_vault_unlocked() {
+            return self.ui.current_identity().ok_or(UiError::NoIdentity);
+        }
+
         self.ui.unlock_store(path, passphrase)?;
 
         // Restore the saved identity, or seed and persist a fresh one so the
@@ -322,7 +334,14 @@ impl ComradeRuntime {
     ///
     /// All network and decryption work happens inside these spawned tasks,
     /// keeping the UI thread free (Architecture Quality Gate).
-    pub fn spawn_event_loops(&self) {
+    ///
+    /// Idempotent: calling it more than once (e.g. after a repeated unlock) is
+    /// a no-op, so the feed/DM loops are spawned at most once per runtime.
+    pub fn spawn_event_loops(&mut self) {
+        if self.loops_spawned {
+            return;
+        }
+        self.loops_spawned = true;
         if let Some(sabha) = self.sabha.clone() {
             let tx = self.events.clone();
             tokio::spawn(async move {
@@ -731,6 +750,25 @@ mod tests {
         assert!(rt.is_store_unlocked());
         // Timeline is reachable (empty cache) once unlocked.
         assert!(rt.fetch_sabha_timeline().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn second_unlock_is_idempotent_and_keeps_the_same_identity() {
+        // A repeated unlock must return the existing identity without rebuilding
+        // engines (which would orphan the running ones and duplicate loops).
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+        let first = rt.unlock_vault(dir.path(), "pin").await.unwrap().npub;
+        let sabha_ptr = Arc::as_ptr(rt.sabha.as_ref().unwrap()) as usize;
+        // Second unlock — same or different args — is a no-op that returns the
+        // current identity and leaves the engine instances untouched.
+        let second = rt.unlock_vault(dir.path(), "pin").await.unwrap().npub;
+        assert_eq!(first, second);
+        assert_eq!(
+            sabha_ptr,
+            Arc::as_ptr(rt.sabha.as_ref().unwrap()) as usize,
+            "engines must not be rebuilt on a repeated unlock"
+        );
     }
 
     #[tokio::test]
