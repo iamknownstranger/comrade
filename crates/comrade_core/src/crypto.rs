@@ -17,6 +17,7 @@ use nostr_sdk::{Keys, PublicKey, SecretKey, ToBech32};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use tracing::instrument;
+use zeroize::Zeroize;
 
 use crate::error::CryptoError;
 
@@ -25,11 +26,30 @@ const AEAD_NONCE_LEN: usize = 12;
 
 // ── Key profile ──────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct KeyProfile {
     pub keys: Keys,
     pub npub: String,
     pub nsec: String,
+}
+
+/// `Debug` is implemented by hand so a stray `{:?}` in a log line can never
+/// leak the secret key — only the public npub is printed.
+impl std::fmt::Debug for KeyProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyProfile")
+            .field("npub", &self.npub)
+            .field("nsec", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Best-effort zeroization of the Bech32 secret on drop. (The inner
+/// `nostr_sdk::Keys` manages its own secret-key memory.)
+impl Drop for KeyProfile {
+    fn drop(&mut self) {
+        self.nsec.zeroize();
+    }
 }
 
 impl KeyProfile {
@@ -171,6 +191,15 @@ mod tests {
         let profile = KeyProfile::generate().expect("keygen");
         assert!(profile.npub.starts_with("npub1"), "npub prefix");
         assert!(profile.nsec.starts_with("nsec1"), "nsec prefix");
+    }
+
+    #[test]
+    fn debug_never_leaks_the_secret_key() {
+        let profile = KeyProfile::generate().expect("keygen");
+        let debug = format!("{profile:?}");
+        assert!(debug.contains(&profile.npub));
+        assert!(!debug.contains(&profile.nsec), "nsec must be redacted");
+        assert!(debug.contains("<redacted>"));
     }
 
     #[test]

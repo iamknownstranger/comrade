@@ -105,6 +105,8 @@ fn print_help() {
     println!("  ledger     — demo: append an entry and show CRDT ledger");
     println!("  relays     — demo: NIP-65 outbox-model relay routing");
     println!("  media      — demo: NIP-94/96 encrypted media pipeline");
+    println!("  call       — demo: audio/video call signaling handshake (Pukar)");
+    println!("  voicemsg   — demo: encrypted voice message with duration (NIP-94)");
     println!("  unlock <PIN> — open the encrypted local store with a PIN");
     println!("  save       — persist current identity to the encrypted store");
     println!("  load       — load the saved identity from the encrypted store");
@@ -117,7 +119,11 @@ fn read_line(prompt: &str) -> io::Result<String> {
     print!("{prompt}");
     io::stdout().flush()?;
     let mut buf = String::new();
-    io::stdin().read_line(&mut buf)?;
+    // 0 bytes read = EOF (Ctrl-D / exhausted pipe): surface it as an error so
+    // callers exit instead of spinning on empty prompts forever.
+    if io::stdin().read_line(&mut buf)? == 0 {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "stdin closed"));
+    }
     Ok(buf.trim().to_string())
 }
 
@@ -339,6 +345,148 @@ fn demo_relay_routing() {
     );
 }
 
+/// Walk both sides of a call through the real Pukar state machines: offer →
+/// ring → accept → ICE → connect → hang-up, plus the busy path. This is the
+/// exact logic the Android/desktop WebRTC layers drive over the network.
+fn demo_call_signaling() {
+    use comrade_core::pukar::{CallEvent, CallManager, CallMedia, CallSignal, RejectReason};
+
+    let now = 1_000u64;
+    let mut alice = CallManager::new();
+    let mut bob = CallManager::new();
+    // Incoming calls are deny-by-default (consent gate); the demo peers
+    // explicitly allow anyone, as a real app would allow saved contacts.
+    alice.set_policy(comrade_core::pukar::CallPolicy::AllowAll);
+    bob.set_policy(comrade_core::pukar::CallPolicy::AllowAll);
+    println!("  Demonstrating Pukar call signaling (SDP/ICE are platform blobs) …");
+
+    // Alice places a video call to Bob.
+    let (session, offer) =
+        match alice.place_call("bob-pubkey", CallMedia::Video, "<sdp-offer>", now) {
+            Ok(r) => r,
+            Err(e) => {
+                println!("  place_call failed: {e}");
+                return;
+            }
+        };
+    println!("  Alice → Offer   (call {}…, video)", &session.call_id[..8]);
+
+    // Bob's device rings.
+    let (events, _) = bob.handle_signal("alice-pubkey", offer, now);
+    if let Some(CallEvent::IncomingCall { call, .. }) = events.first() {
+        println!("  Bob   ← ringing (from {}, {:?})", call.peer, call.media);
+    }
+
+    // Carol calls Bob while he is ringing — auto-busy.
+    let carol_offer = CallSignal::Offer {
+        call_id: "carol-call-id".into(),
+        media: CallMedia::Audio,
+        sdp: "<sdp>".into(),
+    };
+    let (_, reply) = bob.handle_signal("carol-pubkey", carol_offer, now + 1);
+    if let Some(CallSignal::Reject {
+        reason: RejectReason::Busy,
+        ..
+    }) = reply
+    {
+        println!("  Carol ← Reject(busy) — Bob's call is undisturbed");
+    }
+
+    // Bob accepts; Alice applies the answer.
+    let (answer, _withheld_ice) = match bob.accept(&session.call_id, "<sdp-answer>", now + 3) {
+        Ok(r) => r,
+        Err(e) => {
+            println!("  accept failed: {e}");
+            return;
+        }
+    };
+    println!("  Bob   → Answer");
+    let (events, _) = alice.handle_signal("bob-pubkey", answer, now + 3);
+    if matches!(events.first(), Some(CallEvent::CallAnswered { .. })) {
+        println!("  Alice ← answered → connecting");
+    }
+
+    // Trickle ICE, then both sides report media up.
+    if let Ok(ice) = alice.local_ice(&session.call_id, "<candidate>", Some("0".into()), Some(0)) {
+        let _ = bob.handle_signal("alice-pubkey", ice, now + 4);
+        println!("  Alice → Ice, Bob applies candidate");
+    }
+    let _ = alice.mark_connected(&session.call_id, now + 5);
+    let _ = bob.mark_connected(&session.call_id, now + 5);
+    println!("  Both  — media flowing (Active)");
+
+    // Alice hangs up after a minute of talk.
+    match alice.hangup(&session.call_id, now + 65) {
+        Ok(end) => {
+            let _ = bob.handle_signal("alice-pubkey", end, now + 65);
+            println!("  Alice → End(hangup)");
+        }
+        Err(e) => println!("  hangup failed: {e}"),
+    }
+
+    println!("  ── Call logs ────────────────────────────────────────────");
+    for (who, mgr) in [("Alice", &alice), ("Bob", &bob)] {
+        for c in mgr.call_log() {
+            println!(
+                "  {who}: {:?} {:?} — {:?}, talk {}s",
+                c.direction,
+                c.media,
+                c.cause.unwrap_or(comrade_core::pukar::EndCause::Failed),
+                c.duration_secs().unwrap_or(0),
+            );
+        }
+    }
+}
+
+/// Record → encrypt → upload → describe → fetch → decrypt a voice message.
+async fn demo_voice_message() {
+    use comrade_core::crypto::KeyProfile;
+    use comrade_core::media::{decrypt_media, parse_file_metadata, InMemoryUploader, MediaEngine};
+
+    println!("  Demonstrating an encrypted voice message …");
+    let keys = match KeyProfile::generate() {
+        Ok(p) => p.keys.clone(),
+        Err(e) => {
+            println!("  Keygen failed: {e}");
+            return;
+        }
+    };
+    let uploader = InMemoryUploader::new("https://blossom.example");
+    let engine = MediaEngine::new(uploader.clone(), keys);
+
+    let audio = b"OggS pretend-opus-voice-note-bytes";
+    let key = [0x42u8; 32]; // in practice: per-file random, shared via E2E DM
+    let (event, secret) = match engine
+        .share_voice_message(audio, "audio/ogg", 17, &key)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            println!("  Share failed: {e}");
+            return;
+        }
+    };
+
+    match parse_file_metadata(&event) {
+        Ok(meta) => {
+            println!("  url      : {}", meta.url);
+            println!("  mime     : {}", meta.mime_type);
+            println!("  duration : {}s", meta.duration_secs.unwrap_or(0));
+            if let Some(blob) = uploader.fetch(&meta.url).await {
+                match decrypt_media(&blob, &secret) {
+                    Ok(rec) => println!(
+                        "  Recipient decrypted {} bytes — matches original: {}",
+                        rec.len(),
+                        rec == audio
+                    ),
+                    Err(e) => println!("  Decrypt failed: {e}"),
+                }
+            }
+        }
+        Err(e) => println!("  Metadata parse failed: {e}"),
+    }
+}
+
 async fn demo_media() {
     use comrade_core::crypto::KeyProfile;
     use comrade_core::media::{decrypt_media, parse_file_metadata, InMemoryUploader, MediaEngine};
@@ -346,7 +494,7 @@ async fn demo_media() {
     println!("  Demonstrating encrypted media (NIP-94/96) …");
 
     let keys = match KeyProfile::generate() {
-        Ok(p) => p.keys,
+        Ok(p) => p.keys.clone(),
         Err(e) => {
             println!("  Keygen failed: {e}");
             return;
@@ -851,11 +999,12 @@ async fn main() -> anyhow::Result<()> {
             }
 
             "mood" => {
-                let mut it = arg.splitn(2, ' ');
+                // split_whitespace tolerates double spaces ('mood  -1 tired').
+                let mut it = arg.split_whitespace();
                 match it.next().and_then(|v| v.parse::<i8>().ok()) {
                     Some(m) => {
-                        let note = it.next().unwrap_or("").trim();
-                        companion_write(&state, CompanionMode::Journal, note, Some(m)).await;
+                        let note = it.collect::<Vec<_>>().join(" ");
+                        companion_write(&state, CompanionMode::Journal, &note, Some(m)).await;
                     }
                     None => {
                         println!("  Usage: mood <-2..2> [optional note]  (e.g. 'mood -1 tired')")
@@ -886,14 +1035,41 @@ async fn main() -> anyhow::Result<()> {
 
             "media" => demo_media().await,
 
+            "call" => demo_call_signaling(),
+
+            "voicemsg" => demo_voice_message().await,
+
             "unlock" => {
-                if arg.is_empty() {
+                // Trim: the startup passphrase prompt trims too — a PIN that
+                // works at `unlock` must keep working at the next boot.
+                let pin = arg.trim();
+                if pin.is_empty() {
                     println!("  Usage: unlock <PIN>");
+                } else if state.read().await.store.is_some() {
+                    println!("  Store is already unlocked (sled holds an exclusive lock).");
                 } else {
-                    match EncryptedStore::open(STORE_PATH, arg) {
+                    match EncryptedStore::open(STORE_PATH, pin) {
                         Ok(store) => {
                             println!("  Encrypted store unlocked at '{STORE_PATH}'.");
                             let mut guard = state.write().await;
+                            // Restore the persisted identity — otherwise the
+                            // session keeps its throwaway keypair and a later
+                            // 'save' would silently overwrite the real nsec.
+                            match store.load_identity() {
+                                Ok(Some(id)) => match KeyProfile::from_nsec(&id.nsec) {
+                                    Ok(profile) => {
+                                        println!("  Profile restored: {}", profile.npub);
+                                        guard.profile = profile;
+                                    }
+                                    Err(e) => println!(
+                                        "  Stored nsec invalid ({e}); keeping the current identity."
+                                    ),
+                                },
+                                Ok(None) => println!(
+                                    "  (no saved identity yet — 'save' to persist this one)"
+                                ),
+                                Err(e) => println!("  Could not read stored identity: {e}"),
+                            }
                             guard.store = Some(store);
                             guard.ctx.set_storage_status(StorageStatus::Unlocked);
                         }

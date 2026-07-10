@@ -124,7 +124,9 @@ pub struct CompanionResponse {
 pub struct UiService {
     ctx: RuntimeContext,
     identity: Option<KeyProfile>,
-    store: Option<EncryptedStore>,
+    /// Shared behind `Arc` so background tasks (relay feed loops) can persist
+    /// incoming events without holding the whole service lock.
+    store: Option<std::sync::Arc<EncryptedStore>>,
 }
 
 impl Default for UiService {
@@ -201,7 +203,7 @@ impl UiService {
     /// Open the encrypted store at `path` with `pin`.
     pub fn unlock_store(&mut self, path: impl AsRef<Path>, pin: &str) -> Result<(), UiError> {
         let store = EncryptedStore::open(path, pin).map_err(|e| UiError::Storage(e.to_string()))?;
-        self.store = Some(store);
+        self.store = Some(std::sync::Arc::new(store));
         Ok(())
     }
 
@@ -219,7 +221,13 @@ impl UiService {
     /// Crate-internal borrow of the unlocked encrypted store, for cache reads
     /// (e.g. the offline Sabha timeline) performed by the [`runtime`] bridge.
     pub(crate) fn store_ref(&self) -> Option<&EncryptedStore> {
-        self.store.as_ref()
+        self.store.as_deref()
+    }
+
+    /// Crate-internal clone of the shared store handle, for background tasks
+    /// (feed persistence, call-log writes) that outlive a `&self` borrow.
+    pub(crate) fn store_arc(&self) -> Option<std::sync::Arc<EncryptedStore>> {
+        self.store.clone()
     }
 
     /// Persist the current identity to the unlocked store.
@@ -355,10 +363,23 @@ impl UiService {
         Ok(removed)
     }
 
-    /// On-device insights (streak, momentum, mood trend, top tags).
+    /// On-device insights (streak, momentum, mood trend, top tags), with day
+    /// boundaries at UTC midnight. Prefer [`journal_insights_at`].
+    ///
+    /// [`journal_insights_at`]: Self::journal_insights_at
     pub fn journal_insights(&self) -> Result<Insights, UiError> {
+        self.journal_insights_at(0)
+    }
+
+    /// Insights with streak days rolling at the device's local midnight
+    /// (`tz_offset_secs` from UTC, e.g. +19800 for IST).
+    pub fn journal_insights_at(&self, tz_offset_secs: i32) -> Result<Insights, UiError> {
         let entries = self.list_journal_entries()?;
-        Ok(Insights::from_entries(&entries, now_secs()))
+        Ok(Insights::from_entries_at(
+            &entries,
+            now_secs(),
+            tz_offset_secs,
+        ))
     }
 
     /// Number of stored entries, or 0 if the store is locked (used as a prompt

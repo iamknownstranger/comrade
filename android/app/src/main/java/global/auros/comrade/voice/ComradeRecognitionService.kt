@@ -49,6 +49,7 @@ class ComradeRecognitionService : RecognitionService() {
     override fun onStopListening(listener: Callback?) { /* one-shot stops itself */ }
 
     override fun onCancel(listener: Callback?) {
+        recognizer?.cancel()
         recognizer = null
     }
 

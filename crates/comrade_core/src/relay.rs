@@ -179,6 +179,9 @@ pub const DEFAULT_MAX_RELAYS_PER_USER: usize = 3;
 #[derive(Debug, Clone)]
 pub struct RelayRouter {
     lists: HashMap<String, RelayList>,
+    /// `created_at` of the newest ingested kind-10002 per author, so a relay
+    /// replaying an OLD replaceable event can never roll a user's list back.
+    freshness: HashMap<String, u64>,
     fallback_relays: Vec<String>,
     max_relays_per_user: usize,
 }
@@ -189,6 +192,7 @@ impl RelayRouter {
     pub fn new(fallback_relays: Vec<String>) -> Self {
         Self {
             lists: HashMap::new(),
+            freshness: HashMap::new(),
             fallback_relays: fallback_relays.iter().map(|r| normalise_url(r)).collect(),
             max_relays_per_user: DEFAULT_MAX_RELAYS_PER_USER,
         }
@@ -199,17 +203,33 @@ impl RelayRouter {
         self
     }
 
-    /// Record (or replace) a user's relay list.
+    /// Record (or replace) a user's relay list unconditionally (trusted local
+    /// input — e.g. the user editing their own list). Clears any recorded
+    /// event freshness for the author.
     pub fn update(&mut self, pubkey_hex: impl Into<String>, list: RelayList) {
-        self.lists.insert(pubkey_hex.into(), list);
+        let key = pubkey_hex.into();
+        self.freshness.remove(&key);
+        self.lists.insert(key, list);
     }
 
     /// Parse a kind-10002 event and record its author's relay list.
+    ///
+    /// Kind 10002 is a *replaceable* event: only the newest per author counts.
+    /// An event older than the newest already ingested for that author is
+    /// ignored, so replays cannot roll a relay list back.
     pub fn ingest_event(&mut self, event: &Event) -> Result<(), GossipError> {
         let list = parse_relay_list(event)?;
         let author = event.pubkey.to_hex();
+        let created_at = event.created_at.as_secs();
+        if let Some(&newest) = self.freshness.get(&author) {
+            if created_at <= newest {
+                debug!(author = %author, "gossip: ignoring stale relay-list event");
+                return Ok(());
+            }
+        }
         debug!(author = %author, relays = list.entries.len(), "gossip: ingested relay list");
-        self.update(author, list);
+        self.freshness.insert(author.clone(), created_at);
+        self.lists.insert(author, list);
         Ok(())
     }
 
@@ -392,6 +412,41 @@ mod tests {
             .tags(parsed)
             .sign_with_keys(keys)
             .expect("sign")
+    }
+
+    #[test]
+    fn stale_relay_list_event_cannot_roll_back_newer_one() {
+        let keys = Keys::generate();
+        let newer = EventBuilder::new(Kind::from(RELAY_LIST_KIND), "")
+            .tags([Tag::parse(["r", "wss://new.example"]).unwrap()])
+            .custom_created_at(Timestamp::from(2_000_000_000u64))
+            .sign_with_keys(&keys)
+            .unwrap();
+        let older = EventBuilder::new(Kind::from(RELAY_LIST_KIND), "")
+            .tags([Tag::parse(["r", "wss://old.example"]).unwrap()])
+            .custom_created_at(Timestamp::from(1_000_000_000u64))
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let mut router = RelayRouter::new(vec![]);
+        router.ingest_event(&newer).unwrap();
+        // Replayed older event must be ignored (kind 10002 is replaceable).
+        router.ingest_event(&older).unwrap();
+        let list = router.relay_list_for(&keys.public_key().to_hex()).unwrap();
+        assert_eq!(list.entries[0].url, "wss://new.example");
+
+        // A manual (local, trusted) update still overrides.
+        router.update(
+            keys.public_key().to_hex(),
+            RelayList {
+                entries: vec![RelayListEntry {
+                    url: "wss://manual.example".into(),
+                    policy: RelayPolicy::ReadWrite,
+                }],
+            },
+        );
+        let list = router.relay_list_for(&keys.public_key().to_hex()).unwrap();
+        assert_eq!(list.entries[0].url, "wss://manual.example");
     }
 
     #[test]

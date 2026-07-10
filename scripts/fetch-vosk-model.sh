@@ -34,6 +34,10 @@ unzip -q "$tmp/model.zip" -d "$tmp/extracted"
 # The zip contains a single top-level folder (e.g. vosk-model-small-en-us-0.15);
 # move its *contents* into assets/model-en-us so StorageService.unpack finds am/.
 inner="$(find "$tmp/extracted" -maxdepth 1 -mindepth 1 -type d | head -n1)"
+if [[ -z "$inner" ]]; then
+  echo "Unexpected zip layout: no top-level model directory found" >&2
+  exit 1
+fi
 mkdir -p "$TARGET_DIR"
 mv "$inner"/* "$TARGET_DIR"/
 

@@ -77,10 +77,64 @@ object ComradeCore {
     external fun toggleWorkspace(target: String): String
 
     /**
-     * Non-blocking drain of the next bridge event (incoming Chitthi / DM).
-     * @return event JSON, `{"empty":true}` when idle, or `{"error":"…"}`.
+     * Non-blocking drain of the next bridge event (incoming Chitthi / DM /
+     * call). Prefer [pollEvents] — one event per JNI crossing cannot keep up
+     * with the public feed.
+     * @return event JSON, `{"empty":true}` when idle, `{"lagged":n}` when the
+     * consumer fell `n` events behind (recover from the encrypted caches:
+     * timeline, DM history, call log), `{"closed":true}` when the bus is
+     * gone, or `{"error":"…"}`.
      */
     external fun pollEvent(): String
+
+    /**
+     * Non-blocking batch drain of up to [max] bridge events in one crossing.
+     * @return JSON `{"events":[…]}` (possibly empty), plus `"lagged":n` when
+     * events were evicted before this poll, or `{"closed":true}`.
+     */
+    external fun pollEvents(max: Int): String
+
+    // ── Pukar: audio/video calls (WebRTC signaling over encrypted Nostr) ─────
+    //
+    // The Rust core owns signaling + call state; this layer supplies SDP/ICE
+    // strings from org.webrtc's PeerConnection and reacts to call events
+    // drained via [pollEvent] (`{"type":"call","call":{...}}`).
+
+    /**
+     * Start ringing `peer` (npub or hex). @return the session JSON
+     * (`call_id`, `state`:"ringing", …) or `{"error":"…"}`.
+     */
+    external fun placeCall(peer: String, video: Boolean, sdpOffer: String): String
+
+    /** Accept the ringing incoming call. @return `{"ok":true}` or an error. */
+    external fun answerCall(callId: String, sdpAnswer: String): String
+
+    /** Decline the ringing incoming call. */
+    external fun declineCall(callId: String): String
+
+    /** Hang up the active call, or cancel an outgoing ring. */
+    external fun endCall(callId: String): String
+
+    /**
+     * Forward a locally-gathered ICE candidate to the peer.
+     * @param sdpMid pass `""` when the candidate has none.
+     * @param sdpMlineIndex pass `-1` when the candidate has none.
+     */
+    external fun sendCallIce(
+        callId: String,
+        candidate: String,
+        sdpMid: String,
+        sdpMlineIndex: Int,
+    ): String
+
+    /** Report that WebRTC media is flowing (ICE completed). */
+    external fun callConnected(callId: String): String
+
+    /** The live call JSON, or `{"none":true}` when idle. */
+    external fun activeCall(): String
+
+    /** Ended calls (newest first) as a JSON array — the call log. */
+    external fun fetchCallLog(): String
 
     // ── Companion: private, anonymous journal ────────────────────────────────
 
@@ -97,8 +151,13 @@ object ComradeCore {
     /** The private journal, newest first, as a JSON array (or `{"error":…}`). */
     external fun fetchJournal(): String
 
-    /** On-device journaling insights as JSON (or `{"error":…}`). */
-    external fun journalInsights(): String
+    /**
+     * On-device journaling insights as JSON (or `{"error":…}`).
+     * @param tzOffsetSecs device offset from UTC in seconds — pass
+     * `TimeZone.getDefault().getOffset(System.currentTimeMillis()) / 1000`
+     * so streaks roll at the user's midnight rather than UTC's.
+     */
+    external fun journalInsights(tzOffsetSecs: Int): String
 
     /** A supportive prompt for `mode`: JSON `{"prompt":"…"}` or `{"error":…}`. */
     external fun companionPrompt(mode: String): String

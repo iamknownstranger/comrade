@@ -170,18 +170,32 @@ impl JournalEntry {
         self
     }
 
-    /// The Unix day-number this entry falls on (used for streaks).
+    /// The Unix day-number this entry falls on (used for streaks), UTC.
     pub fn day(&self) -> u64 {
-        self.created_at / SECS_PER_DAY
+        self.day_at(0)
+    }
+
+    /// The local day-number for a device at `tz_offset_secs` from UTC —
+    /// streaks must roll over at the user's midnight, not UTC midnight
+    /// (which lands mid-morning for this app's India-first audience).
+    pub fn day_at(&self, tz_offset_secs: i32) -> u64 {
+        local_day(self.created_at, tz_offset_secs)
     }
 }
 
+/// Unix-seconds timestamp → day number in a timezone `tz_offset_secs` from UTC.
+fn local_day(unix_secs: u64, tz_offset_secs: i32) -> u64 {
+    let shifted = (unix_secs as i64) + i64::from(tz_offset_secs);
+    (shifted.max(0) as u64) / SECS_PER_DAY
+}
+
 /// Extract `#hashtags` from free text, lowercased and de-duplicated in order.
+/// Tags are recognised anywhere in a token, so "(#work)" and "so:#tired" count.
 pub fn extract_hashtags(text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for token in text.split(|c: char| c.is_whitespace()) {
-        if let Some(rest) = token.strip_prefix('#') {
-            let tag: String = rest
+        for piece in token.split('#').skip(1) {
+            let tag: String = piece
                 .chars()
                 .take_while(|c| c.is_alphanumeric() || *c == '_')
                 .collect::<String>()
@@ -350,7 +364,18 @@ any time:";
 /// [`CRISIS_PHRASES`]; when anything matches, the assessment carries a warm
 /// message and [`crisis_resources`].
 pub fn scan_safety(text: &str) -> SafetyAssessment {
-    let haystack = text.to_lowercase();
+    // Speech keyboards and voice transcripts emit typographic apostrophes
+    // (\u{2019}) and quotes; the phrase list uses ASCII. Normalise first —
+    // a missed match here silently withholds helpline resources.
+    let haystack: String = text
+        .to_lowercase()
+        .chars()
+        .map(|c| match c {
+            '\u{2018}' | '\u{2019}' | '`' | '\u{02BC}' => '\'',
+            '\u{2013}' | '\u{2014}' => '-',
+            c => c,
+        })
+        .collect();
     let matched: Vec<String> = CRISIS_PHRASES
         .iter()
         .filter(|p| haystack.contains(*p))
@@ -386,15 +411,23 @@ pub struct Insights {
 }
 
 impl Insights {
-    /// Compute insights as of `now` (Unix seconds). Pure — pass the clock in so
-    /// the result is deterministic and testable.
+    /// Compute insights as of `now` (Unix seconds), with day boundaries at
+    /// UTC midnight. Prefer [`from_entries_at`](Self::from_entries_at) with
+    /// the device's timezone offset so streaks roll at local midnight.
     pub fn from_entries(entries: &[JournalEntry], now: u64) -> Self {
+        Self::from_entries_at(entries, now, 0)
+    }
+
+    /// Compute insights as of `now` (Unix seconds) for a device at
+    /// `tz_offset_secs` from UTC (e.g. +19800 for IST). Pure — clock and
+    /// timezone are injected so the result is deterministic and testable.
+    pub fn from_entries_at(entries: &[JournalEntry], now: u64, tz_offset_secs: i32) -> Self {
         let total = entries.len();
-        let today = now / SECS_PER_DAY;
+        let today = local_day(now, tz_offset_secs);
         let week_ago = now.saturating_sub(7 * SECS_PER_DAY);
 
-        // Distinct days with an entry.
-        let mut days: Vec<u64> = entries.iter().map(JournalEntry::day).collect();
+        // Distinct (local) days with an entry.
+        let mut days: Vec<u64> = entries.iter().map(|e| e.day_at(tz_offset_secs)).collect();
         days.sort_unstable();
         days.dedup();
 
@@ -552,6 +585,42 @@ mod tests {
     #[test]
     fn safety_scan_is_case_insensitive() {
         assert!(scan_safety("I am SUICIDAL").concerning);
+    }
+
+    #[test]
+    fn safety_scan_survives_typographic_apostrophes() {
+        // Android keyboards emit U+2019, not ASCII apostrophes.
+        assert!(scan_safety("some days I can\u{2019}t go on").concerning);
+        assert!(scan_safety("I don\u{2019}t want to be here").concerning);
+        assert!(scan_safety("i can`t go on").concerning);
+    }
+
+    #[test]
+    fn hashtags_survive_surrounding_punctuation() {
+        assert_eq!(
+            extract_hashtags("felt low (#lonely), then better: #Grateful!"),
+            vec!["lonely".to_string(), "grateful".to_string()]
+        );
+        assert!(extract_hashtags("## #").is_empty());
+    }
+
+    #[test]
+    fn streaks_roll_at_local_midnight_not_utc() {
+        const IST: i32 = 19_800; // UTC+5:30
+        let day = SECS_PER_DAY;
+        // 23:00 IST on local day D falls on UTC day D-…: two entries either
+        // side of *local* midnight collapse to one UTC day but form a genuine
+        // 2-day streak in IST.
+        let e1 = entry("a", 10 * day + 63_000, "evening"); // 17:30 UTC
+        let e2 = entry("b", 10 * day + 70_200, "past local midnight"); // 19:30 UTC
+        assert_eq!(e1.day_at(IST) + 1, e2.day_at(IST));
+        assert_eq!(e1.day(), e2.day());
+
+        let now = 10 * day + 70_500;
+        let utc = Insights::from_entries(&[e1.clone(), e2.clone()], now);
+        let ist = Insights::from_entries_at(&[e1, e2], now, IST);
+        assert_eq!(utc.current_streak_days, 1);
+        assert_eq!(ist.current_streak_days, 2);
     }
 
     #[test]

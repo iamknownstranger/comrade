@@ -22,11 +22,17 @@ class ComradeTts(context: Context) {
     init {
         engine = TextToSpeech(context.applicationContext) { status ->
             if (status == TextToSpeech.SUCCESS) {
+                // isLanguageAvailable returns a tiered >= 0 result
+                // (LANG_AVAILABLE=0, COUNTRY=1, COUNTRY_VAR=2); an == check
+                // wrongly rejected exact country matches like en_US.
                 engine?.language = Locale.getDefault().takeIf {
-                    engine?.isLanguageAvailable(it) == TextToSpeech.LANG_AVAILABLE
+                    (engine?.isLanguageAvailable(it) ?: TextToSpeech.LANG_NOT_SUPPORTED) >=
+                        TextToSpeech.LANG_AVAILABLE
                 } ?: Locale.US
-                ready.set(true)
+                // Flip ready and drain under the same lock speak() enqueues
+                // with, so no utterance can slip between check and enqueue.
                 synchronized(pending) {
+                    ready.set(true)
                     while (pending.isNotEmpty()) speakNow(pending.removeFirst())
                 }
             } else {
@@ -38,11 +44,13 @@ class ComradeTts(context: Context) {
     /** Speak [text], flushing any in-progress utterance. */
     fun speak(text: String) {
         if (text.isBlank()) return
-        if (ready.get()) {
-            speakNow(text)
-        } else {
-            synchronized(pending) { pending.addLast(text) }
+        synchronized(pending) {
+            if (!ready.get()) {
+                pending.addLast(text)
+                return
+            }
         }
+        speakNow(text)
     }
 
     private fun speakNow(text: String) {

@@ -27,6 +27,7 @@
  */
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{EncryptedStore, StorageError};
 
@@ -137,20 +138,42 @@ impl EncryptedStore {
     }
 
     // Contacts ----------------------------------------------------------------
+    //
+    // Logical sled keys are stored in plaintext (see crate docs), so contacts
+    // are keyed by SHA-256(npub) rather than the npub itself — otherwise the
+    // user's entire social graph would be readable straight off the disk,
+    // contradicting the crate's encrypted-at-rest promise. Rows written by
+    // older builds under the raw npub remain readable and are migrated to the
+    // hashed key on their next upsert.
 
-    /// Insert or update a contact, keyed by npub.
+    fn contact_key(npub: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(npub.as_bytes());
+        hex_string(&hasher.finalize())
+    }
+
+    /// Insert or update a contact (keyed by a hash of the npub — the social
+    /// graph is never written to disk in plaintext).
     pub fn upsert_contact(&self, contact: &Contact) -> Result<(), StorageError> {
-        self.put(CONTACTS_TREE, &contact.npub, contact)
+        // Migrate any legacy plaintext-keyed row out of the way.
+        let _ = self.delete(CONTACTS_TREE, &contact.npub)?;
+        self.put(CONTACTS_TREE, &Self::contact_key(&contact.npub), contact)
     }
 
     /// Fetch a single contact by npub.
     pub fn get_contact(&self, npub: &str) -> Result<Option<Contact>, StorageError> {
-        self.get(CONTACTS_TREE, npub)
+        match self.get(CONTACTS_TREE, &Self::contact_key(npub))? {
+            Some(c) => Ok(Some(c)),
+            // Legacy row written by an older build under the raw npub.
+            None => self.get(CONTACTS_TREE, npub),
+        }
     }
 
     /// Remove a contact by npub. Returns `true` if one was removed.
     pub fn remove_contact(&self, npub: &str) -> Result<bool, StorageError> {
-        self.delete(CONTACTS_TREE, npub)
+        let hashed = self.delete(CONTACTS_TREE, &Self::contact_key(npub))?;
+        let legacy = self.delete(CONTACTS_TREE, npub)?;
+        Ok(hashed || legacy)
     }
 
     /// List all saved contacts.
@@ -235,6 +258,15 @@ impl EncryptedStore {
     }
 }
 
+/// Lowercase hex of a digest (kept local to avoid another dependency).
+fn hex_string(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -281,6 +313,44 @@ mod tests {
         assert_eq!(s.get_contact("npub1alice").unwrap(), Some(alice));
         assert!(s.remove_contact("npub1bob").unwrap());
         assert_eq!(s.list_contacts().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn contact_npubs_never_appear_as_plaintext_keys() {
+        let (_d, s) = store();
+        s.upsert_contact(&Contact {
+            npub: "npub1supersecretfriend".into(),
+            petname: "Friend".into(),
+            relays: vec![],
+        })
+        .unwrap();
+        // The logical keys of the contacts tree must not contain the npub.
+        let keys = s.keys("contacts").unwrap();
+        assert!(keys.iter().all(|k| !k.contains("npub1supersecretfriend")));
+        // Lookups by npub still work.
+        assert!(s.get_contact("npub1supersecretfriend").unwrap().is_some());
+        assert!(s.remove_contact("npub1supersecretfriend").unwrap());
+        assert!(s.get_contact("npub1supersecretfriend").unwrap().is_none());
+    }
+
+    #[test]
+    fn legacy_plaintext_keyed_contact_is_readable_and_migrates() {
+        let (_d, s) = store();
+        let legacy = Contact {
+            npub: "npub1legacy".into(),
+            petname: "Old".into(),
+            relays: vec![],
+        };
+        // Simulate a row written by an older build (raw npub key).
+        s.put("contacts", &legacy.npub, &legacy).unwrap();
+        assert_eq!(s.get_contact("npub1legacy").unwrap(), Some(legacy.clone()));
+
+        // Upsert migrates it to the hashed key and drops the plaintext key.
+        s.upsert_contact(&legacy).unwrap();
+        let keys = s.keys("contacts").unwrap();
+        assert!(!keys.contains(&"npub1legacy".to_string()));
+        assert_eq!(s.list_contacts().unwrap().len(), 1);
+        assert_eq!(s.get_contact("npub1legacy").unwrap(), Some(legacy));
     }
 
     #[test]

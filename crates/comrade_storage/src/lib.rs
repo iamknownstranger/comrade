@@ -7,15 +7,25 @@
  * cached messages and CRDT ledger snapshots survive app restarts — without
  * ever writing plaintext to disk.
  *
- * Design:
+ * Design (envelope encryption / KEK pattern):
  *  • Embedded `sled` key-value store (pure Rust, no system dependencies).
  *  • Every stored *value* is sealed with AES-256-GCM (random 96-bit nonce per
- *    record, prepended to the ciphertext). Relays/disk see only opaque bytes.
- *  • The AES key is derived at runtime from a user PIN/password via Argon2id
- *    (memory-hard) over a per-store random salt. The key lives only in memory
- *    and is zeroized on drop. It is never written to disk.
- *  • A verification token (a known magic value, sealed with the derived key)
+ *    record, prepended to the ciphertext) under a random 32-byte **master
+ *    key**. Relays/disk see only opaque bytes.
+ *  • The master key itself is stored sealed under a **PIN key** derived from
+ *    the user's PIN/password via Argon2id (memory-hard) over a per-store
+ *    random salt. Keys live only in memory (zeroized on drop) — neither is
+ *    ever written to disk in plaintext.
+ *  • A verification token (a known magic value, sealed with the PIN key)
  *    lets `open` detect an incorrect PIN up front instead of failing later.
+ *  • Changing the PIN re-seals only the master key — a single atomic sled
+ *    batch on the meta tree — so an interrupted `change_pin` can never leave
+ *    the store half re-encrypted (values are never rewritten).
+ *
+ * Stores created before the master-key record existed sealed values directly
+ * under the PIN key; they open unchanged (the PIN key doubles as the master
+ * key) and are upgraded to the envelope layout atomically on their next
+ * `change_pin`.
  *
  * This composes standard, audited primitives (Argon2id + AES-256-GCM) in the
  * conventional envelope-encryption pattern — it does not invent new crypto.
@@ -47,10 +57,15 @@ pub use repository::{
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-/// Reserved sled tree holding the KDF salt and PIN-verification token.
+/// Reserved sled tree holding the KDF salt, PIN-verification token, and the
+/// sealed master key.
 const META_TREE: &str = "__comrade_meta__";
 const SALT_KEY: &str = "argon2_salt";
 const VERIFY_KEY: &str = "verify_token";
+/// The random master key (which seals all values), itself sealed under the
+/// PIN-derived key. Absent on legacy stores, whose values are sealed directly
+/// under the PIN key.
+const MASTER_KEY: &str = "master_key_sealed";
 /// Plaintext sealed under the derived key to verify the PIN on reopen.
 const VERIFY_MAGIC: &[u8] = b"comrade-storage-v1";
 
@@ -66,16 +81,18 @@ const NONCE_LEN: usize = 12;
 /// behind an `Arc` if it must cross threads.
 pub struct EncryptedStore {
     db: sled::Db,
-    /// 32-byte AES-256 key, zeroized on drop. Never persisted.
+    /// 32-byte AES-256 **value key** (the unsealed master key, or on legacy
+    /// stores the PIN-derived key). Zeroized on drop. Never persisted raw.
     key: Zeroizing<[u8; 32]>,
 }
 
 impl EncryptedStore {
     /// Open (or create) an encrypted store at `path`, unlocked with `pin`.
     ///
-    /// On first use a random salt + verification token are written. On
-    /// subsequent opens the PIN is verified against that token; a wrong PIN
-    /// returns [`StorageError::InvalidPin`] rather than silently corrupting data.
+    /// On first use a random salt, verification token, and sealed master key
+    /// are written. On subsequent opens the PIN is verified against that
+    /// token; a wrong PIN returns [`StorageError::InvalidPin`] rather than
+    /// silently corrupting data.
     pub fn open(path: impl AsRef<Path>, pin: &str) -> Result<Self, StorageError> {
         let db = sled::open(path)?;
         let meta = db.open_tree(META_TREE)?;
@@ -92,22 +109,48 @@ impl EncryptedStore {
             }
         };
 
-        let key = derive_key(pin.as_bytes(), &salt)?;
+        let pin_key = derive_key(pin.as_bytes(), &salt)?;
 
         // Verify PIN, or write the verification token on first use.
-        match meta.get(VERIFY_KEY)? {
+        let brand_new = match meta.get(VERIFY_KEY)? {
             Some(token) => {
-                let decrypted = aes_decrypt(&key, &token).map_err(|_| StorageError::InvalidPin)?;
+                let decrypted =
+                    aes_decrypt(&pin_key, &token).map_err(|_| StorageError::InvalidPin)?;
                 if decrypted != VERIFY_MAGIC {
                     return Err(StorageError::InvalidPin);
                 }
+                false
             }
             None => {
-                let token = aes_encrypt(&key, VERIFY_MAGIC)?;
+                let token = aes_encrypt(&pin_key, VERIFY_MAGIC)?;
                 meta.insert(VERIFY_KEY, token)?;
                 debug!("storage: wrote PIN verification token");
+                true
             }
-        }
+        };
+
+        // Resolve the value key (envelope pattern): unseal the stored master
+        // key; mint one for brand-new stores; fall back to the PIN key for
+        // legacy stores (upgraded atomically on their next `change_pin`).
+        let key = match meta.get(MASTER_KEY)? {
+            Some(sealed) => {
+                let raw = aes_decrypt(&pin_key, &sealed)
+                    .map_err(|_| StorageError::Corrupt("master key unseal failed".into()))?;
+                let arr: [u8; 32] = raw
+                    .try_into()
+                    .map_err(|_| StorageError::Corrupt("master key length".into()))?;
+                Zeroizing::new(arr)
+            }
+            None if brand_new => {
+                let mut master = Zeroizing::new([0u8; 32]);
+                rand::thread_rng().fill_bytes(master.as_mut());
+                meta.insert(MASTER_KEY, aes_encrypt(&pin_key, master.as_ref())?)?;
+                debug!("storage: minted new sealed master key");
+                master
+            }
+            // Legacy layout: values are sealed directly under the PIN key.
+            None => pin_key,
+        };
 
         db.flush()?;
         info!("storage: encrypted store unlocked");
@@ -198,42 +241,33 @@ impl EncryptedStore {
         Ok(())
     }
 
-    /// Re-key the entire store under a new PIN.
+    /// Re-key the store under a new PIN.
     ///
-    /// Every value across every user tree is decrypted with the current key and
-    /// re-sealed with a freshly derived key over a new salt, then the salt and
-    /// verification token are rewritten. After this returns, only `new_pin`
-    /// unlocks the store.
+    /// Only the master key is re-sealed — values are never rewritten — and
+    /// the salt, verification token, and sealed master key are replaced in a
+    /// **single atomic sled batch**, so an interruption (crash, power loss)
+    /// leaves the store fully openable with either the old or the new PIN,
+    /// never half re-encrypted. Legacy stores (values sealed directly under
+    /// the PIN key) are upgraded to the envelope layout by the same batch.
+    /// After this returns, only `new_pin` unlocks the store.
     pub fn change_pin(&mut self, new_pin: &str) -> Result<(), StorageError> {
-        // Derive the new key over a fresh salt.
+        // Derive the new PIN key over a fresh salt.
         let mut new_salt = vec![0u8; SALT_LEN];
         rand::thread_rng().fill_bytes(&mut new_salt);
-        let new_key = derive_key(new_pin.as_bytes(), &new_salt)?;
+        let new_pin_key = derive_key(new_pin.as_bytes(), &new_salt)?;
 
-        // Re-seal every value in every user tree.
-        for tree_name in self.db.tree_names() {
-            if tree_name.as_ref() == META_TREE.as_bytes()
-                || tree_name.as_ref() == b"__sled__default"
-            {
-                continue;
-            }
-            let tree = self.db.open_tree(&tree_name)?;
-            for item in tree.iter() {
-                let (k, sealed) = item?;
-                let plaintext = self.unseal(&sealed)?;
-                let resealed = aes_encrypt(&new_key, &plaintext)?;
-                tree.insert(k, resealed)?;
-            }
-        }
+        // The current value key becomes (or remains) the master key, sealed
+        // under the new PIN key. Values stay untouched.
+        let mut batch = sled::Batch::default();
+        batch.insert(SALT_KEY, new_salt);
+        batch.insert(VERIFY_KEY, aes_encrypt(&new_pin_key, VERIFY_MAGIC)?);
+        batch.insert(MASTER_KEY, aes_encrypt(&new_pin_key, self.key.as_ref())?);
 
-        // Rewrite salt + verification token under the new key.
         let meta = self.db.open_tree(META_TREE)?;
-        meta.insert(SALT_KEY, new_salt)?;
-        meta.insert(VERIFY_KEY, aes_encrypt(&new_key, VERIFY_MAGIC)?)?;
+        meta.apply_batch(batch)?;
         self.db.flush()?;
 
-        self.key = new_key;
-        info!("storage: PIN changed and store re-encrypted");
+        info!("storage: PIN changed (master key re-sealed atomically)");
         Ok(())
     }
 
@@ -402,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn change_pin_reencrypts_and_revokes_old_pin() {
+    fn change_pin_revokes_old_pin_without_rewriting_values() {
         let dir = TempDir::new().unwrap();
         {
             let mut store = EncryptedStore::open(dir.path(), "old-pin").unwrap();
@@ -422,5 +456,74 @@ mod tests {
         let store = EncryptedStore::open(dir.path(), "new-pin").unwrap();
         let got: Option<String> = store.get("identity", "self").unwrap();
         assert_eq!(got.as_deref(), Some("persistent-data"));
+    }
+
+    #[test]
+    fn change_pin_chained_thrice_keeps_data() {
+        let dir = TempDir::new().unwrap();
+        {
+            let mut store = EncryptedStore::open(dir.path(), "p0").unwrap();
+            store.put("t", "k", &"v").unwrap();
+            for pin in ["p1", "p2", "p3"] {
+                store.change_pin(pin).unwrap();
+            }
+            store.flush().unwrap();
+        }
+        for stale in ["p0", "p1", "p2"] {
+            assert!(matches!(
+                EncryptedStore::open(dir.path(), stale),
+                Err(StorageError::InvalidPin)
+            ));
+        }
+        let store = EncryptedStore::open(dir.path(), "p3").unwrap();
+        assert_eq!(store.get::<String>("t", "k").unwrap().as_deref(), Some("v"));
+    }
+
+    /// Stores written before the master-key record existed sealed values
+    /// directly under the PIN key. They must open unchanged, and `change_pin`
+    /// must upgrade them to the envelope layout without touching values.
+    #[test]
+    fn legacy_store_without_master_key_opens_and_upgrades() {
+        let dir = TempDir::new().unwrap();
+
+        // Hand-craft the legacy layout: salt + verify token + one value, all
+        // under the PIN-derived key, with no master-key record.
+        {
+            let db = sled::open(dir.path()).unwrap();
+            let meta = db.open_tree(META_TREE).unwrap();
+            let mut salt = vec![0u8; SALT_LEN];
+            rand::thread_rng().fill_bytes(&mut salt);
+            let pin_key = derive_key(b"legacy-pin", &salt).unwrap();
+            meta.insert(SALT_KEY, salt).unwrap();
+            meta.insert(VERIFY_KEY, aes_encrypt(&pin_key, VERIFY_MAGIC).unwrap())
+                .unwrap();
+            let tree = db.open_tree("identity").unwrap();
+            let plaintext = serde_json::to_vec(&"legacy-value").unwrap();
+            tree.insert("self", aes_encrypt(&pin_key, &plaintext).unwrap())
+                .unwrap();
+            db.flush().unwrap();
+        }
+
+        // Opens with the legacy PIN; value readable.
+        {
+            let mut store = EncryptedStore::open(dir.path(), "legacy-pin").unwrap();
+            let got: Option<String> = store.get("identity", "self").unwrap();
+            assert_eq!(got.as_deref(), Some("legacy-value"));
+
+            // Upgrade to envelope layout via change_pin.
+            store.change_pin("fresh-pin").unwrap();
+            store.flush().unwrap();
+        }
+
+        // Old PIN revoked; new PIN reads the (never rewritten) value.
+        assert!(matches!(
+            EncryptedStore::open(dir.path(), "legacy-pin"),
+            Err(StorageError::InvalidPin)
+        ));
+        let store = EncryptedStore::open(dir.path(), "fresh-pin").unwrap();
+        assert_eq!(
+            store.get::<String>("identity", "self").unwrap().as_deref(),
+            Some("legacy-value")
+        );
     }
 }

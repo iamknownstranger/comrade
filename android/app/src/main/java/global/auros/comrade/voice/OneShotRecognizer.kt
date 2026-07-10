@@ -67,6 +67,13 @@ class OneShotRecognizer(private val context: Context) {
         )
     }
 
+    /** Abort an in-flight capture: stop the mic, suppress the callbacks. */
+    fun cancel() {
+        mainHandler.removeCallbacksAndMessages(null)
+        finished = true
+        teardown()
+    }
+
     private fun extract(hypothesis: String?): String =
         hypothesis?.let { runCatching { JSONObject(it).optString("text") }.getOrNull() }
             ?.trim().orEmpty()

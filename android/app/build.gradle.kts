@@ -18,14 +18,18 @@ android {
 
     signingConfigs {
         // Release signing via environment variables — set these in CI secrets or local keystore.
-        // If SIGNING_KEY_ALIAS is absent the build falls back to the debug key (sideload-ready).
-        if (System.getenv("SIGNING_KEY_ALIAS") != null) {
+        // If SIGNING_KEY_ALIAS is absent OR BLANK the build falls back to the debug key
+        // (CI materialises unset secrets as empty strings, not nulls — a bare null
+        // check would create a broken release config and fail assembleRelease).
+        val signingAlias = System.getenv("SIGNING_KEY_ALIAS")?.takeIf { it.isNotBlank() }
+        if (signingAlias != null) {
             create("release") {
-                keyAlias = System.getenv("SIGNING_KEY_ALIAS")
+                keyAlias = signingAlias
                 keyPassword = System.getenv("SIGNING_KEY_PASSWORD")
                 storePassword = System.getenv("SIGNING_STORE_PASSWORD")
                 storeFile = rootProject.file(
-                    System.getenv("SIGNING_STORE_FILE") ?: "keystore.jks"
+                    System.getenv("SIGNING_STORE_FILE")?.takeIf { it.isNotBlank() }
+                        ?: "keystore.jks"
                 )
             }
         }

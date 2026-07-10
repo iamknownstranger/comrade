@@ -16,12 +16,13 @@ helplines (see [Companion](#companion--your-private-space)).
 | Engine | Protocol | Feature |
 |--------|----------|---------|
 | **Companion** | Local-only, encrypted | Anonymous **journal / vent / brainstorm / reflect** entries (typed or voice), supportive prompts, mood + streak insights, and offline crisis-signal safety with helpline resources |
+| **Pukar** | WebRTC + ephemeral Nostr signaling | **Audio/video calls** — SDP/ICE signaling as NIP-44-encrypted ephemeral events (kind 25050), consent-gated ringing, glare-safe call state machine, persistent call log + missed-call DMs |
 | **Sabha** | Nostr Kind-1 + NIP-10 | Public microblogging — the **Chitthi Feed**, with nested `ChitthiThread` reply trees |
 | **Vault** | Nostr Kind-4 + NIP-04 | End-to-end encrypted direct messages; `/pay` UPI intent detection |
 | **Saathi** | libp2p mDNS + Gossipsub | Off-grid local mesh — works without internet |
 | **Sakha/Sakhi** | Yrs CRDT + AES-256-GCM | Cryptographically isolated shared ledger for couples |
 | **Relay gossip** | NIP-65 | Dynamic relay discovery + outbox-model routing |
-| **Media** | NIP-94 / NIP-96 | Encrypted file staging + pluggable decentralized upload |
+| **Media** | NIP-94 / NIP-96 | Encrypted file staging + pluggable decentralized upload; **voice/video messages** with playback duration |
 | **Storage** | sled + Argon2id + AES-256-GCM | Encrypted-at-rest persistence (identity, ChitthiCache, VaultCache, LedgerState) unlocked by a passphrase |
 | **Voice** | Vosk (offline) + Android TTS | "Hey Comrade" wake word, tap-to-talk, and assist-app role — all on-device, no cloud |
 
@@ -167,6 +168,56 @@ hidden.
 
 Try it in the CLI (`cargo run`): `unlock <PIN>`, then `journal …`, `vent …`,
 `reflect`, `mood -1 tired`, `entries`, `insights`.
+
+## Calls & rich messaging — Pukar
+
+Telegram-style communication, decentralised and end-to-end private:
+
+- **Audio & video calls.** Media travels over **WebRTC**, owned by the platform
+  layer (Android `org.webrtc`; the Tauri webview's WebRTC on desktop). The Rust
+  core ([`comrade_core::pukar`](crates/comrade_core/src/pukar.rs)) owns
+  everything else: signaling, ringing, busy handling, timeouts, hang-up, and
+  the call log. Signaling messages (SDP offers/answers, trickle-ICE) are
+  **NIP-44 v2-encrypted** and sent as **ephemeral Nostr events** (kind 25050)
+  — relays forward but never store them.
+- **Consent before ringing.** Incoming calls are **deny-by-default**: only
+  saved contacts can make the device ring (the runtime installs the contact
+  set at unlock; apps can opt in to open calling via `set_call_policy`).
+  Offers from strangers are dropped silently — no busy reply, no presence
+  oracle, no harassment vector.
+- **Hardened state machine** (pure, clock-injected, 22 unit tests): one live
+  call at a time with auto-`busy`; deterministic **glare** resolution when two
+  people dial each other simultaneously (lower call-id wins on both sides);
+  ring (60 s) *and* connect (30 s) timeouts so a lost signal can never wedge
+  the call slot; signals accepted only when both the call id *and* the
+  sender's verified pubkey match; replay/freshness windows (−120 s/+10 s);
+  early ICE buffered and withheld until the callee accepts (no network probing
+  before consent); honest end causes (a call that never connected is never
+  logged "completed").
+- **Missed calls survive.** Ended calls persist to the encrypted store, and an
+  unanswered outgoing call leaves the callee a persistent E2E "missed call" DM
+  — ephemeral signaling alone would leave an offline callee no trace.
+- **Voice & video messages.** Recorded notes ride the existing NIP-94/96
+  encrypted media pipeline with a playback-`duration` tag
+  (`MediaEngine::share_voice_message` / `share_video_message`) — the key never
+  appears in the public event; it travels over the E2E channel.
+- **Try it offline:** `cargo run`, then `call` (full two-party signaling
+  handshake incl. the busy path) and `voicemsg` (record → encrypt → upload →
+  fetch → decrypt).
+
+The JNI bridge exposes `placeCall / answerCall / declineCall / endCall /
+sendCallIce / callConnected / activeCall / fetchCallLog`; call events arrive
+through the `pollEvents` stream as `{"type":"call","call":{...}}`.
+
+> **Known limitations, stated honestly.** (1) Media transport is not wired
+> yet: integrating `org.webrtc`'s `PeerConnection` on Android (with a
+> relay-only/TURN ICE policy so answering never leaks your IP) is the
+> remaining platform step. (2) An offline device cannot ring — ephemeral
+> events are not stored; a push wake-up (e.g. UnifiedPush) is future work,
+> the missed-call DM is the current fallback. (3) Relays can observe that
+> kind-25050 traffic flows from caller to callee (who-calls-whom + timing),
+> even though the payload is encrypted; hiding the sender needs NIP-59
+> gift-wrapping, which is future work.
 
 ## Voice — "Hey Comrade" (Android)
 

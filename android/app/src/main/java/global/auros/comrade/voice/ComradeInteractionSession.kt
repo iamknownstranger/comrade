@@ -14,12 +14,17 @@ class ComradeInteractionSession(context: Context) :
     android.service.voice.VoiceInteractionSession(context) {
 
     private val tts = ComradeTts(context)
-    private val recognizer = OneShotRecognizer(context)
     private val dispatcher = CommandDispatcher(ComradeCoreBackend())
     private val worker = Executors.newSingleThreadExecutor()
 
+    /** One-shot by design: a fresh recogniser per assist invocation. */
+    private var recognizer: OneShotRecognizer? = null
+
     override fun onShow(args: Bundle?, showFlags: Int) {
         super.onShow(args, showFlags)
+        recognizer?.cancel()
+        val recognizer = OneShotRecognizer(context)
+        this.recognizer = recognizer
         tts.speak("Yes?")
         recognizer.listen(
             onText = { text ->
@@ -44,6 +49,7 @@ class ComradeInteractionSession(context: Context) :
     }
 
     override fun onDestroy() {
+        recognizer?.cancel()
         worker.shutdownNow()
         tts.shutdown()
         super.onDestroy()

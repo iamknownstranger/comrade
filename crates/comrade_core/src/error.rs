@@ -25,6 +25,9 @@ pub enum CoreError {
     #[error("media: {0}")]
     Media(#[from] MediaError),
 
+    #[error("pukar: {0}")]
+    Pukar(#[from] PukarError),
+
     #[error("serialization: {0}")]
     Serde(#[from] serde_json::Error),
 
@@ -141,6 +144,29 @@ pub enum MediaError {
 
     #[error("http error: {0}")]
     Http(String),
+}
+
+// ── Pukar: real-time call signaling ──────────────────────────────────────────
+
+#[derive(Debug, Error)]
+pub enum PukarError {
+    #[error("a call is already in progress")]
+    AlreadyInCall,
+
+    #[error("no live call with id {0}")]
+    NoSuchCall(String),
+
+    #[error("invalid call state: {0}")]
+    InvalidState(String),
+
+    #[error("malformed signal payload: {0}")]
+    Malformed(String),
+
+    #[error("unsupported signal version: {0}")]
+    UnsupportedVersion(u64),
+
+    #[error("signaling transport error: {0}")]
+    Signaling(String),
 }
 
 // ── Milestone 5: Sakha/Sakhi CRDT ledger ────────────────────────────────────

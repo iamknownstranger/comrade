@@ -56,12 +56,16 @@ pub struct ChitthiThread {
 }
 
 impl ChitthiThread {
-    /// Total number of events across all levels.
+    /// Total number of events across all levels (iterative — safe on any
+    /// tree shape).
     pub fn len(&self) -> usize {
-        fn count(nodes: &[ChitthiNode]) -> usize {
-            nodes.iter().map(|n| 1 + count(&n.children)).sum()
+        let mut count = 0;
+        let mut stack: Vec<&ChitthiNode> = self.roots.iter().collect();
+        while let Some(node) = stack.pop() {
+            count += 1;
+            stack.extend(node.children.iter());
         }
-        count(&self.roots)
+        count
     }
 
     pub fn is_empty(&self) -> bool {
@@ -119,7 +123,14 @@ fn extract_e_tags(event: &Event) -> Vec<(String, String, String)> {
 }
 
 /// Determine the immediate parent event ID for a given event following NIP-10.
-fn resolve_parent_id(event: &Event) -> Option<String> {
+/// Public so the UI layer can thread live incoming events the same way the
+/// tree builder does.
+///
+/// Marker precedence: `reply` > `root`; `mention` tags never denote a parent
+/// (a quote-post that only mentions an event is NOT a reply to it). The
+/// positional last-tag fallback applies only to fully unmarked (deprecated
+/// NIP-10 style) tags.
+pub fn resolve_parent_id(event: &Event) -> Option<String> {
     let e_tags = extract_e_tags(event);
     if e_tags.is_empty() {
         return None;
@@ -130,7 +141,12 @@ fn resolve_parent_id(event: &Event) -> Option<String> {
     if let Some((id, _, _)) = e_tags.iter().find(|(_, _, m)| m == "root") {
         return Some(id.clone());
     }
-    e_tags.last().map(|(id, _, _)| id.clone())
+    // Positional fallback: only among unmarked tags. If every e-tag is a
+    // mention, the event is a quote/repost, not a reply.
+    e_tags
+        .iter()
+        .rfind(|(_, _, m)| m.is_empty())
+        .map(|(id, _, _)| id.clone())
 }
 
 // ── Tree builder ─────────────────────────────────────────────────────────────
@@ -166,6 +182,11 @@ pub fn build_chitthi_thread(events: Vec<Event>) -> ChitthiThread {
 
     root_ids.sort_by_key(|id| event_map[id].created_at);
 
+    /// Reply chains deeper than this are flattened: `build_node` recursion
+    /// depth equals thread depth, so an attacker-supplied ultra-deep chain
+    /// must not be able to overflow the stack.
+    const MAX_THREAD_DEPTH: usize = 256;
+
     fn build_node(
         id: &str,
         depth: usize,
@@ -174,6 +195,9 @@ pub fn build_chitthi_thread(events: Vec<Event>) -> ChitthiThread {
     ) -> ChitthiNode {
         let event = event_map[id].clone();
         let mut node = ChitthiNode::new(event, depth);
+        if depth >= MAX_THREAD_DEPTH {
+            return node;
+        }
         if let Some(child_ids) = children_of.get(id) {
             let mut sorted = child_ids.clone();
             sorted.sort_by_key(|cid| event_map[cid].created_at);
@@ -358,5 +382,44 @@ mod tests {
         let child = make_bare_event(Some(&orphan_id), Some("reply"));
         let tree = build_chitthi_thread(vec![child]);
         assert_eq!(tree.roots.len(), 1);
+    }
+
+    #[test]
+    fn mention_only_tags_do_not_make_a_reply() {
+        // A quote-post referencing another event with a "mention" marker must
+        // remain a root, not get threaded under the mentioned event.
+        let quoted = make_bare_event(None, None);
+        let quoting = make_bare_event(Some(&quoted.id.to_hex()), Some("mention"));
+        assert_eq!(resolve_parent_id(&quoting), None);
+        let tree = build_chitthi_thread(vec![quoted, quoting]);
+        assert_eq!(tree.roots.len(), 2);
+    }
+
+    #[test]
+    fn unmarked_positional_tag_still_resolves() {
+        let root = make_bare_event(None, None);
+        let child = make_bare_event(Some(&root.id.to_hex()), None); // bare e-tag
+        assert_eq!(resolve_parent_id(&child), Some(root.id.to_hex()));
+    }
+
+    #[test]
+    fn pathological_deep_chain_does_not_overflow_the_stack() {
+        // Build a 5000-deep reply chain; the tree must cap, not crash.
+        let keys = Keys::generate();
+        let mut events = Vec::new();
+        let mut parent: Option<String> = None;
+        for i in 0..5000 {
+            let mut builder = EventBuilder::new(Kind::TextNote, format!("d{i}"));
+            if let Some(pid) = &parent {
+                builder = builder.tag(Tag::parse(["e", pid, "", "reply"]).unwrap());
+            }
+            let ev = builder.sign_with_keys(&keys).unwrap();
+            parent = Some(ev.id.to_hex());
+            events.push(ev);
+        }
+        let tree = build_chitthi_thread(events);
+        assert_eq!(tree.roots.len(), 1);
+        // len() is iterative and must also survive.
+        assert!(tree.len() <= 5000);
     }
 }

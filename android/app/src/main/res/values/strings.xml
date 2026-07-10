@@ -2,6 +2,15 @@
 <resources>
     <string name="app_name">Comrade</string>
 
+    <!-- Vault unlock -->
+    <string name="unlock_section_title">Unlock</string>
+    <string name="unlock_rationale">Posting, calls, and journaling need your encrypted vault. Pick a passphrase on first use.</string>
+    <string name="unlock_passphrase">Passphrase</string>
+    <string name="unlock_button">Unlock vault</string>
+    <string name="unlock_busy">Unlocking…</string>
+    <string name="unlock_empty">Passphrase cannot be empty.</string>
+    <string name="unlock_done">Vault unlocked. Your public key:</string>
+
     <!-- Voice assistant -->
     <string name="voice_notification_title">Comrade voice</string>
     <string name="voice_channel_name">Voice assistant</string>

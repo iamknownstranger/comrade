@@ -21,6 +21,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import global.auros.comrade.ui.theme.ComradeTheme
@@ -30,6 +31,8 @@ import global.auros.comrade.voice.ComradeTts
 import global.auros.comrade.voice.OneShotRecognizer
 import global.auros.comrade.voice.VoiceCommand
 import global.auros.comrade.voice.WakeWordService
+import java.io.File
+import java.util.concurrent.Executors
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -96,6 +99,10 @@ fun ComradeApp() {
 
         item { HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp)) }
 
+        item { UnlockSection() }
+
+        item { HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp)) }
+
         item { VoiceSection() }
 
         item { HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp)) }
@@ -105,16 +112,113 @@ fun ComradeApp() {
 }
 
 @Composable
+fun UnlockSection() {
+    val context = LocalContext.current
+    var passphrase by remember { mutableStateOf("") }
+    var status by remember { mutableStateOf<String?>(null) }
+    var busy by remember { mutableStateOf(false) }
+    var unlockedNpub by remember { mutableStateOf<String?>(null) }
+    val executor = remember { Executors.newSingleThreadExecutor() }
+    DisposableEffect(Unit) { onDispose { executor.shutdownNow() } }
+
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text(
+            text = stringResource(R.string.unlock_section_title),
+            style = MaterialTheme.typography.titleSmall,
+            color = MaterialTheme.colorScheme.primary,
+        )
+        if (unlockedNpub == null) {
+            Text(
+                text = stringResource(R.string.unlock_rationale),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            OutlinedTextField(
+                value = passphrase,
+                onValueChange = { passphrase = it },
+                label = { Text(stringResource(R.string.unlock_passphrase)) },
+                singleLine = true,
+                visualTransformation = PasswordVisualTransformation(),
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Button(
+                onClick = {
+                    val pass = passphrase
+                    if (pass.isBlank()) {
+                        status = context.getString(R.string.unlock_empty)
+                        return@Button
+                    }
+                    busy = true
+                    status = null
+                    // unlockVault opens the store, derives keys (Argon2), and
+                    // dials relays — strictly off the main thread.
+                    executor.execute {
+                        val storePath = File(context.filesDir, "comrade-store").absolutePath
+                        val result = runCatching {
+                            ComradeCore.unlockVaultTyped(storePath, pass)
+                        }
+                        result
+                            .onSuccess { npub ->
+                                unlockedNpub = npub
+                                status = null
+                            }
+                            .onFailure { status = it.message }
+                        busy = false
+                    }
+                },
+                enabled = !busy,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(
+                    stringResource(
+                        if (busy) R.string.unlock_busy else R.string.unlock_button,
+                    ),
+                )
+            }
+        } else {
+            Text(
+                text = stringResource(R.string.unlock_done),
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Text(
+                text = unlockedNpub ?: "",
+                style = MaterialTheme.typography.bodySmall,
+                fontFamily = FontFamily.Monospace,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        status?.let {
+            Text(
+                it,
+                color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+    }
+}
+
+@Composable
 fun VoiceSection() {
     val context = LocalContext.current
-    var wakeEnabled by remember { mutableStateOf(false) }
+    // Initialise from the real service state — Compose state alone drifts
+    // whenever the activity is recreated while the service keeps running.
+    var wakeEnabled by remember { mutableStateOf(WakeWordService.isRunning) }
     var lastReply by remember { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
 
     // Voice helpers live for the lifetime of this screen.
     val tts = remember { ComradeTts(context) }
     val dispatcher = remember { CommandDispatcher(ComradeCoreBackend()) }
-    DisposableEffect(Unit) { onDispose { tts.shutdown() } }
+    val executor = remember { Executors.newSingleThreadExecutor() }
+    DisposableEffect(Unit) {
+        onDispose {
+            tts.shutdown()
+            executor.shutdownNow()
+        }
+    }
 
     fun runTapToTalk() {
         busy = true
@@ -125,11 +229,16 @@ fun VoiceSection() {
                     lastReply = "I didn't catch that."
                     busy = false
                 } else {
-                    val reply = runCatching { dispatcher.handle(VoiceCommand.parse(heard)) }
-                        .getOrElse { "Something went wrong." }
-                    lastReply = "“$heard” → $reply"
-                    tts.speak(reply)
-                    busy = false
+                    // Command dispatch crosses JNI into relay I/O — never on
+                    // the main thread (ANR).
+                    executor.execute {
+                        val reply =
+                            runCatching { dispatcher.handle(VoiceCommand.parse(heard)) }
+                                .getOrElse { "Something went wrong." }
+                        lastReply = "“$heard” → $reply"
+                        tts.speak(reply)
+                        busy = false
+                    }
                 }
             },
             onError = { lastReply = "Voice unavailable: ${it.message}"; busy = false },

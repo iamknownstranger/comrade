@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
 
 env:
@@ -39,5 +39,36 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: cargo clippy (nip96-http feature)
+        run: cargo clippy -p comrade_core --features nip96-http --all-targets -- -D warnings
+
       - name: cargo test
         run: cargo test --workspace --verbose
+
+  android-test:
+    name: Android Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: temurin
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: "8.5"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install platform
+        run: sdkmanager "platforms;android-34" "build-tools;34.0.0"
+
+      # JVM-only unit tests (voice grammar, dispatcher): no NDK/.so needed.
+      - name: Run Kotlin unit tests
+        working-directory: android
+        run: gradle testDebugUnitTest --no-daemon

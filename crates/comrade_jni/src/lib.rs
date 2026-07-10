@@ -42,16 +42,18 @@ fn jni_string(env: &mut JNIEnv, s: &JString) -> Option<String> {
 // ── Async runtime & shared state (M4) ─────────────────────────────────────────
 
 /// Process-global multi-thread Tokio runtime. Owned in a `OnceLock` so the
-/// spawned relay/feed loops survive across JNI calls. Returns `None` (rather
-/// than panicking) if the runtime cannot be built.
+/// spawned relay/feed loops survive across JNI calls. `get_or_init` makes the
+/// initialisation race-free (the old check-then-set could build two runtimes
+/// and silently drop one); a build failure panics inside `guard_json`, which
+/// converts it to an error JSON instead of crossing the FFI boundary.
 fn runtime() -> Option<&'static Runtime> {
     static RT: OnceLock<Runtime> = OnceLock::new();
-    if RT.get().is_none() {
-        if let Ok(rt) = Builder::new_multi_thread().enable_all().build() {
-            let _ = RT.set(rt);
-        }
-    }
-    RT.get()
+    Some(RT.get_or_init(|| {
+        Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build Tokio runtime")
+    }))
 }
 
 /// Process-global handle to the live [`ComradeRuntime`], mirroring the desktop's
@@ -219,6 +221,10 @@ pub extern "C" fn Java_global_auros_comrade_ComradeCore_unlockVault<'local>(
             Ok(json!({ "npub": id.npub, "has_secret": id.has_secret }))
         })
     });
+    // Arm the event receiver NOW: the loops just spawned, and a lazily
+    // created receiver (first pollEvent) would silently drop every event
+    // emitted before that first poll.
+    let _ = event_rx();
     to_jstring(&mut env, &out)
 }
 
@@ -244,11 +250,16 @@ pub extern "C" fn Java_global_auros_comrade_ComradeCore_broadcastChitthi<'local>
         let rt = runtime().ok_or_else(|| "failed to initialise async runtime".to_string())?;
         let state = state();
         rt.block_on(async move {
-            let guard = state.read().await;
-            let id = guard
-                .broadcast_chitthi(&content, reply_to)
-                .await
-                .map_err(|e| e.to_string())?;
+            // Hold the shared runtime lock only while BUILDING the task —
+            // holding it across the multi-second relay send would stall every
+            // other native call behind the fair RwLock.
+            let task = {
+                let guard = state.read().await;
+                guard
+                    .broadcast_chitthi_task(content, reply_to)
+                    .map_err(|e| e.to_string())?
+            };
+            let id = task.await.map_err(|e| e.to_string())?;
             Ok(json!({ "event_id": id }))
         })
     });
@@ -293,6 +304,217 @@ pub extern "C" fn Java_global_auros_comrade_ComradeCore_toggleWorkspace<'local>(
         let mut guard = state.blocking_write();
         let ws = guard.toggle_workspace(&target).map_err(|e| e.to_string())?;
         serde_json::to_value(ws).map_err(|e| e.to_string())
+    });
+    to_jstring(&mut env, &out)
+}
+
+// ── Pukar: audio/video calls ──────────────────────────────────────────────────
+
+/// Start an audio/video call. `peer` is an npub or hex pubkey; `sdpOffer`
+/// comes from the platform WebRTC stack. Returns the ringing session JSON
+/// (with `call_id`) or `{"error":"…"}`.
+#[no_mangle]
+pub extern "C" fn Java_global_auros_comrade_ComradeCore_placeCall<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    peer: JString<'local>,
+    video: jboolean,
+    sdp_offer: JString<'local>,
+) -> jstring {
+    let Some(peer) = jni_string(&mut env, &peer) else {
+        return to_jstring(
+            &mut env,
+            &json!({"error":"invalid peer argument"}).to_string(),
+        );
+    };
+    let Some(sdp_offer) = jni_string(&mut env, &sdp_offer) else {
+        return to_jstring(
+            &mut env,
+            &json!({"error":"invalid sdp argument"}).to_string(),
+        );
+    };
+    let video = video != 0;
+
+    let out = guard_json(move || {
+        let rt = runtime().ok_or_else(|| "failed to initialise async runtime".to_string())?;
+        let state = state();
+        rt.block_on(async move {
+            let guard = state.read().await;
+            let session = guard
+                .place_call(&peer, video, &sdp_offer)
+                .await
+                .map_err(|e| e.to_string())?;
+            serde_json::to_value(session).map_err(|e| e.to_string())
+        })
+    });
+    to_jstring(&mut env, &out)
+}
+
+/// Accept the ringing incoming call with the platform's SDP answer.
+#[no_mangle]
+pub extern "C" fn Java_global_auros_comrade_ComradeCore_answerCall<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    call_id: JString<'local>,
+    sdp_answer: JString<'local>,
+) -> jstring {
+    let (Some(call_id), Some(sdp_answer)) = (
+        jni_string(&mut env, &call_id),
+        jni_string(&mut env, &sdp_answer),
+    ) else {
+        return to_jstring(&mut env, &json!({"error":"invalid argument"}).to_string());
+    };
+    let out = guard_json(move || {
+        let rt = runtime().ok_or_else(|| "failed to initialise async runtime".to_string())?;
+        let state = state();
+        rt.block_on(async move {
+            let guard = state.read().await;
+            guard
+                .answer_call(&call_id, &sdp_answer)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!({ "ok": true }))
+        })
+    });
+    to_jstring(&mut env, &out)
+}
+
+/// Decline the ringing incoming call.
+#[no_mangle]
+pub extern "C" fn Java_global_auros_comrade_ComradeCore_declineCall<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    call_id: JString<'local>,
+) -> jstring {
+    let Some(call_id) = jni_string(&mut env, &call_id) else {
+        return to_jstring(&mut env, &json!({"error":"invalid argument"}).to_string());
+    };
+    let out = guard_json(move || {
+        let rt = runtime().ok_or_else(|| "failed to initialise async runtime".to_string())?;
+        let state = state();
+        rt.block_on(async move {
+            let task = {
+                let guard = state.read().await;
+                guard
+                    .decline_call_task(&call_id)
+                    .map_err(|e| e.to_string())?
+            };
+            task.await.map_err(|e| e.to_string())?;
+            Ok(json!({ "ok": true }))
+        })
+    });
+    to_jstring(&mut env, &out)
+}
+
+/// Hang up the active call (or cancel an outgoing ring).
+#[no_mangle]
+pub extern "C" fn Java_global_auros_comrade_ComradeCore_endCall<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    call_id: JString<'local>,
+) -> jstring {
+    let Some(call_id) = jni_string(&mut env, &call_id) else {
+        return to_jstring(&mut env, &json!({"error":"invalid argument"}).to_string());
+    };
+    let out = guard_json(move || {
+        let rt = runtime().ok_or_else(|| "failed to initialise async runtime".to_string())?;
+        let state = state();
+        rt.block_on(async move {
+            let task = {
+                let guard = state.read().await;
+                guard.end_call_task(&call_id).map_err(|e| e.to_string())?
+            };
+            task.await.map_err(|e| e.to_string())?;
+            Ok(json!({ "ok": true }))
+        })
+    });
+    to_jstring(&mut env, &out)
+}
+
+/// Forward a locally-gathered ICE candidate. `sdpMlineIndex < 0` means unset;
+/// an empty `sdpMid` means unset.
+#[no_mangle]
+pub extern "C" fn Java_global_auros_comrade_ComradeCore_sendCallIce<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    call_id: JString<'local>,
+    candidate: JString<'local>,
+    sdp_mid: JString<'local>,
+    sdp_mline_index: jint,
+) -> jstring {
+    let (Some(call_id), Some(candidate)) = (
+        jni_string(&mut env, &call_id),
+        jni_string(&mut env, &candidate),
+    ) else {
+        return to_jstring(&mut env, &json!({"error":"invalid argument"}).to_string());
+    };
+    let sdp_mid = jni_string(&mut env, &sdp_mid).filter(|s| !s.is_empty());
+    let mline = u32::try_from(sdp_mline_index).ok();
+
+    let out = guard_json(move || {
+        let rt = runtime().ok_or_else(|| "failed to initialise async runtime".to_string())?;
+        let state = state();
+        rt.block_on(async move {
+            let task = {
+                let guard = state.read().await;
+                guard
+                    .send_call_ice_task(&call_id, candidate, sdp_mid, mline)
+                    .map_err(|e| e.to_string())?
+            };
+            task.await.map_err(|e| e.to_string())?;
+            Ok(json!({ "ok": true }))
+        })
+    });
+    to_jstring(&mut env, &out)
+}
+
+/// Platform WebRTC reports the media path is up. Returns the active session.
+#[no_mangle]
+pub extern "C" fn Java_global_auros_comrade_ComradeCore_callConnected<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    call_id: JString<'local>,
+) -> jstring {
+    let Some(call_id) = jni_string(&mut env, &call_id) else {
+        return to_jstring(&mut env, &json!({"error":"invalid argument"}).to_string());
+    };
+    let out = guard_json(move || {
+        let state = state();
+        let guard = state.blocking_read();
+        let session = guard.call_connected(&call_id).map_err(|e| e.to_string())?;
+        serde_json::to_value(session).map_err(|e| e.to_string())
+    });
+    to_jstring(&mut env, &out)
+}
+
+/// The live call as JSON, or `{"none":true}` when idle.
+#[no_mangle]
+pub extern "C" fn Java_global_auros_comrade_ComradeCore_activeCall<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jstring {
+    let out = guard_json(move || {
+        let state = state();
+        let guard = state.blocking_read();
+        match guard.active_call().map_err(|e| e.to_string())? {
+            Some(session) => serde_json::to_value(session).map_err(|e| e.to_string()),
+            None => Ok(json!({ "none": true })),
+        }
+    });
+    to_jstring(&mut env, &out)
+}
+
+/// Ended calls (newest first) as a JSON array.
+#[no_mangle]
+pub extern "C" fn Java_global_auros_comrade_ComradeCore_fetchCallLog<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jstring {
+    let out = guard_json(move || {
+        let state = state();
+        let guard = state.blocking_read();
+        let log = guard.call_log().map_err(|e| e.to_string())?;
+        serde_json::to_value(log).map_err(|e| e.to_string())
     });
     to_jstring(&mut env, &out)
 }
@@ -362,15 +584,21 @@ pub extern "C" fn Java_global_auros_comrade_ComradeCore_fetchJournal<'local>(
 }
 
 /// On-device journaling insights (streak, momentum, mood trend, top tags).
+/// `tz_offset_secs` is the device's UTC offset (Kotlin:
+/// `TimeZone.getDefault().getOffset(now) / 1000`) so streaks roll at the
+/// user's midnight rather than UTC's.
 #[no_mangle]
 pub extern "C" fn Java_global_auros_comrade_ComradeCore_journalInsights<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
+    tz_offset_secs: jint,
 ) -> jstring {
     let out = guard_json(move || {
         let state = state();
         let guard = state.blocking_read();
-        let insights = guard.journal_insights().map_err(|e| e.to_string())?;
+        let insights = guard
+            .journal_insights(tz_offset_secs)
+            .map_err(|e| e.to_string())?;
         serde_json::to_value(insights).map_err(|e| e.to_string())
     });
     to_jstring(&mut env, &out)
@@ -398,8 +626,14 @@ pub extern "C" fn Java_global_auros_comrade_ComradeCore_companionPrompt<'local>(
     to_jstring(&mut env, &out)
 }
 
-/// Non-blocking drain of the next bridge event (incoming Chitthi / DM). Returns
-/// the event JSON, `{"empty":true}` when none is queued, or `{"error":"…"}`.
+/// Non-blocking drain of the next bridge event (incoming Chitthi / DM / call).
+/// Returns the event JSON, `{"empty":true}` when none is queued,
+/// `{"lagged":n}` when the consumer fell `n` events behind (recover missed
+/// data from the encrypted caches: timeline, DM history, call log),
+/// `{"closed":true}` when the bus is gone, or `{"error":"…"}`.
+///
+/// Prefer [`pollEvents`](Java_global_auros_comrade_ComradeCore_pollEvents):
+/// one event per JNI crossing cannot keep up with the public feed.
 #[no_mangle]
 pub extern "C" fn Java_global_auros_comrade_ComradeCore_pollEvent<'local>(
     mut env: JNIEnv<'local>,
@@ -415,6 +649,48 @@ pub extern "C" fn Java_global_auros_comrade_ComradeCore_pollEvent<'local>(
             Err(broadcast::error::TryRecvError::Lagged(n)) => Ok(json!({ "lagged": n })),
             Err(broadcast::error::TryRecvError::Closed) => Ok(json!({ "closed": true })),
         }
+    });
+    to_jstring(&mut env, &out)
+}
+
+/// Non-blocking batch drain of up to `max` bridge events in one JNI crossing.
+///
+/// Returns `{"events":[…], "lagged":n}` — `events` may be empty, and `lagged`
+/// (present only when > 0) is how many events were evicted because the
+/// consumer fell behind; recover missed data from the encrypted caches
+/// (timeline, DM history, call log). `{"closed":true}` when the bus is gone.
+#[no_mangle]
+pub extern "C" fn Java_global_auros_comrade_ComradeCore_pollEvents<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    max: jint,
+) -> jstring {
+    let out = guard_json(move || {
+        let max = max.clamp(1, 512) as usize;
+        let mut rx = event_rx()
+            .lock()
+            .map_err(|_| "event receiver lock poisoned".to_string())?;
+        let mut events = Vec::new();
+        let mut lagged: u64 = 0;
+        while events.len() < max {
+            match rx.try_recv() {
+                Ok(ev) => events.push(serde_json::to_value(ev).map_err(|e| e.to_string())?),
+                // Lagged: count the eviction and keep draining what's left.
+                Err(broadcast::error::TryRecvError::Lagged(n)) => lagged += n,
+                Err(broadcast::error::TryRecvError::Empty) => break,
+                Err(broadcast::error::TryRecvError::Closed) => {
+                    if events.is_empty() {
+                        return Ok(json!({ "closed": true }));
+                    }
+                    break;
+                }
+            }
+        }
+        let mut out = json!({ "events": events });
+        if lagged > 0 {
+            out["lagged"] = json!(lagged);
+        }
+        Ok(out)
     });
     to_jstring(&mut env, &out)
 }

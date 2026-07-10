@@ -20,7 +20,6 @@ import org.vosk.Model
 import org.vosk.Recognizer
 import org.vosk.android.RecognitionListener
 import org.vosk.android.SpeechService
-import org.vosk.android.StorageService
 import java.util.concurrent.Executors
 
 /**
@@ -46,15 +45,18 @@ class WakeWordService : Service(), RecognitionListener {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val worker = Executors.newSingleThreadExecutor()
 
-    private var model: Model? = null
     private var speechService: SpeechService? = null
     private var tts: ComradeTts? = null
     private lateinit var dispatcher: CommandDispatcher
+
+    /** Vosk callbacks are async: once destroyed, every late callback is a no-op. */
+    @Volatile private var destroyed = false
 
     @Volatile private var state = State.IDLE
     private val revertToIdle = Runnable {
         if (state == State.LISTENING) {
             state = State.IDLE
+            updateNotification(getString(R.string.voice_listening))
             tts?.speak("Never mind.")
         }
     }
@@ -73,6 +75,7 @@ class WakeWordService : Service(), RecognitionListener {
             }
         }
         startForegroundNotified(getString(R.string.voice_listening))
+        isRunning = true
         if (speechService == null) initRecogniser()
         return START_STICKY
     }
@@ -80,16 +83,12 @@ class WakeWordService : Service(), RecognitionListener {
     // ── Model + recogniser bootstrap ─────────────────────────────────────────
 
     private fun initRecogniser() {
-        // Unpack the Vosk model shipped under assets/model-en-us into filesDir.
-        StorageService.unpack(
+        // Shared, process-wide model (also used by tap-to-talk and the assist
+        // session): never unpacked twice, never closed by this service.
+        VoskModel.withModel(
             this,
-            MODEL_ASSET,
-            MODEL_TARGET,
-            { unpacked ->
-                model = unpacked
-                startRecognition(unpacked)
-            },
-            { exception ->
+            onReady = { model -> startRecognition(model) },
+            onError = { exception ->
                 Log.e(TAG, "Vosk model unavailable", exception)
                 updateNotification(getString(R.string.voice_model_missing))
             },
@@ -97,6 +96,9 @@ class WakeWordService : Service(), RecognitionListener {
     }
 
     private fun startRecognition(model: Model) {
+        // Model unpacking is async: the service may have been stopped, or a
+        // second start may have raced us — never run two recognisers.
+        if (destroyed || speechService != null) return
         runCatching {
             val recognizer = Recognizer(model, SAMPLE_RATE)
             val service = SpeechService(recognizer, SAMPLE_RATE)
@@ -117,6 +119,7 @@ class WakeWordService : Service(), RecognitionListener {
     override fun onFinalResult(hypothesis: String?) = onFinalised(hypothesis)
 
     private fun onFinalised(hypothesis: String?) {
+        if (destroyed) return
         val text = hypothesis?.let { runCatching { JSONObject(it).optString("text") }.getOrNull() }
             ?.trim().orEmpty()
         if (text.isEmpty()) return
@@ -154,12 +157,17 @@ class WakeWordService : Service(), RecognitionListener {
 
     /** Parse + execute a command off the audio thread, then speak the reply. */
     private fun dispatch(commandText: String) {
-        worker.execute {
-            val reply = runCatching {
-                dispatcher.handle(VoiceCommand.parse(commandText))
-            }.getOrElse { "Something went wrong. ${it.message ?: ""}".trim() }
-            tts?.speak(reply)
-        }
+        // The executor rejects work after shutdownNow() — a late Vosk callback
+        // arriving mid-destroy must not crash the process.
+        runCatching {
+            worker.execute {
+                if (destroyed) return@execute
+                val reply = runCatching {
+                    dispatcher.handle(VoiceCommand.parse(commandText))
+                }.getOrElse { "Something went wrong. ${it.message ?: ""}".trim() }
+                tts?.speak(reply)
+            }
+        }.onFailure { Log.w(TAG, "dispatch after shutdown ignored", it) }
     }
 
     // ── Foreground notification ──────────────────────────────────────────────
@@ -224,12 +232,15 @@ class WakeWordService : Service(), RecognitionListener {
     }
 
     override fun onDestroy() {
+        destroyed = true
+        isRunning = false
         mainHandler.removeCallbacks(revertToIdle)
+        // Stop the mic FIRST so no further recognition callbacks fire, then
+        // tear the rest down. The Vosk model itself is shared process-wide
+        // (VoskModel) and must NOT be closed here.
         speechService?.stop()
         speechService?.shutdown()
         speechService = null
-        model?.close()
-        model = null
         tts?.shutdown()
         tts = null
         worker.shutdownNow()
@@ -242,6 +253,10 @@ class WakeWordService : Service(), RecognitionListener {
         private const val TAG = "WakeWordService"
         const val ACTION_START = "global.auros.comrade.voice.START"
         const val ACTION_STOP = "global.auros.comrade.voice.STOP"
+
+        /** Live service state, so UI toggles reflect reality across restarts. */
+        @Volatile var isRunning: Boolean = false
+            private set
 
         private const val CHANNEL_ID = "comrade_voice"
         private const val NOTIFICATION_ID = 0x0C0DE

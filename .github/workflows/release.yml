@@ -77,7 +77,7 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-${{ matrix.target }}-
 
       - name: Install cargo-ndk
-        run: cargo install cargo-ndk --locked
+        run: cargo install cargo-ndk --version 3.5.4 --locked
 
       - name: Set up Android NDK
         uses: nttld/setup-ndk@v1
@@ -95,11 +95,16 @@ jobs:
             --output-dir android/app/src/main/jniLibs \
             -- build --release -p comrade_jni
 
+      # Upload from the jniLibs ROOT: the artifact must contain the
+      # `<abi>/libcomrade_jni.so` structure. Uploading the ABI directory's
+      # *contents* would flatten all three ABIs into one directory on the
+      # merged download and ship an APK with no loadable native library.
       - name: Upload JNI .so artifact
         uses: actions/upload-artifact@v4
         with:
           name: jniLibs-${{ matrix.abi }}
-          path: android/app/src/main/jniLibs/${{ matrix.abi }}/
+          path: android/app/src/main/jniLibs/
+          if-no-files-found: error
 
 # ── Job 3: Build the Android APK ──────────────────────────────────────────────
   build-apk:
@@ -139,12 +144,15 @@ jobs:
         # Set SIGNING_STORE_B64, SIGNING_KEY_ALIAS, SIGNING_KEY_PASSWORD,
         # and SIGNING_STORE_PASSWORD as repository secrets to get a
         # production-signed APK.  Without them the debug key is used.
-        if: ${{ env.SIGNING_STORE_B64 != '' }}
+        if: ${{ secrets.SIGNING_STORE_B64 != '' }}
         env:
           SIGNING_STORE_B64: ${{ secrets.SIGNING_STORE_B64 }}
         run: |
           echo "$SIGNING_STORE_B64" | base64 --decode \
             > android/app/keystore.jks
+
+      - name: Fetch offline voice model (Vosk)
+        run: ./scripts/fetch-vosk-model.sh
 
       - name: Build release APK
         working-directory: android

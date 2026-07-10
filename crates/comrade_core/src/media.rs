@@ -115,6 +115,8 @@ pub struct FileMetadata {
     /// SHA-256 of the original file — NIP-94 `ox`.
     pub original_sha256_hex: Option<String>,
     pub size: Option<usize>,
+    /// Playback length in seconds for voice/video messages (`duration` tag).
+    pub duration_secs: Option<u64>,
     /// Free-text caption (event content).
     pub caption: String,
 }
@@ -137,6 +139,9 @@ pub fn build_file_metadata_event(keys: &Keys, meta: &FileMetadata) -> Result<Eve
     }
     if let Some(size) = meta.size {
         push(&["size", &size.to_string()])?;
+    }
+    if let Some(duration) = meta.duration_secs {
+        push(&["duration", &duration.to_string()])?;
     }
 
     EventBuilder::new(Kind::from(FILE_METADATA_KIND), meta.caption.clone())
@@ -183,6 +188,7 @@ pub fn parse_file_metadata(event: &Event) -> Result<FileMetadata, MediaError> {
         sha256_hex,
         original_sha256_hex: map.get("ox").cloned(),
         size: map.get("size").and_then(|s| s.parse().ok()),
+        duration_secs: map.get("duration").and_then(|s| s.parse().ok()),
         caption: event.content.clone(),
     })
 }
@@ -260,6 +266,20 @@ impl<U: MediaUploader> MediaEngine<U> {
         caption: &str,
         key: &[u8; 32],
     ) -> Result<(Event, MediaSecret), MediaError> {
+        self.share_encrypted_timed(plaintext, mime_type, caption, key, None)
+            .await
+    }
+
+    /// Like [`share_encrypted`](Self::share_encrypted), additionally recording
+    /// a playback `duration` tag — the primitive behind voice/video messages.
+    pub async fn share_encrypted_timed(
+        &self,
+        plaintext: &[u8],
+        mime_type: &str,
+        caption: &str,
+        key: &[u8; 32],
+        duration_secs: Option<u64>,
+    ) -> Result<(Event, MediaSecret), MediaError> {
         let (media, secret) = encrypt_media(plaintext, mime_type, key)?;
         let receipt = self.uploader.upload(&media.ciphertext, mime_type).await?;
         info!(url = %receipt.url, size = media.size, "media: encrypted blob uploaded");
@@ -270,10 +290,37 @@ impl<U: MediaUploader> MediaEngine<U> {
             sha256_hex: media.sha256_hex,
             original_sha256_hex: Some(secret.original_sha256_hex.clone()),
             size: Some(media.size),
+            duration_secs,
             caption: caption.to_string(),
         };
         let event = build_file_metadata_event(&self.keys, &meta)?;
         Ok((event, secret))
+    }
+
+    /// Share a recorded **voice message** (Telegram-style audio note): the
+    /// audio bytes are encrypted and uploaded, and the NIP-94 event carries
+    /// the playback duration so clients can render the note before download.
+    pub async fn share_voice_message(
+        &self,
+        audio: &[u8],
+        mime_type: &str,
+        duration_secs: u64,
+        key: &[u8; 32],
+    ) -> Result<(Event, MediaSecret), MediaError> {
+        self.share_encrypted_timed(audio, mime_type, "", key, Some(duration_secs))
+            .await
+    }
+
+    /// Share a recorded **video message** (round-video style).
+    pub async fn share_video_message(
+        &self,
+        video: &[u8],
+        mime_type: &str,
+        duration_secs: u64,
+        key: &[u8; 32],
+    ) -> Result<(Event, MediaSecret), MediaError> {
+        self.share_encrypted_timed(video, mime_type, "", key, Some(duration_secs))
+            .await
     }
 }
 
@@ -308,10 +355,16 @@ mod nip96 {
         }
 
         /// Build the base64-encoded NIP-98 auth event for a POST to `url`.
-        fn auth_header(&self, url: &str) -> Result<String, MediaError> {
+        ///
+        /// The `payload` tag (SHA-256 of the request body) binds the token to
+        /// this exact upload — without it, an intercepted Authorization header
+        /// could be replayed with different content inside its time window.
+        fn auth_header(&self, url: &str, payload_sha256_hex: &str) -> Result<String, MediaError> {
             let tags = vec![
                 Tag::parse(["u", url]).map_err(|e| MediaError::Http(e.to_string()))?,
                 Tag::parse(["method", "POST"]).map_err(|e| MediaError::Http(e.to_string()))?,
+                Tag::parse(["payload", payload_sha256_hex])
+                    .map_err(|e| MediaError::Http(e.to_string()))?,
             ];
             let event = EventBuilder::new(Kind::from(HTTP_AUTH_KIND), "")
                 .tags(tags)
@@ -331,7 +384,7 @@ mod nip96 {
                 .map_err(|e| MediaError::Http(e.to_string()))?;
             let form = reqwest::multipart::Form::new().part("file", part);
 
-            let auth = self.auth_header(&self.api_url)?;
+            let auth = self.auth_header(&self.api_url, &sha256_hex(blob))?;
             let resp = self
                 .client
                 .post(&self.api_url)
@@ -433,12 +486,51 @@ mod tests {
             sha256_hex: "a".repeat(64),
             original_sha256_hex: Some("b".repeat(64)),
             size: Some(2048),
+            duration_secs: None,
             caption: "a sunset".into(),
         };
         let event = build_file_metadata_event(&keys, &meta).unwrap();
         assert_eq!(event.kind, Kind::from(FILE_METADATA_KIND));
         let parsed = parse_file_metadata(&event).unwrap();
         assert_eq!(parsed, meta);
+    }
+
+    #[test]
+    fn duration_tag_roundtrips_for_timed_media() {
+        let keys = Keys::generate();
+        let meta = FileMetadata {
+            url: "https://host.example/note".into(),
+            mime_type: "audio/ogg".into(),
+            sha256_hex: "a".repeat(64),
+            original_sha256_hex: None,
+            size: Some(512),
+            duration_secs: Some(42),
+            caption: String::new(),
+        };
+        let event = build_file_metadata_event(&keys, &meta).unwrap();
+        let parsed = parse_file_metadata(&event).unwrap();
+        assert_eq!(parsed.duration_secs, Some(42));
+    }
+
+    #[tokio::test]
+    async fn voice_message_pipeline_carries_duration_and_decrypts() {
+        let keys = Keys::generate();
+        let uploader = InMemoryUploader::new("https://blob.example");
+        let engine = MediaEngine::new(uploader.clone(), keys);
+
+        let audio = b"OggS pretend this is opus audio";
+        let (event, secret) = engine
+            .share_voice_message(audio, "audio/ogg", 17, &key())
+            .await
+            .unwrap();
+
+        let meta = parse_file_metadata(&event).unwrap();
+        assert_eq!(meta.mime_type, "audio/ogg");
+        assert_eq!(meta.duration_secs, Some(17));
+
+        // Recipient path: fetch the opaque blob, decrypt, verify.
+        let blob = uploader.fetch(&meta.url).await.expect("blob present");
+        assert_eq!(decrypt_media(&blob, &secret).unwrap(), audio);
     }
 
     #[test]

@@ -26,6 +26,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use comrade_core::pukar::{CallCallback, CallEvent, CallMedia, CallSession, PukarEngine};
 use comrade_core::sabha::{ChitthiCallback, SabhaEngine, DEFAULT_RELAYS};
 use comrade_core::sakha::SakhaEngine;
 use comrade_core::vault::{VaultCallback, VaultEngine, VaultMessage};
@@ -37,8 +38,10 @@ use tracing::warn;
 use crate::{IdentityDto, UiError, UiService, UpiIntentDto, WorkspaceDto};
 
 /// Capacity of the event bus. Slow consumers lag rather than block producers —
-/// the relay loop never stalls waiting on the webview.
-const EVENT_BUS_CAPACITY: usize = 256;
+/// the relay loop never stalls waiting on the webview. Sized for the public
+/// Kind-1 firehose sharing the bus with DMs and call signals; lagged consumers
+/// recover via the encrypted caches (timeline, DM history, call log).
+const EVENT_BUS_CAPACITY: usize = 1024;
 
 // ── Event DTOs (serialised across the IPC / FFI boundary) ────────────────────
 
@@ -64,7 +67,8 @@ impl ChitthiDto {
             author,
             content: event.content.clone(),
             created_at: event.created_at.as_secs(),
-            reply_to: None,
+            // Thread live events exactly like the cached path does.
+            reply_to: comrade_core::sabha::resolve_parent_id(event),
         }
     }
 
@@ -120,6 +124,9 @@ pub enum BridgeEvent {
     IncomingChitthi(ChitthiDto),
     /// A new encrypted DM (Kind-4) was decrypted in the Vault inbox.
     IncomingDirectMessage(DirectMessageDto),
+    /// A call state change (incoming ring, answer, ICE, connect, end). The
+    /// inner [`CallEvent`] is itself `type`-tagged for the frontend switch.
+    Call { call: CallEvent },
 }
 
 // ── Runtime ───────────────────────────────────────────────────────────────────
@@ -132,7 +139,11 @@ pub struct ComradeRuntime {
     sabha: Option<Arc<SabhaEngine>>,
     vault: Option<Arc<VaultEngine>>,
     sakha: Option<Arc<SakhaEngine>>,
+    pukar: Option<Arc<PukarEngine>>,
     events: broadcast::Sender<BridgeEvent>,
+    /// Set once [`spawn_event_loops`](Self::spawn_event_loops) has run, so a
+    /// second unlock can never spawn duplicate loops onto the same bus.
+    loops_started: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Default for ComradeRuntime {
@@ -149,7 +160,9 @@ impl ComradeRuntime {
             sabha: None,
             vault: None,
             sakha: None,
+            pukar: None,
             events,
+            loops_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -182,6 +195,14 @@ impl ComradeRuntime {
         path: impl AsRef<std::path::Path>,
         passphrase: &str,
     ) -> Result<IdentityDto, UiError> {
+        // Idempotent: a second unlock (e.g. Android activity re-creation)
+        // must not rebuild engines — the old ones own live subscriptions, and
+        // duplicates would double-deliver every event.
+        if self.is_vault_unlocked() {
+            if let Some(identity) = self.ui.current_identity() {
+                return Ok(identity);
+            }
+        }
         self.ui.unlock_store(path, passphrase)?;
 
         // Restore the saved identity, or seed and persist a fresh one so the
@@ -204,7 +225,7 @@ impl ComradeRuntime {
                 .map_err(|e| UiError::Engine(e.to_string()))?,
         ));
         self.vault = Some(Arc::new(
-            VaultEngine::new(&keys, relays)
+            VaultEngine::new(&keys, relays.clone())
                 .await
                 .map_err(|e| UiError::Engine(e.to_string()))?,
         ));
@@ -213,8 +234,42 @@ impl ComradeRuntime {
                 .await
                 .map_err(|e| UiError::Engine(e.to_string()))?,
         ));
+        let pukar = Arc::new(
+            PukarEngine::new(&keys, relays)
+                .await
+                .map_err(|e| UiError::Engine(e.to_string()))?,
+        );
+        // Incoming-call consent gate: ring only for saved contacts. An app
+        // that wants open inbound calling opts in via `set_call_policy`.
+        pukar.set_policy(self.contact_call_policy());
+        self.pukar = Some(pukar);
 
         Ok(identity)
+    }
+
+    /// Build the contacts-only [`CallPolicy`] from the store's saved contacts
+    /// (their pubkeys normalised to hex, matching signal sender identities).
+    ///
+    /// [`CallPolicy`]: comrade_core::pukar::CallPolicy
+    fn contact_call_policy(&self) -> comrade_core::pukar::CallPolicy {
+        let mut allowed = std::collections::HashSet::new();
+        if let Some(store) = self.ui.store_ref() {
+            if let Ok(contacts) = store.list_contacts() {
+                for c in contacts {
+                    if let Ok(pk) = nostr_sdk::PublicKey::parse(&c.npub) {
+                        allowed.insert(pk.to_hex());
+                    }
+                }
+            }
+        }
+        comrade_core::pukar::CallPolicy::ContactsOnly(allowed)
+    }
+
+    /// Override who may ring this device (see [`comrade_core::pukar::CallPolicy`]).
+    pub fn set_call_policy(&self, policy: comrade_core::pukar::CallPolicy) -> Result<(), UiError> {
+        let engine = self.pukar.as_ref().ok_or(UiError::VaultLocked)?;
+        engine.set_policy(policy);
+        Ok(())
     }
 
     /// Whether the vault has been unlocked and the engines built.
@@ -230,33 +285,145 @@ impl ComradeRuntime {
     ///
     /// All network and decryption work happens inside these spawned tasks,
     /// keeping the UI thread free (Architecture Quality Gate).
+    /// Every subscription is **supervised**: `handle_notifications` returns
+    /// `Ok(())` when its internal channel lags (a steady-state condition on
+    /// the public Kind-1 firehose), which previously killed the loop silently
+    /// — the app would just never receive another event until restart. Each
+    /// loop therefore reconnects and resubscribes with a backoff, forever.
     pub fn spawn_event_loops(&self) {
+        // A second unlock must never double-spawn onto the same bus.
+        if self
+            .loops_started
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            warn!("event loops already running; skipping duplicate spawn");
+            return;
+        }
+        const RESUBSCRIBE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(10);
+
         if let Some(sabha) = self.sabha.clone() {
             let tx = self.events.clone();
+            let store = self.ui.store_arc();
             tokio::spawn(async move {
                 sabha.connect().await;
-                let cb: ChitthiCallback = Box::new(move |event| {
-                    // A send error only means no subscribers are listening yet;
-                    // the relay loop must keep running regardless.
-                    let _ = tx.send(BridgeEvent::IncomingChitthi(ChitthiDto::from_event(&event)));
-                });
-                if let Err(e) = sabha.subscribe_chitthi_feed(3600, cb).await {
-                    warn!("sabha feed loop ended: {e}");
+                loop {
+                    let tx = tx.clone();
+                    let store = store.clone();
+                    let cb: ChitthiCallback = Box::new(move |event| {
+                        // Persist to the encrypted cache so the offline
+                        // timeline holds more than the user's own posts and
+                        // survives event-bus lag.
+                        if let Some(store) = &store {
+                            let row = comrade_storage::Chitthi {
+                                id: event.id.to_hex(),
+                                author_npub: event
+                                    .pubkey
+                                    .to_bech32()
+                                    .unwrap_or_else(|_| event.pubkey.to_hex()),
+                                content: event.content.clone(),
+                                created_at: event.created_at.as_secs(),
+                                reply_to: comrade_core::sabha::resolve_parent_id(&event),
+                            };
+                            if let Err(e) = store.cache_chitthi(&row) {
+                                warn!("failed to cache incoming chitthi: {e}");
+                            }
+                        }
+                        // A send error only means no subscribers are listening
+                        // yet; the relay loop must keep running regardless.
+                        let _ =
+                            tx.send(BridgeEvent::IncomingChitthi(ChitthiDto::from_event(&event)));
+                    });
+                    match sabha.subscribe_chitthi_feed(3600, cb).await {
+                        Ok(()) => warn!("sabha feed loop lagged out; resubscribing"),
+                        Err(e) => warn!("sabha feed loop ended: {e}; resubscribing"),
+                    }
+                    tokio::time::sleep(RESUBSCRIBE_BACKOFF).await;
                 }
             });
         }
 
         if let Some(vault) = self.vault.clone() {
             let tx = self.events.clone();
+            let store = self.ui.store_arc();
             tokio::spawn(async move {
                 vault.connect().await;
-                let cb: VaultCallback = Box::new(move |msg| {
-                    let _ = tx.send(BridgeEvent::IncomingDirectMessage(DirectMessageDto::from(
-                        msg,
-                    )));
-                });
-                if let Err(e) = vault.subscribe_inbox_with_callback(cb).await {
-                    warn!("vault inbox loop ended: {e}");
+                loop {
+                    let tx = tx.clone();
+                    let store = store.clone();
+                    let cb: VaultCallback = Box::new(move |msg| {
+                        // Persist decrypted DMs: if the UI misses the bus
+                        // event (lag, backgrounded app), the message is still
+                        // recoverable from the encrypted vault cache.
+                        if let Some(store) = &store {
+                            let row = comrade_storage::StoredMessage {
+                                id: msg.event_id.clone(),
+                                peer_npub: msg.sender_pubkey.clone(),
+                                content: msg.content.clone(),
+                                created_at: msg.created_at,
+                                outgoing: false,
+                            };
+                            if let Err(e) = store.save_message(&row) {
+                                warn!("failed to cache incoming DM: {e}");
+                            }
+                        }
+                        let _ = tx.send(BridgeEvent::IncomingDirectMessage(
+                            DirectMessageDto::from(msg),
+                        ));
+                    });
+                    match vault.subscribe_inbox_with_callback(cb).await {
+                        Ok(()) => warn!("vault inbox loop lagged out; resubscribing"),
+                        Err(e) => warn!("vault inbox loop ended: {e}; resubscribing"),
+                    }
+                    tokio::time::sleep(RESUBSCRIBE_BACKOFF).await;
+                }
+            });
+        }
+
+        if let Some(pukar) = self.pukar.clone() {
+            // Incoming signaling → state machine → UI events.
+            let tx = self.events.clone();
+            let store = self.ui.store_arc();
+            let engine = pukar.clone();
+            tokio::spawn(async move {
+                engine.connect().await;
+                loop {
+                    let tx = tx.clone();
+                    let store = store.clone();
+                    let cb: CallCallback = Box::new(move |call| {
+                        if let (Some(store), CallEvent::CallEnded { call }) = (&store, &call) {
+                            persist_call(store, call);
+                        }
+                        let _ = tx.send(BridgeEvent::Call { call });
+                    });
+                    match engine.subscribe_signals(cb).await {
+                        Ok(()) => warn!("pukar signaling loop lagged out; resubscribing"),
+                        Err(e) => warn!("pukar signaling loop ended: {e}; resubscribing"),
+                    }
+                    tokio::time::sleep(RESUBSCRIBE_BACKOFF).await;
+                }
+            });
+
+            // Ring/connect-timeout ticker (~5 s granularity suffices for a
+            // 60 s ring). Also leaves a persistent "missed call" DM for
+            // callees who were offline — ephemeral signals leave no trace.
+            let tx = self.events.clone();
+            let store = self.ui.store_arc();
+            let vault = self.vault.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+                loop {
+                    interval.tick().await;
+                    for call in pukar.tick().await {
+                        if let CallEvent::CallEnded { call: session } = &call {
+                            if let Some(store) = &store {
+                                persist_call(store, session);
+                            }
+                            if session.cause == Some(comrade_core::pukar::EndCause::NoAnswer) {
+                                notify_missed_call(vault.as_deref(), session).await;
+                            }
+                        }
+                        let _ = tx.send(BridgeEvent::Call { call });
+                    }
                 }
             });
         }
@@ -281,7 +448,28 @@ impl ComradeRuntime {
         content: &str,
         reply_to: Option<String>,
     ) -> Result<String, UiError> {
+        self.broadcast_chitthi_task(content.to_string(), reply_to)?
+            .await
+    }
+
+    /// Detached variant of [`broadcast_chitthi`](Self::broadcast_chitthi):
+    /// captures everything it needs up front and returns a `'static` future.
+    /// FFI bridges hold the shared `RwLock<ComradeRuntime>` only while
+    /// *building* the task, not across the multi-second relay send — holding
+    /// it that long stalls every other bridge call behind the fair lock.
+    pub fn broadcast_chitthi_task(
+        &self,
+        content: String,
+        reply_to: Option<String>,
+    ) -> Result<impl std::future::Future<Output = Result<String, UiError>> + Send + 'static, UiError>
+    {
         let sabha = self.sabha.clone().ok_or(UiError::VaultLocked)?;
+        let store = self.ui.store_arc();
+        let author_npub = self
+            .ui
+            .current_identity()
+            .map(|i| i.npub)
+            .unwrap_or_default();
 
         let parent = match reply_to.as_deref() {
             Some(hex) => Some(
@@ -291,31 +479,29 @@ impl ComradeRuntime {
             None => None,
         };
 
-        let id = sabha
-            .broadcast_chitthi_reply(content, parent)
-            .await
-            .map_err(|e| UiError::Engine(e.to_string()))?;
+        Ok(async move {
+            let id = sabha
+                .broadcast_chitthi_reply(&content, parent)
+                .await
+                .map_err(|e| UiError::Engine(e.to_string()))?;
 
-        // Best-effort: persist our own Chitthi to the encrypted cache so it
-        // shows up in the offline timeline immediately.
-        if let Some(store) = self.ui.store_ref() {
-            let row = comrade_storage::Chitthi {
-                id: id.to_hex(),
-                author_npub: self
-                    .ui
-                    .current_identity()
-                    .map(|i| i.npub)
-                    .unwrap_or_default(),
-                content: content.to_string(),
-                created_at: now_secs(),
-                reply_to,
-            };
-            if let Err(e) = store.cache_chitthi(&row).and_then(|()| store.flush()) {
-                warn!("failed to cache outgoing chitthi: {e}");
+            // Best-effort: persist our own Chitthi to the encrypted cache so
+            // it shows up in the offline timeline immediately.
+            if let Some(store) = store {
+                let row = comrade_storage::Chitthi {
+                    id: id.to_hex(),
+                    author_npub,
+                    content,
+                    created_at: now_secs(),
+                    reply_to,
+                };
+                if let Err(e) = store.cache_chitthi(&row).and_then(|()| store.flush()) {
+                    warn!("failed to cache outgoing chitthi: {e}");
+                }
             }
-        }
 
-        Ok(id.to_hex())
+            Ok(id.to_hex())
+        })
     }
 
     // ── Milestone 3: progressive-disclosure workspace controller ─────────────
@@ -373,6 +559,194 @@ impl ComradeRuntime {
         self.ui.is_store_unlocked()
     }
 
+    // ── Pukar: audio/video calls ─────────────────────────────────────────────
+
+    /// Start an audio (`video = false`) or video call to `peer` (npub or hex).
+    /// `sdp_offer` comes from the platform's WebRTC stack. Returns the session
+    /// (with its `call_id`) while the peer's device rings.
+    pub async fn place_call(
+        &self,
+        peer: &str,
+        video: bool,
+        sdp_offer: &str,
+    ) -> Result<CallSession, UiError> {
+        self.place_call_task(peer, video, sdp_offer.to_string())?
+            .await
+    }
+
+    /// Detached variant of [`place_call`](Self::place_call) — see
+    /// [`broadcast_chitthi_task`](Self::broadcast_chitthi_task) for why FFI
+    /// bridges must not hold the shared runtime lock across relay sends.
+    pub fn place_call_task(
+        &self,
+        peer: &str,
+        video: bool,
+        sdp_offer: String,
+    ) -> Result<
+        impl std::future::Future<Output = Result<CallSession, UiError>> + Send + 'static,
+        UiError,
+    > {
+        let engine = self.pukar.clone().ok_or(UiError::VaultLocked)?;
+        let peer = parse_pubkey(peer)?;
+        let media = if video {
+            CallMedia::Video
+        } else {
+            CallMedia::Audio
+        };
+        Ok(async move {
+            engine
+                .place_call(&peer, media, &sdp_offer)
+                .await
+                .map_err(|e| UiError::Engine(e.to_string()))
+        })
+    }
+
+    /// Accept the ringing incoming call with the platform's SDP answer. ICE
+    /// candidates withheld while ringing are flushed onto the event bus.
+    pub async fn answer_call(&self, call_id: &str, sdp_answer: &str) -> Result<(), UiError> {
+        self.answer_call_task(call_id, sdp_answer.to_string())?
+            .await
+    }
+
+    /// Detached variant of [`answer_call`](Self::answer_call).
+    pub fn answer_call_task(
+        &self,
+        call_id: &str,
+        sdp_answer: String,
+    ) -> Result<impl std::future::Future<Output = Result<(), UiError>> + Send + 'static, UiError>
+    {
+        let engine = self.pukar.clone().ok_or(UiError::VaultLocked)?;
+        let events = self.events.clone();
+        let call_id = call_id.to_string();
+        Ok(async move {
+            let flushed = engine
+                .accept(&call_id, &sdp_answer)
+                .await
+                .map_err(|e| UiError::Engine(e.to_string()))?;
+            for call in flushed {
+                let _ = events.send(BridgeEvent::Call { call });
+            }
+            Ok(())
+        })
+    }
+
+    /// Decline the ringing incoming call. Emits `CallEnded` so the UI can
+    /// drive its whole call screen from the event stream alone.
+    pub async fn decline_call(&self, call_id: &str) -> Result<(), UiError> {
+        self.decline_call_task(call_id)?.await
+    }
+
+    /// Detached variant of [`decline_call`](Self::decline_call).
+    pub fn decline_call_task(
+        &self,
+        call_id: &str,
+    ) -> Result<impl std::future::Future<Output = Result<(), UiError>> + Send + 'static, UiError>
+    {
+        let engine = self.pukar.clone().ok_or(UiError::VaultLocked)?;
+        let events = self.events.clone();
+        let store = self.ui.store_arc();
+        let call_id = call_id.to_string();
+        Ok(async move {
+            let ended = engine
+                .reject(&call_id)
+                .await
+                .map_err(|e| UiError::Engine(e.to_string()))?;
+            finish_call(store.as_deref(), &events, ended);
+            Ok(())
+        })
+    }
+
+    /// Hang up the active call (or cancel an outgoing ring). Emits `CallEnded`.
+    pub async fn end_call(&self, call_id: &str) -> Result<(), UiError> {
+        self.end_call_task(call_id)?.await
+    }
+
+    /// Detached variant of [`end_call`](Self::end_call).
+    pub fn end_call_task(
+        &self,
+        call_id: &str,
+    ) -> Result<impl std::future::Future<Output = Result<(), UiError>> + Send + 'static, UiError>
+    {
+        let engine = self.pukar.clone().ok_or(UiError::VaultLocked)?;
+        let events = self.events.clone();
+        let store = self.ui.store_arc();
+        let call_id = call_id.to_string();
+        Ok(async move {
+            let ended = engine
+                .hangup(&call_id)
+                .await
+                .map_err(|e| UiError::Engine(e.to_string()))?;
+            finish_call(store.as_deref(), &events, ended);
+            Ok(())
+        })
+    }
+
+    /// Forward a locally-gathered ICE candidate to the peer.
+    pub async fn send_call_ice(
+        &self,
+        call_id: &str,
+        candidate: &str,
+        sdp_mid: Option<String>,
+        sdp_mline_index: Option<u32>,
+    ) -> Result<(), UiError> {
+        self.send_call_ice_task(call_id, candidate.to_string(), sdp_mid, sdp_mline_index)?
+            .await
+    }
+
+    /// Detached variant of [`send_call_ice`](Self::send_call_ice).
+    pub fn send_call_ice_task(
+        &self,
+        call_id: &str,
+        candidate: String,
+        sdp_mid: Option<String>,
+        sdp_mline_index: Option<u32>,
+    ) -> Result<impl std::future::Future<Output = Result<(), UiError>> + Send + 'static, UiError>
+    {
+        let engine = self.pukar.clone().ok_or(UiError::VaultLocked)?;
+        let call_id = call_id.to_string();
+        Ok(async move {
+            engine
+                .send_ice(&call_id, &candidate, sdp_mid, sdp_mline_index)
+                .await
+                .map_err(|e| UiError::Engine(e.to_string()))
+        })
+    }
+
+    /// Platform WebRTC reports the media path is established. Emits
+    /// `CallConnected` so every frontend surface sees the transition.
+    pub fn call_connected(&self, call_id: &str) -> Result<CallSession, UiError> {
+        let engine = self.pukar.as_ref().ok_or(UiError::VaultLocked)?;
+        let session = engine
+            .mark_connected(call_id)
+            .map_err(|e| UiError::Engine(e.to_string()))?;
+        let _ = self.events.send(BridgeEvent::Call {
+            call: CallEvent::CallConnected {
+                call_id: session.call_id.clone(),
+            },
+        });
+        Ok(session)
+    }
+
+    /// The live call, if any.
+    pub fn active_call(&self) -> Result<Option<CallSession>, UiError> {
+        let engine = self.pukar.as_ref().ok_or(UiError::VaultLocked)?;
+        Ok(engine.active_call())
+    }
+
+    /// Ended calls, newest first. Read from the encrypted store (survives
+    /// restarts) when unlocked, falling back to the engine's in-memory log.
+    pub fn call_log(&self) -> Result<Vec<CallSession>, UiError> {
+        let engine = self.pukar.as_ref().ok_or(UiError::VaultLocked)?;
+        if let Some(store) = self.ui.store_ref() {
+            let mut log: Vec<CallSession> = store
+                .values(CALL_LOG_TREE)
+                .map_err(|e| UiError::Storage(e.to_string()))?;
+            log.sort_by(|a, b| b.ended_at.cmp(&a.ended_at));
+            return Ok(log);
+        }
+        Ok(engine.call_log())
+    }
+
     // ── Companion (private, anonymous journal) ───────────────────────────────
 
     /// A supportive prompt for the given companion mode.
@@ -409,9 +783,13 @@ impl ComradeRuntime {
         self.ui.delete_journal_entry(id)
     }
 
-    /// On-device journaling insights.
-    pub fn journal_insights(&self) -> Result<comrade_core::companion::Insights, UiError> {
-        self.ui.journal_insights()
+    /// On-device journaling insights. `tz_offset_secs` is the device's offset
+    /// from UTC so streaks roll at local midnight.
+    pub fn journal_insights(
+        &self,
+        tz_offset_secs: i32,
+    ) -> Result<comrade_core::companion::Insights, UiError> {
+        self.ui.journal_insights_at(tz_offset_secs)
     }
 }
 
@@ -420,6 +798,55 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or_default()
+}
+
+/// Parse an npub or hex public key into a [`nostr_sdk::PublicKey`].
+fn parse_pubkey(s: &str) -> Result<nostr_sdk::PublicKey, UiError> {
+    nostr_sdk::PublicKey::parse(s)
+        .map_err(|e| UiError::Engine(format!("invalid peer public key: {e}")))
+}
+
+/// sled tree persisting ended calls (encrypted like everything else).
+const CALL_LOG_TREE: &str = "call_log";
+
+/// Best-effort write of an ended call into the encrypted call log.
+fn persist_call(store: &comrade_storage::EncryptedStore, call: &CallSession) {
+    if let Err(e) = store.put(CALL_LOG_TREE, &call.call_id, call) {
+        warn!("failed to persist call log entry: {e}");
+    }
+}
+
+/// Persist an ended session and emit its `CallEnded` bus event.
+fn finish_call(
+    store: Option<&comrade_storage::EncryptedStore>,
+    events: &broadcast::Sender<BridgeEvent>,
+    ended: Option<CallSession>,
+) {
+    if let Some(session) = ended {
+        if let Some(store) = store {
+            persist_call(store, &session);
+        }
+        let _ = events.send(BridgeEvent::Call {
+            call: CallEvent::CallEnded { call: session },
+        });
+    }
+}
+
+/// Leave a persistent "missed call" DM for a callee who was offline while the
+/// ephemeral signaling rang out — otherwise they would never learn about it.
+async fn notify_missed_call(vault: Option<&VaultEngine>, session: &CallSession) {
+    let Some(vault) = vault else { return };
+    let Ok(peer) = nostr_sdk::PublicKey::from_hex(&session.peer) else {
+        return;
+    };
+    let kind = match session.media {
+        comrade_core::pukar::CallMedia::Audio => "audio",
+        comrade_core::pukar::CallMedia::Video => "video",
+    };
+    let note = format!("\u{1F4DE} Missed {kind} call \u{2014} I tried to reach you.");
+    if let Err(e) = vault.send_dm(&peer, &note).await {
+        warn!("failed to leave missed-call DM: {e}");
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -524,6 +951,51 @@ mod tests {
         assert_eq!(feed.len(), 1);
         assert_eq!(feed[0].id, "abc123");
         assert_eq!(feed[0].content, "Namaste");
+    }
+
+    #[tokio::test]
+    async fn call_commands_reject_gracefully_when_locked() {
+        let rt = ComradeRuntime::new();
+        assert!(matches!(
+            rt.place_call("npub1whatever", false, "sdp").await,
+            Err(UiError::VaultLocked)
+        ));
+        assert!(matches!(
+            rt.answer_call("c1", "sdp").await,
+            Err(UiError::VaultLocked)
+        ));
+        assert!(matches!(rt.end_call("c1").await, Err(UiError::VaultLocked)));
+        assert!(matches!(rt.call_log(), Err(UiError::VaultLocked)));
+        assert!(matches!(rt.active_call(), Err(UiError::VaultLocked)));
+    }
+
+    #[tokio::test]
+    async fn unlocked_runtime_rejects_bad_peer_key_and_has_empty_call_log() {
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+        rt.unlock_vault(dir.path(), "pin").await.unwrap();
+
+        // Garbage peer key is a typed error, not a panic.
+        let err = rt.place_call("not-a-key", true, "sdp").await;
+        assert!(matches!(err, Err(UiError::Engine(_))));
+
+        // No calls yet.
+        assert!(rt.call_log().unwrap().is_empty());
+        assert!(rt.active_call().unwrap().is_none());
+    }
+
+    #[test]
+    fn call_bridge_event_serialises_with_nested_type_tags() {
+        let event = BridgeEvent::Call {
+            call: CallEvent::CallConnected {
+                call_id: "abc".into(),
+            },
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"type\":\"call\""));
+        assert!(json.contains("\"type\":\"call_connected\""));
+        let back: BridgeEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, event);
     }
 
     #[tokio::test]

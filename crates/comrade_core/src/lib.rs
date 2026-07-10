@@ -10,12 +10,15 @@
  *   sakha   — Yrs CRDT shared ledger + DH-encrypted Nostr sync
  *   relay   — NIP-65 relay-list metadata + outbox-model routing
  *   media   — NIP-94/96 encrypted media staging + pluggable uploaders
+ *   pukar   — audio/video call signaling (WebRTC SDP/ICE over encrypted
+ *             ephemeral Nostr events) + pure call state machine
  */
 
 pub mod companion;
 pub mod crypto;
 pub mod error;
 pub mod media;
+pub mod pukar;
 pub mod relay;
 pub mod saathi;
 pub mod sabha;
