@@ -1,4 +1,4 @@
-package global.auros.comrade.voice
+package mullu.comrade.voice
 
 /**
  * Backend surface the voice layer needs. Abstracted behind an interface so the

@@ -1,4 +1,4 @@
-package global.auros.comrade
+package mullu.comrade
 
 import android.Manifest
 import android.content.Context
@@ -24,13 +24,13 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
-import global.auros.comrade.ui.theme.ComradeTheme
-import global.auros.comrade.voice.CommandDispatcher
-import global.auros.comrade.voice.ComradeCoreBackend
-import global.auros.comrade.voice.ComradeTts
-import global.auros.comrade.voice.OneShotRecognizer
-import global.auros.comrade.voice.VoiceCommand
-import global.auros.comrade.voice.WakeWordService
+import mullu.comrade.ui.theme.ComradeTheme
+import mullu.comrade.voice.CommandDispatcher
+import mullu.comrade.voice.ComradeCoreBackend
+import mullu.comrade.voice.ComradeTts
+import mullu.comrade.voice.OneShotRecognizer
+import mullu.comrade.voice.VoiceCommand
+import mullu.comrade.voice.WakeWordService
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {

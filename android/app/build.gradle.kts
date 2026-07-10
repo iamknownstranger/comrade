@@ -4,11 +4,11 @@ plugins {
 }
 
 android {
-    namespace = "global.auros.comrade"
+    namespace = "mullu.comrade"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "global.auros.comrade"
+        applicationId = "mullu.comrade"
         minSdk = 26
         targetSdk = 34
         versionCode = project.findProperty("versionCode")?.toString()?.toInt() ?: 1

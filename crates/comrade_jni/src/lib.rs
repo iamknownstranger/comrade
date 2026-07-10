@@ -5,7 +5,7 @@
  * Each function maps to a `native` method in `ComradeCore.kt`.
  *
  * Naming convention: Java_<package_underscored>_<ClassName>_<methodName>
- * Package: global.auros.comrade  →  global_auros_comrade
+ * Package: mullu.comrade  →  mullu_comrade
  */
 
 use std::panic::AssertUnwindSafe;
@@ -89,7 +89,7 @@ where
 
 /// Returns the comrade_jni crate version string (e.g. "0.1.0").
 #[no_mangle]
-pub extern "C" fn Java_global_auros_comrade_ComradeCore_getVersion<'local>(
+pub extern "C" fn Java_mullu_comrade_ComradeCore_getVersion<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> jstring {
@@ -106,7 +106,7 @@ pub extern "C" fn Java_global_auros_comrade_ComradeCore_getVersion<'local>(
 /// ```
 /// On error returns `{"error":"<message>"}`.
 #[no_mangle]
-pub extern "C" fn Java_global_auros_comrade_ComradeCore_generateKeypair<'local>(
+pub extern "C" fn Java_mullu_comrade_ComradeCore_generateKeypair<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> jstring {
@@ -121,7 +121,7 @@ pub extern "C" fn Java_global_auros_comrade_ComradeCore_generateKeypair<'local>(
 ///
 /// Returns the npub string on success, or `null` if the nsec is invalid.
 #[no_mangle]
-pub extern "C" fn Java_global_auros_comrade_ComradeCore_getNpubFromNsec<'local>(
+pub extern "C" fn Java_mullu_comrade_ComradeCore_getNpubFromNsec<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     nsec: JString<'local>,
@@ -143,7 +143,7 @@ pub extern "C" fn Java_global_auros_comrade_ComradeCore_getNpubFromNsec<'local>(
 /// `workspace` should be one of: "Base", "OffGridTravel", "CoupleSandboxSakha",
 /// "CoupleSandboxSakhi".  Returns `null` for unknown values.
 #[no_mangle]
-pub extern "C" fn Java_global_auros_comrade_ComradeCore_workspaceLabel<'local>(
+pub extern "C" fn Java_mullu_comrade_ComradeCore_workspaceLabel<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     workspace: JString<'local>,
@@ -167,7 +167,7 @@ pub extern "C" fn Java_global_auros_comrade_ComradeCore_workspaceLabel<'local>(
 /// ]
 /// ```
 #[no_mangle]
-pub extern "C" fn Java_global_auros_comrade_ComradeCore_allWorkspaces<'local>(
+pub extern "C" fn Java_mullu_comrade_ComradeCore_allWorkspaces<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> jstring {
@@ -187,7 +187,7 @@ pub extern "C" fn Java_global_auros_comrade_ComradeCore_allWorkspaces<'local>(
 /// Returns JSON `{"npub":"npub1…","has_secret":true}` on success or
 /// `{"error":"…"}` on failure. Never panics across the boundary.
 #[no_mangle]
-pub extern "C" fn Java_global_auros_comrade_ComradeCore_unlockVault<'local>(
+pub extern "C" fn Java_mullu_comrade_ComradeCore_unlockVault<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     path: JString<'local>,
@@ -225,7 +225,7 @@ pub extern "C" fn Java_global_auros_comrade_ComradeCore_unlockVault<'local>(
 /// Broadcast a Chitthi (optionally a reply). `replyTo` may be null/empty for a
 /// top-level post. Returns `{"event_id":"…"}` or `{"error":"…"}`.
 #[no_mangle]
-pub extern "C" fn Java_global_auros_comrade_ComradeCore_broadcastChitthi<'local>(
+pub extern "C" fn Java_mullu_comrade_ComradeCore_broadcastChitthi<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     content: JString<'local>,
@@ -258,7 +258,7 @@ pub extern "C" fn Java_global_auros_comrade_ComradeCore_broadcastChitthi<'local>
 /// Load the Sabha timeline from the encrypted offline cache. Returns a JSON
 /// array of Chitthis or `{"error":"…"}`.
 #[no_mangle]
-pub extern "C" fn Java_global_auros_comrade_ComradeCore_fetchSabhaTimeline<'local>(
+pub extern "C" fn Java_mullu_comrade_ComradeCore_fetchSabhaTimeline<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> jstring {
@@ -276,7 +276,7 @@ pub extern "C" fn Java_global_auros_comrade_ComradeCore_fetchSabhaTimeline<'loca
 /// Toggle the active workspace, enforcing the transition state machine.
 /// Returns the new workspace JSON or a typed `{"error":"…"}`.
 #[no_mangle]
-pub extern "C" fn Java_global_auros_comrade_ComradeCore_toggleWorkspace<'local>(
+pub extern "C" fn Java_mullu_comrade_ComradeCore_toggleWorkspace<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     target: JString<'local>,
@@ -300,7 +300,7 @@ pub extern "C" fn Java_global_auros_comrade_ComradeCore_toggleWorkspace<'local>(
 /// Non-blocking drain of the next bridge event (incoming Chitthi / DM). Returns
 /// the event JSON, `{"empty":true}` when none is queued, or `{"error":"…"}`.
 #[no_mangle]
-pub extern "C" fn Java_global_auros_comrade_ComradeCore_pollEvent<'local>(
+pub extern "C" fn Java_mullu_comrade_ComradeCore_pollEvent<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> jstring {

@@ -1,4 +1,4 @@
-package global.auros.comrade.voice
+package mullu.comrade.voice
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue

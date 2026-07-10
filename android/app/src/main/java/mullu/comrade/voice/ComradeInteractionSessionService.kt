@@ -1,4 +1,4 @@
-package global.auros.comrade.voice
+package mullu.comrade.voice
 
 import android.os.Bundle
 import android.service.voice.VoiceInteractionSession
