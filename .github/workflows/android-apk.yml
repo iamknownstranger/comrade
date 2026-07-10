@@ -1,0 +1,287 @@
+# Android APK — build the installable APK and smoke-test it on device lanes.
+#
+# Scope honesty:
+#   * GitHub-hosted runners have no physical phones. The "device" lanes are
+#     Android emulators (x86_64, KVM-accelerated): one uses the Pixel 9 AVD
+#     hardware profile on Android 15 (API 35), and one stands in for the
+#     Moto Edge 60 Pro — no Motorola AVD profile exists, so a similar
+#     6.7-inch profile on API 34 is used, which also keeps the app's
+#     targetSdk (34) runtime covered. Testing on real Pixel/Moto hardware
+#     requires a device farm (e.g. Firebase Test Lab), which needs a paid
+#     account + service-account secrets and is intentionally not wired here.
+#   * There is no iOS lane: an APK is an Android package and cannot run on
+#     an iPhone, and this repository has no iOS frontend.
+name: Android APK
+
+on:
+  push:
+    branches: ["**"]
+    # Emulator lanes are expensive (~10-15 min each); only run when something
+    # that can change the APK changes. `pull_request` is intentionally not a
+    # trigger — all PRs come from same-repo branches (see ci.yml).
+    paths:
+      - "android/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/android-apk.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: android-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ── Job 1: Cross-compile Rust → Android .so ─────────────────────────────────
+  # arm64-v8a is what real handsets run (Pixel 9, Moto Edge 60 Pro are both
+  # arm64), so the uploaded APK can be sideloaded onto them. x86_64 is what
+  # the emulator lanes below run.
+  build-jni:
+    name: Build JNI lib (${{ matrix.abi }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-linux-android
+            abi: arm64-v8a
+          - target: x86_64-linux-android
+            abi: x86_64
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust stable + Android target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-${{ matrix.target }}-
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Set up Android NDK
+        uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r27c
+          # local-cache:true can report an ndk-path whose toolchain lives one
+          # directory deeper (the r27c archive nests), which breaks cargo-ndk's
+          # linker lookup. Disable it and resolve the real path below.
+          local-cache: false
+
+      - name: Resolve NDK toolchain path
+        # cargo-ndk spawns $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/<host>/bin/clang.
+        # Confirm clang is actually there; if setup-ndk nested it, locate it and
+        # re-point ANDROID_NDK_HOME/ROOT. Fail fast with a clear message otherwise.
+        run: |
+          set -euo pipefail
+          host="linux-x86_64"
+          ndk="${{ steps.ndk.outputs.ndk-path }}"
+          echo "setup-ndk reported ndk-path: '$ndk'"
+          clang="$ndk/toolchains/llvm/prebuilt/$host/bin/clang"
+          if [ ! -x "$clang" ]; then
+            echo "clang not at '$clang'; searching under '$ndk' …"
+            found="$(find "$ndk" -type f -name clang -path "*/prebuilt/$host/bin/clang" 2>/dev/null | head -n1 || true)"
+            if [ -z "$found" ]; then
+              echo "::error::NDK clang not found under '$ndk' — setup-ndk layout unexpected."
+              exit 1
+            fi
+            ndk="${found%/toolchains/*}"
+            echo "resolved real NDK home: '$ndk'"
+          fi
+          echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ndk" >> "$GITHUB_ENV"
+          echo "Using NDK at: $ndk"
+
+      - name: Build comrade_jni for ${{ matrix.abi }}
+        run: |
+          cargo ndk \
+            --target ${{ matrix.target }} \
+            --output-dir android/app/src/main/jniLibs \
+            -- build --release -p comrade_jni
+
+      - name: Upload JNI .so artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-jniLibs-${{ matrix.abi }}
+          # Upload the jniLibs ROOT so the artifact keeps the <abi>/ folder —
+          # AGP needs jniLibs/<abi>/libcomrade_jni.so (see release.yml).
+          path: android/app/src/main/jniLibs/
+          if-no-files-found: error
+
+  # ── Job 2: Assemble the debug APK and publish it as a run artifact ──────────
+  # Debug-signed, so anyone can download it from the run and sideload it onto
+  # a real Pixel 9 / Moto Edge 60 Pro for manual testing.
+  build-apk:
+    name: Assemble debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: build-jni
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download JNI libs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: apk-jniLibs-*
+          merge-multiple: true
+          path: android/app/src/main/jniLibs/
+
+      - name: Verify JNI lib layout
+        run: |
+          ls -R android/app/src/main/jniLibs
+          for abi in arm64-v8a x86_64; do
+            test -f "android/app/src/main/jniLibs/$abi/libcomrade_jni.so" \
+              || { echo "::error::missing jniLibs/$abi/libcomrade_jni.so"; exit 1; }
+          done
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          java-version: "17"
+          distribution: temurin
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install build-tools & platform
+        run: sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Assemble debug APK
+        working-directory: android
+        run: ./gradlew assembleDebug --no-daemon
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: comrade-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+  # ── Job 3: Install + run the on-device smoke suite on emulator lanes ────────
+  # Runs `connectedDebugAndroidTest` (android/app/src/androidTest), which
+  # builds the APK + test APK, installs both on the emulator, and executes
+  # DeviceSmokeTest on the device: JNI .so loads, Rust crypto round-trips,
+  # MainActivity reaches RESUMED.
+  device-test:
+    name: Device test — ${{ matrix.device }} (API ${{ matrix.api-level }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: build-jni
+    strategy:
+      # One lane failing should not cancel the other — per-device signal is
+      # the whole point of the matrix.
+      fail-fast: false
+      matrix:
+        include:
+          # Google Pixel 9 — real AVD hardware profile, Android 15 (API 35),
+          # matching what the handset ships with.
+          - device: pixel-9
+            api-level: 35
+            preferred-profile: pixel_9
+            fallback-profile: pixel_7
+          # Moto Edge 60 Pro — no Motorola AVD profile exists, so approximate
+          # with a similar 6.7" class profile. Runs API 34 so the matrix covers
+          # the app's targetSdk runtime as well as Android 15 (Pixel lane),
+          # instead of testing the same OS twice.
+          - device: moto-edge-60-pro
+            api-level: 34
+            preferred-profile: pixel_6_pro
+            fallback-profile: pixel_6
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download JNI lib (x86_64)
+        # The emulator lanes run x86_64 images, so only that ABI is needed in
+        # the tree for the Gradle connected build.
+        uses: actions/download-artifact@v4
+        with:
+          name: apk-jniLibs-x86_64
+          path: android/app/src/main/jniLibs/
+
+      - name: Verify JNI lib layout
+        run: |
+          test -f android/app/src/main/jniLibs/x86_64/libcomrade_jni.so \
+            || { echo "::error::missing jniLibs/x86_64/libcomrade_jni.so"; exit 1; }
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          java-version: "17"
+          distribution: temurin
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Enable KVM group perms
+        # Hardware acceleration for the emulator on GitHub-hosted Linux runners.
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Pick AVD hardware profile
+        id: profile
+        # Device profiles come from the SDK's devices.xml; older cmdline-tools
+        # may lack the newest handsets (e.g. pixel_9). Fall back to a similar
+        # profile instead of failing the lane on avdmanager.
+        run: |
+          set -euo pipefail
+          preferred="${{ matrix.preferred-profile }}"
+          fallback="${{ matrix.fallback-profile }}"
+          if avdmanager list device -c | grep -qx "$preferred"; then
+            echo "profile=$preferred" >> "$GITHUB_OUTPUT"
+            echo "Using AVD profile: $preferred"
+          else
+            echo "::warning::AVD profile '$preferred' not available in this SDK; using '$fallback'"
+            echo "profile=$fallback" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run on-device smoke tests
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ matrix.api-level }}
+          arch: x86_64
+          target: google_apis
+          profile: ${{ steps.profile.outputs.profile }}
+          disable-animations: true
+          emulator-options: >-
+            -no-snapshot -no-window -gpu swiftshader_indirect -noaudio
+            -no-boot-anim -camera-back none
+          working-directory: android
+          script: ./gradlew connectedDebugAndroidTest --no-daemon
+
+      - name: Upload instrumentation reports
+        # Only worth the storage when something failed.
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: device-test-report-${{ matrix.device }}
+          path: |
+            android/app/build/reports/androidTests/
+            android/app/build/outputs/androidTest-results/
+          if-no-files-found: ignore
