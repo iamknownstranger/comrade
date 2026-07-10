@@ -99,7 +99,13 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: jniLibs-${{ matrix.abi }}
-          path: android/app/src/main/jniLibs/${{ matrix.abi }}/
+          # Upload the jniLibs ROOT so the artifact keeps the <abi>/ folder.
+          # Uploading .../jniLibs/<abi>/ directly strips the ABI directory and
+          # the merged download then puts every .so flat into jniLibs/, which
+          # AGP rejects ("... is not an ABI") at :app:mergeReleaseNativeLibs.
+          # Each matrix job builds exactly one target, so the root only
+          # contains this job's ABI folder.
+          path: android/app/src/main/jniLibs/
 
 # ── Job 3: Build the Android APK ──────────────────────────────────────────────
   build-apk:
@@ -116,6 +122,16 @@ jobs:
           pattern: jniLibs-*
           merge-multiple: true
           path: android/app/src/main/jniLibs/
+
+      - name: Verify JNI lib layout
+        # Fail fast with a readable error if the artifact handoff ever
+        # regresses — AGP needs jniLibs/<abi>/libcomrade_jni.so.
+        run: |
+          ls -R android/app/src/main/jniLibs
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            test -f "android/app/src/main/jniLibs/$abi/libcomrade_jni.so" \
+              || { echo "::error::missing jniLibs/$abi/libcomrade_jni.so"; exit 1; }
+          done
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
