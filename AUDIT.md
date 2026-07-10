@@ -16,6 +16,13 @@ The Rust workspace shows genuinely strong engineering discipline for a prototype
 
 ---
 
+## Decision log
+
+- **2026-07-10 (owner):** Proceed on the current Rust stack; framework maturity risk (sled 0.34, yrs pre-1.0, libp2p/nostr-sdk churn) is *accepted* on the assumption these mature over time. Consequences: D1's sled migration is **out of scope** (document in SECURITY.md instead); unmaintained transitive-dep advisories from these frameworks are ignored with reasons + exit conditions in `deny.toml`; the hickory-proto DNS advisories wait on a libp2p release against hickory ≥ 0.26.
+- **2026-07-10:** M0 executed (wrapper, CI lanes, cargo-deny gate, desktop lockfile, change_pin crash-safety regression test) plus M1 quick wins (M1-3 README truth pass, M1-6 backup/FLAG_SECURE/nsec masking, M1-7 checksum logic — pin pending network access, M1-8 CSP). MSRV measured from the lock: **rustc ≥ 1.88** (supersedes the sweep's 1.83 estimate in N3).
+
+---
+
 ## 2. Repo Map
 
 **Purpose.** "Comrade" — a privacy-first, cross-platform social client over Nostr, with an off-grid libp2p mesh mode and an encrypted couple's shared ledger. Hindi-derived nomenclature: public post = *Chitthi*, engines = *Sabha* (public feed), *Vault* (E2E DMs), *Saathi* (mesh), *Sakha/Sakhi* (couple CRDT ledger).

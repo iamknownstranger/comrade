@@ -467,10 +467,12 @@
     try {
       const ws = await safeInvoke("toggle_app_workspace", { target });
       applyWorkspace(ws);
+      // Honest copy: switching workspace only changes the app's mode today —
+      // engine disconnect/mesh start-up is not wired yet (AUDIT A1 / M2-4).
       showToast(
         want
-          ? "Off-Grid / Travel mode — public relays paused, Saathi mesh active"
-          : "Back on the public relays",
+          ? "Off-Grid / Travel mode enabled (relay disconnect not yet implemented)"
+          : "Back in Base mode",
         "info",
       );
     } catch {
