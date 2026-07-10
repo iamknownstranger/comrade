@@ -238,22 +238,28 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
-      - name: Pick AVD hardware profile
-        id: profile
-        # Device profiles come from the SDK's devices.xml; older cmdline-tools
-        # may lack the newest handsets (e.g. pixel_9). Fall back to a similar
-        # profile instead of failing the lane on avdmanager.
+      - name: Create AVD (${{ matrix.device }})
+        # The emulator-runner action bundles an older cmdline-tools whose
+        # devices.xml predates the Pixel 9 line, so letting it create the AVD
+        # fails with "No device found matching --device pixel_9". Create the
+        # AVD here with setup-android's current avdmanager instead; the action
+        # below reuses it (avd-name + force-avd-creation: false). The fallback
+        # profile covers runners whose SDK tools are older still.
         run: |
           set -euo pipefail
-          preferred="${{ matrix.preferred-profile }}"
-          fallback="${{ matrix.fallback-profile }}"
-          if avdmanager list device -c | grep -qx "$preferred"; then
-            echo "profile=$preferred" >> "$GITHUB_OUTPUT"
-            echo "Using AVD profile: $preferred"
-          else
-            echo "::warning::AVD profile '$preferred' not available in this SDK; using '$fallback'"
-            echo "profile=$fallback" >> "$GITHUB_OUTPUT"
+          sdkmanager --install \
+            "system-images;android-${{ matrix.api-level }};google_apis;x86_64" \
+            "platform-tools" "emulator" > /dev/null
+          profile="${{ matrix.preferred-profile }}"
+          if ! avdmanager list device -c | grep -qx "$profile"; then
+            echo "::warning::AVD profile '$profile' not available in this SDK; using '${{ matrix.fallback-profile }}'"
+            profile="${{ matrix.fallback-profile }}"
           fi
+          echo "Creating AVD 'test' with profile '$profile'"
+          echo "no" | avdmanager create avd --force --name test \
+            --package "system-images;android-${{ matrix.api-level }};google_apis;x86_64" \
+            --device "$profile"
+          avdmanager list avd
 
       - name: Run on-device smoke tests
         uses: reactivecircus/android-emulator-runner@v2
@@ -261,7 +267,8 @@ jobs:
           api-level: ${{ matrix.api-level }}
           arch: x86_64
           target: google_apis
-          profile: ${{ steps.profile.outputs.profile }}
+          avd-name: test
+          force-avd-creation: false
           disable-animations: true
           emulator-options: >-
             -no-snapshot -no-window -gpu swiftshader_indirect -noaudio
