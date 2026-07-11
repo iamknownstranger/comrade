@@ -91,6 +91,11 @@ fun ComradeApp() {
         if (core !is CoreState.Loading) activity?.reportFullyDrawn()
     }
 
+    // Every item carries a stable key: when the workspace cards stream in after
+    // the async core load, positions shift, and without keys LazyColumn would
+    // treat the sections below as brand-new items — disposing and recreating
+    // VoiceSection (tearing down a TTS engine mid-bind: "stop failed: TTS
+    // engine connection not fully set up") and KeygenSection on every launch.
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
@@ -99,7 +104,7 @@ fun ComradeApp() {
         verticalArrangement = Arrangement.spacedBy(12.dp),
         contentPadding = PaddingValues(vertical = 48.dp),
     ) {
-        item {
+        item(key = "header") {
             Text(
                 text = "Comrade",
                 style = MaterialTheme.typography.displayMedium,
@@ -122,9 +127,9 @@ fun ComradeApp() {
             )
         }
 
-        item { HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp)) }
+        item(key = "divider-1") { HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp)) }
 
-        item {
+        item(key = "workspaces-title") {
             Text(
                 text = "Workspaces",
                 style = MaterialTheme.typography.titleSmall,
@@ -134,7 +139,7 @@ fun ComradeApp() {
         }
 
         when (val c = core) {
-            CoreState.Loading -> item {
+            CoreState.Loading -> item(key = "workspaces-loading") {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.Center,
@@ -142,25 +147,25 @@ fun ComradeApp() {
                     CircularProgressIndicator(modifier = Modifier.size(24.dp))
                 }
             }
-            is CoreState.Failed -> item {
+            is CoreState.Failed -> item(key = "workspaces-error") {
                 Text(
                     text = c.reason,
                     color = MaterialTheme.colorScheme.error,
                     style = MaterialTheme.typography.bodySmall,
                 )
             }
-            is CoreState.Ready -> items(c.workspaces) { ws ->
+            is CoreState.Ready -> items(c.workspaces, key = { "workspace-${it.key}" }) { ws ->
                 WorkspaceCard(info = ws)
             }
         }
 
-        item { HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp)) }
+        item(key = "divider-2") { HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp)) }
 
-        item { VoiceSection() }
+        item(key = "voice") { VoiceSection() }
 
-        item { HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp)) }
+        item(key = "divider-3") { HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp)) }
 
-        item { KeygenSection() }
+        item(key = "keygen") { KeygenSection() }
     }
 }
 

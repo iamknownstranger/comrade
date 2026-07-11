@@ -50,8 +50,13 @@ class ComradeTts(context: Context) {
     }
 
     fun shutdown() {
-        ready.set(false)
-        engine?.stop()
+        // Only stop() a fully connected engine — calling it while the service
+        // is still binding logs "stop failed: TTS engine connection not fully
+        // set up". shutdown() alone is safe at any point and releases the
+        // half-open connection.
+        if (ready.getAndSet(false)) {
+            engine?.stop()
+        }
         engine?.shutdown()
         engine = null
     }
