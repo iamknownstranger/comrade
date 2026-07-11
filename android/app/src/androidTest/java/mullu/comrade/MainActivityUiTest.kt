@@ -40,12 +40,12 @@ class MainActivityUiTest {
         composeRule.onAllNodesWithTag(tag).fetchSemanticsNodes().isNotEmpty()
 
     /** The onboarding error line's text, when one is showing. */
-    private fun onboardingError(): String? =
-        composeRule.onAllNodesWithTag("onboarding-error").fetchSemanticsNodes()
-            .firstOrNull()
-            ?.config
-            ?.getOrNull(SemanticsProperties.Text)
-            ?.joinToString()
+    private fun onboardingError(): String? {
+        val node = composeRule.onAllNodesWithTag("onboarding-error").fetchSemanticsNodes()
+            .firstOrNull() ?: return null
+        if (!node.config.contains(SemanticsProperties.Text)) return null
+        return node.config[SemanticsProperties.Text].joinToString()
+    }
 
     private fun submitOnboarding() {
         // Typing opens the soft keyboard, which can cover the submit button and

@@ -626,7 +626,7 @@ impl ComradeRuntime {
                 last_outgoing: m.outgoing,
             })
             .collect();
-        list.sort_by(|a, b| b.last_at.cmp(&a.last_at));
+        list.sort_by_key(|c| std::cmp::Reverse(c.last_at));
         Ok(list)
     }
 
@@ -728,7 +728,7 @@ impl ComradeRuntime {
                 alias: c.petname,
             })
             .collect();
-        contacts.sort_by(|a, b| a.alias.to_lowercase().cmp(&b.alias.to_lowercase()));
+        contacts.sort_by_key(|c| c.alias.to_lowercase());
         Ok(contacts)
     }
 
