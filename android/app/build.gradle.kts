@@ -63,8 +63,11 @@ android {
 
     packaging {
         jniLibs {
-            // Prefer pre-built .so files over AAR-bundled ones
-            useLegacyPackaging = true
+            // Store .so files uncompressed in the APK so the linker mmaps them
+            // straight from the archive instead of extracting a copy at install
+            // time — faster cold start for the multi-MB Rust core and a smaller
+            // on-device footprint. (minSdk 26 comfortably supports this.)
+            useLegacyPackaging = false
         }
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
@@ -88,8 +91,12 @@ dependencies {
     debugImplementation("androidx.compose.ui:ui-tooling")
 
     testImplementation("junit:junit:4.13.2")
+    androidTestImplementation(composeBom)
     androidTestImplementation("androidx.test.ext:junit:1.1.5")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.5.1")
+    // Compose semantics assertions for the on-device startup test
+    // (MainActivityUiTest) — the workspace list now loads asynchronously.
+    androidTestImplementation("androidx.compose.ui:ui-test-junit4")
     // ActivityScenario (DeviceSmokeTest) + the AndroidJUnitRunner declared in
     // defaultConfig — neither is guaranteed transitively by ext:junit/espresso.
     androidTestImplementation("androidx.test:core:1.5.0")

@@ -16,6 +16,7 @@
     <!-- allowBackup=false: the encrypted vault must not leave the device via
          adb/cloud backup — an exported copy is an offline brute-force target. -->
     <application
+        android:name=".ComradeApplication"
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"

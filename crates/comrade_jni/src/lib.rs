@@ -98,6 +98,16 @@ pub extern "C" fn Java_mullu_comrade_ComradeCore_getVersion<'local>(
 
 // ── Key management ────────────────────────────────────────────────────────────
 
+/// Serialised keypair payload. Uses serde_json (not hand-rolled `format!`) so
+/// an error message containing quotes/backslashes still yields valid JSON that
+/// the Kotlin `JSONObject` parser can read.
+fn keypair_json() -> String {
+    match KeyProfile::generate() {
+        Ok(p) => json!({ "npub": p.npub, "nsec": p.nsec }).to_string(),
+        Err(e) => json!({ "error": e.to_string() }).to_string(),
+    }
+}
+
 /// Generate a new secp256k1 keypair.
 ///
 /// Returns a JSON object:
@@ -110,11 +120,7 @@ pub extern "C" fn Java_mullu_comrade_ComradeCore_generateKeypair<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> jstring {
-    let json = match KeyProfile::generate() {
-        Ok(p) => format!(r#"{{"npub":"{}","nsec":"{}"}}"#, p.npub, p.nsec),
-        Err(e) => format!(r#"{{"error":"{}"}}"#, e),
-    };
-    to_jstring(&mut env, &json)
+    to_jstring(&mut env, &keypair_json())
 }
 
 /// Derive the npub from an nsec Bech32 string.
@@ -171,12 +177,16 @@ pub extern "C" fn Java_mullu_comrade_ComradeCore_allWorkspaces<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> jstring {
-    let entries: Vec<String> = AppWorkspace::all()
+    to_jstring(&mut env, &workspaces_json())
+}
+
+/// Serialised workspace list, escaping-safe for any future label text.
+fn workspaces_json() -> String {
+    let entries: Vec<Value> = AppWorkspace::all()
         .iter()
-        .map(|ws| format!(r#"{{"key":"{}","label":"{}"}}"#, ws.key(), ws.label()))
+        .map(|ws| json!({ "key": ws.key(), "label": ws.label() }))
         .collect();
-    let json = format!("[{}]", entries.join(","));
-    to_jstring(&mut env, &json)
+    Value::Array(entries).to_string()
 }
 
 // ── IPC bridge: vault, timeline, broadcast, workspace, events (M4) ────────────
@@ -316,4 +326,58 @@ pub extern "C" fn Java_mullu_comrade_ComradeCore_pollEvent<'local>(
         }
     });
     to_jstring(&mut env, &out)
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+//
+// The `extern "C"` wrappers need a live JVM to exercise, but the payloads they
+// marshal are plain Rust — test those directly so a malformed JSON contract
+// (the bug class serde_json replaced `format!` to fix) fails in `cargo test`
+// rather than as a Kotlin JSONException on device.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keypair_json_is_valid_and_typed() {
+        let parsed: Value = serde_json::from_str(&keypair_json()).expect("valid JSON");
+        let obj = parsed.as_object().expect("JSON object");
+        assert!(
+            obj["npub"].as_str().unwrap().starts_with("npub1"),
+            "npub must be bech32: {parsed}"
+        );
+        assert!(obj["nsec"].as_str().unwrap().starts_with("nsec1"));
+        assert!(!obj.contains_key("error"));
+    }
+
+    #[test]
+    fn workspaces_json_lists_every_workspace_with_labels() {
+        let parsed: Value = serde_json::from_str(&workspaces_json()).expect("valid JSON");
+        let arr = parsed.as_array().expect("JSON array");
+        assert_eq!(arr.len(), AppWorkspace::all().len());
+        assert!(arr.iter().any(|w| w["key"] == "Base"));
+        for ws in arr {
+            assert!(!ws["key"].as_str().unwrap().is_empty());
+            assert!(!ws["label"].as_str().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn guard_json_serialises_errors_with_special_characters() {
+        // Regression for the hand-rolled `format!` JSON: an error containing
+        // quotes must still round-trip as parseable JSON.
+        let out = guard_json(|| Err(r#"boom: "quoted" \path"#.to_string()));
+        let parsed: Value = serde_json::from_str(&out).expect("valid JSON despite quotes");
+        assert_eq!(parsed["error"], r#"boom: "quoted" \path"#);
+    }
+
+    #[test]
+    fn guard_json_captures_panics_at_the_boundary() {
+        // The FFI safety net `unlock_vault`/`broadcastChitthi` rely on — this
+        // is also why the release profile must NOT set `panic = "abort"`.
+        let out = guard_json(|| panic!("do not cross the FFI boundary"));
+        let parsed: Value = serde_json::from_str(&out).expect("valid JSON");
+        assert!(parsed["error"].as_str().unwrap().contains("panic"));
+    }
 }

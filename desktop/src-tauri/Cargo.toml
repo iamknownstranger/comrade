@@ -15,6 +15,15 @@ description = "Comrade cross-platform desktop shell (Tauri 2)"
 name = "comrade_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+# Mirrors the root workspace's release profile (this crate is its own workspace
+# root, so it does not inherit it): faster-loading, smaller shipped binaries.
+# No `panic = "abort"` — comrade_ui is shared with the JNI bridge, which relies
+# on unwinding for its FFI panic guard.
+[profile.release]
+lto           = "thin"
+codegen-units = 1
+strip         = "debuginfo"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
