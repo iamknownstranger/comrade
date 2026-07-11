@@ -38,6 +38,20 @@ argon2         = "0.5"
 zeroize        = { version = "1",      features = ["derive"] }
 tempfile       = "3"
 
+# ── Release profile ─────────────────────────────────────────────────────────
+# Tuned for the artifacts users actually launch — above all the Android
+# `libcomrade_jni.so`, whose size directly sets how long System.loadLibrary
+# blocks at app startup. Thin LTO + a single codegen unit shrink the code
+# section across the statically linked tokio/nostr/libp2p graph, and stripping
+# debuginfo keeps local `cargo ndk` builds as lean as CI ones.
+# `panic = "abort"` is deliberately NOT set: the JNI bridge catches panics with
+# `catch_unwind` at the FFI boundary (comrade_jni::guard_json), which requires
+# unwinding to stay enabled.
+[profile.release]
+lto           = "thin"
+codegen-units = 1
+strip         = "debuginfo"
+
 # ── Root binary ─────────────────────────────────────────────────────────────
 [package]
 name    = "comrade"

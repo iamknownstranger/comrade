@@ -1,6 +1,7 @@
 package mullu.comrade
 
 import android.Manifest
+import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -24,6 +25,8 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import mullu.comrade.ui.theme.ComradeTheme
 import mullu.comrade.voice.CommandDispatcher
 import mullu.comrade.voice.ComradeCoreBackend
@@ -54,10 +57,39 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+/** Facts served by the native core, resolved off the main thread at startup. */
+sealed interface CoreState {
+    object Loading : CoreState
+    data class Ready(
+        val version: String,
+        val workspaces: List<ComradeCore.WorkspaceInfo>,
+    ) : CoreState
+    data class Failed(val reason: String) : CoreState
+}
+
 @Composable
 fun ComradeApp() {
-    val version = remember { ComradeCore.getVersion() }
-    val workspaces = remember { ComradeCore.workspaces() }
+    // The first ComradeCore touch pays for System.loadLibrary of the full Rust
+    // core (the Application warm-up usually races ahead of this, but must not
+    // be relied on). Resolving these on the IO dispatcher keeps the first
+    // frame free of JNI work — the shell renders immediately and the
+    // workspace list streams in when the native library is ready.
+    val core by produceState<CoreState>(initialValue = CoreState.Loading) {
+        value = withContext(Dispatchers.IO) {
+            runCatching {
+                CoreState.Ready(ComradeCore.getVersion(), ComradeCore.workspaces())
+            }.getOrElse {
+                CoreState.Failed(it.message ?: "native core unavailable")
+            }
+        }
+    }
+
+    // Startup observability: logs an ActivityTaskManager "Fully drawn" line
+    // (visible in logcat / Perfetto) once real content replaced the placeholder.
+    val activity = LocalContext.current as? Activity
+    LaunchedEffect(core is CoreState.Loading) {
+        if (core !is CoreState.Loading) activity?.reportFullyDrawn()
+    }
 
     LazyColumn(
         modifier = Modifier
@@ -79,7 +111,11 @@ fun ComradeApp() {
             )
             Spacer(Modifier.height(8.dp))
             Text(
-                text = "core v$version",
+                text = when (val c = core) {
+                    is CoreState.Ready -> "core v${c.version}"
+                    is CoreState.Failed -> "core unavailable"
+                    CoreState.Loading -> "starting core…"
+                },
                 style = MaterialTheme.typography.labelSmall,
                 fontFamily = FontFamily.Monospace,
                 color = MaterialTheme.colorScheme.outline,
@@ -97,8 +133,25 @@ fun ComradeApp() {
             )
         }
 
-        items(workspaces) { ws ->
-            WorkspaceCard(info = ws)
+        when (val c = core) {
+            CoreState.Loading -> item {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.Center,
+                ) {
+                    CircularProgressIndicator(modifier = Modifier.size(24.dp))
+                }
+            }
+            is CoreState.Failed -> item {
+                Text(
+                    text = c.reason,
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            is CoreState.Ready -> items(c.workspaces) { ws ->
+                WorkspaceCard(info = ws)
+            }
         }
 
         item { HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp)) }

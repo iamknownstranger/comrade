@@ -75,6 +75,27 @@ cargo run
 cargo test --workspace
 ```
 
+### Startup performance
+
+App startup is dominated by loading `libcomrade_jni.so` (the entire statically
+linked Rust core). Three things keep it fast — please don't regress them:
+
+- **Release profile** — the root `Cargo.toml` sets thin LTO, one codegen unit,
+  and debuginfo stripping for `[profile.release]`, which cuts the shipped `.so`
+  by ~20%. `panic = "abort"` must stay **off**: the JNI bridge's `guard_json`
+  panic guard needs unwinding.
+- **Off-main-thread load** — `ComradeApplication` warms the library on a
+  background thread at process start, and `ComradeApp` resolves core facts via
+  `produceState(Dispatchers.IO)`, so the first Compose frame never blocks on
+  JNI. `MainActivityUiTest` guards this on the CI device lanes.
+- **mmap-from-APK packaging** — `useLegacyPackaging = false` stores the `.so`
+  uncompressed so the linker maps it straight from the APK.
+
+Observability: logcat shows `ComradeApplication: comrade_jni v… warmed in N ms`
+and the framework's `Fully drawn` line (via `reportFullyDrawn()`); the Rust
+side traces `vault unlocked: store opened and engines built` with `kdf_ms` /
+`total_ms` fields on every unlock.
+
 ### Build the Android APK locally
 
 ```sh

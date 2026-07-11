@@ -183,10 +183,20 @@ impl UiService {
     // Encrypted store --------------------------------------------------------
 
     /// Open the encrypted store at `path` with `pin`.
+    ///
+    /// Argon2id key stretching makes this deliberately expensive — async
+    /// callers should open the store on a blocking thread and hand it over via
+    /// [`Self::attach_store`] instead (see `ComradeRuntime::unlock_vault`).
     pub fn unlock_store(&mut self, path: impl AsRef<Path>, pin: &str) -> Result<(), UiError> {
         let store = EncryptedStore::open(path, pin).map_err(|e| UiError::Storage(e.to_string()))?;
-        self.store = Some(Arc::new(store));
+        self.attach_store(store);
         Ok(())
+    }
+
+    /// Attach an already-opened encrypted store (e.g. one unlocked on a
+    /// blocking thread by the async bridge). Replaces any store held so far.
+    pub fn attach_store(&mut self, store: EncryptedStore) {
+        self.store = Some(Arc::new(store));
     }
 
     pub fn is_store_unlocked(&self) -> bool {

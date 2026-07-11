@@ -272,6 +272,10 @@ impl ComradeRuntime {
     /// so this never blocks on the network. Call [`spawn_event_loops`] afterward
     /// to connect and begin streaming.
     ///
+    /// The Argon2id key stretch + sled open run on Tokio's blocking pool, so a
+    /// deliberately slow KDF never stalls a reactor thread that other tasks
+    /// (relay loops, other IPC commands) are scheduled on.
+    ///
     /// [`spawn_event_loops`]: ComradeRuntime::spawn_event_loops
     pub async fn unlock_vault(
         &mut self,
@@ -286,7 +290,19 @@ impl ComradeRuntime {
             return self.ui.current_identity().ok_or(UiError::NoIdentity);
         }
 
-        self.ui.unlock_store(path, passphrase)?;
+        let started = std::time::Instant::now();
+        let store = {
+            let path = path.as_ref().to_path_buf();
+            let passphrase = passphrase.to_string();
+            tokio::task::spawn_blocking(move || {
+                comrade_storage::EncryptedStore::open(path, &passphrase)
+            })
+            .await
+            .map_err(|e| UiError::Storage(format!("unlock task failed: {e}")))?
+            .map_err(|e| UiError::Storage(e.to_string()))?
+        };
+        let kdf_ms = started.elapsed().as_millis() as u64;
+        self.ui.attach_store(store);
 
         // Restore the saved identity, or seed and persist a fresh one so the
         // engines always have keys to sign with.
@@ -317,6 +333,14 @@ impl ComradeRuntime {
                 .await
                 .map_err(|e| UiError::Engine(e.to_string()))?,
         ));
+
+        // Startup observability: the unlock is the gate every frontend waits
+        // on, so record how long its two phases actually took.
+        tracing::info!(
+            kdf_ms,
+            total_ms = started.elapsed().as_millis() as u64,
+            "vault unlocked: store opened and engines built"
+        );
 
         Ok(identity)
     }
