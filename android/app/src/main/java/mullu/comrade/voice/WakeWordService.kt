@@ -61,6 +61,7 @@ class WakeWordService : Service(), RecognitionListener {
 
     override fun onCreate() {
         super.onCreate()
+        isRunning = true
         dispatcher = CommandDispatcher(ComradeCoreBackend())
         tts = ComradeTts(this)
     }
@@ -224,6 +225,7 @@ class WakeWordService : Service(), RecognitionListener {
     }
 
     override fun onDestroy() {
+        isRunning = false
         mainHandler.removeCallbacks(revertToIdle)
         speechService?.stop()
         speechService?.shutdown()
@@ -242,6 +244,14 @@ class WakeWordService : Service(), RecognitionListener {
         private const val TAG = "WakeWordService"
         const val ACTION_START = "mullu.comrade.voice.START"
         const val ACTION_STOP = "mullu.comrade.voice.STOP"
+
+        /**
+         * Whether the service is currently alive. The Voice screen is disposed
+         * on every tab switch, so its toggle re-seeds from this instead of
+         * assuming the service died with the composable.
+         */
+        @Volatile var isRunning: Boolean = false
+            private set
 
         private const val CHANNEL_ID = "comrade_voice"
         private const val NOTIFICATION_ID = 0x0C0DE

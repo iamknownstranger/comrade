@@ -84,6 +84,11 @@ dependencies {
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
+    // Bottom-navigation glyphs (Home/Lock). material3 already exposes this
+    // transitively; declared explicitly because MainActivity imports it. The
+    // extended icon pack is deliberately NOT used — the one missing glyph
+    // (Mic) is inlined as a custom ImageVector instead.
+    implementation("androidx.compose.material:material-icons-core")
 
     // Offline "Hey Comrade" wake word + speech recognition (Apache-2.0, no cloud)
     implementation("com.alphacephei:vosk-android:0.3.47")

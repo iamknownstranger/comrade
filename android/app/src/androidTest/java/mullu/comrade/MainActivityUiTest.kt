@@ -4,6 +4,7 @@ import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.performClick
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import org.junit.Rule
 import org.junit.Test
@@ -39,5 +40,17 @@ class MainActivityUiTest {
             composeRule.onAllNodesWithText("core v", substring = true)
                 .fetchSemanticsNodes().isNotEmpty()
         }
+    }
+
+    @Test
+    fun bottomNavigationSwitchesSections() {
+        composeRule.onNodeWithText("Voice").performClick()
+        composeRule.onNodeWithText("Voice Assistant").assertIsDisplayed()
+
+        composeRule.onNodeWithText("Keys").performClick()
+        composeRule.onNodeWithText("Key Management").assertIsDisplayed()
+
+        composeRule.onNodeWithText("Home").performClick()
+        composeRule.onNodeWithText("Workspaces").assertIsDisplayed()
     }
 }
