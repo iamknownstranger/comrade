@@ -321,7 +321,7 @@ impl SabhaEngine {
             .into_values()
             .filter_map(|e| Metadata::from_json(&e.content).ok().map(|m| (e.pubkey, m)))
             .collect();
-        profiles.sort_by(|a, b| profile_sort_key(&a.1).cmp(&profile_sort_key(&b.1)));
+        profiles.sort_by_key(|a| profile_sort_key(&a.1));
         profiles.truncate(limit);
         Ok(profiles)
     }

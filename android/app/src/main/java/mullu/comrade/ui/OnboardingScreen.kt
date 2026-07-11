@@ -200,7 +200,12 @@ fun OnboardingScreen(
         }
 
         error?.let {
-            Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+            Text(
+                it,
+                color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.testTag("onboarding-error"),
+            )
         }
 
         Spacer(Modifier.height(4.dp))

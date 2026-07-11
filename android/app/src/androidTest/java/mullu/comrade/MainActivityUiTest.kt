@@ -1,12 +1,16 @@
 package mullu.comrade
 
+import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTextInput
+import androidx.test.espresso.Espresso
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import org.junit.Rule
 import org.junit.Test
@@ -32,6 +36,24 @@ class MainActivityUiTest {
     private fun hasText(text: String) =
         composeRule.onAllNodesWithText(text).fetchSemanticsNodes().isNotEmpty()
 
+    private fun hasTag(tag: String) =
+        composeRule.onAllNodesWithTag(tag).fetchSemanticsNodes().isNotEmpty()
+
+    /** The onboarding error line's text, when one is showing. */
+    private fun onboardingError(): String? =
+        composeRule.onAllNodesWithTag("onboarding-error").fetchSemanticsNodes()
+            .firstOrNull()
+            ?.config
+            ?.getOrNull(SemanticsProperties.Text)
+            ?.joinToString()
+
+    private fun submitOnboarding() {
+        // Typing opens the soft keyboard, which can cover the submit button and
+        // swallow the injected tap — close it and scroll the button into view.
+        Espresso.closeSoftKeyboard()
+        composeRule.onNodeWithTag("onboarding-submit").performScrollTo().performClick()
+    }
+
     @Test
     fun onboardingLeadsToChatsShell() {
         // The startup check resolves into one of three doors.
@@ -43,15 +65,25 @@ class MainActivityUiTest {
             composeRule.onNodeWithTag("onboarding-username").performTextInput(USERNAME)
             composeRule.onNodeWithTag("onboarding-passcode").performTextInput(PASSCODE)
             composeRule.onNodeWithTag("onboarding-confirm").performTextInput(PASSCODE)
-            composeRule.onNodeWithTag("onboarding-submit").performClick()
+            submitOnboarding()
         } else if (hasText("Unlock")) {
             composeRule.onNodeWithTag("onboarding-passcode").performTextInput(PASSCODE)
-            composeRule.onNodeWithTag("onboarding-submit").performClick()
+            submitOnboarding()
         }
 
         // Argon2 key stretching + engine construction run off the UI thread;
-        // the shell appears when the vault is open.
-        composeRule.waitUntil(timeoutMillis = 120_000) { hasText("Chats") }
+        // the shell appears when the vault is open. Fail fast — with the
+        // on-screen message — if onboarding surfaced an error instead.
+        composeRule.waitUntil(timeoutMillis = 120_000) {
+            hasText("Chats") || onboardingError() != null
+        }
+        onboardingError()?.let { message ->
+            throw AssertionError("Onboarding reported an error: $message")
+        }
+
+        // The IME may still be up from the onboarding fields; drop it so taps
+        // reach the bottom navigation.
+        Espresso.closeSoftKeyboard()
 
         // Bottom navigation reaches every section.
         composeRule.onNodeWithText("Feed").performClick()
