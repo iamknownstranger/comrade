@@ -52,46 +52,55 @@
       </div>
     </section>
 
-    <!-- ───────────────────────── Base Workspace shell ───────────────────────── -->
+    <!-- ───────────────────────── Base Workspace shell ─────────────────────────
+         Layout: a fixed left sidebar (brand · navigation · modes · status ·
+         identity) beside the main content area. The sidebar groups everything
+         that used to crowd the old single header row. ─────────────────────── -->
     <section id="screen-app" class="screen screen-app" hidden aria-label="Comrade workspace">
-      <header class="app-header">
-        <div class="header-left">
+      <aside class="sidebar" aria-label="Navigation and status">
+        <div class="sidebar-brand">
           <span class="brand-mark sm" aria-hidden="true">⬢</span>
           <span class="brand-name sm">Comrade</span>
           <span id="ws-badge" class="ws-badge">Base</span>
         </div>
 
-        <div class="header-right">
-          <span class="net-pills" aria-label="Network status">
-            <span id="pill-relays" class="pill" title="Public relays">relays</span>
-            <span id="pill-mesh" class="pill" title="Off-grid mesh">mesh</span>
-          </span>
+        <nav class="tabs" role="tablist" aria-orientation="vertical" aria-label="Sections">
+          <button class="tab is-active" data-tab="sabha" role="tab" aria-selected="true">
+            <span class="tab-icon" aria-hidden="true">📢</span>
+            <span class="tab-text">Sabha <span class="tab-sub">Public Chitthis</span></span>
+          </button>
+          <button class="tab" data-tab="vault" role="tab" aria-selected="false">
+            <span class="tab-icon" aria-hidden="true">🔐</span>
+            <span class="tab-text">Vault <span class="tab-sub">Encrypted DMs</span></span>
+          </button>
+        </nav>
+
+        <div class="sidebar-section" aria-label="Modes">
+          <div class="sidebar-heading">Modes</div>
 
           <label class="switch" title="Toggle Off-Grid / Travel mode">
             <input id="travel-toggle" type="checkbox" />
             <span class="switch-track"><span class="switch-thumb"></span></span>
-            <span class="switch-text">Travel</span>
+            <span class="switch-text">Off-Grid / Travel</span>
           </label>
 
-          <button id="partner-btn" class="icon-btn lg" title="Open Partner Portal" aria-label="Open Partner Portal">
-            🔒
+          <button id="partner-btn" class="btn btn-ghost partner-btn" title="Open Partner Portal">
+            <span aria-hidden="true">❤</span> Partner Portal
           </button>
+        </div>
+
+        <div class="sidebar-foot">
+          <span class="net-pills" aria-label="Network status">
+            <span id="pill-relays" class="pill" title="Public relays">relays</span>
+            <span id="pill-mesh" class="pill" title="Off-grid mesh">mesh</span>
+          </span>
 
           <button id="identity-chip" class="identity-chip" title="Click to copy your npub">
             <span class="dot"></span>
             <span id="identity-npub" class="mono">npub…</span>
           </button>
         </div>
-      </header>
-
-      <nav class="tabs" role="tablist">
-        <button class="tab is-active" data-tab="sabha" role="tab" aria-selected="true">
-          Sabha <span class="tab-sub">Public Chitthis</span>
-        </button>
-        <button class="tab" data-tab="vault" role="tab" aria-selected="false">
-          Vault <span class="tab-sub">Encrypted DMs</span>
-        </button>
-      </nav>
+      </aside>
 
       <main class="app-body">
         <!-- Sabha timeline -->

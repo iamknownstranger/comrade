@@ -25,13 +25,16 @@ workspace model:
 
 1. **Vault Door** — passphrase lock screen → `invoke('unlock_comrade_vault')`.
    Any passphrase forges/loads the encrypted vault and seeds an identity.
-2. **Base Workspace** — tabbed **Sabha** (compose + broadcast Chitthis, live
-   feed) and **Vault** (contacts + encrypted chat populated by the live DM
-   stream, with on-device UPI `/pay` detection and a 📎 **encrypted media**
-   attachment).
+2. **Base Workspace** — a fixed left sidebar (brand + workspace badge,
+   section navigation, mode controls, network status, identity chip) beside
+   the content area; it folds into a compact top bar below ~840 px. Sections:
+   **Sabha** (compose + broadcast Chitthis, live feed) and **Vault** (contacts
+   + encrypted chat populated by the live DM stream, with on-device UPI `/pay`
+   detection and a 📎 **encrypted media** attachment).
 3. **Modality overlays** — a **Travel / Off-Grid** switch and a **Partner
-   Portal** (cryptographic pairing → Couple Sandbox, which also offers encrypted
-   media sharing) that re-theme the whole app by swapping a `<body>` class.
+   Portal** button in the sidebar's Modes group (cryptographic pairing →
+   Couple Sandbox, which also offers encrypted media sharing) that re-theme
+   the whole app by swapping a `<body>` class.
 
 ### Encrypted media pipeline (NIP-94/96 · Blossom)
 
