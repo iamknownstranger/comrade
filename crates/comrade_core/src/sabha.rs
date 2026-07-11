@@ -261,6 +261,71 @@ impl SabhaEngine {
         Ok(*output.id())
     }
 
+    /// Publish (or update) our public profile — a Kind-0 metadata event carrying
+    /// the chosen @handle — so peers can discover this identity by name.
+    ///
+    /// Handles are display names, not unique identifiers: the network cannot
+    /// stop two people from publishing the same handle. Identity remains the
+    /// keypair; callers must always bind contacts to the npub, never the handle.
+    pub async fn publish_profile(
+        &self,
+        name: &str,
+        about: Option<&str>,
+    ) -> Result<EventId, SabhaError> {
+        let mut metadata = Metadata::new().name(name).display_name(name);
+        if let Some(about) = about {
+            metadata = metadata.about(about);
+        }
+        let output = self
+            .client
+            .send_event_builder(EventBuilder::metadata(&metadata))
+            .await
+            .map_err(|e| SabhaError::RelayError(e.to_string()))?;
+        info!(event_id = %output.id(), name, "profile published");
+        Ok(*output.id())
+    }
+
+    /// Best-effort people search: query Kind-0 profiles via NIP-50 full-text
+    /// search on whichever connected relays support it (relay.nostr.band in the
+    /// default set does; the rest silently return nothing).
+    ///
+    /// Returns at most `limit` profiles, newest metadata per author, as
+    /// `(author, metadata)` pairs. An empty result is normal — it means no
+    /// search-capable relay knew the handle, not that the person doesn't exist.
+    pub async fn search_profiles(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<(PublicKey, Metadata)>, SabhaError> {
+        let filter = Filter::new()
+            .kind(Kind::Metadata)
+            .search(query)
+            .limit(limit * 3); // headroom: duplicates collapse per author below
+        let events = self
+            .client
+            .fetch_events(filter, std::time::Duration::from_secs(8))
+            .await
+            .map_err(|e| SabhaError::RelayError(e.to_string()))?;
+
+        // Keep only the newest Kind-0 per author.
+        let mut newest: HashMap<PublicKey, Event> = HashMap::new();
+        for event in events.into_iter() {
+            match newest.get(&event.pubkey) {
+                Some(existing) if existing.created_at >= event.created_at => {}
+                _ => {
+                    newest.insert(event.pubkey, event);
+                }
+            }
+        }
+        let mut profiles: Vec<(PublicKey, Metadata)> = newest
+            .into_values()
+            .filter_map(|e| Metadata::from_json(&e.content).ok().map(|m| (e.pubkey, m)))
+            .collect();
+        profiles.sort_by(|a, b| profile_sort_key(&a.1).cmp(&profile_sort_key(&b.1)));
+        profiles.truncate(limit);
+        Ok(profiles)
+    }
+
     /// Subscribe to the Chitthi feed (Kind-1 events) since `since_secs` seconds ago.
     pub async fn subscribe_chitthi_feed(
         &self,
@@ -295,6 +360,11 @@ impl SabhaEngine {
             .await
             .map_err(|e| SabhaError::SubscriptionError(e.to_string()))
     }
+}
+
+/// Stable ordering for search results: named profiles first, then by name.
+fn profile_sort_key(m: &Metadata) -> String {
+    m.name.clone().unwrap_or_else(|| "\u{10FFFF}".to_string())
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

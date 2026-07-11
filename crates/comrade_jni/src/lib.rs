@@ -307,6 +307,183 @@ pub extern "C" fn Java_mullu_comrade_ComradeCore_toggleWorkspace<'local>(
     to_jstring(&mut env, &out)
 }
 
+// ── Chat, profile & contacts (Telegram-like flow) ────────────────────────────
+
+/// Send an E2E-encrypted DM to `target` (npub or hex). Persists to the offline
+/// history. Returns the stored message JSON or `{"error":"…"}`.
+#[no_mangle]
+pub extern "C" fn Java_mullu_comrade_ComradeCore_sendDm<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    target: JString<'local>,
+    content: JString<'local>,
+) -> jstring {
+    let (Some(target), Some(content)) = (
+        jni_string(&mut env, &target),
+        jni_string(&mut env, &content),
+    ) else {
+        return to_jstring(&mut env, &json!({"error":"invalid arguments"}).to_string());
+    };
+    let out = guard_json(move || {
+        let rt = runtime().ok_or_else(|| "failed to initialise async runtime".to_string())?;
+        let state = state();
+        rt.block_on(async move {
+            let guard = state.read().await;
+            let msg = guard
+                .send_dm(&target, &content)
+                .await
+                .map_err(|e| e.to_string())?;
+            serde_json::to_value(msg).map_err(|e| e.to_string())
+        })
+    });
+    to_jstring(&mut env, &out)
+}
+
+/// Claim a display @handle for this identity (persist locally, publish Kind-0
+/// best-effort). Returns the profile JSON `{"npub":…,"username":…}`.
+#[no_mangle]
+pub extern "C" fn Java_mullu_comrade_ComradeCore_setUsername<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    name: JString<'local>,
+) -> jstring {
+    let Some(name) = jni_string(&mut env, &name) else {
+        return to_jstring(
+            &mut env,
+            &json!({"error":"invalid name argument"}).to_string(),
+        );
+    };
+    let out = guard_json(move || {
+        let rt = runtime().ok_or_else(|| "failed to initialise async runtime".to_string())?;
+        let state = state();
+        rt.block_on(async move {
+            let mut guard = state.write().await;
+            let profile = guard.set_username(&name).await.map_err(|e| e.to_string())?;
+            serde_json::to_value(profile).map_err(|e| e.to_string())
+        })
+    });
+    to_jstring(&mut env, &out)
+}
+
+/// The local profile (npub + optional username), or `{"error":…}` pre-unlock.
+#[no_mangle]
+pub extern "C" fn Java_mullu_comrade_ComradeCore_currentProfile<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jstring {
+    let out = guard_json(move || {
+        let state = state();
+        let guard = state.blocking_read();
+        let profile = guard.profile().map_err(|e| e.to_string())?;
+        serde_json::to_value(profile).map_err(|e| e.to_string())
+    });
+    to_jstring(&mut env, &out)
+}
+
+/// Best-effort people search by handle (NIP-50 relays). Returns a JSON array
+/// of `{"npub","name","about"}`; empty when no search relay knew the name.
+#[no_mangle]
+pub extern "C" fn Java_mullu_comrade_ComradeCore_searchProfiles<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    query: JString<'local>,
+) -> jstring {
+    let Some(query) = jni_string(&mut env, &query) else {
+        return to_jstring(
+            &mut env,
+            &json!({"error":"invalid query argument"}).to_string(),
+        );
+    };
+    let out = guard_json(move || {
+        let rt = runtime().ok_or_else(|| "failed to initialise async runtime".to_string())?;
+        let state = state();
+        rt.block_on(async move {
+            let guard = state.read().await;
+            let found = guard
+                .search_profiles(&query)
+                .await
+                .map_err(|e| e.to_string())?;
+            serde_json::to_value(found).map_err(|e| e.to_string())
+        })
+    });
+    to_jstring(&mut env, &out)
+}
+
+/// Save (or re-alias) a contact pinned by npub. Returns the contact JSON.
+#[no_mangle]
+pub extern "C" fn Java_mullu_comrade_ComradeCore_addContact<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    npub: JString<'local>,
+    alias: JString<'local>,
+) -> jstring {
+    let (Some(npub), Some(alias)) = (jni_string(&mut env, &npub), jni_string(&mut env, &alias))
+    else {
+        return to_jstring(&mut env, &json!({"error":"invalid arguments"}).to_string());
+    };
+    let out = guard_json(move || {
+        let state = state();
+        let guard = state.blocking_read();
+        let contact = guard
+            .add_contact(&npub, &alias)
+            .map_err(|e| e.to_string())?;
+        serde_json::to_value(contact).map_err(|e| e.to_string())
+    });
+    to_jstring(&mut env, &out)
+}
+
+/// All saved contacts as a JSON array of `{"npub","alias"}`.
+#[no_mangle]
+pub extern "C" fn Java_mullu_comrade_ComradeCore_listContacts<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jstring {
+    let out = guard_json(move || {
+        let state = state();
+        let guard = state.blocking_read();
+        let contacts = guard.list_contacts().map_err(|e| e.to_string())?;
+        serde_json::to_value(contacts).map_err(|e| e.to_string())
+    });
+    to_jstring(&mut env, &out)
+}
+
+/// The chat list (one entry per peer, newest first) as a JSON array.
+#[no_mangle]
+pub extern "C" fn Java_mullu_comrade_ComradeCore_listConversations<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jstring {
+    let out = guard_json(move || {
+        let state = state();
+        let guard = state.blocking_read();
+        let convos = guard.conversations().map_err(|e| e.to_string())?;
+        serde_json::to_value(convos).map_err(|e| e.to_string())
+    });
+    to_jstring(&mut env, &out)
+}
+
+/// The offline message history with `peer`, oldest first, as a JSON array.
+#[no_mangle]
+pub extern "C" fn Java_mullu_comrade_ComradeCore_messagesWith<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    peer: JString<'local>,
+) -> jstring {
+    let Some(peer) = jni_string(&mut env, &peer) else {
+        return to_jstring(
+            &mut env,
+            &json!({"error":"invalid peer argument"}).to_string(),
+        );
+    };
+    let out = guard_json(move || {
+        let state = state();
+        let guard = state.blocking_read();
+        let msgs = guard.messages_with(&peer).map_err(|e| e.to_string())?;
+        serde_json::to_value(msgs).map_err(|e| e.to_string())
+    });
+    to_jstring(&mut env, &out)
+}
+
 /// Non-blocking drain of the next bridge event (incoming Chitthi / DM). Returns
 /// the event JSON, `{"empty":true}` when none is queued, or `{"error":"…"}`.
 #[no_mangle]

@@ -117,11 +117,13 @@ itself was **not** compiled in the development sandbox (no webview system
 libraries available), so verify `cargo tauri dev` on a machine with the
 prerequisites above before release.
 
-Known frontend gaps (await backend commands, not yet exposed): outbound *text*
-DM send (`send_dm`), persistent contact list, and server-side QR-pairing
-validation. The Vault tab therefore renders live *incoming* DMs and validates
-pairing payloads client-side before committing the workspace transition.
-(Encrypted *media* send is implemented — it rides the existing NIP-04 channel.)
+Outbound text DM send is wired (`send_dm`), and the Vault tab seeds its
+contact list and threads from the Rust-side offline history (`conversations` /
+`messages_with`). Remaining known gaps: server-side QR-pairing validation
+(pairing payloads are validated client-side before committing the workspace
+transition) and a desktop UI for the profile/username commands the backend
+now exposes (`current_profile`, `set_username`, `search_profiles`,
+`add_contact`, `list_contacts`).
 
 The desktop crate's webview build needs system GTK/webkit libs absent from the
 CI sandbox, so the media commands compile-check via the workspace crates

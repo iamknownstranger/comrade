@@ -200,6 +200,56 @@ fn to_npub(pubkey: &str) -> String {
         .unwrap_or_else(|| pubkey.to_string())
 }
 
+/// The local user's profile: the unforgeable identity (npub) plus the chosen
+/// display handle. The handle is an alias, never an identifier — see
+/// [`ComradeRuntime::set_username`] for the trust model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileDto {
+    pub npub: String,
+    pub username: Option<String>,
+}
+
+/// A profile discovered via relay search. `npub` is the identity; `name` is a
+/// self-declared, non-unique handle — the UI must always show both.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FoundProfileDto {
+    pub npub: String,
+    pub name: Option<String>,
+    pub about: Option<String>,
+}
+
+/// A saved contact: an npub pinned on first add (trust-on-first-use) with a
+/// local alias. A different key later claiming the same handle can never
+/// silently replace this entry — contacts are keyed by npub, not by name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContactDto {
+    pub npub: String,
+    pub alias: String,
+}
+
+/// One entry of the chat list: a peer plus the newest message in the thread.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationDto {
+    /// Peer npub (canonical bech32) — the conversation key.
+    pub peer: String,
+    /// Saved contact alias for the peer, when one exists.
+    pub alias: Option<String>,
+    pub last_message: String,
+    pub last_at: u64,
+    pub last_outgoing: bool,
+}
+
+/// A single direct message in a conversation, from the offline history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageDto {
+    pub id: String,
+    /// Peer npub the thread is keyed by (sender if incoming, recipient if outgoing).
+    pub peer: String,
+    pub content: String,
+    pub created_at: u64,
+    pub outgoing: bool,
+}
+
 /// A push event emitted by the background Tokio loops and forwarded across the
 /// webview boundary (`window.emit`) or polled over JNI. Internally tagged so the
 /// frontend can `switch (evt.type)`.
@@ -422,6 +472,20 @@ impl ComradeRuntime {
                             size: env.size,
                         }));
                     } else {
+                        // Persist plain DMs so conversations survive restarts —
+                        // the chat list is rebuilt from this offline history.
+                        if let Some(store) = store.as_ref() {
+                            let row = comrade_storage::StoredMessage {
+                                id: msg.event_id.clone(),
+                                peer_npub: to_npub(&msg.sender_pubkey),
+                                content: msg.content.clone(),
+                                created_at: msg.created_at,
+                                outgoing: false,
+                            };
+                            if let Err(e) = store.save_message(&row).and_then(|()| store.flush()) {
+                                warn!("failed to persist incoming DM: {e}");
+                            }
+                        }
                         let _ = tx.send(BridgeEvent::IncomingDirectMessage(
                             DirectMessageDto::from(msg),
                         ));
@@ -488,6 +552,206 @@ impl ComradeRuntime {
         }
 
         Ok(id.to_hex())
+    }
+
+    // ── Direct messages (Telegram-like chat flow) ────────────────────────────
+
+    /// Send an end-to-end encrypted DM to `target` (npub or hex pubkey) and
+    /// persist it to the offline history. Returns the stored message DTO.
+    pub async fn send_dm(&self, target: &str, content: &str) -> Result<MessageDto, UiError> {
+        if content.trim().is_empty() {
+            return Err(UiError::Engine("message is empty".into()));
+        }
+        let vault = self.vault.clone().ok_or(UiError::VaultLocked)?;
+        let peer = parse_pubkey(target)?;
+        let id = vault
+            .send_dm(&peer, content)
+            .await
+            .map_err(|e| UiError::Engine(e.to_string()))?;
+
+        let dto = MessageDto {
+            id: id.to_hex(),
+            peer: to_npub(target),
+            content: content.to_string(),
+            created_at: now_secs(),
+            outgoing: true,
+        };
+        if let Some(store) = self.ui.store_ref() {
+            let row = comrade_storage::StoredMessage {
+                id: dto.id.clone(),
+                peer_npub: dto.peer.clone(),
+                content: dto.content.clone(),
+                created_at: dto.created_at,
+                outgoing: true,
+            };
+            if let Err(e) = store.save_message(&row).and_then(|()| store.flush()) {
+                warn!("failed to persist outgoing DM: {e}");
+            }
+        }
+        Ok(dto)
+    }
+
+    /// The chat list: one entry per peer, newest thread first, with saved
+    /// contact aliases joined in. Built from the offline message history.
+    pub fn conversations(&self) -> Result<Vec<ConversationDto>, UiError> {
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        let aliases: std::collections::HashMap<String, String> = store
+            .list_contacts()
+            .map_err(|e| UiError::Storage(e.to_string()))?
+            .into_iter()
+            .map(|c| (c.npub, c.petname))
+            .collect();
+
+        let mut newest: std::collections::HashMap<String, comrade_storage::StoredMessage> =
+            std::collections::HashMap::new();
+        for msg in store
+            .all_messages()
+            .map_err(|e| UiError::Storage(e.to_string()))?
+        {
+            match newest.get(&msg.peer_npub) {
+                Some(existing) if existing.created_at >= msg.created_at => {}
+                _ => {
+                    newest.insert(msg.peer_npub.clone(), msg);
+                }
+            }
+        }
+
+        let mut list: Vec<ConversationDto> = newest
+            .into_values()
+            .map(|m| ConversationDto {
+                alias: aliases.get(&m.peer_npub).cloned(),
+                peer: m.peer_npub,
+                last_message: m.content,
+                last_at: m.created_at,
+                last_outgoing: m.outgoing,
+            })
+            .collect();
+        list.sort_by(|a, b| b.last_at.cmp(&a.last_at));
+        Ok(list)
+    }
+
+    /// Full offline message history with `peer` (npub or hex), oldest first.
+    pub fn messages_with(&self, peer: &str) -> Result<Vec<MessageDto>, UiError> {
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        let peer = to_npub(peer);
+        let mut msgs: Vec<MessageDto> = store
+            .messages_with(&peer)
+            .map_err(|e| UiError::Storage(e.to_string()))?
+            .into_iter()
+            .map(|m| MessageDto {
+                id: m.id,
+                peer: m.peer_npub,
+                content: m.content,
+                created_at: m.created_at,
+                outgoing: m.outgoing,
+            })
+            .collect();
+        msgs.sort_by_key(|m| m.created_at);
+        Ok(msgs)
+    }
+
+    // ── Profile & contacts (username = alias, identity = keypair) ────────────
+
+    /// The local profile: npub plus the chosen @handle (if set).
+    pub fn profile(&self) -> Result<ProfileDto, UiError> {
+        let id = self.ui.current_identity().ok_or(UiError::NoIdentity)?;
+        Ok(ProfileDto {
+            npub: id.npub,
+            username: self.ui.username(),
+        })
+    }
+
+    /// Claim a display handle for this identity.
+    ///
+    /// Trust model — why this cannot be globally unique: Comrade has no central
+    /// registry, so nothing can stop a second keypair from publishing the same
+    /// handle. The unforgeable identifier is the keypair (npub); the handle is
+    /// a discovery alias published as Kind-0 metadata. Contacts pin the npub on
+    /// first use, so a later "@same_handle" under a different key shows up as a
+    /// different person and can never read or receive this thread's messages.
+    ///
+    /// The handle is persisted locally first; relay publication is best-effort
+    /// (offline claims succeed and publish on a later set).
+    pub async fn set_username(&mut self, handle: &str) -> Result<ProfileDto, UiError> {
+        let handle = normalize_handle(handle)?;
+        self.ui.set_username(handle.clone())?;
+        if let Some(sabha) = self.sabha.clone() {
+            // Fire-and-forget: the handle is already persisted locally, and at
+            // onboarding time the relays may not have finished connecting —
+            // never block (or fail) the claim on network state.
+            let name = handle.clone();
+            tokio::spawn(async move {
+                if let Err(e) = sabha.publish_profile(&name, None).await {
+                    warn!("profile publish deferred (offline?): {e}");
+                }
+            });
+        }
+        self.profile()
+    }
+
+    /// Save (or re-alias) a contact, pinned by npub — trust on first use.
+    pub fn add_contact(&self, npub: &str, alias: &str) -> Result<ContactDto, UiError> {
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        let peer = parse_pubkey(npub)?;
+        let canonical = peer
+            .to_bech32()
+            .map_err(|e| UiError::Engine(e.to_string()))?;
+        let alias = alias.trim();
+        let contact = comrade_storage::Contact {
+            npub: canonical.clone(),
+            petname: if alias.is_empty() {
+                canonical.chars().take(12).collect()
+            } else {
+                alias.to_string()
+            },
+            relays: vec![],
+        };
+        store
+            .upsert_contact(&contact)
+            .and_then(|()| store.flush())
+            .map_err(|e| UiError::Storage(e.to_string()))?;
+        Ok(ContactDto {
+            npub: contact.npub,
+            alias: contact.petname,
+        })
+    }
+
+    /// All saved contacts, alias-sorted.
+    pub fn list_contacts(&self) -> Result<Vec<ContactDto>, UiError> {
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        let mut contacts: Vec<ContactDto> = store
+            .list_contacts()
+            .map_err(|e| UiError::Storage(e.to_string()))?
+            .into_iter()
+            .map(|c| ContactDto {
+                npub: c.npub,
+                alias: c.petname,
+            })
+            .collect();
+        contacts.sort_by(|a, b| a.alias.to_lowercase().cmp(&b.alias.to_lowercase()));
+        Ok(contacts)
+    }
+
+    /// Best-effort people search by handle over NIP-50-capable relays. An empty
+    /// result means no search relay knew the name — offer add-by-npub instead.
+    pub async fn search_profiles(&self, query: &str) -> Result<Vec<FoundProfileDto>, UiError> {
+        let sabha = self.sabha.clone().ok_or(UiError::VaultLocked)?;
+        let query = query.trim().trim_start_matches('@');
+        if query.is_empty() {
+            return Ok(vec![]);
+        }
+        let found = sabha
+            .search_profiles(query, 10)
+            .await
+            .map_err(|e| UiError::Engine(e.to_string()))?;
+        Ok(found
+            .into_iter()
+            .map(|(pk, meta)| FoundProfileDto {
+                npub: pk.to_bech32().unwrap_or_else(|_| pk.to_hex()),
+                name: meta.name.or(meta.display_name),
+                about: meta.about,
+            })
+            .collect())
     }
 
     // ── Encrypted media pipeline (NIP-94/96 · Blossom) ───────────────────────
@@ -709,6 +973,28 @@ fn now_secs() -> u64 {
         .unwrap_or_default()
 }
 
+/// Normalise and validate a chosen @handle: strip a leading '@', lowercase,
+/// then require 3–24 chars of `[a-z0-9_]`. One rule shared by every bridge.
+fn normalize_handle(raw: &str) -> Result<String, UiError> {
+    let handle = raw.trim().trim_start_matches('@').to_lowercase();
+    if handle.len() < 3 || handle.len() > 24 {
+        return Err(UiError::Engine("username must be 3–24 characters".into()));
+    }
+    if !handle
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    {
+        return Err(UiError::Engine(
+            "username may only contain a–z, 0–9 and _".into(),
+        ));
+    }
+    // "primary" is the legacy no-username marker inside the store.
+    if handle == "primary" {
+        return Err(UiError::Engine("that username is reserved".into()));
+    }
+    Ok(handle)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -909,6 +1195,161 @@ mod tests {
         assert!(json.contains("\"type\":\"incoming_media\""));
         let back: BridgeEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(back, ev);
+    }
+
+    #[test]
+    fn handle_normalisation_rules() {
+        assert_eq!(normalize_handle("@Abc_User").unwrap(), "abc_user");
+        assert_eq!(normalize_handle("  neo42 ").unwrap(), "neo42");
+        assert!(normalize_handle("ab").is_err(), "too short");
+        assert!(normalize_handle(&"x".repeat(25)).is_err(), "too long");
+        assert!(normalize_handle("has space").is_err());
+        assert!(normalize_handle("emoji🙂").is_err());
+        assert!(normalize_handle("primary").is_err(), "reserved");
+    }
+
+    #[tokio::test]
+    async fn username_round_trips_through_the_encrypted_store() {
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+        rt.unlock_vault(dir.path(), "pin").await.unwrap();
+        assert_eq!(rt.profile().unwrap().username, None);
+
+        let profile = rt.set_username("@Chandra_M").await.unwrap();
+        assert_eq!(profile.username.as_deref(), Some("chandra_m"));
+
+        // Reopen: the handle must survive alongside the identity.
+        drop(rt);
+        let mut rt2 = ComradeRuntime::new();
+        rt2.unlock_vault(dir.path(), "pin").await.unwrap();
+        assert_eq!(
+            rt2.profile().unwrap().username.as_deref(),
+            Some("chandra_m")
+        );
+    }
+
+    #[tokio::test]
+    async fn contacts_are_pinned_by_npub_not_by_alias() {
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+        rt.unlock_vault(dir.path(), "pin").await.unwrap();
+
+        let a = nostr_sdk::Keys::generate()
+            .public_key()
+            .to_bech32()
+            .unwrap();
+        let b = nostr_sdk::Keys::generate()
+            .public_key()
+            .to_bech32()
+            .unwrap();
+
+        // Two different keys may claim the same alias — both entries survive,
+        // because the store is keyed by npub (TOFU), not by the display name.
+        rt.add_contact(&a, "abc_user").unwrap();
+        rt.add_contact(&b, "abc_user").unwrap();
+        let contacts = rt.list_contacts().unwrap();
+        assert_eq!(contacts.len(), 2);
+        assert!(contacts.iter().any(|c| c.npub == a));
+        assert!(contacts.iter().any(|c| c.npub == b));
+
+        // Re-adding the same npub renames in place instead of duplicating.
+        rt.add_contact(&a, "renamed").unwrap();
+        let contacts = rt.list_contacts().unwrap();
+        assert_eq!(contacts.len(), 2);
+        assert_eq!(
+            contacts.iter().find(|c| c.npub == a).unwrap().alias,
+            "renamed"
+        );
+
+        // Junk npubs are a typed error, not a stored contact.
+        assert!(rt.add_contact("not-a-key", "x").is_err());
+    }
+
+    #[tokio::test]
+    async fn conversations_group_history_by_peer_newest_first() {
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+        rt.unlock_vault(dir.path(), "pin").await.unwrap();
+        let store = rt.ui.store_ref().unwrap();
+
+        let alice = nostr_sdk::Keys::generate()
+            .public_key()
+            .to_bech32()
+            .unwrap();
+        let bob = nostr_sdk::Keys::generate()
+            .public_key()
+            .to_bech32()
+            .unwrap();
+        for (id, peer, content, at, outgoing) in [
+            ("m1", &alice, "hi alice", 10u64, true),
+            ("m2", &alice, "hello back", 20, false),
+            ("m3", &bob, "yo bob", 15, true),
+        ] {
+            store
+                .save_message(&comrade_storage::StoredMessage {
+                    id: id.into(),
+                    peer_npub: peer.to_string(),
+                    content: content.into(),
+                    created_at: at,
+                    outgoing,
+                })
+                .unwrap();
+        }
+        rt.add_contact(&alice, "Alice").unwrap();
+
+        let convos = rt.conversations().unwrap();
+        assert_eq!(convos.len(), 2);
+        // Alice's thread is newest (t=20) and carries her saved alias.
+        assert_eq!(convos[0].peer, alice);
+        assert_eq!(convos[0].alias.as_deref(), Some("Alice"));
+        assert_eq!(convos[0].last_message, "hello back");
+        assert!(!convos[0].last_outgoing);
+        assert_eq!(convos[1].peer, bob);
+        assert_eq!(convos[1].alias, None);
+
+        // Per-thread history comes back oldest-first for rendering.
+        let msgs = rt.messages_with(&alice).unwrap();
+        assert_eq!(
+            msgs.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["m1", "m2"]
+        );
+    }
+
+    #[tokio::test]
+    async fn dm_and_profile_commands_reject_when_locked() {
+        let mut rt = ComradeRuntime::new();
+        assert!(matches!(
+            rt.send_dm("npub1x", "hi").await,
+            Err(UiError::VaultLocked)
+        ));
+        assert!(matches!(rt.conversations(), Err(UiError::VaultLocked)));
+        assert!(matches!(rt.messages_with("x"), Err(UiError::VaultLocked)));
+        assert!(matches!(rt.list_contacts(), Err(UiError::VaultLocked)));
+        assert!(matches!(rt.profile(), Err(UiError::NoIdentity)));
+        assert!(matches!(
+            rt.set_username("neo").await,
+            Err(UiError::NoIdentity)
+        ));
+        assert!(matches!(
+            rt.search_profiles("neo").await,
+            Err(UiError::VaultLocked)
+        ));
+    }
+
+    #[tokio::test]
+    async fn send_dm_rejects_empty_and_bad_recipient() {
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+        rt.unlock_vault(dir.path(), "pin").await.unwrap();
+        assert!(rt.send_dm("npub1notvalid", "hello").await.is_err());
+        let ok = nostr_sdk::Keys::generate()
+            .public_key()
+            .to_bech32()
+            .unwrap();
+        assert!(matches!(
+            rt.send_dm(&ok, "   ").await,
+            Err(UiError::Engine(_))
+        ));
     }
 
     #[tokio::test]

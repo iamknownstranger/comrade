@@ -164,14 +164,15 @@
                   placeholder="Message… (try “/pay 250 to friend@upi”)"
                   disabled
                 />
-                <button id="dm-send" class="btn btn-primary" disabled title="DM sending is pending backend support">
-                  Send
+                <button id="dm-send" class="btn btn-primary" disabled>
+                  <span class="btn-label">Send</span>
+                  <span class="spinner" hidden></span>
                 </button>
               </div>
               <p class="hint sm">
-                Live UPI <code>/pay</code> detection is active. The 📎 attaches an
-                end-to-end encrypted photo/audio (max 10 MB). Text DM transmission
-                awaits a backend <code>send_dm</code> command.
+                Messages are end-to-end encrypted. Live UPI <code>/pay</code>
+                detection is active, and the 📎 attaches an encrypted photo/audio
+                (max 10 MB).
               </p>
             </div>
           </div>

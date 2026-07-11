@@ -264,6 +264,7 @@
       }));
       applyWorkspace(ws);
       await loadTimeline();
+      await loadConversations();
     } catch {
       /* error already toasted */
     } finally {
@@ -428,12 +429,87 @@
     }
   }
 
+  /** Seed the contact list from the persisted offline history (chat list). */
+  async function loadConversations() {
+    let convos;
+    try {
+      convos = await safeInvoke("conversations", undefined, { silent: true });
+    } catch {
+      return; // older backend without the command — live events still work
+    }
+    for (const c of convos || []) {
+      if (!state.dms.has(c.peer)) {
+        state.dms.set(c.peer, [
+          { content: c.last_message, created_at: c.last_at, outgoing: !!c.last_outgoing, upi: [] },
+        ]);
+      }
+    }
+    renderContacts();
+  }
+
   function selectContact(key) {
     state.activeContact = key;
     $("#dm-input").disabled = false;
     $("#dm-attach").disabled = false;
+    $("#dm-send").disabled = false;
     renderContacts();
     renderConversation();
+    // Pull the full persisted thread; keep live media bubbles (not part of the
+    // stored text history) merged in.
+    safeInvoke("messages_with", { peer: key }, { silent: true })
+      .then((msgs) => {
+        if (!Array.isArray(msgs) || !msgs.length || state.activeContact !== key) return;
+        const media = (state.dms.get(key) || []).filter((m) => m.media);
+        const merged = msgs
+          .map((m) => ({
+            content: m.content,
+            created_at: m.created_at,
+            outgoing: !!m.outgoing,
+            upi: [],
+          }))
+          .concat(media)
+          .sort((a, b) => a.created_at - b.created_at);
+        state.dms.set(key, merged);
+        renderConversation();
+      })
+      .catch(() => {});
+  }
+
+  /** Send the composed DM to the active contact (real end-to-end send). */
+  async function handleDmSend() {
+    const input = $("#dm-input");
+    const content = input.value.trim();
+    if (!content) return;
+    if (!state.activeContact) {
+      showToast("Select a conversation first", "warn");
+      return;
+    }
+    const btn = $("#dm-send");
+    setBusy(btn, true);
+    try {
+      const msg = await safeInvoke("send_dm", {
+        target: state.activeContact,
+        content,
+      });
+      input.value = "";
+      const preview = $("#dm-upi-preview");
+      preview.hidden = true;
+      preview.innerHTML = "";
+      const list = state.dms.get(state.activeContact) || [];
+      list.push({
+        content: msg.content,
+        created_at: msg.created_at,
+        outgoing: true,
+        upi: [],
+      });
+      state.dms.set(state.activeContact, list);
+      renderContacts();
+      renderConversation();
+    } catch {
+      /* toasted */
+    } finally {
+      setBusy(btn, false);
+    }
   }
 
   function renderConversation() {
@@ -759,9 +835,13 @@
     $("#chitthi-input").addEventListener("input", updateCount);
     $("#broadcast-btn").addEventListener("click", handleBroadcast);
     $("#dm-input").addEventListener("input", handleDmInput);
-    $("#dm-send").addEventListener("click", () =>
-      showToast("Outbound DM transmission needs a backend send_dm command.", "info"),
-    );
+    $("#dm-send").addEventListener("click", handleDmSend);
+    $("#dm-input").addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        handleDmSend();
+      }
+    });
 
     // Media attachments (Vault + Couple sandbox)
     $("#dm-attach").addEventListener("click", () => $("#dm-file").click());
@@ -836,6 +916,20 @@
           ];
         case "broadcast_chitthi":
           return "mock_" + Date.now();
+        case "send_dm":
+          return {
+            id: "mockdm_" + Date.now(),
+            peer: args.target,
+            content: args.content,
+            created_at: nowSecs(),
+            outgoing: true,
+          };
+        case "conversations":
+        case "messages_with":
+        case "list_contacts":
+          return [];
+        case "current_profile":
+          return { npub: "npub1mockdev0identity00000000000000000000000000000000", username: "mockuser" };
         case "extract_payments": {
           const out = [];
           let m;
