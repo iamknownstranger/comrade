@@ -30,6 +30,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::{EncryptedStore, StorageError};
 
+/// Monotonic rank of a delivery status so receipts only ever move forward:
+/// sent (0) < delivered (1) < read (2). Unknown strings rank as sent.
+fn status_rank(status: &str) -> u8 {
+    match status {
+        "read" => 2,
+        "delivered" => 1,
+        _ => 0,
+    }
+}
+
 // ── Tree names ────────────────────────────────────────────────────────────────
 
 const IDENTITY_TREE: &str = "identity";
@@ -38,6 +48,10 @@ const CHITTHI_TREE: &str = "chitthi_cache";
 const MESSAGES_TREE: &str = "vault_cache";
 const LEDGER_TREE: &str = "ledger";
 const JOURNAL_TREE: &str = "journal";
+/// Per-peer conversation gate: request / accepted / blocked (message requests).
+const CONVERSATIONS_TREE: &str = "conversation_meta";
+/// Voice/video call log, keyed by call id.
+const CALLS_TREE: &str = "call_log";
 
 const IDENTITY_KEY: &str = "self";
 const LEDGER_SNAPSHOT_KEY: &str = "hisab_kitab";
@@ -105,6 +119,14 @@ pub struct StoredMessage {
     pub content: String,
     pub created_at: u64,
     pub outgoing: bool,
+    /// Delivery status of an outgoing message: `"sent"`, `"delivered"`, or
+    /// `"read"`. Incoming messages are always `"read"`. Defaulted to `"sent"`
+    /// so rows written before receipts existed keep deserialising.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Event id (hex) this message replies to (NIP-10 `e` tag), if any.
+    #[serde(default)]
+    pub reply_to: Option<String>,
 }
 
 /// A private journal entry — the wellbeing pillar's core record. Strictly
@@ -119,6 +141,40 @@ pub struct JournalEntry {
     #[serde(default)]
     pub mood: Option<String>,
     pub created_at: u64,
+}
+
+/// Per-peer conversation gate — the storage half of message requests. A DM from
+/// a peer with no `Accepted` record lands in the *requests* bucket instead of
+/// the chat list, and no profile/receipts are shared with them until accepted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationMeta {
+    pub peer_npub: String,
+    /// `"pending"` (incoming request), `"accepted"`, or `"blocked"`.
+    pub state: String,
+    /// Whether we have shared our @handle with this peer (sent on accept, or
+    /// implicitly when we started the conversation).
+    #[serde(default)]
+    pub profile_shared: bool,
+    pub updated_at: u64,
+}
+
+/// One entry of the voice/video call log, keyed by call id. Mirrors the shape
+/// of [`StoredMessage`] so the chat UI can interleave calls and messages.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallRecord {
+    /// The call id minted by the caller (hex).
+    pub id: String,
+    pub peer_npub: String,
+    /// `"audio"` or `"video"`.
+    pub media: String,
+    /// True if this device received the call, false if it placed it.
+    pub incoming: bool,
+    /// `"connected"`, `"missed"`, `"declined"`, `"cancelled"`, `"busy"`, or `"failed"`.
+    pub outcome: String,
+    pub started_at: u64,
+    /// Connected duration in seconds; 0 if the call never connected.
+    #[serde(default)]
+    pub duration_secs: u64,
 }
 
 /// A binary CRDT (Yrs) snapshot of the Sakha/Sakhi shared ledger, plus the wall
@@ -227,6 +283,77 @@ impl EncryptedStore {
         self.vault_cache()
     }
 
+    /// Fetch a single stored message by its event id.
+    pub fn get_message(&self, id: &str) -> Result<Option<StoredMessage>, StorageError> {
+        self.get(MESSAGES_TREE, id)
+    }
+
+    /// Advance an outgoing message's delivery `status` (sent → delivered →
+    /// read) in response to a receipt. Never downgrades — a late "delivered"
+    /// receipt can't unset a "read" already recorded. Returns whether the row
+    /// existed and changed.
+    pub fn set_message_status(&self, id: &str, status: &str) -> Result<bool, StorageError> {
+        let Some(mut msg) = self.get_message(id)? else {
+            return Ok(false);
+        };
+        if status_rank(status) <= status_rank(msg.status.as_deref().unwrap_or("sent")) {
+            return Ok(false);
+        }
+        msg.status = Some(status.to_string());
+        self.save_message(&msg)?;
+        Ok(true)
+    }
+
+    // Conversation gate (message requests) ------------------------------------
+
+    /// Insert or update the conversation gate for a peer.
+    pub fn set_conversation_meta(&self, meta: &ConversationMeta) -> Result<(), StorageError> {
+        self.put(CONVERSATIONS_TREE, &meta.peer_npub, meta)
+    }
+
+    /// Fetch a peer's conversation gate, if one has been recorded.
+    pub fn get_conversation_meta(
+        &self,
+        peer_npub: &str,
+    ) -> Result<Option<ConversationMeta>, StorageError> {
+        self.get(CONVERSATIONS_TREE, peer_npub)
+    }
+
+    /// All recorded conversation gates.
+    pub fn list_conversation_meta(&self) -> Result<Vec<ConversationMeta>, StorageError> {
+        self.values(CONVERSATIONS_TREE)
+    }
+
+    /// Remove a peer's conversation gate. Returns `true` if one existed.
+    pub fn remove_conversation_meta(&self, peer_npub: &str) -> Result<bool, StorageError> {
+        self.delete(CONVERSATIONS_TREE, peer_npub)
+    }
+
+    // Call log ----------------------------------------------------------------
+
+    /// Persist (or overwrite) a call-log entry, keyed by call id.
+    pub fn save_call_record(&self, record: &CallRecord) -> Result<(), StorageError> {
+        self.put(CALLS_TREE, &record.id, record)
+    }
+
+    /// All call-log entries exchanged with `peer_npub`, newest first.
+    pub fn calls_with(&self, peer_npub: &str) -> Result<Vec<CallRecord>, StorageError> {
+        let mut calls: Vec<CallRecord> = self
+            .values::<CallRecord>(CALLS_TREE)?
+            .into_iter()
+            .filter(|c| c.peer_npub == peer_npub)
+            .collect();
+        calls.sort_by_key(|c| std::cmp::Reverse(c.started_at));
+        Ok(calls)
+    }
+
+    /// The whole call log across every peer, newest first.
+    pub fn all_calls(&self) -> Result<Vec<CallRecord>, StorageError> {
+        let mut calls: Vec<CallRecord> = self.values(CALLS_TREE)?;
+        calls.sort_by_key(|c| std::cmp::Reverse(c.started_at));
+        Ok(calls)
+    }
+
     // Journal (local-only, never networked) ------------------------------------
 
     /// Persist a journal entry, keyed by its id.
@@ -330,6 +457,8 @@ mod tests {
             content: "second".into(),
             created_at: 200,
             outgoing: true,
+            status: Some("sent".into()),
+            reply_to: None,
         })
         .unwrap();
         s.save_message(&StoredMessage {
@@ -338,6 +467,8 @@ mod tests {
             content: "first".into(),
             created_at: 100,
             outgoing: false,
+            status: None,
+            reply_to: None,
         })
         .unwrap();
         s.save_message(&StoredMessage {
@@ -346,6 +477,8 @@ mod tests {
             content: "other".into(),
             created_at: 150,
             outgoing: false,
+            status: None,
+            reply_to: Some("e1".into()),
         })
         .unwrap();
 
@@ -526,6 +659,8 @@ mod tests {
             content: "second".into(),
             created_at: 20,
             outgoing: true,
+            status: Some("sent".into()),
+            reply_to: None,
         })
         .unwrap();
         s.save_message(&StoredMessage {
@@ -534,10 +669,118 @@ mod tests {
             content: "first".into(),
             created_at: 10,
             outgoing: false,
+            status: None,
+            reply_to: None,
         })
         .unwrap();
         let cache = s.vault_cache().unwrap();
         assert_eq!(cache.len(), 2);
         assert_eq!(cache[0].content, "first");
+    }
+
+    #[test]
+    fn message_status_only_moves_forward() {
+        let (_d, s) = store();
+        s.save_message(&StoredMessage {
+            id: "m1".into(),
+            peer_npub: "npub1x".into(),
+            content: "hi".into(),
+            created_at: 1,
+            outgoing: true,
+            status: Some("sent".into()),
+            reply_to: None,
+        })
+        .unwrap();
+        // sent → delivered → read all advance.
+        assert!(s.set_message_status("m1", "delivered").unwrap());
+        assert_eq!(
+            s.get_message("m1").unwrap().unwrap().status.as_deref(),
+            Some("delivered")
+        );
+        assert!(s.set_message_status("m1", "read").unwrap());
+        // A late "delivered" can't downgrade "read"; idempotent no-ops return false.
+        assert!(!s.set_message_status("m1", "delivered").unwrap());
+        assert!(!s.set_message_status("m1", "read").unwrap());
+        assert_eq!(
+            s.get_message("m1").unwrap().unwrap().status.as_deref(),
+            Some("read")
+        );
+        // Unknown message id is a clean false, not an error.
+        assert!(!s.set_message_status("nope", "read").unwrap());
+    }
+
+    #[test]
+    fn conversation_meta_crud() {
+        let (_d, s) = store();
+        assert!(s.get_conversation_meta("npub1x").unwrap().is_none());
+        let meta = ConversationMeta {
+            peer_npub: "npub1x".into(),
+            state: "pending".into(),
+            profile_shared: false,
+            updated_at: 5,
+        };
+        s.set_conversation_meta(&meta).unwrap();
+        assert_eq!(s.get_conversation_meta("npub1x").unwrap(), Some(meta));
+        // Upsert to accepted.
+        s.set_conversation_meta(&ConversationMeta {
+            peer_npub: "npub1x".into(),
+            state: "accepted".into(),
+            profile_shared: true,
+            updated_at: 6,
+        })
+        .unwrap();
+        let got = s.get_conversation_meta("npub1x").unwrap().unwrap();
+        assert_eq!(got.state, "accepted");
+        assert!(got.profile_shared);
+        assert_eq!(s.list_conversation_meta().unwrap().len(), 1);
+        assert!(s.remove_conversation_meta("npub1x").unwrap());
+        assert!(!s.remove_conversation_meta("npub1x").unwrap());
+    }
+
+    #[test]
+    fn call_log_filtered_by_peer_and_newest_first() {
+        let (_d, s) = store();
+        for (id, peer, at, outcome) in [
+            ("c1", "npub1a", 100u64, "connected"),
+            ("c2", "npub1a", 300, "missed"),
+            ("c3", "npub1b", 200, "declined"),
+        ] {
+            s.save_call_record(&CallRecord {
+                id: id.into(),
+                peer_npub: peer.into(),
+                media: "audio".into(),
+                incoming: false,
+                outcome: outcome.into(),
+                started_at: at,
+                duration_secs: if outcome == "connected" { 42 } else { 0 },
+            })
+            .unwrap();
+        }
+        let with_a = s.calls_with("npub1a").unwrap();
+        assert_eq!(with_a.len(), 2);
+        assert_eq!(with_a[0].id, "c2", "newest first");
+        assert_eq!(with_a[1].id, "c1");
+        assert_eq!(s.all_calls().unwrap().len(), 3);
+        // Overwrite (same id) updates in place rather than duplicating.
+        s.save_call_record(&CallRecord {
+            id: "c1".into(),
+            peer_npub: "npub1a".into(),
+            media: "video".into(),
+            incoming: true,
+            outcome: "connected".into(),
+            started_at: 100,
+            duration_secs: 99,
+        })
+        .unwrap();
+        assert_eq!(s.calls_with("npub1a").unwrap().len(), 2);
+        assert_eq!(
+            s.calls_with("npub1a")
+                .unwrap()
+                .iter()
+                .find(|c| c.id == "c1")
+                .unwrap()
+                .media,
+            "video"
+        );
     }
 }

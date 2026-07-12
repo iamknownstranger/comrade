@@ -26,8 +26,9 @@ use thiserror::Error;
 pub mod runtime;
 
 pub use runtime::{
-    BridgeEvent, ChitthiDto, ComradeRuntime, ContactDto, ConversationDto, DirectMessageDto,
-    FoundProfileDto, JournalEntryDto, MediaBytesDto, MediaMessageDto, MessageDto, ProfileDto,
+    BridgeEvent, CallRecordDto, CallSessionDto, CallSignalDto, ChitthiDto, ComradeRuntime,
+    ContactDto, ConversationDto, DirectMessageDto, FoundProfileDto, IceServerDto, JournalEntryDto,
+    MediaBytesDto, MediaMessageDto, MessageDto, MessageRequestDto, ProfileDto,
 };
 
 // ── Errors ──────────────────────────────────────────────────────────────────────

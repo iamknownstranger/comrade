@@ -15,9 +15,9 @@
 use std::sync::Arc;
 
 use comrade_ui::{
-    ChitthiDto, ComradeRuntime, ContactDto, ConversationDto, FoundProfileDto, IdentityDto,
-    JournalEntryDto, MediaBytesDto, MediaMessageDto, MessageDto, ProfileDto, UpiIntentDto,
-    WorkspaceDto,
+    CallRecordDto, CallSessionDto, ChitthiDto, ComradeRuntime, ContactDto, ConversationDto,
+    FoundProfileDto, IceServerDto, IdentityDto, JournalEntryDto, MediaBytesDto, MediaMessageDto,
+    MessageDto, MessageRequestDto, ProfileDto, UpiIntentDto, WorkspaceDto,
 };
 use tokio::sync::RwLock;
 
@@ -136,6 +136,170 @@ pub async fn messages_with(
     peer: String,
 ) -> Result<Vec<MessageDto>, String> {
     state.read().await.messages_with(&peer).map_err(|e| e.to_string())
+}
+
+/// Send a DM as a reply to a prior message (`reply_to` = replied event id hex).
+#[tauri::command]
+pub async fn send_dm_reply(
+    state: tauri::State<'_, Runtime>,
+    target: String,
+    content: String,
+    reply_to: Option<String>,
+) -> Result<MessageDto, String> {
+    state
+        .read()
+        .await
+        .send_dm_reply(&target, &content, reply_to.as_deref())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+// ── Message requests (gate strangers) + receipts ──────────────────────────────
+
+/// Pending message requests (strangers' DMs awaiting accept/block).
+#[tauri::command]
+pub async fn message_requests(
+    state: tauri::State<'_, Runtime>,
+) -> Result<Vec<MessageRequestDto>, String> {
+    state.read().await.message_requests().map_err(|e| e.to_string())
+}
+
+/// Accept a message request (into the chat list; share handle; ack messages).
+#[tauri::command]
+pub async fn accept_request(state: tauri::State<'_, Runtime>, peer: String) -> Result<(), String> {
+    state.read().await.accept_request(&peer).map_err(|e| e.to_string())
+}
+
+/// Block a peer (hide + drop future DMs).
+#[tauri::command]
+pub async fn block_conversation(
+    state: tauri::State<'_, Runtime>,
+    peer: String,
+) -> Result<(), String> {
+    state.read().await.block_conversation(&peer).map_err(|e| e.to_string())
+}
+
+/// Send a read receipt for a conversation (call when the thread is opened).
+#[tauri::command]
+pub async fn mark_conversation_read(
+    state: tauri::State<'_, Runtime>,
+    peer: String,
+) -> Result<(), String> {
+    state
+        .read()
+        .await
+        .mark_conversation_read(&peer)
+        .map_err(|e| e.to_string())
+}
+
+// ── Calls (voice/video · WebRTC signalling over the DM channel) ───────────────
+
+/// ICE servers (public STUN + any configured TURN) for `RTCPeerConnection`.
+#[tauri::command]
+pub async fn call_ice_servers(
+    state: tauri::State<'_, Runtime>,
+) -> Result<Vec<IceServerDto>, String> {
+    Ok(state.read().await.call_ice_servers())
+}
+
+/// Configure (blank `url` clears) the TURN relay used for calls.
+#[tauri::command]
+pub async fn set_turn_server(
+    state: tauri::State<'_, Runtime>,
+    url: String,
+    username: String,
+    credential: String,
+) -> Result<(), String> {
+    state
+        .read()
+        .await
+        .set_turn_server(&url, &username, &credential)
+        .map_err(|e| e.to_string())
+}
+
+/// Begin a call to `peer` (`media` = "audio"/"video"); returns the call session.
+#[tauri::command]
+pub async fn place_call(
+    state: tauri::State<'_, Runtime>,
+    peer: String,
+    media: String,
+) -> Result<CallSessionDto, String> {
+    state.read().await.place_call(&peer, &media).map_err(|e| e.to_string())
+}
+
+/// Send one call-signaling payload (`signal_json` = a CallSignal) to `peer`.
+#[tauri::command]
+pub async fn send_call_signal(
+    state: tauri::State<'_, Runtime>,
+    peer: String,
+    call_id: String,
+    media: String,
+    signal_json: String,
+) -> Result<(), String> {
+    state
+        .read()
+        .await
+        .send_call_signal(&peer, &call_id, &media, &signal_json)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Send a `Hangup` with `reason` to end/reject a call.
+#[tauri::command]
+pub async fn hangup_call(
+    state: tauri::State<'_, Runtime>,
+    peer: String,
+    call_id: String,
+    media: String,
+    reason: String,
+) -> Result<(), String> {
+    state
+        .read()
+        .await
+        .hangup_call(&peer, &call_id, &media, &reason)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Persist a finished call to the call log.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn log_call(
+    state: tauri::State<'_, Runtime>,
+    peer: String,
+    call_id: String,
+    media: String,
+    incoming: bool,
+    outcome: String,
+    started_at: u64,
+    duration_secs: u64,
+) -> Result<CallRecordDto, String> {
+    state
+        .read()
+        .await
+        .log_call(
+            &peer,
+            &call_id,
+            &media,
+            incoming,
+            &outcome,
+            started_at,
+            duration_secs,
+        )
+        .map_err(|e| e.to_string())
+}
+
+/// The call log (single `peer`, or all peers when `None`), newest first.
+#[tauri::command]
+pub async fn call_history(
+    state: tauri::State<'_, Runtime>,
+    peer: Option<String>,
+) -> Result<Vec<CallRecordDto>, String> {
+    state
+        .read()
+        .await
+        .call_history(peer.as_deref())
+        .map_err(|e| e.to_string())
 }
 
 /// The local profile: npub plus the chosen @handle, if any.

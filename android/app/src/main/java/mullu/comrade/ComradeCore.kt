@@ -141,6 +141,67 @@ object ComradeCore {
     /** Offline message history with [peer], oldest first, as a JSON array. */
     external fun messagesWith(peer: String): String
 
+    // ── Replies, message requests & receipts ─────────────────────────────────
+
+    /** Send a reply DM ([replyTo] = replied event id hex, or "" for none). */
+    external fun sendDmReply(target: String, content: String, replyTo: String): String
+
+    /** Pending message requests as a JSON array of `{"peer","last_message","last_at"}`. */
+    external fun messageRequests(): String
+
+    /** Accept a message request; returns `{"accepted":true}` or `{"error":"…"}`. */
+    external fun acceptRequest(peer: String): String
+
+    /** Block a peer; returns `{"blocked":true}` or `{"error":"…"}`. */
+    external fun blockConversation(peer: String): String
+
+    /** Send a read receipt for [peer]'s thread; returns `{"ok":true}`. */
+    external fun markConversationRead(peer: String): String
+
+    // ── Encrypted media (send/receive) ────────────────────────────────────────
+
+    /** Encrypt + upload [base64] media and deliver the reference. Returns media JSON. */
+    external fun sendMediaBytes(
+        target: String,
+        mimeType: String,
+        caption: String,
+        base64: String,
+    ): String
+
+    /** Resolve + decrypt a media reference by event id. Returns `{"mime_type","base64"}`. */
+    external fun downloadMedia(eventId: String): String
+
+    // ── Calls (voice/video signaling over the DM channel) ─────────────────────
+
+    /** ICE servers for the WebRTC layer as a JSON array. */
+    external fun callIceServers(): String
+
+    /** Configure ("" url clears) the TURN relay; returns `{"ok":true}`. */
+    external fun setTurnServer(url: String, username: String, credential: String): String
+
+    /** Begin a call to [peer] ([media] = "audio"/"video"); returns call-session JSON. */
+    external fun placeCall(peer: String, media: String): String
+
+    /** Send one call-signaling payload ([signalJson] = a CallSignal). Returns `{"ok":true}`. */
+    external fun sendCallSignal(peer: String, callId: String, media: String, signalJson: String): String
+
+    /** Send a `Hangup` with [reason]; returns `{"ok":true}`. */
+    external fun hangupCall(peer: String, callId: String, media: String, reason: String): String
+
+    /** Persist a finished call to the log; returns the call-record JSON. */
+    external fun logCall(
+        peer: String,
+        callId: String,
+        media: String,
+        incoming: Boolean,
+        outcome: String,
+        startedAt: Long,
+        durationSecs: Long,
+    ): String
+
+    /** Call log as a JSON array ([peer] "" = all peers). */
+    external fun callHistory(peer: String): String
+
     // ── Journal (strictly local, never networked) ────────────────────────────
 
     /**
@@ -235,7 +296,54 @@ object ComradeCore {
         val content: String,
         val createdAt: Long,
         val outgoing: Boolean,
+        /** Delivery status for outgoing messages: "sent"/"delivered"/"read"; null for incoming. */
+        val status: String? = null,
+        /** Event id (hex) this message replies to, if any. */
+        val replyTo: String? = null,
     )
+
+    /** A pending message request — a stranger's DM gated until accepted. */
+    data class MessageRequestInfo(val peer: String, val lastMessage: String, val lastAt: Long)
+
+    /** A WebRTC ICE server for the call layer's RTCConfiguration. */
+    data class IceServerInfo(
+        val urls: List<String>,
+        val username: String?,
+        val credential: String?,
+    )
+
+    /** A minted call session: id, peer, media kind, and ICE servers. */
+    data class CallSessionInfo(
+        val callId: String,
+        val peer: String,
+        val media: String,
+        val iceServers: List<IceServerInfo>,
+    )
+
+    /** A call-log entry. */
+    data class CallRecordInfo(
+        val id: String,
+        val peer: String,
+        val media: String,
+        val incoming: Boolean,
+        val outcome: String,
+        val startedAt: Long,
+        val durationSecs: Long,
+    )
+
+    /** An encrypted-media message (send result or incoming reference). */
+    data class MediaMessageInfo(
+        val eventId: String,
+        val url: String,
+        val mimeType: String,
+        val caption: String,
+        val sender: String,
+        val createdAt: Long,
+        val size: Long,
+    )
+
+    /** Decrypted media bytes (base64) plus MIME type. */
+    data class MediaBytesInfo(val mimeType: String, val base64: String)
 
     /** A private journal entry — local-only, sealed by the passcode. */
     data class JournalEntryInfo(
@@ -340,6 +448,144 @@ object ComradeCore {
         return (0 until arr.length()).map { i -> arr.getJSONObject(i).toMessage() }
     }
 
+    /** Send a reply DM ([replyTo] null/"" for a normal message). */
+    fun sendDmReplyTyped(target: String, content: String, replyTo: String?): MessageInfo =
+        JSONObject(sendDmReply(target, content, replyTo ?: "")).failOnError("Send").toMessage()
+
+    /** Pending message requests, newest first. */
+    fun messageRequests(): List<MessageRequestInfo> {
+        val parsed = JSONTokener(messageRequests()).nextValue()
+        if (parsed is JSONObject) parsed.failOnError("Requests")
+        val arr = parsed as JSONArray
+        return (0 until arr.length()).map { i ->
+            val o = arr.getJSONObject(i)
+            MessageRequestInfo(
+                peer = o.getString("peer"),
+                lastMessage = o.getString("last_message"),
+                lastAt = o.getLong("last_at"),
+            )
+        }
+    }
+
+    /** Accept a message request; throws on backend error. */
+    fun acceptRequestTyped(peer: String) {
+        JSONObject(acceptRequest(peer)).failOnError("Accept")
+    }
+
+    /** Block a peer; throws on backend error. */
+    fun blockConversationTyped(peer: String) {
+        JSONObject(blockConversation(peer)).failOnError("Block")
+    }
+
+    /** Send a read receipt for a conversation; throws on backend error. */
+    fun markConversationReadTyped(peer: String) {
+        JSONObject(markConversationRead(peer)).failOnError("Mark read")
+    }
+
+    private fun JSONObject.toMediaMessage() = MediaMessageInfo(
+        eventId = getString("event_id"),
+        url = getString("url"),
+        mimeType = getString("mime_type"),
+        caption = optString("caption"),
+        sender = getString("sender"),
+        createdAt = getLong("created_at"),
+        size = getLong("size"),
+    )
+
+    /** Encrypt + send media, returning the stored reference or throwing. */
+    fun sendMediaBytesTyped(
+        target: String,
+        mimeType: String,
+        caption: String,
+        base64: String,
+    ): MediaMessageInfo =
+        JSONObject(sendMediaBytes(target, mimeType, caption, base64))
+            .failOnError("Send media")
+            .toMediaMessage()
+
+    /** Download + decrypt a media reference by event id. */
+    fun downloadMediaTyped(eventId: String): MediaBytesInfo {
+        val o = JSONObject(downloadMedia(eventId)).failOnError("Media download")
+        return MediaBytesInfo(mimeType = o.getString("mime_type"), base64 = o.getString("base64"))
+    }
+
+    private fun JSONObject.toIceServer(): IceServerInfo {
+        val urlsArr = getJSONArray("urls")
+        val urls = (0 until urlsArr.length()).map { urlsArr.getString(it) }
+        return IceServerInfo(
+            urls = urls,
+            username = optNullableString("username"),
+            credential = optNullableString("credential"),
+        )
+    }
+
+    /** ICE servers for the WebRTC layer. */
+    fun callIceServersTyped(): List<IceServerInfo> {
+        val parsed = JSONTokener(callIceServers()).nextValue()
+        if (parsed is JSONObject) parsed.failOnError("ICE servers")
+        val arr = parsed as JSONArray
+        return (0 until arr.length()).map { i -> arr.getJSONObject(i).toIceServer() }
+    }
+
+    /** Configure ("" url clears) the TURN relay; throws on backend error. */
+    fun setTurnServerTyped(url: String, username: String, credential: String) {
+        JSONObject(setTurnServer(url, username, credential)).failOnError("TURN config")
+    }
+
+    /** Begin a call, returning the minted session (id + ICE servers). */
+    fun placeCallTyped(peer: String, media: String): CallSessionInfo {
+        val o = JSONObject(placeCall(peer, media)).failOnError("Place call")
+        val iceArr = o.getJSONArray("ice_servers")
+        return CallSessionInfo(
+            callId = o.getString("call_id"),
+            peer = o.getString("peer"),
+            media = o.getString("media"),
+            iceServers = (0 until iceArr.length()).map { iceArr.getJSONObject(it).toIceServer() },
+        )
+    }
+
+    /** Send one call-signaling payload; throws on backend error. */
+    fun sendCallSignalTyped(peer: String, callId: String, media: String, signalJson: String) {
+        JSONObject(sendCallSignal(peer, callId, media, signalJson)).failOnError("Call signal")
+    }
+
+    /** Send a `Hangup` with [reason]; throws on backend error. */
+    fun hangupCallTyped(peer: String, callId: String, media: String, reason: String) {
+        JSONObject(hangupCall(peer, callId, media, reason)).failOnError("Hangup")
+    }
+
+    private fun JSONObject.toCallRecord() = CallRecordInfo(
+        id = getString("id"),
+        peer = getString("peer"),
+        media = getString("media"),
+        incoming = getBoolean("incoming"),
+        outcome = getString("outcome"),
+        startedAt = getLong("started_at"),
+        durationSecs = getLong("duration_secs"),
+    )
+
+    /** Persist a finished call to the log, returning the stored record. */
+    fun logCallTyped(
+        peer: String,
+        callId: String,
+        media: String,
+        incoming: Boolean,
+        outcome: String,
+        startedAt: Long,
+        durationSecs: Long,
+    ): CallRecordInfo =
+        JSONObject(logCall(peer, callId, media, incoming, outcome, startedAt, durationSecs))
+            .failOnError("Log call")
+            .toCallRecord()
+
+    /** The call log ([peer] null = all peers), newest first. */
+    fun callHistoryTyped(peer: String? = null): List<CallRecordInfo> {
+        val parsed = JSONTokener(callHistory(peer ?: "")).nextValue()
+        if (parsed is JSONObject) parsed.failOnError("Call history")
+        val arr = parsed as JSONArray
+        return (0 until arr.length()).map { i -> arr.getJSONObject(i).toCallRecord() }
+    }
+
     private fun JSONObject.toJournalEntry() = JournalEntryInfo(
         id = getString("id"),
         text = getString("text"),
@@ -376,6 +622,8 @@ object ComradeCore {
         content = getString("content"),
         createdAt = getLong("created_at"),
         outgoing = getBoolean("outgoing"),
+        status = optNullableString("status"),
+        replyTo = optNullableString("reply_to"),
     )
 
     /** The cached Sabha timeline as a list of [ChitthiInfo]. */

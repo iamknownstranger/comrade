@@ -66,6 +66,51 @@ pub struct VaultMessage {
     pub content: String,
     pub created_at: u64,
     pub upi_intents: Vec<UpiPaymentIntent>,
+    /// The event id (hex) this message replies to, from a NIP-10 `e` tag, if
+    /// any. Lets the chat UI render a quoted "replying to…" preview.
+    #[serde(default)]
+    pub reply_to: Option<String>,
+}
+
+/// Extract the reply-target event id (hex) from an incoming DM's NIP-10 `e`
+/// tags. Prefers an explicit `reply` marker, then `root`, then the last `e`
+/// tag — mirroring the Sabha thread resolver so DM and feed replies agree.
+///
+/// Read from the event's canonical JSON so it is robust across nostr-sdk tag
+/// representations (the same approach the Sabha thread parser uses).
+fn reply_target(event: &Event) -> Option<String> {
+    let val = serde_json::to_value(event).ok()?;
+    let tags = val.get("tags")?.as_array()?;
+    let mut e_tags: Vec<(String, String)> = Vec::new(); // (id, marker)
+    for tag in tags {
+        let arr = match tag.as_array() {
+            Some(a) => a,
+            None => continue,
+        };
+        if arr.first().and_then(|v| v.as_str()) != Some("e") {
+            continue;
+        }
+        let id = arr
+            .get(1)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let marker = arr
+            .get(3)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if !id.is_empty() {
+            e_tags.push((id, marker));
+        }
+    }
+    if let Some((id, _)) = e_tags.iter().find(|(_, m)| m == "reply") {
+        return Some(id.clone());
+    }
+    if let Some((id, _)) = e_tags.iter().find(|(_, m)| m == "root") {
+        return Some(id.clone());
+    }
+    e_tags.last().map(|(id, _)| id.clone())
 }
 
 // ── Vault Engine ─────────────────────────────────────────────────────────────
@@ -116,11 +161,36 @@ impl VaultEngine {
         recipient: &PublicKey,
         plaintext: &str,
     ) -> Result<EventId, VaultError> {
+        self.send_dm_reply(recipient, plaintext, None).await
+    }
+
+    /// Send an E2E encrypted DM, optionally as a reply to a prior message.
+    ///
+    /// When `reply_to` is `Some(event_id_hex)`, a NIP-10 `["e", <id>, "",
+    /// "reply"]` tag is attached so the recipient can render a quoted preview.
+    /// The message body stays plain ciphertext — no envelope — so ordinary
+    /// Nostr clients still show the text; only the thread link is metadata.
+    pub async fn send_dm_reply(
+        &self,
+        recipient: &PublicKey,
+        plaintext: &str,
+        reply_to: Option<&str>,
+    ) -> Result<EventId, VaultError> {
         let encrypted = nip04::encrypt(self.our_keys.secret_key(), recipient, plaintext.as_bytes())
             .map_err(|e| VaultError::EncryptionFailed(e.to_string()))?;
 
-        let event = EventBuilder::new(Kind::EncryptedDirectMessage, encrypted)
-            .tag(Tag::public_key(*recipient))
+        // The single `p` tag stays the unambiguous NIP-04 recipient; a reply
+        // adds one `e` tag. Junk reply ids are dropped rather than failing the
+        // send — a broken quote link must never cost the user their message.
+        let mut builder = EventBuilder::new(Kind::EncryptedDirectMessage, encrypted)
+            .tag(Tag::public_key(*recipient));
+        if let Some(id) = reply_to.filter(|s| !s.is_empty()) {
+            match Tag::parse(["e", id, "", "reply"]) {
+                Ok(tag) => builder = builder.tag(tag),
+                Err(e) => warn!("dropping invalid reply tag {id}: {e}"),
+            }
+        }
+        let event = builder
             .sign_with_keys(&self.our_keys)
             .map_err(|e| VaultError::EncryptionFailed(e.to_string()))?;
 
@@ -215,12 +285,14 @@ impl VaultEngine {
                             );
                         }
 
+                        let reply_to = reply_target(&event);
                         let msg = VaultMessage {
                             event_id: event.id.to_hex(),
                             sender_pubkey: sender_pk.to_hex(),
                             content: decrypted,
                             created_at: event.created_at.as_secs(),
                             upi_intents,
+                            reply_to,
                         };
 
                         inbox.write().await.push(msg.clone());
@@ -312,5 +384,26 @@ mod tests {
             nip04::decrypt(bob.secret_key(), &alice.public_key(), encrypted).expect("decrypt");
 
         assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn reply_target_reads_the_nip10_e_tag() {
+        let keys = Keys::generate();
+        let parent = "b".repeat(64);
+
+        // A DM carrying a reply e-tag exposes the parent id.
+        let reply = EventBuilder::new(Kind::EncryptedDirectMessage, "ciphertext")
+            .tag(Tag::public_key(keys.public_key()))
+            .tag(Tag::parse(["e", parent.as_str(), "", "reply"]).unwrap())
+            .sign_with_keys(&keys)
+            .unwrap();
+        assert_eq!(reply_target(&reply).as_deref(), Some(parent.as_str()));
+
+        // A DM with no e-tag has no reply target.
+        let plain = EventBuilder::new(Kind::EncryptedDirectMessage, "ciphertext")
+            .tag(Tag::public_key(keys.public_key()))
+            .sign_with_keys(&keys)
+            .unwrap();
+        assert_eq!(reply_target(&plain), None);
     }
 }

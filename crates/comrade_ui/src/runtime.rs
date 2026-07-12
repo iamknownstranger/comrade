@@ -27,7 +27,12 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use comrade_core::call::{
+    default_ice_servers, new_call_id, parse_call_envelope, CallEnvelope, CallMediaKind, CallSignal,
+    HangupReason, IceServer,
+};
 use comrade_core::crypto::derive_media_key;
+use comrade_core::dm::{parse_profile_share, parse_receipt, ProfileShare, Receipt, ReceiptKind};
 use comrade_core::media::{
     build_file_metadata_event, encrypt_media, fetch_and_decrypt_media, FileMetadata,
     MAX_MEDIA_BYTES,
@@ -65,6 +70,16 @@ const PROFILE_REFRESH_CAP: usize = 16;
 /// Publish attempts before giving up until the next launch (see
 /// [`publish_profile_with_retry`]).
 const PUBLISH_ATTEMPTS: u32 = 5;
+/// Encrypted-store tree for app settings that are not per-peer (e.g. the TURN
+/// relay a user has configured for calls).
+const SETTINGS_TREE: &str = "app_settings";
+/// Settings key holding the optional [`TurnConfig`] for WebRTC calls.
+const TURN_CONFIG_KEY: &str = "turn_server";
+
+/// Conversation gate states (persisted in `ConversationMeta.state`).
+const STATE_PENDING: &str = "pending";
+const STATE_ACCEPTED: &str = "accepted";
+const STATE_BLOCKED: &str = "blocked";
 
 // ── Event DTOs (serialised across the IPC / FFI boundary) ────────────────────
 
@@ -114,6 +129,8 @@ pub struct DirectMessageDto {
     pub content: String,
     pub created_at: u64,
     pub upi_intents: Vec<UpiIntentDto>,
+    /// Event id (hex) this message replies to, if any (for a quoted preview).
+    pub reply_to: Option<String>,
 }
 
 impl From<VaultMessage> for DirectMessageDto {
@@ -123,6 +140,7 @@ impl From<VaultMessage> for DirectMessageDto {
             sender: to_npub(&m.sender_pubkey),
             content: m.content,
             created_at: m.created_at,
+            reply_to: m.reply_to,
             upi_intents: m
                 .upi_intents
                 .into_iter()
@@ -134,6 +152,81 @@ impl From<VaultMessage> for DirectMessageDto {
                 .collect(),
         }
     }
+}
+
+/// A WebRTC ICE server (STUN/TURN) for the frontend's `RTCConfiguration`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IceServerDto {
+    pub urls: Vec<String>,
+    pub username: Option<String>,
+    pub credential: Option<String>,
+}
+
+impl From<comrade_core::call::IceServer> for IceServerDto {
+    fn from(s: comrade_core::call::IceServer) -> Self {
+        Self {
+            urls: s.urls,
+            username: s.username,
+            credential: s.credential,
+        }
+    }
+}
+
+/// Everything a frontend needs to begin negotiating a call: the call id, the
+/// peer, the media kind, and the ICE servers to hand to `RTCPeerConnection`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallSessionDto {
+    pub call_id: String,
+    pub peer: String,
+    pub media: String,
+    pub ice_servers: Vec<IceServerDto>,
+}
+
+/// One incoming call-signaling payload (offer/answer/ICE/hangup/…) routed to
+/// the frontend. `signal` is the raw [`comrade_core::call::CallSignal`] JSON so
+/// the WebRTC layer can `switch` on its `kind`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CallSignalDto {
+    pub call_id: String,
+    pub peer: String,
+    pub media: String,
+    pub signal: serde_json::Value,
+}
+
+/// A voice/video call-log entry as the frontend sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallRecordDto {
+    pub id: String,
+    pub peer: String,
+    pub media: String,
+    pub incoming: bool,
+    pub outcome: String,
+    pub started_at: u64,
+    pub duration_secs: u64,
+}
+
+impl From<comrade_storage::CallRecord> for CallRecordDto {
+    fn from(c: comrade_storage::CallRecord) -> Self {
+        Self {
+            id: c.id,
+            peer: c.peer_npub,
+            media: c.media,
+            incoming: c.incoming,
+            outcome: c.outcome,
+            started_at: c.started_at,
+            duration_secs: c.duration_secs,
+        }
+    }
+}
+
+/// A pending message request: a stranger's DM that is gated out of the chat
+/// list until the user accepts it. Only the preview and timing are exposed —
+/// the peer's chosen handle is not shared until they, in turn, accept.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageRequestDto {
+    pub peer: String,
+    pub last_message: String,
+    pub last_at: u64,
 }
 
 /// A NIP-94 encrypted-media reference as the frontend sees it (no key material).
@@ -307,6 +400,11 @@ pub struct MessageDto {
     pub content: String,
     pub created_at: u64,
     pub outgoing: bool,
+    /// Delivery status of an outgoing message: `sent` / `delivered` / `read`.
+    /// `None` for incoming messages (no ticks shown on the receiver's side).
+    pub status: Option<String>,
+    /// Event id (hex) this message replies to, if any.
+    pub reply_to: Option<String>,
 }
 
 /// A push event emitted by the background Tokio loops and forwarded across the
@@ -317,10 +415,27 @@ pub struct MessageDto {
 pub enum BridgeEvent {
     /// A new public Chitthi (Kind-1) arrived on the Sabha timeline.
     IncomingChitthi(ChitthiDto),
-    /// A new encrypted DM (Kind-4) was decrypted in the Vault inbox.
+    /// A new encrypted DM (Kind-4) was decrypted in the Vault inbox — from an
+    /// already-accepted conversation.
     IncomingDirectMessage(DirectMessageDto),
     /// A new encrypted-media reference (NIP-94) arrived over the DM channel.
     IncomingMedia(MediaMessageDto),
+    /// A call-signaling payload (offer/answer/ICE/hangup) arrived for the
+    /// frontend's WebRTC layer.
+    IncomingCallSignal(CallSignalDto),
+    /// A stranger (not yet accepted) sent a DM — surfaced as a message request,
+    /// not a chat. Accepting it moves the conversation into the chat list.
+    IncomingMessageRequest(MessageRequestDto),
+    /// A delivered/read receipt advanced the status of one or more of our
+    /// outgoing messages in `peer`'s thread.
+    MessageStatus {
+        peer: String,
+        message_ids: Vec<String>,
+        status: String,
+    },
+    /// A peer shared (or updated) their display handle — e.g. by accepting our
+    /// message request. The chat list should re-title their conversation.
+    PeerProfileUpdated { peer: String, name: Option<String> },
 }
 
 // ── Runtime ───────────────────────────────────────────────────────────────────
@@ -517,62 +632,13 @@ impl ComradeRuntime {
         if let Some(vault) = self.vault.clone() {
             let tx = self.events.clone();
             let store = self.ui.store_arc();
+            // A clone of the vault handle the callback can use to send back
+            // delivered receipts (the callback itself is sync; it spawns).
+            let vault_cb = vault.clone();
             tokio::spawn(async move {
                 vault.connect().await;
                 let cb: VaultCallback = Box::new(move |msg| {
-                    // A media envelope rides inside an ordinary E2E DM. Surface it
-                    // as a media event (and persist the ref so it can later be
-                    // decrypted by event id); everything else is a plain DM.
-                    if let Some(env) = parse_media_envelope(&msg.content) {
-                        if let Some(store) = store.as_ref() {
-                            let reff = MediaRef {
-                                url: env.url.clone(),
-                                peer_pubkey: msg.sender_pubkey.clone(),
-                                mime_type: env.mime.clone(),
-                                caption: env.caption.clone(),
-                                size: env.size,
-                                sha256_hex: env.sha256_hex.clone(),
-                                outgoing: false,
-                                created_at: msg.created_at,
-                            };
-                            // A dropped ref means download_and_decrypt_media
-                            // later can't resolve this event — surface it rather
-                            // than silently losing the media.
-                            if let Err(e) = store
-                                .put(MEDIA_REFS_TREE, &env.event_id, &reff)
-                                .and_then(|()| store.flush())
-                            {
-                                warn!("failed to persist incoming media ref: {e}");
-                            }
-                        }
-                        let _ = tx.send(BridgeEvent::IncomingMedia(MediaMessageDto {
-                            event_id: env.event_id,
-                            url: env.url,
-                            mime_type: env.mime,
-                            caption: env.caption,
-                            sender: to_npub(&msg.sender_pubkey),
-                            created_at: msg.created_at,
-                            size: env.size,
-                        }));
-                    } else {
-                        // Persist plain DMs so conversations survive restarts —
-                        // the chat list is rebuilt from this offline history.
-                        if let Some(store) = store.as_ref() {
-                            let row = comrade_storage::StoredMessage {
-                                id: msg.event_id.clone(),
-                                peer_npub: to_npub(&msg.sender_pubkey),
-                                content: msg.content.clone(),
-                                created_at: msg.created_at,
-                                outgoing: false,
-                            };
-                            if let Err(e) = store.save_message(&row).and_then(|()| store.flush()) {
-                                warn!("failed to persist incoming DM: {e}");
-                            }
-                        }
-                        let _ = tx.send(BridgeEvent::IncomingDirectMessage(
-                            DirectMessageDto::from(msg),
-                        ));
-                    }
+                    dispatch_incoming_dm(&vault_cb, store.as_ref(), &tx, msg);
                 });
                 if let Err(e) = vault.subscribe_inbox_with_callback(cb).await {
                     warn!("vault inbox loop ended: {e}");
@@ -642,22 +708,38 @@ impl ComradeRuntime {
     /// Send an end-to-end encrypted DM to `target` (npub or hex pubkey) and
     /// persist it to the offline history. Returns the stored message DTO.
     pub async fn send_dm(&self, target: &str, content: &str) -> Result<MessageDto, UiError> {
+        self.send_dm_reply(target, content, None).await
+    }
+
+    /// Send an E2E DM, optionally as a reply to a prior message (`reply_to` is
+    /// the replied message's event id, hex). Sending to someone accepts the
+    /// conversation on our side and shares our @handle once (so they can title
+    /// the chat) — the sender-side half of "username shared once engaged".
+    pub async fn send_dm_reply(
+        &self,
+        target: &str,
+        content: &str,
+        reply_to: Option<&str>,
+    ) -> Result<MessageDto, UiError> {
         if content.trim().is_empty() {
             return Err(UiError::Engine("message is empty".into()));
         }
         let vault = self.vault.clone().ok_or(UiError::VaultLocked)?;
         let peer = parse_pubkey(target)?;
         let id = vault
-            .send_dm(&peer, content)
+            .send_dm_reply(&peer, content, reply_to)
             .await
             .map_err(|e| UiError::Engine(e.to_string()))?;
 
+        let peer_npub = to_npub(target);
         let dto = MessageDto {
             id: id.to_hex(),
-            peer: to_npub(target),
+            peer: peer_npub.clone(),
             content: content.to_string(),
             created_at: now_secs(),
             outgoing: true,
+            status: Some("sent".into()),
+            reply_to: reply_to.map(str::to_string),
         };
         if let Some(store) = self.ui.store_ref() {
             let row = comrade_storage::StoredMessage {
@@ -666,16 +748,20 @@ impl ComradeRuntime {
                 content: dto.content.clone(),
                 created_at: dto.created_at,
                 outgoing: true,
+                status: Some("sent".into()),
+                reply_to: dto.reply_to.clone(),
             };
             if let Err(e) = store.save_message(&row).and_then(|()| store.flush()) {
                 warn!("failed to persist outgoing DM: {e}");
             }
         }
+        self.mark_accepted_and_share_profile(&peer_npub, &peer);
         Ok(dto)
     }
 
-    /// The chat list: one entry per peer, newest thread first, with saved
-    /// contact aliases joined in. Built from the offline message history.
+    /// The chat list: one entry per **accepted** peer, newest thread first, with
+    /// saved contact aliases joined in. Pending message requests and blocked
+    /// peers are excluded (see [`Self::message_requests`]).
     pub fn conversations(&self) -> Result<Vec<ConversationDto>, UiError> {
         let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
         let aliases: std::collections::HashMap<String, String> = store
@@ -684,6 +770,10 @@ impl ComradeRuntime {
             .into_iter()
             .map(|c| (c.npub, c.petname))
             .collect();
+        // Peers gated out of the chat list: pending requests + blocked. A peer
+        // with no meta at all (e.g. history from before this feature) is treated
+        // as an ordinary accepted conversation.
+        let gated = self.gated_peers(store)?;
 
         let mut newest: std::collections::HashMap<String, comrade_storage::StoredMessage> =
             std::collections::HashMap::new();
@@ -691,6 +781,9 @@ impl ComradeRuntime {
             .all_messages()
             .map_err(|e| UiError::Storage(e.to_string()))?
         {
+            if gated.contains(&msg.peer_npub) {
+                continue;
+            }
             match newest.get(&msg.peer_npub) {
                 Some(existing) if existing.created_at >= msg.created_at => {}
                 _ => {
@@ -716,7 +809,9 @@ impl ComradeRuntime {
         Ok(list)
     }
 
-    /// Full offline message history with `peer` (npub or hex), oldest first.
+    /// Full offline message history with `peer` (npub or hex), oldest first —
+    /// carrying each message's delivery status and reply target. Not gated, so
+    /// a pending request's thread is viewable before it is accepted.
     pub fn messages_with(&self, peer: &str) -> Result<Vec<MessageDto>, UiError> {
         let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
         let peer = to_npub(peer);
@@ -729,11 +824,372 @@ impl ComradeRuntime {
                 peer: m.peer_npub,
                 content: m.content,
                 created_at: m.created_at,
+                status: if m.outgoing {
+                    Some(m.status.unwrap_or_else(|| "sent".into()))
+                } else {
+                    None
+                },
+                reply_to: m.reply_to,
                 outgoing: m.outgoing,
             })
             .collect();
         msgs.sort_by_key(|m| m.created_at);
         Ok(msgs)
+    }
+
+    // ── Message requests (gate strangers; accept/block; profile on accept) ────
+
+    /// Peers to hide from the chat list: those with a `pending` or `blocked`
+    /// conversation gate. A peer with no gate record is shown (accepted).
+    fn gated_peers(
+        &self,
+        store: &comrade_storage::EncryptedStore,
+    ) -> Result<std::collections::HashSet<String>, UiError> {
+        Ok(store
+            .list_conversation_meta()
+            .map_err(|e| UiError::Storage(e.to_string()))?
+            .into_iter()
+            .filter(|m| m.state == STATE_PENDING || m.state == STATE_BLOCKED)
+            .map(|m| m.peer_npub)
+            .collect())
+    }
+
+    /// Pending message requests — strangers' DMs awaiting accept/block, newest
+    /// first, with a preview of their latest message.
+    pub fn message_requests(&self) -> Result<Vec<MessageRequestDto>, UiError> {
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        let pending: std::collections::HashSet<String> = store
+            .list_conversation_meta()
+            .map_err(|e| UiError::Storage(e.to_string()))?
+            .into_iter()
+            .filter(|m| m.state == STATE_PENDING)
+            .map(|m| m.peer_npub)
+            .collect();
+        if pending.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut newest: std::collections::HashMap<String, comrade_storage::StoredMessage> =
+            std::collections::HashMap::new();
+        for msg in store
+            .all_messages()
+            .map_err(|e| UiError::Storage(e.to_string()))?
+        {
+            if !pending.contains(&msg.peer_npub) {
+                continue;
+            }
+            match newest.get(&msg.peer_npub) {
+                Some(existing) if existing.created_at >= msg.created_at => {}
+                _ => {
+                    newest.insert(msg.peer_npub.clone(), msg);
+                }
+            }
+        }
+        let mut list: Vec<MessageRequestDto> = newest
+            .into_values()
+            .map(|m| MessageRequestDto {
+                peer: m.peer_npub,
+                last_message: m.content,
+                last_at: m.created_at,
+            })
+            .collect();
+        list.sort_by_key(|r| std::cmp::Reverse(r.last_at));
+        Ok(list)
+    }
+
+    /// Accept a pending message request: mark the conversation accepted, share
+    /// our @handle with the peer (this is the moment "the username is shared"),
+    /// and acknowledge their messages as read. The conversation now appears in
+    /// the chat list. Idempotent for an already-accepted peer.
+    pub fn accept_request(&self, peer: &str) -> Result<(), UiError> {
+        let peer_pk = parse_pubkey(peer)?;
+        let peer_npub = peer_pk
+            .to_bech32()
+            .map_err(|e| UiError::Engine(e.to_string()))?;
+        if self.ui.store_ref().is_none() {
+            return Err(UiError::VaultLocked);
+        }
+        self.mark_accepted_and_share_profile(&peer_npub, &peer_pk);
+        // Their messages are now read — acknowledge them.
+        let ids = self.incoming_ids(&peer_npub);
+        self.spawn_receipt(&peer_pk, ReceiptKind::Read, ids);
+        Ok(())
+    }
+
+    /// Block a peer: hide them from the chat list and drop their future DMs in
+    /// the inbox loop. The message history is left intact locally.
+    pub fn block_conversation(&self, peer: &str) -> Result<(), UiError> {
+        let peer_pk = parse_pubkey(peer)?;
+        let peer_npub = peer_pk
+            .to_bech32()
+            .map_err(|e| UiError::Engine(e.to_string()))?;
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        let meta = comrade_storage::ConversationMeta {
+            peer_npub,
+            state: STATE_BLOCKED.to_string(),
+            profile_shared: false,
+            updated_at: now_secs(),
+        };
+        store
+            .set_conversation_meta(&meta)
+            .and_then(|()| store.flush())
+            .map_err(|e| UiError::Storage(e.to_string()))
+    }
+
+    /// Mark a conversation read: send a read receipt covering the peer's
+    /// incoming messages. The frontend calls this when the thread is opened
+    /// (accepted conversations only — we never ack a pending request).
+    pub fn mark_conversation_read(&self, peer: &str) -> Result<(), UiError> {
+        let peer_pk = parse_pubkey(peer)?;
+        let peer_npub = peer_pk
+            .to_bech32()
+            .map_err(|e| UiError::Engine(e.to_string()))?;
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        // Only ack accepted conversations — acking a pending request would leak
+        // that we saw it before deciding to accept.
+        let accepted = store
+            .get_conversation_meta(&peer_npub)
+            .map_err(|e| UiError::Storage(e.to_string()))?
+            .map(|m| m.state == STATE_ACCEPTED)
+            .unwrap_or(true); // no gate record ⇒ ordinary conversation
+        if !accepted {
+            return Ok(());
+        }
+        let ids = self.incoming_ids(&peer_npub);
+        self.spawn_receipt(&peer_pk, ReceiptKind::Read, ids);
+        Ok(())
+    }
+
+    /// Event ids of the peer's incoming (received) messages in this thread.
+    fn incoming_ids(&self, peer_npub: &str) -> Vec<String> {
+        self.ui
+            .store_ref()
+            .and_then(|s| s.messages_with(peer_npub).ok())
+            .map(|msgs| {
+                msgs.into_iter()
+                    .filter(|m| !m.outgoing)
+                    .map(|m| m.id)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Record the conversation as accepted and, once, share our @handle with the
+    /// peer over the encrypted channel. The share runs in the background so the
+    /// user's action is never blocked on the network; the `profile_shared` flag
+    /// flips only on a successful send, so a failed share retries next time.
+    fn mark_accepted_and_share_profile(&self, peer_npub: &str, peer: &PublicKey) {
+        let Some(store) = self.ui.store_arc() else {
+            return;
+        };
+        let already_shared = store
+            .get_conversation_meta(peer_npub)
+            .ok()
+            .flatten()
+            .map(|m| m.profile_shared)
+            .unwrap_or(false);
+        let meta = comrade_storage::ConversationMeta {
+            peer_npub: peer_npub.to_string(),
+            state: STATE_ACCEPTED.to_string(),
+            profile_shared: already_shared,
+            updated_at: now_secs(),
+        };
+        if let Err(e) = store
+            .set_conversation_meta(&meta)
+            .and_then(|()| store.flush())
+        {
+            warn!("failed to record accepted conversation: {e}");
+        }
+        if already_shared {
+            return;
+        }
+        let (Some(vault), username) = (self.vault.clone(), self.ui.username()) else {
+            return;
+        };
+        let peer = *peer;
+        let peer_npub = peer_npub.to_string();
+        tokio::spawn(async move {
+            let Ok(json) = ProfileShare::new(username).to_json() else {
+                return;
+            };
+            if vault.send_dm(&peer, &json).await.is_ok() {
+                let meta = comrade_storage::ConversationMeta {
+                    peer_npub,
+                    state: STATE_ACCEPTED.to_string(),
+                    profile_shared: true,
+                    updated_at: now_secs(),
+                };
+                let _ = store
+                    .set_conversation_meta(&meta)
+                    .and_then(|()| store.flush());
+            }
+        });
+    }
+
+    /// Fire-and-forget a receipt DM (delivered/read) to `peer`.
+    fn spawn_receipt(&self, peer: &PublicKey, kind: ReceiptKind, message_ids: Vec<String>) {
+        if message_ids.is_empty() {
+            return;
+        }
+        let Some(vault) = self.vault.clone() else {
+            return;
+        };
+        let peer = *peer;
+        tokio::spawn(async move {
+            if let Ok(json) = Receipt::new(kind, message_ids).to_json() {
+                let _ = vault.send_dm(&peer, &json).await;
+            }
+        });
+    }
+
+    // ── Calls (voice/video · WebRTC signalled over the DM channel) ────────────
+
+    /// The ICE servers to hand a frontend `RTCPeerConnection`: public STUN by
+    /// default, plus a user-configured TURN relay if one has been set.
+    pub fn call_ice_servers(&self) -> Vec<IceServerDto> {
+        let mut servers = default_ice_servers();
+        if let Some(store) = self.ui.store_ref() {
+            if let Ok(Some(turn)) = store.get::<TurnConfig>(SETTINGS_TREE, TURN_CONFIG_KEY) {
+                if !turn.url.trim().is_empty() {
+                    servers.push(IceServer::turn(turn.url, turn.username, turn.credential));
+                }
+            }
+        }
+        servers.into_iter().map(IceServerDto::from).collect()
+    }
+
+    /// Configure (or, with a blank `url`, clear) the TURN relay used for calls
+    /// that cannot connect over STUN alone. Persisted in the encrypted store.
+    pub fn set_turn_server(
+        &self,
+        url: &str,
+        username: &str,
+        credential: &str,
+    ) -> Result<(), UiError> {
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        if url.trim().is_empty() {
+            store
+                .delete(SETTINGS_TREE, TURN_CONFIG_KEY)
+                .map_err(|e| UiError::Storage(e.to_string()))?;
+        } else {
+            let cfg = TurnConfig {
+                url: url.trim().to_string(),
+                username: username.to_string(),
+                credential: credential.to_string(),
+            };
+            store
+                .put(SETTINGS_TREE, TURN_CONFIG_KEY, &cfg)
+                .map_err(|e| UiError::Storage(e.to_string()))?;
+        }
+        store.flush().map_err(|e| UiError::Storage(e.to_string()))
+    }
+
+    /// Begin a call to `peer`: mint a call id and return the session the
+    /// frontend needs (id, peer, media kind, ICE servers). No signal is sent
+    /// yet — the frontend creates the WebRTC offer, then calls
+    /// [`Self::send_call_signal`]. `media` is `"audio"` or `"video"`.
+    pub fn place_call(&self, peer: &str, media: &str) -> Result<CallSessionDto, UiError> {
+        if self.vault.is_none() {
+            return Err(UiError::VaultLocked);
+        }
+        let _ = parse_pubkey(peer)?; // validate the target up front
+        Ok(CallSessionDto {
+            call_id: new_call_id(),
+            peer: to_npub(peer),
+            media: CallMediaKind::from_str_lenient(media).as_str().to_string(),
+            ice_servers: self.call_ice_servers(),
+        })
+    }
+
+    /// Send one call-signaling payload to `peer` over the encrypted DM channel.
+    /// `signal_json` is a serialised [`comrade_core::call::CallSignal`], e.g.
+    /// `{"kind":"offer","sdp":"…"}` or `{"kind":"ice","candidate":"…"}`.
+    pub async fn send_call_signal(
+        &self,
+        peer: &str,
+        call_id: &str,
+        media: &str,
+        signal_json: &str,
+    ) -> Result<(), UiError> {
+        let vault = self.vault.clone().ok_or(UiError::VaultLocked)?;
+        let peer_pk = parse_pubkey(peer)?;
+        let signal: CallSignal = serde_json::from_str(signal_json)
+            .map_err(|e| UiError::Engine(format!("invalid call signal: {e}")))?;
+        let env = CallEnvelope::new(
+            call_id.to_string(),
+            CallMediaKind::from_str_lenient(media),
+            signal,
+        );
+        let json = env.to_json().map_err(|e| UiError::Engine(e.to_string()))?;
+        vault
+            .send_dm(&peer_pk, &json)
+            .await
+            .map_err(|e| UiError::Engine(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Convenience: send a `Hangup` signal with `reason` (`normal`, `declined`,
+    /// `busy`, `missed`, `cancelled`, `failed`) to end/reject a call.
+    pub async fn hangup_call(
+        &self,
+        peer: &str,
+        call_id: &str,
+        media: &str,
+        reason: &str,
+    ) -> Result<(), UiError> {
+        let signal = CallSignal::Hangup {
+            reason: HangupReason::from_str_lenient(reason),
+        };
+        let json = serde_json::to_string(&signal).map_err(|e| UiError::Engine(e.to_string()))?;
+        self.send_call_signal(peer, call_id, media, &json).await
+    }
+
+    /// Persist a finished call to the call log. `outcome` is one of
+    /// `connected` / `missed` / `declined` / `cancelled` / `busy` / `failed`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn log_call(
+        &self,
+        peer: &str,
+        call_id: &str,
+        media: &str,
+        incoming: bool,
+        outcome: &str,
+        started_at: u64,
+        duration_secs: u64,
+    ) -> Result<CallRecordDto, UiError> {
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        let record = comrade_storage::CallRecord {
+            id: call_id.to_string(),
+            peer_npub: to_npub(peer),
+            media: CallMediaKind::from_str_lenient(media).as_str().to_string(),
+            incoming,
+            outcome: outcome.to_string(),
+            started_at: if started_at == 0 {
+                now_secs()
+            } else {
+                started_at
+            },
+            duration_secs,
+        };
+        store
+            .save_call_record(&record)
+            .and_then(|()| store.flush())
+            .map_err(|e| UiError::Storage(e.to_string()))?;
+        Ok(record.into())
+    }
+
+    /// The call log, newest first — for a single `peer` (npub/hex) or, with
+    /// `None`, across every peer.
+    pub fn call_history(&self, peer: Option<&str>) -> Result<Vec<CallRecordDto>, UiError> {
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        let calls = match peer {
+            Some(p) => store
+                .calls_with(&to_npub(p))
+                .map_err(|e| UiError::Storage(e.to_string()))?,
+            None => store
+                .all_calls()
+                .map_err(|e| UiError::Storage(e.to_string()))?,
+        };
+        Ok(calls.into_iter().map(CallRecordDto::from).collect())
     }
 
     // ── Profile & contacts (username = alias, identity = keypair) ────────────
@@ -1287,6 +1743,240 @@ fn store_profile_record(
     }
 }
 
+/// A user-configured TURN relay for WebRTC calls, sealed in the encrypted store.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TurnConfig {
+    url: String,
+    #[serde(default)]
+    username: String,
+    #[serde(default)]
+    credential: String,
+}
+
+/// The conversation gate for an incoming DM's sender.
+enum IncomingGate {
+    /// Peer is blocked — drop everything from them silently.
+    Blocked,
+    /// Peer is an established conversation — deliver normally + ack.
+    Accepted,
+    /// Peer is a stranger (or an unaccepted request) — route to requests.
+    Pending,
+}
+
+/// Classify an incoming DM's sender against the conversation gate. A peer with
+/// no gate record is treated as `Pending` (a new stranger); [`send_dm`] and
+/// [`accept_request`] are what flip a peer to `Accepted`.
+///
+/// [`send_dm`]: ComradeRuntime::send_dm
+/// [`accept_request`]: ComradeRuntime::accept_request
+fn conversation_gate(store: &comrade_storage::EncryptedStore, peer_npub: &str) -> IncomingGate {
+    match store.get_conversation_meta(peer_npub).ok().flatten() {
+        Some(m) if m.state == STATE_BLOCKED => IncomingGate::Blocked,
+        Some(m) if m.state == STATE_ACCEPTED => IncomingGate::Accepted,
+        _ => IncomingGate::Pending,
+    }
+}
+
+/// Record a peer as a pending request if they have no gate record yet.
+fn ensure_pending(store: Option<&Arc<comrade_storage::EncryptedStore>>, peer_npub: &str) {
+    let Some(store) = store else { return };
+    if store
+        .get_conversation_meta(peer_npub)
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        let meta = comrade_storage::ConversationMeta {
+            peer_npub: peer_npub.to_string(),
+            state: STATE_PENDING.to_string(),
+            profile_shared: false,
+            updated_at: now_secs(),
+        };
+        if let Err(e) = store
+            .set_conversation_meta(&meta)
+            .and_then(|()| store.flush())
+        {
+            warn!("failed to record message request: {e}");
+        }
+    }
+}
+
+/// Cache a peer's shared display handle (from a profile-share envelope).
+fn cache_pushed_peer_name(store: &comrade_storage::EncryptedStore, npub: &str, name: &str) {
+    let record = PeerProfileRecord {
+        name: Some(name.to_string()),
+        about: None,
+        updated_at: now_secs(),
+    };
+    if store_profile_record(store, npub, &record) {
+        let _ = store.flush();
+    }
+}
+
+/// Fire a delivered receipt back to `sender_hex` for `message_id` (best-effort;
+/// only ever called for accepted conversations).
+fn send_delivered_receipt(vault: &Arc<VaultEngine>, sender_hex: &str, message_id: &str) {
+    let Ok(peer) = PublicKey::parse(sender_hex) else {
+        return;
+    };
+    let Ok(json) = Receipt::new(ReceiptKind::Delivered, vec![message_id.to_string()]).to_json()
+    else {
+        return;
+    };
+    let vault = vault.clone();
+    tokio::spawn(async move {
+        if let Err(e) = vault.send_dm(&peer, &json).await {
+            tracing::debug!("delivered receipt not sent: {e}");
+        }
+    });
+}
+
+/// Route one decrypted incoming DM: block-drop, control envelopes
+/// (receipt/profile-share/call), media, or plain chat — applying the message
+/// -request gate throughout. Runs inside the Vault inbox Tokio task.
+fn dispatch_incoming_dm(
+    vault: &Arc<VaultEngine>,
+    store: Option<&Arc<comrade_storage::EncryptedStore>>,
+    tx: &broadcast::Sender<BridgeEvent>,
+    msg: VaultMessage,
+) {
+    let peer_npub = to_npub(&msg.sender_pubkey);
+    let gate = store
+        .map(|s| conversation_gate(s, &peer_npub))
+        .unwrap_or(IncomingGate::Pending);
+    if matches!(gate, IncomingGate::Blocked) {
+        return;
+    }
+
+    // 1) Receipt — advance our outgoing statuses (accepted conversations only).
+    if let Some(receipt) = parse_receipt(&msg.content) {
+        if matches!(gate, IncomingGate::Accepted) {
+            if let Some(store) = store {
+                let status = receipt.status.as_str();
+                let mut changed = Vec::new();
+                for id in &receipt.message_ids {
+                    if store.set_message_status(id, status).unwrap_or(false) {
+                        changed.push(id.clone());
+                    }
+                }
+                let _ = store.flush();
+                if !changed.is_empty() {
+                    let _ = tx.send(BridgeEvent::MessageStatus {
+                        peer: peer_npub,
+                        message_ids: changed,
+                        status: status.to_string(),
+                    });
+                }
+            }
+        }
+        return;
+    }
+
+    // 2) Profile share — cache the peer's shared @handle (any non-blocked peer;
+    //    they revealed it by reaching out or accepting).
+    if let Some(profile) = parse_profile_share(&msg.content) {
+        if let (Some(store), Some(name)) = (store, profile.username) {
+            cache_pushed_peer_name(store, &peer_npub, &name);
+            let _ = tx.send(BridgeEvent::PeerProfileUpdated {
+                peer: peer_npub,
+                name: Some(name),
+            });
+        }
+        return;
+    }
+
+    // 3) Call signaling — only from an established conversation, so a stranger
+    //    cannot ring you before their message request is accepted.
+    if let Some(env) = parse_call_envelope(&msg.content) {
+        if matches!(gate, IncomingGate::Accepted) {
+            let signal = serde_json::to_value(&env.signal).unwrap_or(serde_json::Value::Null);
+            let _ = tx.send(BridgeEvent::IncomingCallSignal(CallSignalDto {
+                call_id: env.call_id,
+                peer: peer_npub,
+                media: env.media.as_str().to_string(),
+                signal,
+            }));
+        }
+        return;
+    }
+
+    // 4) Media envelope — persist the NIP-94 ref, then surface (gated).
+    if let Some(env) = parse_media_envelope(&msg.content) {
+        if let Some(store) = store {
+            let reff = MediaRef {
+                url: env.url.clone(),
+                peer_pubkey: msg.sender_pubkey.clone(),
+                mime_type: env.mime.clone(),
+                caption: env.caption.clone(),
+                size: env.size,
+                sha256_hex: env.sha256_hex.clone(),
+                outgoing: false,
+                created_at: msg.created_at,
+            };
+            if let Err(e) = store
+                .put(MEDIA_REFS_TREE, &env.event_id, &reff)
+                .and_then(|()| store.flush())
+            {
+                warn!("failed to persist incoming media ref: {e}");
+            }
+        }
+        if matches!(gate, IncomingGate::Accepted) {
+            let _ = tx.send(BridgeEvent::IncomingMedia(MediaMessageDto {
+                event_id: env.event_id,
+                url: env.url,
+                mime_type: env.mime,
+                caption: env.caption,
+                sender: to_npub(&msg.sender_pubkey),
+                created_at: msg.created_at,
+                size: env.size,
+            }));
+            send_delivered_receipt(vault, &msg.sender_pubkey, &msg.event_id);
+        } else {
+            ensure_pending(store, &peer_npub);
+            let preview = if env.caption.is_empty() {
+                "📎 Attachment".to_string()
+            } else {
+                format!("📎 {}", env.caption)
+            };
+            let _ = tx.send(BridgeEvent::IncomingMessageRequest(MessageRequestDto {
+                peer: peer_npub,
+                last_message: preview,
+                last_at: msg.created_at,
+            }));
+        }
+        return;
+    }
+
+    // 5) Plain chat text — persist, then deliver or gate into a request.
+    if let Some(store) = store {
+        let row = comrade_storage::StoredMessage {
+            id: msg.event_id.clone(),
+            peer_npub: peer_npub.clone(),
+            content: msg.content.clone(),
+            created_at: msg.created_at,
+            outgoing: false,
+            status: None,
+            reply_to: msg.reply_to.clone(),
+        };
+        if let Err(e) = store.save_message(&row).and_then(|()| store.flush()) {
+            warn!("failed to persist incoming DM: {e}");
+        }
+    }
+    if matches!(gate, IncomingGate::Accepted) {
+        send_delivered_receipt(vault, &msg.sender_pubkey, &msg.event_id);
+        let _ = tx.send(BridgeEvent::IncomingDirectMessage(DirectMessageDto::from(
+            msg,
+        )));
+    } else {
+        ensure_pending(store, &peer_npub);
+        let _ = tx.send(BridgeEvent::IncomingMessageRequest(MessageRequestDto {
+            peer: peer_npub,
+            last_message: msg.content,
+            last_at: msg.created_at,
+        }));
+    }
+}
+
 /// Detached profile-refresh worker. Holds only the engine and store handles,
 /// so the shared `Arc<RwLock<ComradeRuntime>>` guard can be dropped before
 /// the slow network work starts (see [`ComradeRuntime::profile_refresher`]).
@@ -1780,6 +2470,8 @@ mod tests {
                 content: "hello".into(),
                 created_at: 1,
                 outgoing: true,
+                status: None,
+                reply_to: None,
             })
             .unwrap();
 
@@ -1896,6 +2588,8 @@ mod tests {
                 content: "hi".into(),
                 created_at: 1,
                 outgoing: false,
+                status: None,
+                reply_to: None,
             })
             .unwrap();
         store
@@ -1945,6 +2639,8 @@ mod tests {
                 content: "hi".into(),
                 created_at: 10,
                 outgoing: false,
+                status: None,
+                reply_to: None,
             })
             .unwrap();
         // Simulate a discovered/refreshed profile in the cache.
@@ -2008,6 +2704,8 @@ mod tests {
                     content: content.into(),
                     created_at: at,
                     outgoing,
+                    status: None,
+                    reply_to: None,
                 })
                 .unwrap();
         }
@@ -2139,5 +2837,290 @@ mod tests {
         #[cfg(not(feature = "media-http"))]
         assert!(matches!(out, Err(UiError::Engine(_))));
         let _ = out;
+    }
+
+    // ── Message requests, receipts, and calls ────────────────────────────────
+
+    fn stranger() -> (String, String) {
+        let pk = nostr_sdk::Keys::generate().public_key();
+        (pk.to_hex(), pk.to_bech32().unwrap())
+    }
+
+    #[tokio::test]
+    async fn strangers_are_gated_into_requests_then_accepted() {
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+        rt.unlock_vault(dir.path(), "pin").await.unwrap();
+        let (_hex, peer) = stranger();
+        let store = rt.ui.store_ref().unwrap();
+
+        // Simulate the inbox loop recording a stranger's DM: pending + message.
+        store
+            .set_conversation_meta(&comrade_storage::ConversationMeta {
+                peer_npub: peer.clone(),
+                state: "pending".into(),
+                profile_shared: false,
+                updated_at: 1,
+            })
+            .unwrap();
+        store
+            .save_message(&comrade_storage::StoredMessage {
+                id: "in1".into(),
+                peer_npub: peer.clone(),
+                content: "hi, can we talk?".into(),
+                created_at: 5,
+                outgoing: false,
+                status: None,
+                reply_to: None,
+            })
+            .unwrap();
+
+        // Gated out of the chat list; present as a request.
+        assert!(rt.conversations().unwrap().is_empty());
+        let reqs = rt.message_requests().unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].peer, peer);
+        assert_eq!(reqs[0].last_message, "hi, can we talk?");
+
+        // Accept → into the chat list, out of requests.
+        rt.accept_request(&peer).unwrap();
+        assert!(rt.message_requests().unwrap().is_empty());
+        let convos = rt.conversations().unwrap();
+        assert_eq!(convos.len(), 1);
+        assert_eq!(convos[0].peer, peer);
+    }
+
+    #[tokio::test]
+    async fn blocked_peer_is_hidden_from_both_lists() {
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+        rt.unlock_vault(dir.path(), "pin").await.unwrap();
+        let (_hex, peer) = stranger();
+        rt.ui
+            .store_ref()
+            .unwrap()
+            .save_message(&comrade_storage::StoredMessage {
+                id: "in1".into(),
+                peer_npub: peer.clone(),
+                content: "spam".into(),
+                created_at: 1,
+                outgoing: false,
+                status: None,
+                reply_to: None,
+            })
+            .unwrap();
+        rt.block_conversation(&peer).unwrap();
+        assert!(rt.conversations().unwrap().is_empty());
+        assert!(rt.message_requests().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn call_log_roundtrips_per_peer_and_globally() {
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+        rt.unlock_vault(dir.path(), "pin").await.unwrap();
+        let (_hex, peer) = stranger();
+        let rec = rt
+            .log_call(&peer, "call1", "video", true, "connected", 100, 42)
+            .unwrap();
+        assert_eq!(rec.media, "video");
+        assert_eq!(rec.outcome, "connected");
+        assert_eq!(rec.duration_secs, 42);
+        assert_eq!(rt.call_history(Some(&peer)).unwrap().len(), 1);
+        assert_eq!(rt.call_history(None).unwrap().len(), 1);
+        // Unknown media string is coerced to audio.
+        let rec2 = rt
+            .log_call(&peer, "call2", "hologram", false, "missed", 0, 0)
+            .unwrap();
+        assert_eq!(rec2.media, "audio");
+    }
+
+    #[tokio::test]
+    async fn ice_servers_default_stun_and_configurable_turn() {
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+        rt.unlock_vault(dir.path(), "pin").await.unwrap();
+        let defaults = rt.call_ice_servers();
+        assert!(!defaults.is_empty());
+        assert!(defaults.iter().all(|s| s.username.is_none()));
+        rt.set_turn_server("turn:turn.example.com:3478", "u", "p")
+            .unwrap();
+        let with_turn = rt.call_ice_servers();
+        assert_eq!(with_turn.len(), defaults.len() + 1);
+        assert_eq!(with_turn.last().unwrap().username.as_deref(), Some("u"));
+        rt.set_turn_server("", "", "").unwrap();
+        assert_eq!(rt.call_ice_servers().len(), defaults.len());
+    }
+
+    #[tokio::test]
+    async fn place_call_mints_session_and_validates() {
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+        assert!(matches!(
+            rt.place_call("npub1x", "audio"),
+            Err(UiError::VaultLocked)
+        ));
+        rt.unlock_vault(dir.path(), "pin").await.unwrap();
+        let (_hex, peer) = stranger();
+        let session = rt.place_call(&peer, "video").unwrap();
+        assert_eq!(session.peer, peer);
+        assert_eq!(session.media, "video");
+        assert_eq!(session.call_id.len(), 32);
+        assert!(!session.ice_servers.is_empty());
+        assert!(rt.place_call("not-a-key", "audio").is_err());
+    }
+
+    #[tokio::test]
+    async fn send_call_signal_rejects_malformed_json() {
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+        rt.unlock_vault(dir.path(), "pin").await.unwrap();
+        let (_hex, peer) = stranger();
+        let err = rt
+            .send_call_signal(&peer, "c1", "audio", "{not valid")
+            .await;
+        assert!(matches!(err, Err(UiError::Engine(_))));
+    }
+
+    async fn test_vault() -> Arc<VaultEngine> {
+        let keys = nostr_sdk::Keys::generate();
+        Arc::new(
+            VaultEngine::new(&keys, vec!["wss://relay.damus.io".into()])
+                .await
+                .unwrap(),
+        )
+    }
+
+    fn incoming(sender_hex: &str, event_id: &str, content: &str) -> VaultMessage {
+        VaultMessage {
+            event_id: event_id.into(),
+            sender_pubkey: sender_hex.into(),
+            content: content.into(),
+            created_at: 3,
+            upi_intents: vec![],
+            reply_to: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_gates_unknown_sender_as_request() {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(comrade_storage::EncryptedStore::open(dir.path(), "pin").unwrap());
+        let vault = test_vault().await;
+        let (tx, mut rx) = broadcast::channel(16);
+        let (hex, peer) = stranger();
+
+        dispatch_incoming_dm(&vault, Some(&store), &tx, incoming(&hex, "e1", "hello?"));
+
+        assert_eq!(
+            store.get_conversation_meta(&peer).unwrap().unwrap().state,
+            "pending"
+        );
+        assert_eq!(store.messages_with(&peer).unwrap().len(), 1);
+        match rx.try_recv().unwrap() {
+            BridgeEvent::IncomingMessageRequest(r) => {
+                assert_eq!(r.peer, peer);
+                assert_eq!(r.last_message, "hello?");
+            }
+            other => panic!("expected request, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_delivers_accepted_and_advances_receipts() {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(comrade_storage::EncryptedStore::open(dir.path(), "pin").unwrap());
+        let vault = test_vault().await;
+        let (tx, mut rx) = broadcast::channel(16);
+        let (hex, peer) = stranger();
+        store
+            .set_conversation_meta(&comrade_storage::ConversationMeta {
+                peer_npub: peer.clone(),
+                state: "accepted".into(),
+                profile_shared: true,
+                updated_at: 1,
+            })
+            .unwrap();
+
+        // Plain text from an accepted peer is delivered (not gated).
+        dispatch_incoming_dm(&vault, Some(&store), &tx, incoming(&hex, "e1", "yo"));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            BridgeEvent::IncomingDirectMessage(_)
+        ));
+
+        // A read receipt advances one of our outgoing messages.
+        store
+            .save_message(&comrade_storage::StoredMessage {
+                id: "out1".into(),
+                peer_npub: peer.clone(),
+                content: "sup".into(),
+                created_at: 2,
+                outgoing: true,
+                status: Some("sent".into()),
+                reply_to: None,
+            })
+            .unwrap();
+        let receipt = Receipt::new(ReceiptKind::Read, vec!["out1".into()])
+            .to_json()
+            .unwrap();
+        dispatch_incoming_dm(&vault, Some(&store), &tx, incoming(&hex, "e2", &receipt));
+        assert_eq!(
+            store
+                .get_message("out1")
+                .unwrap()
+                .unwrap()
+                .status
+                .as_deref(),
+            Some("read")
+        );
+        match rx.try_recv().unwrap() {
+            BridgeEvent::MessageStatus {
+                message_ids,
+                status,
+                ..
+            } => {
+                assert_eq!(status, "read");
+                assert_eq!(message_ids, vec!["out1".to_string()]);
+            }
+            other => panic!("expected MessageStatus, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_drops_blocked_and_caches_profile_share() {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(comrade_storage::EncryptedStore::open(dir.path(), "pin").unwrap());
+        let vault = test_vault().await;
+        let (tx, mut rx) = broadcast::channel(16);
+        let (hex, peer) = stranger();
+        store
+            .set_conversation_meta(&comrade_storage::ConversationMeta {
+                peer_npub: peer.clone(),
+                state: "blocked".into(),
+                profile_shared: false,
+                updated_at: 1,
+            })
+            .unwrap();
+        dispatch_incoming_dm(&vault, Some(&store), &tx, incoming(&hex, "e1", "let me in"));
+        assert!(store.messages_with(&peer).unwrap().is_empty());
+        assert!(rx.try_recv().is_err(), "blocked peer emits nothing");
+
+        // A profile share (any non-blocked peer) caches the name + emits update.
+        let (other_hex, other_npub) = stranger();
+        let share = ProfileShare::new(Some("charlie".into())).to_json().unwrap();
+        dispatch_incoming_dm(
+            &vault,
+            Some(&store),
+            &tx,
+            incoming(&other_hex, "e2", &share),
+        );
+        match rx.try_recv().unwrap() {
+            BridgeEvent::PeerProfileUpdated { peer, name } => {
+                assert_eq!(peer, other_npub);
+                assert_eq!(name.as_deref(), Some("charlie"));
+            }
+            other => panic!("expected PeerProfileUpdated, got {other:?}"),
+        }
     }
 }
