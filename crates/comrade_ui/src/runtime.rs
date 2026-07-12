@@ -32,10 +32,10 @@ use comrade_core::media::{
     build_file_metadata_event, encrypt_media, fetch_and_decrypt_media, FileMetadata,
     MAX_MEDIA_BYTES,
 };
-use comrade_core::sabha::{ChitthiCallback, SabhaEngine, DEFAULT_RELAYS};
+use comrade_core::sabha::{display_name_of, ChitthiCallback, SabhaEngine, DEFAULT_RELAYS};
 use comrade_core::sakha::SakhaEngine;
 use comrade_core::vault::{VaultCallback, VaultEngine, VaultMessage};
-use nostr_sdk::{EventId, PublicKey, ToBech32};
+use nostr_sdk::{EventId, Metadata, PublicKey, ToBech32};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tracing::warn;
@@ -50,6 +50,21 @@ const EVENT_BUS_CAPACITY: usize = 256;
 const MEDIA_LABEL: &str = "comrade-media-v1";
 /// Encrypted-store tree mapping a NIP-94 event id → local [`MediaRef`].
 const MEDIA_REFS_TREE: &str = "comrade_media_refs";
+/// Encrypted-store tree caching peers' published Kind-0 profiles
+/// (npub → [`PeerProfileRecord`]). This is what lets the chat UI show
+/// "@charlie" instead of a raw public key.
+const PEER_PROFILES_TREE: &str = "peer_profiles";
+/// Re-fetch a cached peer profile with a known name after this long (seconds).
+const PROFILE_TTL_SECS: u64 = 24 * 60 * 60;
+/// Re-fetch a cached record with **no** name after this long (seconds).
+/// Short: an offline fetch is indistinguishable from "peer has no profile",
+/// and it must not freeze a peer as key-only for a whole day.
+const PROFILE_NEGATIVE_TTL_SECS: u64 = 5 * 60;
+/// Upper bound on network fetches per [`ComradeRuntime::refresh_peer_profiles`] call.
+const PROFILE_REFRESH_CAP: usize = 16;
+/// Publish attempts before giving up until the next launch (see
+/// [`publish_profile_with_retry`]).
+const PUBLISH_ATTEMPTS: u32 = 5;
 
 // ── Event DTOs (serialised across the IPC / FFI boundary) ────────────────────
 
@@ -224,7 +239,11 @@ pub struct FoundProfileDto {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContactDto {
     pub npub: String,
+    /// The *user-chosen* local alias (petname). Empty = none set.
     pub alias: String,
+    /// The peer's own published @handle, from the local profile cache.
+    /// Display precedence is alias → name → key; never trust name alone.
+    pub name: Option<String>,
 }
 
 /// One entry of the chat list: a peer plus the newest message in the thread.
@@ -232,11 +251,51 @@ pub struct ContactDto {
 pub struct ConversationDto {
     /// Peer npub (canonical bech32) — the conversation key.
     pub peer: String,
-    /// Saved contact alias for the peer, when one exists.
+    /// Saved contact alias for the peer, when one exists (user-chosen).
     pub alias: Option<String>,
+    /// The peer's own published @handle, from the local profile cache.
+    pub peer_name: Option<String>,
     pub last_message: String,
     pub last_at: u64,
     pub last_outgoing: bool,
+}
+
+/// Locally cached snapshot of a peer's published Kind-0 profile. `name` is a
+/// self-declared, non-unique handle — a display aid, never an identifier.
+/// Every field defaults so rows written by older builds keep deserialising
+/// when the record grows (e.g. the planned avatar field).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PeerProfileRecord {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    about: Option<String>,
+    /// When this record was last written (unix seconds) — drives the TTL.
+    #[serde(default)]
+    updated_at: u64,
+}
+
+/// A private journal entry as the frontend sees it. Journal entries are
+/// **strictly local**: they are never published to a relay or any network —
+/// the only copy lives sealed inside the encrypted store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournalEntryDto {
+    pub id: String,
+    pub text: String,
+    /// Optional self-reported mood marker (an emoji or short tag).
+    pub mood: Option<String>,
+    pub created_at: u64,
+}
+
+impl From<comrade_storage::JournalEntry> for JournalEntryDto {
+    fn from(e: comrade_storage::JournalEntry) -> Self {
+        Self {
+            id: e.id,
+            text: e.text,
+            mood: e.mood,
+            created_at: e.created_at,
+        }
+    }
 }
 
 /// A single direct message in a conversation, from the offline history.
@@ -278,6 +337,10 @@ pub struct ComradeRuntime {
     /// Guards [`spawn_event_loops`] against re-spawning the feed/DM tasks if it
     /// is called more than once. [`spawn_event_loops`]: ComradeRuntime::spawn_event_loops
     loops_spawned: bool,
+    /// The one live profile-publish retry task. Replaced (old one aborted)
+    /// whenever the handle changes, so a stale retry loop can never republish
+    /// an old name over a new one.
+    publish_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Default for ComradeRuntime {
@@ -296,7 +359,17 @@ impl ComradeRuntime {
             sakha: None,
             events,
             loops_spawned: false,
+            publish_task: None,
         }
+    }
+
+    /// Abort any in-flight profile-publish retry loop and start one for
+    /// `name`. Last spawn wins — the relays only ever see the newest handle.
+    fn spawn_profile_publish(&mut self, sabha: Arc<SabhaEngine>, name: String) {
+        if let Some(task) = self.publish_task.take() {
+            task.abort();
+        }
+        self.publish_task = Some(tokio::spawn(publish_profile_with_retry(sabha, name)));
     }
 
     // ── Event bus ──────────────────────────────────────────────────────────
@@ -416,6 +489,16 @@ impl ComradeRuntime {
             return;
         }
         self.loops_spawned = true;
+
+        // Re-publish the saved @handle on every launch. Kind-0 is replaceable
+        // (newest wins) and the publish merges into the currently published
+        // profile, so this is idempotent — and it heals identities whose
+        // original publish was dropped (offline onboarding, relay hiccup),
+        // which otherwise stay undiscoverable forever.
+        if let (Some(sabha), Some(name)) = (self.sabha.clone(), self.ui.username()) {
+            self.spawn_profile_publish(sabha, name);
+        }
+
         if let Some(sabha) = self.sabha.clone() {
             let tx = self.events.clone();
             tokio::spawn(async move {
@@ -619,7 +702,10 @@ impl ComradeRuntime {
         let mut list: Vec<ConversationDto> = newest
             .into_values()
             .map(|m| ConversationDto {
-                alias: aliases.get(&m.peer_npub).cloned(),
+                alias: aliases
+                    .get(&m.peer_npub)
+                    .and_then(|a| user_alias(a, &m.peer_npub)),
+                peer_name: cached_peer_name(store, &m.peer_npub),
                 peer: m.peer_npub,
                 last_message: m.content,
                 last_at: m.created_at,
@@ -670,40 +756,71 @@ impl ComradeRuntime {
     /// first use, so a later "@same_handle" under a different key shows up as a
     /// different person and can never read or receive this thread's messages.
     ///
-    /// The handle is persisted locally first; relay publication is best-effort
-    /// (offline claims succeed and publish on a later set).
+    /// The handle is persisted locally first; relay publication happens in a
+    /// background task with retries (and again on every launch), so an offline
+    /// claim still succeeds and becomes discoverable once a relay is reachable.
     pub async fn set_username(&mut self, handle: &str) -> Result<ProfileDto, UiError> {
         let handle = normalize_handle(handle)?;
         self.ui.set_username(handle.clone())?;
         if let Some(sabha) = self.sabha.clone() {
-            // Fire-and-forget: the handle is already persisted locally, and at
-            // onboarding time the relays may not have finished connecting —
-            // never block (or fail) the claim on network state.
-            let name = handle.clone();
-            tokio::spawn(async move {
-                if let Err(e) = sabha.publish_profile(&name, None).await {
-                    warn!("profile publish deferred (offline?): {e}");
-                }
-            });
+            // Never block (or fail) the claim on network state — but do keep
+            // trying: a single dropped publish is exactly how a fresh identity
+            // ends up unfindable by everyone else. Replaces (aborts) any
+            // earlier retry loop so a stale name can't win the publish race.
+            self.spawn_profile_publish(sabha, handle.clone());
         }
         self.profile()
     }
 
-    /// Save (or re-alias) a contact, pinned by npub — trust on first use.
-    pub fn add_contact(&self, npub: &str, alias: &str) -> Result<ContactDto, UiError> {
-        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
-        let peer = parse_pubkey(npub)?;
-        let canonical = peer
+    /// Canonicalise a contact key: vault must be open, key must parse. One
+    /// rule for every contact method, so junk input behaves identically
+    /// across add/alias/remove on every bridge.
+    fn canonical_contact_npub(&self, npub: &str) -> Result<String, UiError> {
+        if self.ui.store_ref().is_none() {
+            return Err(UiError::VaultLocked);
+        }
+        parse_pubkey(npub)?
             .to_bech32()
-            .map_err(|e| UiError::Engine(e.to_string()))?;
+            .map_err(|e| UiError::Engine(e.to_string()))
+    }
+
+    /// Save a contact, pinned by npub — trust on first use. An empty `alias`
+    /// leaves any existing alias untouched (so opening a chat with a known
+    /// contact never wipes the name the user gave them); a non-empty alias
+    /// sets it. Use [`Self::set_contact_alias`] to explicitly clear one.
+    pub fn add_contact(&self, npub: &str, alias: &str) -> Result<ContactDto, UiError> {
+        let canonical = self.canonical_contact_npub(npub)?;
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
         let alias = alias.trim();
+        let existing = store
+            .get_contact(&canonical)
+            .map_err(|e| UiError::Storage(e.to_string()))?;
+        if alias.is_empty() {
+            if let Some(contact) = existing {
+                // Already pinned and nothing to change — don't rewrite the
+                // record (this path runs on every chat open).
+                return Ok(ContactDto {
+                    name: cached_peer_name(store, &contact.npub),
+                    alias: user_alias(&contact.petname, &contact.npub).unwrap_or_default(),
+                    npub: contact.npub,
+                });
+            }
+        }
+        self.write_contact(canonical, alias.to_string())
+    }
+
+    /// Set (non-empty) or clear (empty) the user-chosen alias for a contact.
+    /// Creates the contact if it doesn't exist yet.
+    pub fn set_contact_alias(&self, npub: &str, alias: &str) -> Result<ContactDto, UiError> {
+        let canonical = self.canonical_contact_npub(npub)?;
+        self.write_contact(canonical, alias.trim().to_string())
+    }
+
+    fn write_contact(&self, npub: String, petname: String) -> Result<ContactDto, UiError> {
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
         let contact = comrade_storage::Contact {
-            npub: canonical.clone(),
-            petname: if alias.is_empty() {
-                canonical.chars().take(12).collect()
-            } else {
-                alias.to_string()
-            },
+            npub,
+            petname,
             relays: vec![],
         };
         store
@@ -711,12 +828,26 @@ impl ComradeRuntime {
             .and_then(|()| store.flush())
             .map_err(|e| UiError::Storage(e.to_string()))?;
         Ok(ContactDto {
+            name: cached_peer_name(store, &contact.npub),
             npub: contact.npub,
             alias: contact.petname,
         })
     }
 
-    /// All saved contacts, alias-sorted.
+    /// Remove a saved contact. Returns whether one existed. The message
+    /// history with that peer is untouched — only the pin/alias goes.
+    pub fn remove_contact(&self, npub: &str) -> Result<bool, UiError> {
+        let canonical = self.canonical_contact_npub(npub)?;
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        let removed = store
+            .remove_contact(&canonical)
+            .map_err(|e| UiError::Storage(e.to_string()))?;
+        store.flush().map_err(|e| UiError::Storage(e.to_string()))?;
+        Ok(removed)
+    }
+
+    /// All saved contacts, sorted by their display title (alias, else
+    /// published name, else key).
     pub fn list_contacts(&self) -> Result<Vec<ContactDto>, UiError> {
         let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
         let mut contacts: Vec<ContactDto> = store
@@ -724,34 +855,155 @@ impl ComradeRuntime {
             .map_err(|e| UiError::Storage(e.to_string()))?
             .into_iter()
             .map(|c| ContactDto {
+                name: cached_peer_name(store, &c.npub),
+                alias: user_alias(&c.petname, &c.npub).unwrap_or_default(),
                 npub: c.npub,
-                alias: c.petname,
             })
             .collect();
-        contacts.sort_by_key(|c| c.alias.to_lowercase());
+        contacts.sort_by_key(|c| {
+            if !c.alias.is_empty() {
+                c.alias.to_lowercase()
+            } else {
+                c.name.as_deref().unwrap_or(c.npub.as_str()).to_lowercase()
+            }
+        });
         Ok(contacts)
     }
 
     /// Best-effort people search by handle over NIP-50-capable relays. An empty
     /// result means no search relay knew the name — offer add-by-npub instead.
+    ///
+    /// A query that *is* a key (npub/hex) resolves that identity's profile
+    /// directly instead of a name search. Every result is cached into the
+    /// local profile store so the chat UI can name the peer immediately.
     pub async fn search_profiles(&self, query: &str) -> Result<Vec<FoundProfileDto>, UiError> {
         let sabha = self.sabha.clone().ok_or(UiError::VaultLocked)?;
         let query = query.trim().trim_start_matches('@');
         if query.is_empty() {
             return Ok(vec![]);
         }
-        let found = sabha
-            .search_profiles(query, 10)
-            .await
-            .map_err(|e| UiError::Engine(e.to_string()))?;
-        Ok(found
+
+        // Exact-key lookup: fetch that author's Kind-0 (name may be absent —
+        // the key alone is still a valid, addressable result). Otherwise a
+        // NIP-50 name search. Both branches share the DTO mapping and cache.
+        let dtos: Vec<FoundProfileDto> = if let Ok(pk) = PublicKey::parse(query) {
+            let meta = sabha
+                .fetch_profile(&pk)
+                .await
+                .map_err(|e| UiError::Engine(e.to_string()))?;
+            vec![found_profile_dto(&pk, meta.as_ref())]
+        } else {
+            sabha
+                .search_profiles(query, 10)
+                .await
+                .map_err(|e| UiError::Engine(e.to_string()))?
+                .into_iter()
+                .map(|(pk, meta)| found_profile_dto(&pk, Some(&meta)))
+                .collect()
+        };
+        self.cache_found_profiles(&dtos);
+        Ok(dtos)
+    }
+
+    /// Persist discovered profiles into the local cache (best-effort) so the
+    /// chat list can title peers by their handle without another fetch.
+    fn cache_found_profiles(&self, found: &[FoundProfileDto]) {
+        let Some(store) = self.ui.store_ref() else {
+            return;
+        };
+        let now = now_secs();
+        let mut wrote = false;
+        for profile in found {
+            if profile.name.is_none() {
+                continue; // nothing displayable; don't shadow a future fetch
+            }
+            let record = PeerProfileRecord {
+                name: profile.name.clone(),
+                about: profile.about.clone(),
+                updated_at: now,
+            };
+            wrote |= store_profile_record(store, &profile.npub, &record);
+        }
+        if wrote {
+            if let Err(e) = store.flush() {
+                warn!("failed to flush profile cache: {e}");
+            }
+        }
+    }
+
+    /// Detach a [`ProfileRefresher`] holding only the engine/store handles.
+    ///
+    /// The refresh does slow network work; callers behind the shared
+    /// `Arc<RwLock<ComradeRuntime>>` (JNI, Tauri) MUST take this under a
+    /// briefly-held guard, **drop the guard**, and then await
+    /// [`ProfileRefresher::run`] — holding the runtime lock across relay
+    /// round-trips stalls every other bridge call (AUDIT P2 discipline:
+    /// no guard held across network awaits).
+    pub fn profile_refresher(&self) -> Result<ProfileRefresher, UiError> {
+        Ok(ProfileRefresher {
+            sabha: self.sabha.clone().ok_or(UiError::VaultLocked)?,
+            store: self.ui.store_arc().ok_or(UiError::VaultLocked)?,
+        })
+    }
+
+    /// Convenience wrapper over [`Self::profile_refresher`] for callers that
+    /// own the runtime directly (tests, CLI). Bridge code should use the
+    /// refresher so the shared lock is not held across the network work.
+    pub async fn refresh_peer_profiles(&self) -> Result<usize, UiError> {
+        self.profile_refresher()?.run().await
+    }
+
+    // ── Journal (wellbeing pillar #1 — strictly local, never networked) ──────
+
+    /// Save a new journal entry. `mood` is an optional self-reported marker.
+    /// The entry never leaves the device: no relay, no network — only the
+    /// encrypted store.
+    pub fn add_journal_entry(
+        &self,
+        text: &str,
+        mood: Option<&str>,
+    ) -> Result<JournalEntryDto, UiError> {
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(UiError::Engine("journal entry is empty".into()));
+        }
+        let created_at = now_secs();
+        let entry = comrade_storage::JournalEntry {
+            id: journal_entry_id(created_at),
+            text: text.to_string(),
+            mood: mood
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .map(String::from),
+            created_at,
+        };
+        store
+            .save_journal_entry(&entry)
+            .and_then(|()| store.flush())
+            .map_err(|e| UiError::Storage(e.to_string()))?;
+        Ok(entry.into())
+    }
+
+    /// All journal entries, newest first.
+    pub fn journal_entries(&self) -> Result<Vec<JournalEntryDto>, UiError> {
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        Ok(store
+            .journal_entries()
+            .map_err(|e| UiError::Storage(e.to_string()))?
             .into_iter()
-            .map(|(pk, meta)| FoundProfileDto {
-                npub: pk.to_bech32().unwrap_or_else(|_| pk.to_hex()),
-                name: meta.name.or(meta.display_name),
-                about: meta.about,
-            })
+            .map(JournalEntryDto::from)
             .collect())
+    }
+
+    /// Delete a journal entry by id. Returns whether one existed.
+    pub fn delete_journal_entry(&self, id: &str) -> Result<bool, UiError> {
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        let removed = store
+            .remove_journal_entry(id)
+            .map_err(|e| UiError::Storage(e.to_string()))?;
+        store.flush().map_err(|e| UiError::Storage(e.to_string()))?;
+        Ok(removed)
     }
 
     // ── Encrypted media pipeline (NIP-94/96 · Blossom) ───────────────────────
@@ -973,6 +1225,207 @@ fn now_secs() -> u64 {
         .unwrap_or_default()
 }
 
+/// Store key for a journal entry: a zero-padded timestamp prefix (so ids sort
+/// chronologically) plus a random tail (so two entries in the same second
+/// never collide). The randomness comes from a throwaway secp256k1 key — no
+/// extra dependency, and cryptographically unpredictable.
+fn journal_entry_id(created_at: u64) -> String {
+    let tail = nostr_sdk::Keys::generate().public_key().to_hex();
+    format!("{created_at:020}-{}", &tail[..12])
+}
+
+/// The peer's published @handle from the local profile cache, if known.
+fn cached_peer_name(store: &comrade_storage::EncryptedStore, npub: &str) -> Option<String> {
+    store
+        .get::<PeerProfileRecord>(PEER_PROFILES_TREE, npub)
+        .ok()
+        .flatten()
+        .and_then(|r| r.name)
+}
+
+/// Legacy builds auto-filled an empty alias with the first 12 characters of
+/// the peer's npub. Normalise those placeholders (and blanks) to "no alias"
+/// so the peer's published handle can title the chat — otherwise every
+/// pre-existing key-added contact is stuck displaying `npub1abcdefg` forever.
+const LEGACY_PLACEHOLDER_LEN: usize = 12;
+
+fn user_alias(petname: &str, npub: &str) -> Option<String> {
+    let trimmed = petname.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.len() == LEGACY_PLACEHOLDER_LEN && npub.starts_with(trimmed) {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// Map a fetched Kind-0 (or its absence) to the search-result DTO. One
+/// mapping for both the direct-key branch and the name-search branch, so the
+/// two can never render the same profile differently.
+fn found_profile_dto(pk: &PublicKey, meta: Option<&Metadata>) -> FoundProfileDto {
+    FoundProfileDto {
+        npub: pk.to_bech32().unwrap_or_else(|_| pk.to_hex()),
+        name: meta.and_then(display_name_of),
+        about: meta.and_then(|m| m.about.clone()),
+    }
+}
+
+/// Best-effort single-record write into the profile cache; returns whether
+/// the write succeeded. Callers flush once per batch.
+fn store_profile_record(
+    store: &comrade_storage::EncryptedStore,
+    npub: &str,
+    record: &PeerProfileRecord,
+) -> bool {
+    match store.put(PEER_PROFILES_TREE, npub, record) {
+        Ok(()) => true,
+        Err(e) => {
+            warn!("failed to cache peer profile: {e}");
+            false
+        }
+    }
+}
+
+/// Detached profile-refresh worker. Holds only the engine and store handles,
+/// so the shared `Arc<RwLock<ComradeRuntime>>` guard can be dropped before
+/// the slow network work starts (see [`ComradeRuntime::profile_refresher`]).
+pub struct ProfileRefresher {
+    sabha: Arc<SabhaEngine>,
+    store: Arc<comrade_storage::EncryptedStore>,
+}
+
+impl ProfileRefresher {
+    /// Refresh the cached Kind-0 profiles of everyone we talk to
+    /// (conversation peers and saved contacts) in **one** relay round-trip,
+    /// bounded by [`PROFILE_REFRESH_CAP`] and per-record freshness windows.
+    /// Returns how many display names changed — the frontend reloads its
+    /// chat list when > 0.
+    pub async fn run(self) -> Result<usize, UiError> {
+        let mut peers: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for msg in self
+            .store
+            .all_messages()
+            .map_err(|e| UiError::Storage(e.to_string()))?
+        {
+            if seen.insert(msg.peer_npub.clone()) {
+                peers.push(msg.peer_npub);
+            }
+        }
+        for contact in self
+            .store
+            .list_contacts()
+            .map_err(|e| UiError::Storage(e.to_string()))?
+        {
+            if seen.insert(contact.npub.clone()) {
+                peers.push(contact.npub);
+            }
+        }
+
+        // Select the stale records. A record that has a name is trusted for
+        // the full TTL; a nameless record only briefly — an offline launch
+        // yields Ok(no events) from the pool (indistinguishable from "peer
+        // has no profile"), and that outcome must not freeze the peer as
+        // key-only for a whole day.
+        let now = now_secs();
+        let mut stale: Vec<(String, PublicKey, Option<PeerProfileRecord>)> = Vec::new();
+        for npub in peers {
+            if stale.len() >= PROFILE_REFRESH_CAP {
+                break;
+            }
+            let previous: Option<PeerProfileRecord> = self
+                .store
+                .get(PEER_PROFILES_TREE, &npub)
+                .unwrap_or_default();
+            let ttl = if previous.as_ref().is_some_and(|p| p.name.is_some()) {
+                PROFILE_TTL_SECS
+            } else {
+                PROFILE_NEGATIVE_TTL_SECS
+            };
+            let fresh = previous
+                .as_ref()
+                .is_some_and(|r| now.saturating_sub(r.updated_at) < ttl);
+            if fresh {
+                continue;
+            }
+            let Ok(pk) = PublicKey::parse(&npub) else {
+                continue;
+            };
+            stale.push((npub, pk, previous));
+        }
+        if stale.is_empty() {
+            return Ok(0);
+        }
+
+        let authors: Vec<PublicKey> = stale.iter().map(|(_, pk, _)| *pk).collect();
+        let found = match self.sabha.fetch_profiles(&authors).await {
+            Ok(found) => found,
+            Err(e) => {
+                // Transport error: stamp nothing, so the next refresh retries.
+                warn!("peer profile refresh failed: {e}");
+                return Ok(0);
+            }
+        };
+
+        let mut wrote = false;
+        let mut changed = 0usize;
+        for (npub, pk, previous) in stale {
+            let meta = found.get(&pk);
+            let record = PeerProfileRecord {
+                // A silent relay set must not erase a name we already knew.
+                name: meta
+                    .and_then(display_name_of)
+                    .or_else(|| previous.as_ref().and_then(|p| p.name.clone())),
+                about: meta
+                    .and_then(|m| m.about.clone())
+                    .or_else(|| previous.as_ref().and_then(|p| p.about.clone())),
+                updated_at: now,
+            };
+            let name_changed = record.name != previous.as_ref().and_then(|p| p.name.clone());
+            if store_profile_record(&self.store, &npub, &record) {
+                wrote = true;
+                if name_changed {
+                    changed += 1;
+                }
+            }
+        }
+        if wrote {
+            if let Err(e) = self.store.flush() {
+                warn!("failed to flush profile cache: {e}");
+            }
+        }
+        Ok(changed)
+    }
+}
+
+/// Publish the Kind-0 profile with retries and exponential backoff.
+///
+/// Why this exists: at onboarding the relays are still dialling when the
+/// handle is claimed, and a single fire-and-forget publish that fails leaves
+/// the identity permanently undiscoverable — peers searching the handle find
+/// nothing. `publish_profile` itself waits (bounded) for a connection; this
+/// wrapper keeps trying across transient failures. It is also spawned on
+/// every launch (Kind-0 is replaceable, so republishing is idempotent).
+async fn publish_profile_with_retry(sabha: Arc<SabhaEngine>, name: String) {
+    // Make sure dials were at least initiated, even if the feed loop that
+    // normally calls connect() hasn't run yet. Idempotent.
+    sabha.connect().await;
+    let mut delay = std::time::Duration::from_secs(2);
+    for attempt in 1..=PUBLISH_ATTEMPTS {
+        match sabha.publish_profile(&name, None).await {
+            Ok(_) => {
+                tracing::info!(attempt, "profile handle published to relays");
+                return;
+            }
+            Err(e) => warn!(attempt, "profile publish failed (will retry): {e}"),
+        }
+        tokio::time::sleep(delay).await;
+        delay = delay.saturating_mul(2);
+    }
+    warn!("profile publish gave up after {PUBLISH_ATTEMPTS} attempts; will retry on next launch");
+}
+
 /// Normalise and validate a chosen @handle: strip a leading '@', lowercase,
 /// then require 3–24 chars of `[a-z0-9_]`. One rule shared by every bridge.
 fn normalize_handle(raw: &str) -> Result<String, UiError> {
@@ -1011,6 +1464,30 @@ mod tests {
         assert_send_sync::<ComradeRuntime>();
         assert_send_sync::<std::sync::Arc<tokio::sync::RwLock<ComradeRuntime>>>();
         assert_send_sync::<BridgeEvent>();
+    }
+
+    #[test]
+    fn bridge_futures_are_send() {
+        // Tauri's #[tauri::command] requires every command future to be Send;
+        // the workspace itself never demands that, so without this
+        // compile-time probe a non-Send future (e.g. a borrowed iterator held
+        // across an await deep inside an engine) only surfaces in the desktop
+        // CI lane — which is exactly how the search_profiles regression
+        // escaped local checks once.
+        fn require_send<T: Send>(_t: T) {}
+        #[allow(dead_code)]
+        fn probe(rt: &ComradeRuntime, wrt: &mut ComradeRuntime, urt: &mut ComradeRuntime) {
+            require_send(rt.search_profiles("q"));
+            require_send(rt.refresh_peer_profiles());
+            require_send(rt.send_dm("npub1x", "hi"));
+            require_send(rt.broadcast_chitthi("x", None));
+            require_send(rt.sync_ledger());
+            require_send(rt.upload_and_send_media("x", vec![], "image/png", ""));
+            require_send(rt.download_and_decrypt_media("x"));
+            require_send(wrt.set_username("neo"));
+            require_send(urt.unlock_vault("/tmp/x", "p"));
+        }
+        let _ = probe;
     }
 
     #[test]
@@ -1261,8 +1738,247 @@ mod tests {
             "renamed"
         );
 
+        // An empty alias on re-add (opening an existing chat) must never wipe
+        // the alias the user chose.
+        rt.add_contact(&a, "  ").unwrap();
+        assert_eq!(
+            rt.list_contacts()
+                .unwrap()
+                .iter()
+                .find(|c| c.npub == a)
+                .unwrap()
+                .alias,
+            "renamed"
+        );
+
         // Junk npubs are a typed error, not a stored contact.
         assert!(rt.add_contact("not-a-key", "x").is_err());
+    }
+
+    #[tokio::test]
+    async fn contact_alias_lifecycle_set_clear_remove() {
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+        rt.unlock_vault(dir.path(), "pin").await.unwrap();
+        let peer = nostr_sdk::Keys::generate()
+            .public_key()
+            .to_bech32()
+            .unwrap();
+
+        // Adding by key alone stores no alias (no fake npub-prefix names).
+        let added = rt.add_contact(&peer, "").unwrap();
+        assert_eq!(added.alias, "");
+
+        // A conversation exists with this peer, so the chat list reflects the
+        // alias lifecycle end to end.
+        rt.ui
+            .store_ref()
+            .unwrap()
+            .save_message(&comrade_storage::StoredMessage {
+                id: "m1".into(),
+                peer_npub: peer.clone(),
+                content: "hello".into(),
+                created_at: 1,
+                outgoing: true,
+            })
+            .unwrap();
+
+        // The alias feature: set…
+        let set = rt.set_contact_alias(&peer, "Charlie ❤").unwrap();
+        assert_eq!(set.alias, "Charlie ❤");
+        assert_eq!(
+            rt.conversations().unwrap()[0].alias.as_deref(),
+            Some("Charlie ❤")
+        );
+
+        // …and clear (empty = explicit clear, unlike add_contact).
+        let cleared = rt.set_contact_alias(&peer, "").unwrap();
+        assert_eq!(cleared.alias, "");
+        assert_eq!(rt.conversations().unwrap()[0].alias, None);
+        assert!(rt.remove_contact(&peer).unwrap());
+        assert!(
+            !rt.remove_contact(&peer).unwrap(),
+            "second remove is a no-op"
+        );
+        assert_eq!(rt.messages_with(&peer).unwrap().len(), 1);
+        assert!(matches!(
+            rt.set_contact_alias("junk", "x"),
+            Err(UiError::Engine(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn journal_lifecycle_add_list_delete() {
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+
+        // Locked → typed errors, no panics.
+        assert!(matches!(
+            rt.add_journal_entry("hi", None),
+            Err(UiError::VaultLocked)
+        ));
+        assert!(matches!(rt.journal_entries(), Err(UiError::VaultLocked)));
+        assert!(matches!(
+            rt.delete_journal_entry("x"),
+            Err(UiError::VaultLocked)
+        ));
+
+        rt.unlock_vault(dir.path(), "pin").await.unwrap();
+
+        let first = rt
+            .add_journal_entry("  rough morning  ", Some("😕"))
+            .unwrap();
+        assert_eq!(first.text, "rough morning", "text is trimmed");
+        assert_eq!(first.mood.as_deref(), Some("😕"));
+        let second = rt.add_journal_entry("grateful today", Some("  ")).unwrap();
+        assert_eq!(second.mood, None, "blank mood normalises to none");
+        assert_ne!(first.id, second.id);
+
+        // Whitespace-only text is rejected.
+        assert!(matches!(
+            rt.add_journal_entry("   ", None),
+            Err(UiError::Engine(_))
+        ));
+
+        let entries = rt.journal_entries().unwrap();
+        assert_eq!(entries.len(), 2);
+        // Newest first; same-second entries fall back to id ordering.
+        assert!(entries[0].created_at >= entries[1].created_at);
+
+        assert!(rt.delete_journal_entry(&first.id).unwrap());
+        assert!(!rt.delete_journal_entry(&first.id).unwrap());
+        assert_eq!(rt.journal_entries().unwrap().len(), 1);
+
+        // Entries survive a restart (encrypted at rest).
+        drop(rt);
+        let mut rt2 = ComradeRuntime::new();
+        rt2.unlock_vault(dir.path(), "pin").await.unwrap();
+        let entries = rt2.journal_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].text, "grateful today");
+    }
+
+    #[test]
+    fn journal_ids_sort_chronologically_and_never_collide() {
+        let a = journal_entry_id(5);
+        let b = journal_entry_id(5);
+        let later = journal_entry_id(1_700_000_000);
+        assert_ne!(a, b, "same-second ids must differ");
+        assert!(a < later && b < later, "timestamp prefix sorts");
+    }
+
+    #[tokio::test]
+    async fn legacy_placeholder_petnames_no_longer_mask_published_names() {
+        // Old builds auto-filled an empty alias with the first 12 chars of
+        // the npub. Those placeholders must read as "no alias" so the peer's
+        // published handle can title the chat after an upgrade.
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+        rt.unlock_vault(dir.path(), "pin").await.unwrap();
+        let store = rt.ui.store_ref().unwrap();
+
+        let peer = nostr_sdk::Keys::generate()
+            .public_key()
+            .to_bech32()
+            .unwrap();
+        let placeholder: String = peer.chars().take(12).collect();
+        store
+            .upsert_contact(&comrade_storage::Contact {
+                npub: peer.clone(),
+                petname: placeholder.clone(),
+                relays: vec![],
+            })
+            .unwrap();
+        store
+            .save_message(&comrade_storage::StoredMessage {
+                id: "m1".into(),
+                peer_npub: peer.clone(),
+                content: "hi".into(),
+                created_at: 1,
+                outgoing: false,
+            })
+            .unwrap();
+        store
+            .put(
+                PEER_PROFILES_TREE,
+                &peer,
+                &PeerProfileRecord {
+                    name: Some("charlie".into()),
+                    about: None,
+                    updated_at: 1,
+                },
+            )
+            .unwrap();
+
+        let convo = &rt.conversations().unwrap()[0];
+        assert_eq!(convo.alias, None, "placeholder is not a user alias");
+        assert_eq!(convo.peer_name.as_deref(), Some("charlie"));
+        assert_eq!(rt.list_contacts().unwrap()[0].alias, "");
+
+        // A real alias — even one that looks key-ish but isn't this npub's
+        // prefix — still wins.
+        assert_eq!(user_alias("Mom", &peer).as_deref(), Some("Mom"));
+        assert_eq!(user_alias(&placeholder, &peer), None);
+        assert_eq!(user_alias("  ", &peer), None);
+        assert_eq!(
+            user_alias("npub1someone", &peer).as_deref(),
+            Some("npub1someone"),
+            "a 12-char alias that is not this peer's prefix is kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn conversations_and_contacts_carry_cached_peer_names() {
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+        rt.unlock_vault(dir.path(), "pin").await.unwrap();
+        let store = rt.ui.store_ref().unwrap();
+
+        let peer = nostr_sdk::Keys::generate()
+            .public_key()
+            .to_bech32()
+            .unwrap();
+        store
+            .save_message(&comrade_storage::StoredMessage {
+                id: "m1".into(),
+                peer_npub: peer.clone(),
+                content: "hi".into(),
+                created_at: 10,
+                outgoing: false,
+            })
+            .unwrap();
+        // Simulate a discovered/refreshed profile in the cache.
+        store
+            .put(
+                PEER_PROFILES_TREE,
+                &peer,
+                &PeerProfileRecord {
+                    name: Some("charlie".into()),
+                    about: None,
+                    updated_at: 1,
+                },
+            )
+            .unwrap();
+
+        let convos = rt.conversations().unwrap();
+        assert_eq!(convos.len(), 1);
+        assert_eq!(convos[0].alias, None, "no user alias was set");
+        assert_eq!(
+            convos[0].peer_name.as_deref(),
+            Some("charlie"),
+            "published handle from the profile cache titles the chat"
+        );
+
+        rt.add_contact(&peer, "").unwrap();
+        let contacts = rt.list_contacts().unwrap();
+        assert_eq!(contacts[0].name.as_deref(), Some("charlie"));
+
+        // A user alias always outranks the published handle in the DTO —
+        // display precedence is enforced by returning both.
+        rt.set_contact_alias(&peer, "My Buddy").unwrap();
+        let convos = rt.conversations().unwrap();
+        assert_eq!(convos[0].alias.as_deref(), Some("My Buddy"));
+        assert_eq!(convos[0].peer_name.as_deref(), Some("charlie"));
     }
 
     #[tokio::test]
@@ -1332,6 +2048,18 @@ mod tests {
         ));
         assert!(matches!(
             rt.search_profiles("neo").await,
+            Err(UiError::VaultLocked)
+        ));
+        assert!(matches!(
+            rt.refresh_peer_profiles().await,
+            Err(UiError::VaultLocked)
+        ));
+        assert!(matches!(
+            rt.set_contact_alias("npub1x", "a"),
+            Err(UiError::VaultLocked)
+        ));
+        assert!(matches!(
+            rt.remove_contact("npub1x"),
             Err(UiError::VaultLocked)
         ));
     }

@@ -13,6 +13,9 @@ sealed interface VoiceCommand {
     /** Broadcast a public Chitthi with [text] as its body. */
     data class Post(val text: String) : VoiceCommand
 
+    /** Save [text] as a private journal entry (local-only, never posted). */
+    data class Journal(val text: String) : VoiceCommand
+
     /** Read the cached Sabha timeline aloud. */
     data object ReadTimeline : VoiceCommand
 
@@ -36,6 +39,11 @@ sealed interface VoiceCommand {
         const val WAKE_PHRASE: String = "hey comrade"
 
         private val POST_PREFIXES = listOf("post", "broadcast", "chitthi", "share", "say")
+
+        // Checked BEFORE the post prefixes: a private thought must never fall
+        // through to the public feed because of prefix overlap.
+        private val JOURNAL_PREFIXES =
+            listOf("journal", "write down", "note down", "dear diary", "note")
         private val TIMELINE_PHRASES = listOf(
             "read timeline", "read my timeline", "read feed", "read my feed",
             "show feed", "show timeline", "what's new", "whats new", "catch me up",
@@ -98,6 +106,15 @@ sealed interface VoiceCommand {
             }
 
             parseSwitch(text)?.let { return it }
+
+            for (prefix in JOURNAL_PREFIXES) {
+                if (text == prefix) return Empty // "journal" with no body
+                val withSpace = "$prefix "
+                if (text.startsWith(withSpace)) {
+                    val body = text.removePrefix(withSpace).trim()
+                    return if (body.isEmpty()) Empty else Journal(body)
+                }
+            }
 
             for (prefix in POST_PREFIXES) {
                 if (text == prefix) return Empty // "post" with no body

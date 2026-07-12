@@ -37,6 +37,7 @@ const CONTACTS_TREE: &str = "contacts";
 const CHITTHI_TREE: &str = "chitthi_cache";
 const MESSAGES_TREE: &str = "vault_cache";
 const LEDGER_TREE: &str = "ledger";
+const JOURNAL_TREE: &str = "journal";
 
 const IDENTITY_KEY: &str = "self";
 const LEDGER_SNAPSHOT_KEY: &str = "hisab_kitab";
@@ -104,6 +105,20 @@ pub struct StoredMessage {
     pub content: String,
     pub created_at: u64,
     pub outgoing: bool,
+}
+
+/// A private journal entry — the wellbeing pillar's core record. Strictly
+/// local: journal entries are never published to a relay or any network; the
+/// only copy lives sealed inside this encrypted store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournalEntry {
+    /// Store key. Zero-padded-timestamp-prefixed so ids sort chronologically.
+    pub id: String,
+    pub text: String,
+    /// Optional self-reported mood marker (an emoji or short tag).
+    #[serde(default)]
+    pub mood: Option<String>,
+    pub created_at: u64,
 }
 
 /// A binary CRDT (Yrs) snapshot of the Sakha/Sakhi shared ledger, plus the wall
@@ -212,6 +227,29 @@ impl EncryptedStore {
         self.vault_cache()
     }
 
+    // Journal (local-only, never networked) ------------------------------------
+
+    /// Persist a journal entry, keyed by its id.
+    pub fn save_journal_entry(&self, entry: &JournalEntry) -> Result<(), StorageError> {
+        self.put(JOURNAL_TREE, &entry.id, entry)
+    }
+
+    /// All journal entries, newest first.
+    pub fn journal_entries(&self) -> Result<Vec<JournalEntry>, StorageError> {
+        let mut entries: Vec<JournalEntry> = self.values(JOURNAL_TREE)?;
+        entries.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        Ok(entries)
+    }
+
+    /// Remove a journal entry by id. Returns `true` if one was removed.
+    pub fn remove_journal_entry(&self, id: &str) -> Result<bool, StorageError> {
+        self.delete(JOURNAL_TREE, id)
+    }
+
     // Ledger ------------------------------------------------------------------
 
     /// Persist a binary CRDT (Yrs) ledger snapshot (raw bytes).
@@ -316,6 +354,78 @@ mod tests {
         assert_eq!(with_alice[0].content, "first");
         assert_eq!(with_alice[1].content, "second");
         assert_eq!(s.all_messages().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn journal_crud_and_ordering() {
+        let (_d, s) = store();
+        assert!(s.journal_entries().unwrap().is_empty());
+        for (id, text, mood, at) in [
+            ("00000000000000000010-aaaa", "first thought", None, 10u64),
+            (
+                "00000000000000000030-cccc",
+                "grateful today",
+                Some("🙂"),
+                30,
+            ),
+            ("00000000000000000020-bbbb", "rough morning", Some("😕"), 20),
+        ] {
+            s.save_journal_entry(&JournalEntry {
+                id: id.into(),
+                text: text.into(),
+                mood: mood.map(String::from),
+                created_at: at,
+            })
+            .unwrap();
+        }
+        let entries = s.journal_entries().unwrap();
+        assert_eq!(
+            entries.iter().map(|e| e.created_at).collect::<Vec<_>>(),
+            [30, 20, 10],
+            "newest first"
+        );
+        assert_eq!(entries[0].mood.as_deref(), Some("🙂"));
+
+        assert!(s.remove_journal_entry("00000000000000000020-bbbb").unwrap());
+        assert!(!s.remove_journal_entry("00000000000000000020-bbbb").unwrap());
+        assert_eq!(s.journal_entries().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn journal_text_never_plaintext_at_rest() {
+        // The journal holds the most sensitive words a user writes — prove the
+        // entry body is ciphertext on disk, same guarantee as the nsec test.
+        let dir = TempDir::new().unwrap();
+        let secret_thought = "my-very-private-journal-thought-0123456789";
+        {
+            let s = EncryptedStore::open(dir.path(), "passphrase").unwrap();
+            s.save_journal_entry(&JournalEntry {
+                id: "00000000000000000001-test".into(),
+                text: secret_thought.into(),
+                mood: None,
+                created_at: 1,
+            })
+            .unwrap();
+            s.flush().unwrap();
+        }
+        let mut leaked = false;
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_file() {
+                if let Ok(bytes) = std::fs::read(&path) {
+                    if bytes
+                        .windows(secret_thought.len())
+                        .any(|w| w == secret_thought.as_bytes())
+                    {
+                        leaked = true;
+                    }
+                }
+            }
+        }
+        assert!(!leaked, "journal text must never be written in plaintext");
+
+        let s = EncryptedStore::open(dir.path(), "passphrase").unwrap();
+        assert_eq!(s.journal_entries().unwrap()[0].text, secret_thought);
     }
 
     #[test]

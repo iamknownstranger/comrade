@@ -226,29 +226,39 @@ jobs:
           fi
           echo "VERSION=$v" >> "$GITHUB_ENV"
 
-      - name: Build release APK
+      - name: Build release APK + App Bundle
         working-directory: android
         env:
           SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
           SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
           SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
           SIGNING_STORE_FILE: "app/keystore.jks"
+        # The .apk is for sideloading (GitHub Releases / Obtainium); the .aab
+        # is what Google Play requires for new apps. Same signing config.
         run: |
-          ./gradlew assembleRelease \
+          ./gradlew assembleRelease bundleRelease \
             -PversionCode="${{ github.run_number }}" \
             -PversionName="$VERSION" \
             --no-daemon
 
-      - name: Rename APK
+      - name: Rename artifacts
         run: |
           mv android/app/build/outputs/apk/release/app-release.apk \
              "android/app/build/outputs/apk/release/comrade-$VERSION.apk"
+          mv android/app/build/outputs/bundle/release/app-release.aab \
+             "android/app/build/outputs/bundle/release/comrade-$VERSION.aab"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: comrade-apk-${{ env.VERSION }}
           path: android/app/build/outputs/apk/release/comrade-${{ env.VERSION }}.apk
+
+      - name: Upload AAB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: comrade-aab-${{ env.VERSION }}
+          path: android/app/build/outputs/bundle/release/comrade-${{ env.VERSION }}.aab
 
 # ── Job 4: Create GitHub Release ──────────────────────────────────────────────
   release:
@@ -276,10 +286,11 @@ jobs:
           fi
           echo "VERSION=$v" >> "$GITHUB_ENV"
 
-      - name: Download APK
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
-          name: comrade-apk-${{ env.VERSION }}
+          pattern: comrade-*-${{ env.VERSION }}
+          merge-multiple: true
           path: dist/
 
       - name: Create release
@@ -290,4 +301,6 @@ jobs:
           prerelease: ${{ inputs.pre_release == 'true' }}
           generate_release_notes: true
           fail_on_unmatched_files: true
-          files: dist/comrade-${{ env.VERSION }}.apk
+          files: |
+            dist/comrade-${{ env.VERSION }}.apk
+            dist/comrade-${{ env.VERSION }}.aab

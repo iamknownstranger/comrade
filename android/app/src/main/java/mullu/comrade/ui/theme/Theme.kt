@@ -3,6 +3,7 @@ package mullu.comrade.ui.theme
 import android.app.Activity
 import android.os.Build
 import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.SideEffect
@@ -10,6 +11,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
 
 /*
@@ -48,6 +52,35 @@ private val LightColorScheme = lightColorScheme(
     onTertiary = Color(0xFFFFFFFF),
 )
 
+/**
+ * Soft, generous corner radii — cards, dialogs and sheets read as one
+ * rounded, modern surface system instead of the sharper M3 defaults.
+ */
+private val ComradeShapes = Shapes(
+    extraSmall = RoundedCornerShape(8.dp),
+    small = RoundedCornerShape(12.dp),
+    medium = RoundedCornerShape(16.dp),
+    large = RoundedCornerShape(22.dp),
+    extraLarge = RoundedCornerShape(28.dp),
+)
+
+/**
+ * Default M3 type with a firmer title hierarchy: names and headings sit
+ * semi-bold so lists scan by name first, metadata second.
+ */
+private val ComradeTypography = Typography().let { base ->
+    base.copy(
+        headlineMedium = base.headlineMedium.copy(fontWeight = FontWeight.Bold),
+        titleLarge = base.titleLarge.copy(fontWeight = FontWeight.SemiBold),
+        titleMedium = base.titleMedium.copy(fontWeight = FontWeight.SemiBold),
+        titleSmall = base.titleSmall.copy(
+            fontWeight = FontWeight.SemiBold,
+            letterSpacing = 0.1.sp,
+        ),
+        labelSmall = base.labelSmall.copy(letterSpacing = 0.2.sp),
+    )
+}
+
 @Composable
 fun ComradeTheme(
     darkTheme: Boolean = isSystemInDarkTheme(),
@@ -76,6 +109,8 @@ fun ComradeTheme(
 
     MaterialTheme(
         colorScheme = colorScheme,
+        shapes = ComradeShapes,
+        typography = ComradeTypography,
         content = content,
     )
 }

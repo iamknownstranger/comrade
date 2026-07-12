@@ -27,7 +27,7 @@ pub mod runtime;
 
 pub use runtime::{
     BridgeEvent, ChitthiDto, ComradeRuntime, ContactDto, ConversationDto, DirectMessageDto,
-    FoundProfileDto, MediaBytesDto, MediaMessageDto, MessageDto, ProfileDto,
+    FoundProfileDto, JournalEntryDto, MediaBytesDto, MediaMessageDto, MessageDto, ProfileDto,
 };
 
 // ── Errors ──────────────────────────────────────────────────────────────────────

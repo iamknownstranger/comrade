@@ -7,15 +7,20 @@ import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Create
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -25,9 +30,11 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -35,26 +42,33 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import mullu.comrade.ui.ArticleIcon
+import mullu.comrade.ui.BookIcon
 import mullu.comrade.ui.ChatBubbleIcon
 import mullu.comrade.ui.ChatsScreen
 import mullu.comrade.ui.ConversationScreen
 import mullu.comrade.ui.FeedScreen
+import mullu.comrade.ui.JournalScreen
 import mullu.comrade.ui.NewChatScreen
 import mullu.comrade.ui.OnboardingScreen
+import mullu.comrade.ui.PeerAvatar
 import mullu.comrade.ui.SettingsScreen
 import mullu.comrade.ui.peerTitle
 import mullu.comrade.ui.shortNpub
@@ -140,6 +154,7 @@ fun ComradeApp() {
 
 private enum class MainTab(val label: String, val icon: ImageVector) {
     Chats("Chats", ChatBubbleIcon),
+    Journal("Journal", BookIcon),
     Feed("Feed", ArticleIcon),
     Settings("Settings", Icons.Filled.Settings),
 }
@@ -148,7 +163,13 @@ private enum class MainTab(val label: String, val icon: ImageVector) {
 private sealed interface ChatNav {
     data object List : ChatNav
     data object NewChat : ChatNav
-    data class Open(val peer: String, val alias: String?) : ChatNav
+    data class Open(
+        val peer: String,
+        /** User-chosen alias for the peer, when one exists. */
+        val alias: String?,
+        /** The peer's own published @handle, when known. */
+        val username: String?,
+    ) : ChatNav
 }
 
 /** Events drained from the native bridge, reduced to what the shell reacts to. */
@@ -159,6 +180,9 @@ private sealed interface PumpEvent {
 
 /** Bound on the in-memory public feed (the relay stream is unbounded). */
 private const val FEED_CAP = 500
+
+/** Floor between peer-name refreshes; the Rust side is TTL-gated too. */
+private const val NAME_REFRESH_MIN_INTERVAL_MS = 30_000L
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -188,6 +212,31 @@ private fun MainShell(
         }
         for (item in cached.sortedByDescending { it.createdAt }) addToFeed(item, front = false)
 
+        // Fetch the published @handles of people we already talk to, so chats
+        // are titled by name instead of key. Launched on its own coroutine —
+        // never awaited by the pump, so a slow relay can't stall event
+        // draining — single-flight, and rate-limited (the Rust side is also
+        // TTL-gated). > 0 changes means the chat list needs a reload.
+        var refreshingNames = false
+        var lastNameRefreshAt = 0L
+        fun maybeRefreshNames() {
+            val now = System.currentTimeMillis()
+            if (refreshingNames || now - lastNameRefreshAt < NAME_REFRESH_MIN_INTERVAL_MS) return
+            refreshingNames = true
+            lastNameRefreshAt = now
+            launch {
+                try {
+                    val changed = withContext(Dispatchers.IO) {
+                        runCatching { ComradeCore.refreshPeerProfilesTyped() }.getOrDefault(0)
+                    }
+                    if (changed > 0) chatTick++
+                } finally {
+                    refreshingNames = false
+                }
+            }
+        }
+        maybeRefreshNames()
+
         while (isActive) {
             val events = withContext(Dispatchers.IO) { drainEvents() }
             var dmChanged = false
@@ -197,12 +246,17 @@ private fun MainShell(
                     PumpEvent.DmChanged -> dmChanged = true
                 }
             }
-            if (dmChanged) chatTick++
+            if (dmChanged) {
+                chatTick++
+                // A DM from an unknown key may now be nameable.
+                maybeRefreshNames()
+            }
             delay(600)
         }
     }
 
     val openChat = chatNav as? ChatNav.Open
+    var editingAlias by remember { mutableStateOf(false) }
     BackHandler(enabled = tab == MainTab.Chats && chatNav != ChatNav.List) {
         chatNav = ChatNav.List
     }
@@ -217,14 +271,29 @@ private fun MainShell(
                         }
                     },
                     title = {
-                        Column {
-                            Text(peerTitle(openChat.peer, openChat.alias))
-                            Text(
-                                shortNpub(openChat.peer),
-                                style = MaterialTheme.typography.labelSmall,
-                                fontFamily = FontFamily.Monospace,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
+                        val title = peerTitle(openChat.peer, openChat.alias, openChat.username)
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        ) {
+                            PeerAvatar(title, seed = openChat.peer, size = 36.dp)
+                            Column {
+                                Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text(
+                                    shortNpub(openChat.peer),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontFamily = FontFamily.Monospace,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                    },
+                    actions = {
+                        IconButton(
+                            onClick = { editingAlias = true },
+                            modifier = Modifier.testTag("edit-alias"),
+                        ) {
+                            Icon(Icons.Filled.Edit, contentDescription = "Set alias")
                         }
                     },
                 )
@@ -241,6 +310,7 @@ private fun MainShell(
                         Text(
                             when (tab) {
                                 MainTab.Chats -> "Comrade"
+                                MainTab.Journal -> "Journal"
                                 MainTab.Feed -> "Feed"
                                 MainTab.Settings -> "Settings"
                             },
@@ -279,12 +349,16 @@ private fun MainShell(
             MainTab.Chats -> when (val nav = chatNav) {
                 ChatNav.List -> ChatsScreen(
                     chatTick = chatTick,
-                    onOpen = { peer, alias -> chatNav = ChatNav.Open(peer, alias) },
+                    onOpen = { peer, alias, username ->
+                        chatNav = ChatNav.Open(peer, alias, username)
+                    },
                     onNewChat = { chatNav = ChatNav.NewChat },
                     modifier = content,
                 )
                 ChatNav.NewChat -> NewChatScreen(
-                    onOpen = { peer, alias -> chatNav = ChatNav.Open(peer, alias) },
+                    onOpen = { peer, alias, username ->
+                        chatNav = ChatNav.Open(peer, alias, username)
+                    },
                     modifier = content,
                 )
                 is ChatNav.Open -> ConversationScreen(
@@ -293,6 +367,7 @@ private fun MainShell(
                     modifier = content,
                 )
             }
+            MainTab.Journal -> JournalScreen(modifier = content)
             MainTab.Feed -> FeedScreen(
                 feedItems = feedItems,
                 onPosted = { addToFeed(it, front = true) },
@@ -305,6 +380,101 @@ private fun MainShell(
             )
         }
     }
+
+    if (editingAlias && openChat != null) {
+        EditAliasDialog(
+            peer = openChat.peer,
+            currentAlias = openChat.alias,
+            onDismiss = { editingAlias = false },
+            onSaved = { saved ->
+                editingAlias = false
+                chatNav = ChatNav.Open(
+                    peer = openChat.peer,
+                    alias = saved.alias.ifBlank { null },
+                    username = openChat.username ?: saved.name,
+                )
+                chatTick++ // the chat list titles change too
+            },
+        )
+    }
+}
+
+/**
+ * The contact-alias editor: a local petname for this key, shown above their
+ * self-published @handle. Clearing the field removes the alias.
+ */
+@Composable
+private fun EditAliasDialog(
+    peer: String,
+    currentAlias: String?,
+    onDismiss: () -> Unit,
+    onSaved: (ComradeCore.ContactInfo) -> Unit,
+) {
+    var value by remember { mutableStateOf(currentAlias ?: "") }
+    var busy by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
+
+    AlertDialog(
+        onDismissRequest = { if (!busy) onDismiss() },
+        title = { Text("Alias for this contact") },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = value,
+                    onValueChange = { value = it },
+                    label = { Text("Alias") },
+                    singleLine = true,
+                    enabled = !busy,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("alias-input"),
+                )
+                Text(
+                    "Only you see this name. It's pinned to the key " +
+                        "${shortNpub(peer)} — leave it empty to fall back to " +
+                        "their public username.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 8.dp),
+                )
+                error?.let {
+                    Text(
+                        it,
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.padding(top = 4.dp),
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = !busy,
+                onClick = {
+                    busy = true
+                    error = null
+                    scope.launch {
+                        runCatching {
+                            withContext(Dispatchers.IO) {
+                                ComradeCore.setContactAliasTyped(peer, value.trim())
+                            }
+                        }.onSuccess {
+                            busy = false
+                            onSaved(it)
+                        }.onFailure {
+                            busy = false
+                            error = it.message ?: "Could not save."
+                        }
+                    }
+                },
+                modifier = Modifier.testTag("alias-save"),
+            ) { Text(if (busy) "Saving…" else "Save") }
+        },
+        dismissButton = {
+            TextButton(enabled = !busy, onClick = onDismiss) { Text("Cancel") }
+        },
+    )
 }
 
 /**

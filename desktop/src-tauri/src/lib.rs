@@ -75,8 +75,15 @@ pub fn run() {
             commands::current_profile,
             commands::set_username,
             commands::add_contact,
+            commands::set_contact_alias,
+            commands::remove_contact,
+            commands::refresh_peer_profiles,
             commands::list_contacts,
             commands::search_profiles,
+            // Journal (strictly local)
+            commands::add_journal_entry,
+            commands::journal_entries,
+            commands::delete_journal_entry,
             // View-model commands (existing frontend)
             commands::workspaces,
             commands::current_workspace,

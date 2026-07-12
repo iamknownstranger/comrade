@@ -432,7 +432,78 @@ pub extern "C" fn Java_mullu_comrade_ComradeCore_addContact<'local>(
     to_jstring(&mut env, &out)
 }
 
-/// All saved contacts as a JSON array of `{"npub","alias"}`.
+/// Set (non-empty) or clear (empty) the user-chosen alias for a contact.
+/// Returns the contact JSON or `{"error":"…"}`.
+#[no_mangle]
+pub extern "C" fn Java_mullu_comrade_ComradeCore_setContactAlias<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    npub: JString<'local>,
+    alias: JString<'local>,
+) -> jstring {
+    let (Some(npub), Some(alias)) = (jni_string(&mut env, &npub), jni_string(&mut env, &alias))
+    else {
+        return to_jstring(&mut env, &json!({"error":"invalid arguments"}).to_string());
+    };
+    let out = guard_json(move || {
+        let state = state();
+        let guard = state.blocking_read();
+        let contact = guard
+            .set_contact_alias(&npub, &alias)
+            .map_err(|e| e.to_string())?;
+        serde_json::to_value(contact).map_err(|e| e.to_string())
+    });
+    to_jstring(&mut env, &out)
+}
+
+/// Remove a saved contact (the message history stays). Returns
+/// `{"removed":true|false}` or `{"error":"…"}`.
+#[no_mangle]
+pub extern "C" fn Java_mullu_comrade_ComradeCore_removeContact<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    npub: JString<'local>,
+) -> jstring {
+    let Some(npub) = jni_string(&mut env, &npub) else {
+        return to_jstring(
+            &mut env,
+            &json!({"error":"invalid npub argument"}).to_string(),
+        );
+    };
+    let out = guard_json(move || {
+        let state = state();
+        let guard = state.blocking_read();
+        let removed = guard.remove_contact(&npub).map_err(|e| e.to_string())?;
+        Ok(json!({ "removed": removed }))
+    });
+    to_jstring(&mut env, &out)
+}
+
+/// Refresh the cached Kind-0 profiles of conversation peers and contacts
+/// (bounded, TTL-gated). Returns `{"changed":n}` — reload the chat list when
+/// n > 0 — or `{"error":"…"}`.
+#[no_mangle]
+pub extern "C" fn Java_mullu_comrade_ComradeCore_refreshPeerProfiles<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jstring {
+    let out = guard_json(move || {
+        let rt = runtime().ok_or_else(|| "failed to initialise async runtime".to_string())?;
+        let state = state();
+        rt.block_on(async move {
+            // Detach the refresher under a briefly-held guard, then do the
+            // slow relay work guard-free — holding the shared lock across
+            // network awaits would stall every other bridge call (AUDIT P2).
+            let refresher =
+                { state.read().await.profile_refresher() }.map_err(|e| e.to_string())?;
+            let changed = refresher.run().await.map_err(|e| e.to_string())?;
+            Ok(json!({ "changed": changed }))
+        })
+    });
+    to_jstring(&mut env, &out)
+}
+
+/// All saved contacts as a JSON array of `{"npub","alias","name"}`.
 #[no_mangle]
 pub extern "C" fn Java_mullu_comrade_ComradeCore_listContacts<'local>(
     mut env: JNIEnv<'local>,
@@ -480,6 +551,71 @@ pub extern "C" fn Java_mullu_comrade_ComradeCore_messagesWith<'local>(
         let guard = state.blocking_read();
         let msgs = guard.messages_with(&peer).map_err(|e| e.to_string())?;
         serde_json::to_value(msgs).map_err(|e| e.to_string())
+    });
+    to_jstring(&mut env, &out)
+}
+
+// ── Journal (strictly local, never networked) ─────────────────────────────────
+
+/// Save a journal entry (`mood` may be empty for none). Returns the stored
+/// entry JSON or `{"error":"…"}`. The entry never leaves the device.
+#[no_mangle]
+pub extern "C" fn Java_mullu_comrade_ComradeCore_addJournalEntry<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    text: JString<'local>,
+    mood: JString<'local>,
+) -> jstring {
+    let (Some(text), Some(mood)) = (jni_string(&mut env, &text), jni_string(&mut env, &mood))
+    else {
+        return to_jstring(&mut env, &json!({"error":"invalid arguments"}).to_string());
+    };
+    let out = guard_json(move || {
+        let state = state();
+        let guard = state.blocking_read();
+        let mood = (!mood.trim().is_empty()).then_some(mood.as_str());
+        let entry = guard
+            .add_journal_entry(&text, mood)
+            .map_err(|e| e.to_string())?;
+        serde_json::to_value(entry).map_err(|e| e.to_string())
+    });
+    to_jstring(&mut env, &out)
+}
+
+/// All journal entries, newest first, as a JSON array or `{"error":"…"}`.
+#[no_mangle]
+pub extern "C" fn Java_mullu_comrade_ComradeCore_listJournal<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jstring {
+    let out = guard_json(move || {
+        let state = state();
+        let guard = state.blocking_read();
+        let entries = guard.journal_entries().map_err(|e| e.to_string())?;
+        serde_json::to_value(entries).map_err(|e| e.to_string())
+    });
+    to_jstring(&mut env, &out)
+}
+
+/// Delete a journal entry by id. Returns `{"removed":true|false}` or
+/// `{"error":"…"}`.
+#[no_mangle]
+pub extern "C" fn Java_mullu_comrade_ComradeCore_deleteJournalEntry<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    id: JString<'local>,
+) -> jstring {
+    let Some(id) = jni_string(&mut env, &id) else {
+        return to_jstring(
+            &mut env,
+            &json!({"error":"invalid id argument"}).to_string(),
+        );
+    };
+    let out = guard_json(move || {
+        let state = state();
+        let guard = state.blocking_read();
+        let removed = guard.delete_journal_entry(&id).map_err(|e| e.to_string())?;
+        Ok(json!({ "removed": removed }))
     });
     to_jstring(&mut env, &out)
 }

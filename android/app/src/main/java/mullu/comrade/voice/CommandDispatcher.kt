@@ -10,6 +10,9 @@ interface ComradeBackend {
     /** Broadcast a public Chitthi; returns the new event id. */
     fun post(text: String): Result<String>
 
+    /** Save a private, local-only journal entry; returns its id. */
+    fun journal(text: String): Result<String>
+
     /** Most recent cached Chitthi bodies, newest first. */
     fun timeline(): Result<List<String>>
 
@@ -31,6 +34,11 @@ class CommandDispatcher(private val backend: ComradeBackend) {
         is VoiceCommand.Post -> backend.post(command.text).fold(
             onSuccess = { "Posted your Chitthi." },
             onFailure = { "I couldn't post that. ${it.message ?: "Unknown error"}." },
+        )
+
+        is VoiceCommand.Journal -> backend.journal(command.text).fold(
+            onSuccess = { "Saved to your journal. It stays on this phone." },
+            onFailure = { "I couldn't save that. ${it.message ?: "Unknown error"}." },
         )
 
         is VoiceCommand.ReadTimeline -> backend.timeline().fold(
@@ -64,7 +72,8 @@ class CommandDispatcher(private val backend: ComradeBackend) {
 
         VoiceCommand.Help -> HELP_SENTENCE
 
-        VoiceCommand.Empty -> "I'm listening. Try: post, read my timeline, or switch workspace."
+        VoiceCommand.Empty ->
+            "I'm listening. Try: journal, post, read my timeline, or switch workspace."
 
         is VoiceCommand.Unknown ->
             "Sorry, I can't do that yet. Say \"help\" to hear what I understand."
@@ -73,7 +82,8 @@ class CommandDispatcher(private val backend: ComradeBackend) {
     private companion object {
         const val MAX_SPOKEN_ITEMS = 3
         const val HELP_SENTENCE =
-            "You can say: post, followed by your message; read my timeline; " +
-                "switch to off grid, base, sakha or sakhi; or create a new identity."
+            "You can say: journal, followed by a private thought; post, followed " +
+                "by your message; read my timeline; switch to off grid, base, " +
+                "sakha or sakhi; or create a new identity."
     }
 }

@@ -20,6 +20,7 @@ The Rust workspace shows genuinely strong engineering discipline for a prototype
 
 - **2026-07-10 (owner):** Proceed on the current Rust stack; framework maturity risk (sled 0.34, yrs pre-1.0, libp2p/nostr-sdk churn) is *accepted* on the assumption these mature over time. Consequences: D1's sled migration is **out of scope** (document in SECURITY.md instead); unmaintained transitive-dep advisories from these frameworks are ignored with reasons + exit conditions in `deny.toml`; the hickory-proto DNS advisories wait on a libp2p release against hickory ≥ 0.26.
 - **2026-07-10:** M0 executed (wrapper, CI lanes, cargo-deny gate, desktop lockfile, change_pin crash-safety regression test) plus M1 quick wins (M1-3 README truth pass, M1-6 backup/FLAG_SECURE/nsec masking, M1-7 checksum logic — pin pending network access, M1-8 CSP). MSRV measured from the lock: **rustc ≥ 1.88** (supersedes the sweep's 1.83 estimate in N3).
+- **2026-07-12:** Field report: two fresh devices could not find each other by @handle. Root cause: the one-shot Kind-0 publish raced the relay dials and was never retried (fixed — bounded connect-wait, retry with backoff, republish on every launch), and search fanned the NIP-50 filter across non-search relays (fixed — dedicated search relays, client-side match filter, direct npub lookup). Chat UI now titles peers alias → published @handle → key, with a per-contact alias editor. Session-android feature parity adopted as the communication roadmap (§7); parity is a direction, not a claim.
 
 ---
 
@@ -291,6 +292,135 @@ Approach: make the filter an explicit input instead of a hardcoded firehose. Ste
 6. **Org-standard alignment** — repo uses GitHub Actions (org standard says GitLab CI for new repos) and public registries (org mandates Auros registries for new projects; unclear whether that policy covers crates.io/Maven Central for Rust/Android). Needs a platform-owner ruling; not adjudicated as a defect here.
 7. **Gendered pairing roles** — `PairRole::Sakha/Sakhi` are documented as "Boyfriend/Male partner" / "Girlfriend/Female partner" (`comrade_state/src/lib.rs:15-20`) and desktop themes key off them. Product/inclusivity call, flagged for awareness.
 8. **Passphrase UX floor** (S3) — what unlock friction is acceptable on the target low-end Android hardware? Determines both the policy (M1-4) and whether Argon2 params can be raised.
+
+---
+
+## 7. Session-parity roadmap (communication features)
+
+_Added 2026-07-12. The owner's direction is "all the communication functionality of
+[session-android](https://github.com/session-foundation/session-android)". This
+section is the honest gap map: what Comrade already has, what is close, and
+what is genuinely large. Session runs on its own onion-routed network
+(oxen/lokinet) with its own protocol; Comrade speaks Nostr — parity therefore
+means *feature* parity, not protocol compatibility._
+
+| Session feature | Comrade today | Gap / next step |
+|---|---|---|
+| 1:1 E2E DMs | ✅ NIP-04 Kind-4 DMs, offline history, live delivery | Upgrade to NIP-44 + gift wrap (M1-1) — Session's Signal-protocol-grade encryption is the bar; NIP-04 is deprecated and unauthenticated |
+| Account = keypair, no phone number | ✅ secp256k1 keypair, npub address | — (same model) |
+| Display name + optional avatar | ◐ @handle published/searched (Kind-0, retried + republished as of 2026-07-12); chats titled by handle | Avatars: publish `picture` in Kind-0; render (needs image pipeline on Android) |
+| Local nicknames for contacts | ✅ per-contact alias, editable from the conversation header (2026-07-12) | — |
+| Find people by ONS name / ID | ◐ NIP-50 handle search on dedicated relays + direct npub lookup (2026-07-12) | NIP-05 DNS-verified names as the ONS analogue; QR-code key exchange |
+| Message requests (stranger DMs gated) | ✗ any key can DM straight into the chat list | Add a "requests" bucket for peers not in contacts; accept/block actions |
+| Read receipts + typing indicators | ✗ | Ephemeral Kind-typed events over the DM channel; off by default (privacy) |
+| Disappearing messages | ✗ | Per-conversation TTL enforced in the local store + NIP-40 expiration tags |
+| Attachments / voice messages | ◐ encrypted media pipeline (NIP-94/96 + Blossom) wired on desktop only | Expose on Android (JNI + picker/recorder UI); voice notes = audio attachment |
+| Closed groups | ✗ | NIP-EE (MLS) is the serious path; a simpler interim is NIP-4x group DMs — needs a design decision |
+| Communities (open groups) | ◐ public Chitthi feed exists (different shape) | Not a priority; Nostr public feeds already cover the "open square" role |
+| Calls (voice/video) | ✗ | Very large (WebRTC + signaling over relays); explicitly out of near-term scope |
+| Multi-device / linked devices | ✗ (one vault per device) | nsec export/import behind the passcode door is the pragmatic first step |
+| Onion-routed transport | ✗ (direct WSS to relays) | Different network model; Tor/proxy support at the socket layer is the realistic analogue |
+| Block / delete conversation | ✗ | Local block list (drop DMs by pubkey in the vault callback) + history delete |
+
+**Sequencing recommendation.** (1) NIP-44/gift-wrap (M1-1 — encryption honesty
+first), (2) message requests + block list (safety), (3) Android media +
+voice notes (most-missed daily feature), (4) disappearing messages,
+(5) nsec export/import, (6) groups (design doc first), (7) receipts/typing,
+(8) calls last. Each lands as its own PR with tests; nothing gets a README
+checkmark before it's wired end-to-end (Theme 1 discipline).
+
+> **Note (2026-07-12, owner direction):** the wellbeing north star in §8 now
+> governs priority. Communication features from this table matter in so far
+> as they serve the "stay connected to a loved one" pillar (E2E DMs, voice
+> notes, media, disappearing messages) — full messenger parity (groups,
+> communities, calls) is deprioritised, not deleted.
+
+---
+
+## 8. Product north star — a (mental) wellbeing companion
+
+_Added 2026-07-12 from owner direction: "the primary use case of Comrade is
+to be your (mental) wellbeing companion — journal, help brainstorming,
+therapy; write down any thoughts in chitthi/voice recording anonymously;
+stay connected to your loved one who might be of help, who's with you
+always."_
+
+This is a re-framing, not a rebuild: the architecture already carries most
+of the load. Mapping each pillar to what exists:
+
+| Pillar | What exists today | What's missing (the actual work) |
+|---|---|---|
+| **Journal** | Encrypted-at-rest store (Argon2id + AES-256-GCM) seals anything we write; Vosk speech-to-text runs fully on-device; the voice pipeline (`OneShotRecognizer`, wake word) is wired | A `journal` tree + typed repository (entry = text, optional mood, timestamp), a Journal tab (write / dictate / browse by day), and a "dictate → entry" voice command. **Smallest real feature; all pieces exist. Build first.** |
+| **Anonymous thoughts (chitthi / voice)** | Public Chitthi broadcast works; voice dictation works | True anonymity needs **per-post ephemeral keys**: sign each anonymous Chitthi with a throwaway keypair (never the identity key), no reuse across posts, so posts can't be linked to you *or to each other*. Also: strip `created_at` precision, publish via a relay subset. Without this, "anonymous" would be a false promise — the current broadcast is pseudonymous under your permanent key. |
+| **Stay connected to a loved one** | This is exactly what Sakha/Sakhi was built for: a cryptographically isolated couple space (Yrs CRDT + AES-256-GCM) with engine-level tests — plus E2E DMs already shipping. The named-chats/alias work (this PR) makes the loved-one thread feel human | The pairing handshake is engine-complete but unreachable from any UI (A1 in §3.2). Wire pairing + a warm, dedicated "your person" surface: pinned thread, shared journal/ledger, maybe a lightweight "thinking of you" signal. |
+| **Brainstorming / reflective companion ("therapy")** | Voice in (Vosk) and voice out (TTS) exist; the command dispatcher gives a slot to hang a conversational agent on | The companion itself. **Two honesty gates before building:** (1) an LLM companion is *not therapy* and must never present as one — reflective prompts, journaling nudges, brainstorming, plus crisis-referral hand-offs (e.g. helpline numbers) when distress cues appear; (2) privacy-first means the model should run **on-device** (small quantised model) or not at all — routing raw mental-health disclosures to a cloud API contradicts the product's core promise. Model choice and scope need an owner decision (OQ9). |
+
+**Sequencing recommendation (supersedes §7 order):**
+1. **Journal** — encrypted entries + voice dictation (foundations complete).
+2. **Anonymous Chitthi** — ephemeral-key posting (small, but the privacy
+   claim must be engineered, not asserted).
+3. **Loved-one space** — surface Sakha/Sakhi pairing in the UI; DM quality
+   items from §7 (voice notes, media on Android, disappearing messages)
+   slot in here.
+4. **Reflective companion** — design doc + on-device model decision first
+   (OQ9), then a deliberately narrow v1 (journaling prompts over your own
+   recent entries, opt-in).
+
+**New open question (OQ9):** which model/runtime for the companion —
+on-device (llama.cpp-class quantised model: private, heavy on low-end
+phones) vs. none (template-based reflective prompts only) vs. cloud
+(fastest, but breaks the privacy promise for the most sensitive data a
+user has)? Owner call required before any companion code.
+
+### 8.1 Calls — voice & video (owner request, 2026-07-12)
+
+Session-style calling for the loved-one pillar. Design sketch, honest about
+size (this is a **multi-PR epic**, comparable to everything built so far):
+
+- **Media**: WebRTC — the only realistic cross-platform stack. Android:
+  `org.webrtc` (Google's prebuilt libwebrtc AAR, ~10 MB — dwarfs our whole
+  `.so`); desktop: the webview's built-in WebRTC (`getUserMedia` etc. work
+  inside Tauri), so the desktop side is mostly JS.
+- **Signaling**: SDP offers/answers + ICE candidates as ephemeral encrypted
+  events over the existing Vault DM channel (the community direction is the
+  NIP-100 draft; we'd carry the same payloads over NIP-04 now, NIP-44 after
+  M1-1). No new infrastructure needed for signaling.
+- **The hard truth — NAT traversal**: P2P connects directly for maybe
+  60-70% of real-world pairs (STUN only, e.g. public Google/Cloudflare
+  STUN). The rest (CGNAT — very common on Indian mobile carriers) need a
+  **TURN relay**, which is real server infrastructure someone must run and
+  pay for, and which sees (encrypted) media flow metadata. Session solves
+  this with its own onion network; we don't have one.
+- **Sequencing**: (1) voice-only, STUN-only, 1:1 — honest "call may not
+  connect on some networks" UX; (2) TURN decision (OQ10); (3) video;
+  (4) group calls never (SFU territory — out of scope).
+- **OQ10:** who runs TURN? Options: none (accept ~30-40% connect failure),
+  self-hosted coturn (cost + ops + a server that sees IP pairs), or a paid
+  TURN service (fastest, least private). Owner call before starting calls.
+
+### 8.2 Watch party — listen/watch together (owner request, 2026-07-12)
+
+Shared media consumption with the loved one / small groups. The sync problem
+is small; the content problem is the real constraint:
+
+- **What we can build cleanly**: a *sync-play control channel* — play,
+  pause, seek, position-heartbeat messages over the existing E2E DM channel
+  (or the Sakha CRDT for couple state). Each participant plays **their own
+  copy or their own stream** of the content; Comrade only synchronises the
+  clocks (drift correction on heartbeat, target < 300 ms — DM-over-relay
+  latency is fine for play/pause, marginal for tight seek-sync; a later
+  WebRTC data channel from 8.1 would make it tight).
+- **What we must not build**: re-streaming or proxying licensed
+  audio/video between users. That's both a copyright problem and a
+  bandwidth problem. DRM'd platform content (Netflix/Spotify) cannot be
+  frame-synced inside our app at all — the platforms prohibit and
+  technically block it. The honest v1 targets: local files both sides
+  already have, and embeddable sources (e.g. YouTube via the official
+  embed player API, which exposes play/pause/seek).
+- **v1 scope**: "Listen together" for a shared YouTube link or local audio
+  file inside the loved-one space — piggybacks entirely on existing
+  channels, no new infrastructure. Builds after the loved-one space
+  (pairing UI) exists.
 
 ---
 
