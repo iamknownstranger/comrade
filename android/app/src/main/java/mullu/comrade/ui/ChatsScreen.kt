@@ -1,11 +1,13 @@
 package mullu.comrade.ui
 
+import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -37,6 +39,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -48,6 +51,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
@@ -56,11 +60,14 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
+import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import mullu.comrade.ComradeCore
 import mullu.comrade.Notifier
+import mullu.comrade.media.VoiceRecorder
 
 /**
  * Identity-stable avatar hues: the same key renders the same colour on every
@@ -433,9 +440,19 @@ fun ConversationScreen(
     var error by remember { mutableStateOf<String?>(null) }
     var replyingTo by remember { mutableStateOf<ComradeCore.MessageInfo?>(null) }
     var attaching by remember { mutableStateOf(false) }
+    // Push-to-talk voice notes: hold the mic to record, release to send.
+    var recording by remember { mutableStateOf(false) }
+    var voiceSending by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val listState = rememberLazyListState()
     val context = LocalContext.current
+    val recorder = remember { VoiceRecorder(context) }
+    // MediaRecorder holds the mic while active; a composition that leaves the
+    // conversation mid-record (back-navigation) must not leak it.
+    DisposableEffect(Unit) { onDispose { recorder.cancel() } }
+    val requestMicPermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { /* Granted state is re-checked on the next press; nothing to do here. */ }
 
     // Quick lookup so a bubble carrying reply_to can show a quoted preview.
     val byId = remember(messages) { messages.associateBy { it.id } }
@@ -517,6 +534,40 @@ fun ConversationScreen(
             }.onFailure {
                 attaching = false
                 error = it.message ?: "Could not send the attachment."
+            }
+        }
+    }
+
+    fun hasMicPermission(): Boolean =
+        ContextCompat.checkSelfPermission(context, android.Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+
+    // Encrypt + send a recorded voice note, exactly like any other media
+    // attachment (audio/aac over the DM channel), then wipe the plaintext clip.
+    fun sendVoiceNote(file: File) {
+        if (voiceSending) return
+        voiceSending = true
+        error = null
+        scope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    val bytes = file.readBytes()
+                    // Delete the temp recording the moment the send resolves —
+                    // whether it succeeds or throws (AUDIT S-4): the decrypted
+                    // clip must not linger on disk after the FFI call returns.
+                    try {
+                        ComradeCore.sendMediaBytesTyped(peer, VoiceRecorder.MIME_TYPE, "", bytes)
+                    } finally {
+                        file.delete()
+                    }
+                }
+            }.onSuccess { info ->
+                voiceSending = false
+                mediaItems = mediaItems + info
+                scope.launch { listState.scrollToItem(messages.size + mediaItems.size - 1) }
+            }.onFailure {
+                voiceSending = false
+                error = it.message ?: "Could not send the voice note."
             }
         }
     }
@@ -655,7 +706,31 @@ fun ConversationScreen(
             }
         }
 
-        // Composer: attach + pill input + filled send, Telegram-style.
+        // While the mic is held, replace the composer hint with a live "● Recording…"
+        // banner so it's unmistakable the microphone is hot.
+        if (recording) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Box(
+                    Modifier
+                        .size(10.dp)
+                        .clip(CircleShape)
+                        .background(MaterialTheme.colorScheme.error),
+                )
+                Text(
+                    "Recording… release to send",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+        }
+
+        // Composer: attach + pill input + send / hold-to-talk, Telegram-style.
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -680,18 +755,105 @@ fun ConversationScreen(
                     .testTag("dm-input"),
                 maxLines = 4,
             )
-            FilledIconButton(
-                onClick = { send() },
-                enabled = draft.isNotBlank() && !sending,
-                modifier = Modifier
-                    .size(52.dp)
-                    .testTag("dm-send"),
-            ) {
-                Icon(
-                    Icons.AutoMirrored.Filled.Send,
-                    contentDescription = "Send",
+            // A non-empty draft means "send text"; an empty one offers the mic,
+            // exactly like a mainstream messenger's composer.
+            if (draft.isNotBlank()) {
+                FilledIconButton(
+                    onClick = { send() },
+                    enabled = !sending,
+                    modifier = Modifier
+                        .size(52.dp)
+                        .testTag("dm-send"),
+                ) {
+                    Icon(
+                        Icons.AutoMirrored.Filled.Send,
+                        contentDescription = "Send",
+                    )
+                }
+            } else {
+                VoiceRecordButton(
+                    recording = recording,
+                    sending = voiceSending,
+                    enabled = !attaching,
+                    hasPermission = ::hasMicPermission,
+                    onRequestPermission = {
+                        requestMicPermission.launch(android.Manifest.permission.RECORD_AUDIO)
+                    },
+                    onStart = {
+                        val ok = recorder.start()
+                        if (ok) recording = true
+                        ok
+                    },
+                    onStop = {
+                        recording = false
+                        recorder.stop()?.let { sendVoiceNote(it) }
+                    },
                 )
             }
+        }
+    }
+}
+
+/**
+ * A press-and-hold microphone button: it starts recording on touch-down and
+ * sends on release, like WhatsApp/Telegram voice notes. A too-brief tap records
+ * nothing (see [VoiceRecorder.stop]); the first press without the mic permission
+ * asks for it instead of recording.
+ *
+ * [onStart] returns whether recording actually began — only then does the
+ * release ([onStop]) run, so a denied permission or a busy mic can't leave the
+ * button stuck in a "recording" pose.
+ */
+@Composable
+private fun VoiceRecordButton(
+    recording: Boolean,
+    sending: Boolean,
+    enabled: Boolean,
+    hasPermission: () -> Boolean,
+    onRequestPermission: () -> Unit,
+    onStart: () -> Boolean,
+    onStop: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val bg = when {
+        recording -> MaterialTheme.colorScheme.error
+        else -> MaterialTheme.colorScheme.primary
+    }
+    Box(
+        modifier = modifier
+            .size(52.dp)
+            .testTag("dm-voice")
+            .clip(CircleShape)
+            .background(bg)
+            .pointerInput(enabled, sending) {
+                if (!enabled || sending) return@pointerInput
+                detectTapGestures(
+                    onPress = {
+                        if (!hasPermission()) {
+                            onRequestPermission()
+                        } else if (onStart()) {
+                            // Suspends until the finger lifts (or the gesture is
+                            // cancelled), then sends whatever was captured.
+                            tryAwaitRelease()
+                            onStop()
+                        }
+                    },
+                )
+            },
+        contentAlignment = Alignment.Center,
+    ) {
+        if (sending) {
+            CircularProgressIndicator(
+                modifier = Modifier.size(22.dp),
+                strokeWidth = 2.dp,
+                color = MaterialTheme.colorScheme.onPrimary,
+            )
+        } else {
+            Icon(
+                MicIcon,
+                contentDescription = "Hold to record a voice note",
+                tint = MaterialTheme.colorScheme.onPrimary,
+            )
         }
     }
 }
