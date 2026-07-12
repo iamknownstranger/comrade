@@ -412,13 +412,14 @@ impl SabhaEngine {
             .search(query)
             .limit(limit * 3); // headroom: duplicates collapse per author below
         wait_for_any_relay(&self.client, CONNECT_WAIT).await;
+        // Owned URLs, not a borrowed slice iterator: the borrowed form trips
+        // rustc's higher-ranked auto-trait check inside the generic
+        // `fetch_events_from` future, making it non-Send — which the Tauri
+        // command layer requires (desktop clippy lane caught this).
+        let search_relays: Vec<String> = SEARCH_RELAYS.iter().map(|r| r.to_string()).collect();
         let events = self
             .client
-            .fetch_events_from(
-                SEARCH_RELAYS.iter().copied(),
-                filter,
-                std::time::Duration::from_secs(8),
-            )
+            .fetch_events_from(search_relays, filter, std::time::Duration::from_secs(8))
             .await
             .map_err(|e| SabhaError::RelayError(e.to_string()))?;
 

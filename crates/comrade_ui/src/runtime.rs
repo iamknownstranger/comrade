@@ -1382,6 +1382,30 @@ mod tests {
     }
 
     #[test]
+    fn bridge_futures_are_send() {
+        // Tauri's #[tauri::command] requires every command future to be Send;
+        // the workspace itself never demands that, so without this
+        // compile-time probe a non-Send future (e.g. a borrowed iterator held
+        // across an await deep inside an engine) only surfaces in the desktop
+        // CI lane — which is exactly how the search_profiles regression
+        // escaped local checks once.
+        fn require_send<T: Send>(_t: T) {}
+        #[allow(dead_code)]
+        fn probe(rt: &ComradeRuntime, wrt: &mut ComradeRuntime, urt: &mut ComradeRuntime) {
+            require_send(rt.search_profiles("q"));
+            require_send(rt.refresh_peer_profiles());
+            require_send(rt.send_dm("npub1x", "hi"));
+            require_send(rt.broadcast_chitthi("x", None));
+            require_send(rt.sync_ledger());
+            require_send(rt.upload_and_send_media("x", vec![], "image/png", ""));
+            require_send(rt.download_and_decrypt_media("x"));
+            require_send(wrt.set_username("neo"));
+            require_send(urt.unlock_vault("/tmp/x", "p"));
+        }
+        let _ = probe;
+    }
+
+    #[test]
     fn toggle_workspace_enforces_state_machine() {
         let mut rt = ComradeRuntime::new();
         let dto = rt.toggle_workspace("OffGridTravel").unwrap();
