@@ -1,6 +1,5 @@
 package mullu.comrade.ui
 
-import android.util.Base64
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -508,8 +507,7 @@ fun ConversationScreen(
                         throw IllegalStateException("Attachments are limited to 10 MB.")
                     }
                     val mime = context.contentResolver.getType(uri) ?: "application/octet-stream"
-                    val b64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
-                    ComradeCore.sendMediaBytesTyped(peer, mime, "", b64)
+                    ComradeCore.sendMediaBytesTyped(peer, mime, "", bytes)
                 }
             }.onSuccess {
                 attaching = false
