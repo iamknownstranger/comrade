@@ -162,6 +162,21 @@ dependencies {
     implementation("net.java.dev.jna:jna:5.17.0@aar")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.1")
 
+    // WebRTC — voice/video call media (mic/camera capture + PeerConnection).
+    //
+    // NOT the `org.webrtc:google-webrtc` prebuilt named in the original design
+    // notes: that artifact was only ever published to JCenter, which shut down
+    // in 2021 and was never mirrored to Maven Central or Google's Maven — it no
+    // longer resolves from the repositories this project uses (google() +
+    // mavenCentral(), see settings.gradle.kts, with FAIL_ON_PROJECT_REPOS), so
+    // depending on it would break the build outright. `io.github.webrtc-sdk` is
+    // the actively-maintained, Maven-Central-published successor used across the
+    // ecosystem (LiveKit/Stream); crucially it keeps the **same `org.webrtc.*`
+    // package namespace**, so every `import org.webrtc.…` compiles unchanged.
+    // The AAR bundles native libs for arm64-v8a/armeabi-v7a/x86/x86_64, so it
+    // runs on real handsets and the x86_64 emulator lanes alike.
+    implementation("io.github.webrtc-sdk:android:125.6422.07")
+
     debugImplementation("androidx.compose.ui:ui-tooling")
 
     testImplementation("junit:junit:4.13.2")

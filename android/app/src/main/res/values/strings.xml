@@ -16,4 +16,23 @@
     <string name="voice_tap_to_talk">Tap to talk</string>
     <string name="voice_set_default_assistant">Set Comrade as assist app</string>
     <string name="voice_permission_needed">Microphone permission is required for voice.</string>
+
+    <!-- Voice/video calls -->
+    <string name="call_voice">Voice call</string>
+    <string name="call_video">Video call</string>
+    <string name="call_calling">Calling…</string>
+    <string name="call_ringing">Ringing…</string>
+    <string name="call_incoming_voice">Incoming voice call</string>
+    <string name="call_incoming_video">Incoming video call</string>
+    <string name="call_connecting">Connecting…</string>
+    <string name="call_ended">Call ended</string>
+    <string name="call_accept">Accept</string>
+    <string name="call_decline">Decline</string>
+    <string name="call_hang_up">Hang up</string>
+    <string name="call_cancel">Cancel</string>
+    <string name="call_mute">Mute</string>
+    <string name="call_unmute">Unmute</string>
+    <string name="call_speaker">Speaker</string>
+    <string name="call_switch_camera">Switch camera</string>
+    <string name="call_permission_needed">Microphone (and camera for video) permission is required to call.</string>
 </resources>

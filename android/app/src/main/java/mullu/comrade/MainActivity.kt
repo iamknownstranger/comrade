@@ -80,9 +80,15 @@ import mullu.comrade.ui.SettingsScreen
 import mullu.comrade.ui.peerTitle
 import mullu.comrade.ui.purgeDecryptedMedia
 import mullu.comrade.ui.shortNpub
+import mullu.comrade.ui.CallIcon
+import mullu.comrade.ui.VideocamIcon
 import mullu.comrade.ui.theme.ComradeTheme
-import uniffi.comrade_core.CallSignal
+import mullu.comrade.call.CallManager
+import mullu.comrade.call.CallScreen
+import mullu.comrade.call.CallUiState
+import uniffi.comrade_core.CallMediaKind
 import uniffi.comrade_ui.BridgeEvent
+import uniffi.comrade_ui.CallSignalDto
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -205,14 +211,14 @@ private sealed interface PumpEvent {
     /** A stranger's gated DM — refresh requests + notify. */
     data class Request(val peer: String, val preview: String) : PumpEvent
 
-    /** A ringing incoming call (a fresh WebRTC offer) — notify. */
-    data class IncomingCall(val peer: String, val video: Boolean) : PumpEvent
-
     /** Media / receipt / profile update — just reload the chat lists. */
     data object HistoryChanged : PumpEvent
 
     /** The off-grid mesh's live connectivity changed. */
     data class MeshStatusChanged(val status: ComradeCore.MeshStatus) : PumpEvent
+
+    /** A WebRTC call-signaling payload (offer/answer/ICE/hangup) for the call layer. */
+    data class CallSignal(val dto: CallSignalDto) : PumpEvent
 }
 
 /** Bound on the in-memory public feed (the relay stream is unbounded). */
@@ -246,6 +252,45 @@ private fun MainShell(
         Notifier.ensureChannels(context)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !Notifier.hasPermission(context)) {
             notifPermission.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
+    // ── Calls ─────────────────────────────────────────────────────────────────
+    // A call needs the mic (and, for video, the camera) granted before capture.
+    // We gate the runtime permission here, then run the deferred action.
+    val callState by CallManager.state.collectAsState()
+    var pendingCall by remember { mutableStateOf<(() -> Unit)?>(null) }
+    val callPermissions = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { grants ->
+        val action = pendingCall
+        pendingCall = null
+        if (action != null && grants.values.all { it }) action()
+    }
+    fun withCallPermissions(video: Boolean, action: () -> Unit) {
+        val needed = buildList {
+            add(android.Manifest.permission.RECORD_AUDIO)
+            if (video) add(android.Manifest.permission.CAMERA)
+        }
+        val missing = needed.filter {
+            context.checkSelfPermission(it) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        }
+        if (missing.isEmpty()) action() else {
+            pendingCall = action
+            callPermissions.launch(missing.toTypedArray())
+        }
+    }
+
+    // Once the ring is answered/over, drop the incoming-call notification (leaving
+    // message notifications untouched). The peer is only known off the ringing/
+    // in-call states, so remember the last one to clear on the terminal states.
+    var lastCallPeer by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(callState) {
+        when (val st = callState) {
+            is CallUiState.Ringing -> lastCallPeer = st.peer
+            is CallUiState.Connecting -> { lastCallPeer = st.peer; Notifier.clearCall(context, st.peer) }
+            is CallUiState.Active -> { lastCallPeer = st.peer; Notifier.clearCall(context, st.peer) }
+            is CallUiState.Ended, CallUiState.Idle -> lastCallPeer?.let { Notifier.clearCall(context, it) }
         }
     }
 
@@ -321,14 +366,23 @@ private fun MainShell(
                         requestTick++
                         Notifier.notifyRequest(context, event.peer, event.preview)
                     }
-                    is PumpEvent.IncomingCall -> Notifier.notifyIncomingCall(
-                        context,
-                        event.peer,
-                        shortNpub(event.peer),
-                        event.video,
-                    )
                     PumpEvent.HistoryChanged -> historyChanged = true
                     is PumpEvent.MeshStatusChanged -> MeshStatusMonitor.update(event.status)
+                    is PumpEvent.CallSignal -> {
+                        // Feed every signal into the WebRTC layer (answers + ICE
+                        // land in the live PeerConnection); a fresh incoming offer
+                        // returns true → raise the ringing notification so a call
+                        // is visible even when the app isn't in the foreground.
+                        val freshIncoming = CallManager.onIncomingSignal(event.dto)
+                        if (freshIncoming) {
+                            Notifier.notifyIncomingCall(
+                                context,
+                                event.dto.peer,
+                                shortNpub(event.dto.peer),
+                                video = event.dto.media == "video",
+                            )
+                        }
+                    }
                 }
             }
             if (historyChanged) {
@@ -346,7 +400,8 @@ private fun MainShell(
         chatNav = ChatNav.List
     }
 
-    Column(modifier = Modifier.fillMaxSize()) {
+    Box(modifier = Modifier.fillMaxSize()) {
+        Column(modifier = Modifier.fillMaxSize()) {
         MeshStatusBanner()
         Scaffold(
             modifier = Modifier.weight(1f),
@@ -377,6 +432,25 @@ private fun MainShell(
                             }
                         },
                         actions = {
+                            val callLabel = peerTitle(openChat.peer, openChat.alias, openChat.username)
+                            IconButton(onClick = {
+                                withCallPermissions(video = false) {
+                                    CallManager.startOutgoingCall(
+                                        context, openChat.peer, callLabel, CallMediaKind.AUDIO,
+                                    )
+                                }
+                            }) {
+                                Icon(CallIcon, contentDescription = "Voice call")
+                            }
+                            IconButton(onClick = {
+                                withCallPermissions(video = true) {
+                                    CallManager.startOutgoingCall(
+                                        context, openChat.peer, callLabel, CallMediaKind.VIDEO,
+                                    )
+                                }
+                            }) {
+                                Icon(VideocamIcon, contentDescription = "Video call")
+                            }
                             IconButton(
                                 onClick = { editingAlias = true },
                                 modifier = Modifier.testTag("edit-alias"),
@@ -485,6 +559,13 @@ private fun MainShell(
                 )
             }
         }
+        }
+        // Call overlay — covers the app while a call is ringing/connected.
+        CallScreen(onAccept = {
+            (CallManager.state.value as? CallUiState.Ringing)?.let { ringing ->
+                withCallPermissions(ringing.video) { CallManager.accept(context) }
+            }
+        })
     }
 
     if (editingAlias && openChat != null) {
@@ -672,22 +753,10 @@ private fun drainEvents(max: Int = 200): List<PumpEvent> {
                 peer = event.v1.sender,
                 preview = "📎 " + event.v1.caption.ifBlank { "Attachment" },
             )
-            // Receipt + profile updates only need a chat-list reload (ticks,
-            // titles).
+            // Receipt + profile updates only need a chat-list reload (ticks, titles).
             is BridgeEvent.MessageStatus, is BridgeEvent.PeerProfileUpdated -> out += PumpEvent.HistoryChanged
-            // A fresh WebRTC offer is a ringing incoming call — surface it. The
-            // follow-up signals of an in-progress call (answer/ICE/hangup) are
-            // fed straight into the active PeerConnection by the call layer, not
-            // turned into notifications here.
-            is BridgeEvent.IncomingCallSignal -> {
-                val dto = event.v1
-                if (dto.signal is CallSignal.Offer) {
-                    out += PumpEvent.IncomingCall(
-                        peer = dto.peer,
-                        video = dto.media == "video",
-                    )
-                }
-            }
+            // Call signaling (offer/answer/ICE/hangup) → the WebRTC call layer.
+            is BridgeEvent.IncomingCallSignal -> out += PumpEvent.CallSignal(event.v1)
             is BridgeEvent.MeshStatusChanged -> out += PumpEvent.MeshStatusChanged(
                 ComradeCore.MeshStatus(active = event.v1.active, peerCount = event.v1.peerCount.toInt()),
             )
