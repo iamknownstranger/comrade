@@ -151,6 +151,25 @@ jobs:
               || { echo "::error::missing jniLibs/$abi/libcomrade_jni.so"; exit 1; }
           done
 
+      - name: Install Rust stable
+        # Gradle's Kotlin compile tasks now depend on `generateUniffiBindings`
+        # (android/app/build.gradle.kts), which builds comrade_jni for the
+        # host and runs `comrade_uniffi_bindgen` — needed even here, on the
+        # job that only *assembles* the APK from the already cross-compiled
+        # .so files above.
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo (host, uniffi bindgen)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-host-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-host-
+
       - name: Set up JDK 17
         uses: actions/setup-java@v5
         with:
@@ -219,6 +238,22 @@ jobs:
         run: |
           test -f android/app/src/main/jniLibs/x86_64/libcomrade_jni.so \
             || { echo "::error::missing jniLibs/x86_64/libcomrade_jni.so"; exit 1; }
+
+      - name: Install Rust stable
+        # See the same step in the build-apk job above: Gradle's Kotlin
+        # compile tasks now depend on generateUniffiBindings.
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo (host, uniffi bindgen)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-host-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-host-
 
       - name: Set up JDK 17
         uses: actions/setup-java@v5

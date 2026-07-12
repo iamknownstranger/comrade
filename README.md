@@ -135,12 +135,13 @@ linked Rust core). Three things keep it fast — please don't regress them:
 
 - **Release profile** — the root `Cargo.toml` sets thin LTO, one codegen unit,
   and debuginfo stripping for `[profile.release]`, which cuts the shipped `.so`
-  by ~20%. `panic = "abort"` must stay **off**: the JNI bridge's `guard_json`
-  panic guard needs unwinding.
+  by ~20%. `panic = "abort"` must stay **off**: uniffi's generated scaffolding
+  catches panics at the FFI boundary, which needs unwinding.
 - **Off-main-thread load** — `ComradeApplication` warms the library on a
-  background thread at process start, and `ComradeApp` resolves core facts via
-  `produceState(Dispatchers.IO)`, so the first Compose frame never blocks on
-  JNI. `MainActivityUiTest` guards this on the CI device lanes.
+  background thread at process start, and `ComradeApp` resolves core facts on
+  `Dispatchers.IO` inside a `LaunchedEffect`, so the first Compose frame never
+  blocks on the native call. `MainActivityUiTest` guards this on the CI device
+  lanes.
 - **mmap-from-APK packaging** — `useLegacyPackaging = false` stores the `.so`
   uncompressed so the linker maps it straight from the APK.
 
@@ -163,6 +164,14 @@ cd android
 ./gradlew assembleRelease
 # APK → android/app/build/outputs/apk/release/app-release.apk
 ```
+
+Step 2 also builds `comrade_jni` for your *host* (a separate, fast, non-NDK
+build — not the cross-compiled `.so` from step 1) and runs it through
+`comrade_uniffi_bindgen` to generate the Kotlin bindings, so `cargo` needs to
+be on `PATH` even though step 1 already ran. This happens automatically as a
+Gradle task dependency (`android/app/build.gradle.kts`); there's no separate
+bindgen command to run by hand, and nothing to keep in sync as
+`crates/comrade_jni`'s interface grows.
 
 ### Build the desktop app (Tauri 2)
 

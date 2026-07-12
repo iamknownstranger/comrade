@@ -26,7 +26,7 @@ use crate::sabha::{wait_for_any_relay, CONNECT_WAIT};
 
 // ── UPI payment intent ───────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, uniffi::Record)]
 pub struct UpiPaymentIntent {
     pub amount_inr: f64,
     pub vpa: String,

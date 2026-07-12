@@ -7,6 +7,7 @@ members = [
     "crates/comrade_state",
     "crates/comrade_storage",
     "crates/comrade_ui",
+    "crates/comrade_uniffi_bindgen",
 ]
 # The Tauri desktop shell needs the Tauri toolchain + system webview libs to
 # build, so it is kept out of the workspace to keep `cargo test --workspace`
@@ -34,6 +35,11 @@ secp256k1      = { version = "0.29",  features = ["hashes", "rand-std"] }
 hex            = "0.4"
 anyhow         = "1"
 jni            = { version = "0.21",  features = ["invocation"] }
+# proc-macro-driven FFI bindings (Vault/Sabha/Identity → Kotlin) — see
+# crates/comrade_jni. `tokio` feature lets `#[uniffi::export(async_runtime =
+# "tokio")]` hand async methods to the process-global runtime instead of
+# uniffi's generic (non-Tokio) executor.
+uniffi         = { version = "0.32", features = ["tokio"] }
 redb           = "4"
 # `sled` stays pinned only for the one-time migration reader in
 # comrade_storage::migrate (see AUDIT.md decision log, 2026-07-12) — it is no
@@ -51,9 +57,10 @@ pythonize      = "0.29"
 # blocks at app startup. Thin LTO + a single codegen unit shrink the code
 # section across the statically linked tokio/nostr/libp2p graph, and stripping
 # debuginfo keeps local `cargo ndk` builds as lean as CI ones.
-# `panic = "abort"` is deliberately NOT set: the JNI bridge catches panics with
-# `catch_unwind` at the FFI boundary (comrade_jni::guard_json), which requires
-# unwinding to stay enabled.
+# `panic = "abort"` is deliberately NOT set: uniffi's generated scaffolding
+# catches panics with `catch_unwind` at the FFI boundary (turning one into a
+# thrown `PanicException` on the Kotlin side instead of a crash), which
+# requires unwinding to stay enabled.
 [profile.release]
 lto           = "thin"
 codegen-units = 1

@@ -80,7 +80,7 @@ import mullu.comrade.ui.SettingsScreen
 import mullu.comrade.ui.peerTitle
 import mullu.comrade.ui.shortNpub
 import mullu.comrade.ui.theme.ComradeTheme
-import org.json.JSONObject
+import uniffi.comrade_ui.BridgeEvent
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -618,49 +618,47 @@ private fun EditAliasDialog(
  * Non-blocking drain of the native event bus (bounded per round). Chitthis are
  * parsed for the feed; DM/media arrivals just signal "history changed" — the
  * chat screens reload from the Rust-side offline history, the source of truth.
+ *
+ * [ComradeCore.pollEvent] hands back a typed [BridgeEvent] straight from the
+ * native core's push listener — no JSON parsing here any more.
  */
 private fun drainEvents(max: Int = 200): List<PumpEvent> {
     val out = mutableListOf<PumpEvent>()
     repeat(max) {
-        val raw = runCatching { ComradeCore.pollEvent() }.getOrNull() ?: return out
-        val obj = runCatching { JSONObject(raw) }.getOrNull() ?: return out
-        when {
-            obj.has("empty") || obj.has("closed") || obj.has("error") -> return out
-            obj.has("lagged") -> Unit // dropped events; keep draining
-            else -> when (obj.optString("type")) {
-                "incoming_chitthi" -> out +=
-                    PumpEvent.Chitthi(
-                        ComradeCore.ChitthiInfo(
-                            id = obj.optString("id"),
-                            author = obj.optString("author"),
-                            content = obj.optString("content"),
-                            createdAt = obj.optLong("created_at"),
-                            replyTo = null,
-                        ),
-                    )
-                "incoming_direct_message" -> out += PumpEvent.IncomingDm(
-                    peer = obj.optString("sender"),
-                    preview = obj.optString("content").ifBlank { "New message" },
-                )
-                "incoming_message_request" -> out += PumpEvent.Request(
-                    peer = obj.optString("peer"),
-                    preview = obj.optString("last_message").ifBlank { "New message request" },
-                )
-                "incoming_media" -> out += PumpEvent.IncomingDm(
-                    peer = obj.optString("sender"),
-                    preview = obj.optString("caption").ifBlank { "Attachment" }.let { "📎 $it" },
-                )
-                // Receipt + profile updates only need a chat-list reload (ticks,
-                // titles). Call signals are handled by the desktop/native call
-                // layer, not this messaging pump.
-                "message_status", "peer_profile_updated" -> out += PumpEvent.HistoryChanged
-                "mesh_status_changed" -> out += PumpEvent.MeshStatusChanged(
-                    ComradeCore.MeshStatus(
-                        active = obj.optBoolean("active"),
-                        peerCount = obj.optInt("peer_count"),
-                    ),
-                )
-            }
+        val event = ComradeCore.pollEvent() ?: return out
+        when (event) {
+            is BridgeEvent.IncomingChitthi -> out += PumpEvent.Chitthi(
+                ComradeCore.ChitthiInfo(
+                    id = event.v1.id,
+                    author = event.v1.author,
+                    content = event.v1.content,
+                    createdAt = event.v1.createdAt.toLong(),
+                    replyTo = event.v1.replyTo,
+                ),
+            )
+            is BridgeEvent.IncomingDirectMessage -> out += PumpEvent.IncomingDm(
+                peer = event.v1.sender,
+                preview = event.v1.content.ifBlank { "New message" },
+            )
+            is BridgeEvent.IncomingMessageRequest -> out += PumpEvent.Request(
+                peer = event.v1.peer,
+                preview = event.v1.lastMessage.ifBlank { "New message request" },
+            )
+            is BridgeEvent.IncomingMedia -> out += PumpEvent.IncomingDm(
+                peer = event.v1.sender,
+                preview = "📎 " + event.v1.caption.ifBlank { "Attachment" },
+            )
+            // Receipt + profile updates only need a chat-list reload (ticks,
+            // titles). Call signals are handled by the desktop/native call
+            // layer, not this messaging pump.
+            is BridgeEvent.MessageStatus, is BridgeEvent.PeerProfileUpdated -> out += PumpEvent.HistoryChanged
+            is BridgeEvent.IncomingCallSignal -> Unit
+            is BridgeEvent.MeshStatusChanged -> out += PumpEvent.MeshStatusChanged(
+                ComradeCore.MeshStatus(active = event.v1.active, peerCount = event.v1.peerCount.toInt()),
+            )
+            // Sakha/ledger sync isn't wired into the Android UI yet (desktop-only
+            // via Tauri commands, see comrade_jni::lib.rs) — drop, like call signals.
+            is BridgeEvent.LedgerUpdated -> Unit
         }
     }
     return out

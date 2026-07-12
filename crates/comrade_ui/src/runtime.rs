@@ -4,8 +4,11 @@
  * [`ComradeRuntime`] is the live "runtime context" the Command & Event Bridge
  * manages behind an `Arc<RwLock<…>>`. It is the single, framework-agnostic
  * aggregate that both the **Tauri desktop** shell (`#[tauri::command]` wrappers)
- * and the **Android JNI** layer (`extern "C"` exports) drive — keeping all real
- * logic inside the workspace where it is unit-tested and Send/Sync-checked.
+ * and the **Android** layer (`comrade_jni`'s uniffi-generated Kotlin bindings)
+ * drive — keeping all real logic inside the workspace where it is unit-tested
+ * and Send/Sync-checked. This crate itself stays uniffi-agnostic beyond
+ * deriving `Record`/`Enum`/`Error` on its DTOs — `comrade_jni` is the only
+ * place that wraps this type behind actual FFI scaffolding.
  *
  * It composes the sync view-model ([`UiService`] — workspace state, identity,
  * encrypted store) with the live Nostr engines (Sabha public feed, Vault E2E
@@ -17,7 +20,7 @@
  *
  * Design guarantees the bindings rely on:
  *  • Every method returns a typed [`UiError`] — no `.unwrap()`, no panics — so a
- *    failure becomes a `Promise.reject` (Tauri) or JSON error payload (JNI).
+ *    failure becomes a `Promise.reject` (Tauri) or a thrown exception (uniffi).
  *  • Heavy work (relay connect, feed subscription, DM decryption) runs in
  *    spawned Tokio tasks via [`ComradeRuntime::spawn_event_loops`], never on the
  *    caller's UI thread.
@@ -90,7 +93,7 @@ const STATE_BLOCKED: &str = "blocked";
 // ── Event DTOs (serialised across the IPC / FFI boundary) ────────────────────
 
 /// A public Chitthi (Kind-1) as the frontend sees it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
 pub struct ChitthiDto {
     pub id: String,
     pub author: String,
@@ -128,7 +131,7 @@ impl ChitthiDto {
 }
 
 /// An incoming encrypted direct message (Kind-4) as the frontend sees it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, uniffi::Record)]
 pub struct DirectMessageDto {
     pub id: String,
     pub sender: String,
@@ -161,7 +164,7 @@ impl From<VaultMessage> for DirectMessageDto {
 }
 
 /// A WebRTC ICE server (STUN/TURN) for the frontend's `RTCConfiguration`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
 pub struct IceServerDto {
     pub urls: Vec<String>,
     pub username: Option<String>,
@@ -180,7 +183,7 @@ impl From<comrade_core::call::IceServer> for IceServerDto {
 
 /// Everything a frontend needs to begin negotiating a call: the call id, the
 /// peer, the media kind, and the ICE servers to hand to `RTCPeerConnection`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
 pub struct CallSessionDto {
     pub call_id: String,
     pub peer: String,
@@ -189,18 +192,19 @@ pub struct CallSessionDto {
 }
 
 /// One incoming call-signaling payload (offer/answer/ICE/hangup/…) routed to
-/// the frontend. `signal` is the raw [`comrade_core::call::CallSignal`] JSON so
-/// the WebRTC layer can `switch` on its `kind`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// the frontend. `signal` is the actual [`CallSignal`] value (not a JSON blob)
+/// so the WebRTC layer — and uniffi, which has no "arbitrary JSON" type — gets
+/// a closed enum to `switch` on directly.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, uniffi::Record)]
 pub struct CallSignalDto {
     pub call_id: String,
     pub peer: String,
     pub media: String,
-    pub signal: serde_json::Value,
+    pub signal: CallSignal,
 }
 
 /// A voice/video call-log entry as the frontend sees it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
 pub struct CallRecordDto {
     pub id: String,
     pub peer: String,
@@ -228,7 +232,7 @@ impl From<comrade_storage::CallRecord> for CallRecordDto {
 /// A pending message request: a stranger's DM that is gated out of the chat
 /// list until the user accepts it. Only the preview and timing are exposed —
 /// the peer's chosen handle is not shared until they, in turn, accept.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
 pub struct MessageRequestDto {
     pub peer: String,
     pub last_message: String,
@@ -238,7 +242,7 @@ pub struct MessageRequestDto {
 /// This device's Sakha/Sakhi pairing state — lets the frontend show "pair
 /// with your partner" or, for a returning paired couple, "continue as
 /// {role}" without asking for the partner's key again.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
 pub struct SakhaStatusDto {
     pub paired: bool,
     pub partner_npub: Option<String>,
@@ -259,7 +263,7 @@ struct SakhaPairingRecord {
 }
 
 /// A NIP-94 encrypted-media reference as the frontend sees it (no key material).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
 pub struct MediaMessageDto {
     /// NIP-94 event id — the handle passed back to `download_and_decrypt_media`.
     pub event_id: String,
@@ -279,7 +283,7 @@ pub struct MediaMessageDto {
 
 /// Decrypted media handed back to the frontend. Bytes are base64-encoded so the
 /// IPC payload stays compact (the webview rebuilds a `Blob` from it).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
 pub struct MediaBytesDto {
     pub mime_type: String,
     pub base64: String,
@@ -350,7 +354,7 @@ fn to_npub(pubkey: &str) -> String {
 /// The local user's profile: the unforgeable identity (npub) plus the chosen
 /// display handle. The handle is an alias, never an identifier — see
 /// [`ComradeRuntime::set_username`] for the trust model.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
 pub struct ProfileDto {
     pub npub: String,
     pub username: Option<String>,
@@ -358,7 +362,7 @@ pub struct ProfileDto {
 
 /// A profile discovered via relay search. `npub` is the identity; `name` is a
 /// self-declared, non-unique handle — the UI must always show both.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
 pub struct FoundProfileDto {
     pub npub: String,
     pub name: Option<String>,
@@ -368,7 +372,7 @@ pub struct FoundProfileDto {
 /// A saved contact: an npub pinned on first add (trust-on-first-use) with a
 /// local alias. A different key later claiming the same handle can never
 /// silently replace this entry — contacts are keyed by npub, not by name.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
 pub struct ContactDto {
     pub npub: String,
     /// The *user-chosen* local alias (petname). Empty = none set.
@@ -379,7 +383,7 @@ pub struct ContactDto {
 }
 
 /// One entry of the chat list: a peer plus the newest message in the thread.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
 pub struct ConversationDto {
     /// Peer npub (canonical bech32) — the conversation key.
     pub peer: String,
@@ -410,7 +414,7 @@ struct PeerProfileRecord {
 /// A private journal entry as the frontend sees it. Journal entries are
 /// **strictly local**: they are never published to a relay or any network —
 /// the only copy lives sealed inside the encrypted store.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
 pub struct JournalEntryDto {
     pub id: String,
     pub text: String,
@@ -431,7 +435,7 @@ impl From<comrade_storage::JournalEntry> for JournalEntryDto {
 }
 
 /// A single direct message in a conversation, from the offline history.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
 pub struct MessageDto {
     pub id: String,
     /// Peer npub the thread is keyed by (sender if incoming, recipient if outgoing).
@@ -449,18 +453,20 @@ pub struct MessageDto {
 /// Live connectivity status of the off-grid Saathi mesh (mDNS discovery +
 /// Gossipsub), for a persistent UI indicator — the one signal that still works
 /// with zero cellular or relay reachability.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
 pub struct MeshStatusDto {
     /// Whether the mesh engine is running at all (the workspace is `OffGridTravel`).
     pub active: bool,
-    /// Peers currently reachable over the local network via mDNS.
-    pub peer_count: usize,
+    /// Peers currently reachable over the local network via mDNS. `u64`, not
+    /// `SaathiEngine::peer_count`'s native `usize` — uniffi has no FFI-safe
+    /// representation for a platform-width integer.
+    pub peer_count: u64,
 }
 
 /// A push event emitted by the background Tokio loops and forwarded across the
-/// webview boundary (`window.emit`) or polled over JNI. Internally tagged so the
-/// frontend can `switch (evt.type)`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// webview boundary (`window.emit`) or delivered to Android through a uniffi
+/// callback interface (see `comrade_jni::BridgeEventListener`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, uniffi::Enum)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BridgeEvent {
     /// A new public Chitthi (Kind-1) arrived on the Sabha timeline.
@@ -1797,7 +1803,7 @@ impl ComradeRuntime {
         match &self.saathi {
             Some(engine) => MeshStatusDto {
                 active: true,
-                peer_count: engine.peer_count(),
+                peer_count: engine.peer_count() as u64,
             },
             None => MeshStatusDto {
                 active: false,
@@ -1871,12 +1877,12 @@ impl ComradeRuntime {
         tokio::spawn(async move {
             let _ = tx.send(BridgeEvent::MeshStatusChanged(MeshStatusDto {
                 active: true,
-                peer_count: *peer_count_rx.borrow(),
+                peer_count: *peer_count_rx.borrow() as u64,
             }));
             while peer_count_rx.changed().await.is_ok() {
                 let _ = tx.send(BridgeEvent::MeshStatusChanged(MeshStatusDto {
                     active: true,
-                    peer_count: *peer_count_rx.borrow(),
+                    peer_count: *peer_count_rx.borrow() as u64,
                 }));
             }
         });
@@ -2320,12 +2326,11 @@ fn dispatch_incoming_dm(
     //    cannot ring you before their message request is accepted.
     if let Some(env) = parse_call_envelope(&msg.content) {
         if matches!(gate, IncomingGate::Accepted) {
-            let signal = serde_json::to_value(&env.signal).unwrap_or(serde_json::Value::Null);
             let _ = tx.send(BridgeEvent::IncomingCallSignal(CallSignalDto {
                 call_id: env.call_id,
                 peer: peer_npub,
                 media: env.media.as_str().to_string(),
-                signal,
+                signal: env.signal,
             }));
         }
         return;
