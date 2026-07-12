@@ -26,7 +26,8 @@ use thiserror::Error;
 pub mod runtime;
 
 pub use runtime::{
-    BridgeEvent, ChitthiDto, ComradeRuntime, DirectMessageDto, MediaBytesDto, MediaMessageDto,
+    BridgeEvent, ChitthiDto, ComradeRuntime, ContactDto, ConversationDto, DirectMessageDto,
+    FoundProfileDto, MediaBytesDto, MediaMessageDto, MessageDto, ProfileDto,
 };
 
 // ── Errors ──────────────────────────────────────────────────────────────────────
@@ -106,6 +107,9 @@ pub struct UpiIntentDto {
 pub struct UiService {
     ctx: RuntimeContext,
     identity: Option<KeyProfile>,
+    /// The user's chosen @handle. A display alias only — never an identifier;
+    /// identity is always the keypair (see the runtime's username docs).
+    username: Option<String>,
     /// Behind an `Arc` so background Tokio loops (e.g. the media-aware DM
     /// listener in [`runtime`]) can hold their own handle to the open store.
     store: Option<Arc<EncryptedStore>>,
@@ -122,6 +126,7 @@ impl UiService {
         Self {
             ctx: RuntimeContext::new(),
             identity: None,
+            username: None,
             store: None,
         }
     }
@@ -222,14 +227,15 @@ impl UiService {
         self.store.clone()
     }
 
-    /// Persist the current identity to the unlocked store.
+    /// Persist the current identity to the unlocked store. The identity label
+    /// carries the chosen @handle ("primary" is the legacy no-username marker).
     pub fn save_identity(&self) -> Result<(), UiError> {
         let store = self.store.as_ref().ok_or(UiError::StoreLocked)?;
         let profile = self.identity.as_ref().ok_or(UiError::NoIdentity)?;
         let identity = StoredIdentity::new(
             profile.npub.clone(),
             profile.nsec.clone(),
-            Some("primary".into()),
+            Some(self.username.clone().unwrap_or_else(|| "primary".into())),
         );
         store
             .save_identity(&identity)
@@ -253,9 +259,26 @@ impl UiService {
                     has_secret: true,
                 };
                 self.identity = Some(profile);
+                // "primary" was the fixed label before usernames existed.
+                self.username = id.label.filter(|l| l != "primary");
                 Ok(Some(dto))
             }
         }
+    }
+
+    /// The chosen @handle, if one was set.
+    pub fn username(&self) -> Option<String> {
+        self.username.clone()
+    }
+
+    /// Set the @handle and persist it with the identity. Validation (charset,
+    /// length) happens in the runtime so every bridge shares the same rules.
+    pub fn set_username(&mut self, handle: String) -> Result<(), UiError> {
+        if self.identity.is_none() {
+            return Err(UiError::NoIdentity);
+        }
+        self.username = Some(handle);
+        self.save_identity()
     }
 
     // Payments ---------------------------------------------------------------

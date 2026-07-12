@@ -15,8 +15,8 @@
 use std::sync::Arc;
 
 use comrade_ui::{
-    ChitthiDto, ComradeRuntime, IdentityDto, MediaBytesDto, MediaMessageDto, UpiIntentDto,
-    WorkspaceDto,
+    ChitthiDto, ComradeRuntime, ContactDto, ConversationDto, FoundProfileDto, IdentityDto,
+    MediaBytesDto, MediaMessageDto, MessageDto, ProfileDto, UpiIntentDto, WorkspaceDto,
 };
 use tokio::sync::RwLock;
 
@@ -100,6 +100,91 @@ pub async fn broadcast_chitthi(
 #[tauri::command]
 pub async fn sync_ledger(state: tauri::State<'_, Runtime>) -> Result<String, String> {
     state.read().await.sync_ledger().await.map_err(|e| e.to_string())
+}
+
+// ── Direct messages, profile & contacts (Telegram-like flow) ──────────────────
+
+/// Send an E2E-encrypted DM to `target` (npub or hex pubkey). The message is
+/// persisted to the offline history; returns the stored message DTO.
+#[tauri::command]
+pub async fn send_dm(
+    state: tauri::State<'_, Runtime>,
+    target: String,
+    content: String,
+) -> Result<MessageDto, String> {
+    state
+        .read()
+        .await
+        .send_dm(&target, &content)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// The chat list (one entry per peer, newest first) from the offline history.
+#[tauri::command]
+pub async fn conversations(
+    state: tauri::State<'_, Runtime>,
+) -> Result<Vec<ConversationDto>, String> {
+    state.read().await.conversations().map_err(|e| e.to_string())
+}
+
+/// Full offline message history with `peer`, oldest first.
+#[tauri::command]
+pub async fn messages_with(
+    state: tauri::State<'_, Runtime>,
+    peer: String,
+) -> Result<Vec<MessageDto>, String> {
+    state.read().await.messages_with(&peer).map_err(|e| e.to_string())
+}
+
+/// The local profile: npub plus the chosen @handle, if any.
+#[tauri::command]
+pub async fn current_profile(state: tauri::State<'_, Runtime>) -> Result<ProfileDto, String> {
+    state.read().await.profile().map_err(|e| e.to_string())
+}
+
+/// Claim a display @handle (persisted locally, published best-effort).
+#[tauri::command]
+pub async fn set_username(
+    state: tauri::State<'_, Runtime>,
+    name: String,
+) -> Result<ProfileDto, String> {
+    state
+        .write()
+        .await
+        .set_username(&name)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Save (or re-alias) a contact pinned by npub (trust-on-first-use).
+#[tauri::command]
+pub async fn add_contact(
+    state: tauri::State<'_, Runtime>,
+    npub: String,
+    alias: String,
+) -> Result<ContactDto, String> {
+    state.read().await.add_contact(&npub, &alias).map_err(|e| e.to_string())
+}
+
+/// All saved contacts, alias-sorted.
+#[tauri::command]
+pub async fn list_contacts(state: tauri::State<'_, Runtime>) -> Result<Vec<ContactDto>, String> {
+    state.read().await.list_contacts().map_err(|e| e.to_string())
+}
+
+/// Best-effort people search by handle over NIP-50-capable relays.
+#[tauri::command]
+pub async fn search_profiles(
+    state: tauri::State<'_, Runtime>,
+    query: String,
+) -> Result<Vec<FoundProfileDto>, String> {
+    state
+        .read()
+        .await
+        .search_profiles(&query)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 // ── Milestone 3: progressive-disclosure workspace controller ──────────────────

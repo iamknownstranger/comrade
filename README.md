@@ -7,8 +7,9 @@ view-model layer driving an Android (Kotlin/Compose), desktop (Tauri), or CLI fr
 
 | Engine | Protocol | Feature | Status |
 |--------|----------|---------|--------|
-| **Sabha** | Nostr Kind-1 + NIP-10 | Public microblogging — the **Chitthi Feed**, with nested `ChitthiThread` reply trees | ✅ Wired (desktop: broadcast + live feed; reply threading in live feed pending) |
-| **Vault** | Nostr Kind-4 + NIP-04 | End-to-end encrypted direct messages; `/pay` UPI intent detection | ⚠️ Receive wired (desktop); sending not yet exposed in any UI; NIP-44 migration planned |
+| **Sabha** | Nostr Kind-1 + NIP-10 | Public microblogging — the **Chitthi Feed**, with nested `ChitthiThread` reply trees | ✅ Wired (desktop + Android: broadcast + live feed; reply threading in live feed pending) |
+| **Vault** | Nostr Kind-4 + NIP-04 | End-to-end encrypted direct messages; `/pay` UPI intent detection | ✅ Send + receive wired (desktop + Android), offline chat history persisted; NIP-44 migration planned |
+| **Profiles** | Nostr Kind-0 + NIP-50 | @username display handles: published for discovery, searched via relay full-text search; identity itself stays the keypair (see below) | ✅ Wired (Android onboarding + settings; desktop backend commands) |
 | **Saathi** | libp2p mDNS + Gossipsub | Off-grid local mesh — works without internet | 🧪 Experimental — engine + tests only, not started by any frontend |
 | **Sakha/Sakhi** | Yrs CRDT + AES-256-GCM | Cryptographically isolated shared ledger for couples | 🧪 Engine built; pairing handshake not yet reachable from any UI |
 | **Relay gossip** | NIP-65 | Dynamic relay discovery + outbox-model routing | 🧪 Experimental — routing library + CLI demo only |
@@ -24,6 +25,28 @@ view-model layer driving an Android (Kotlin/Compose), desktop (Tauri), or CLI fr
 > the application layer — `ChitthiNode`/`ChitthiThread`, `broadcast_chitthi`,
 > `subscribe_chitthi_feed`, the `chitthi_cache`. Nostr protocol constants
 > (`Kind::TextNote`, NIP-04) are kept intact at the wire level.
+
+## Identity & usernames
+
+Comrade is serverless, so it deliberately does **not** have Telegram-style
+globally unique usernames — no central registry exists that could enforce
+them, and a first-come claim on public relays would be squattable and
+unreliable. The model instead:
+
+- **Identity = the keypair.** Every account is a secp256k1 keypair created
+  on-device; the public half (`npub…`) is the address peers actually message.
+  It is better than a UUID for device-to-device interaction: globally unique
+  *and* unforgeable — using it requires the private key.
+- **Username = a display alias.** At first launch the app asks for a
+  `@handle`, stores it with the identity, and publishes it as Kind-0 metadata
+  so people can find you by name (NIP-50 relay search, best-effort).
+- **Contacts pin the key, not the name (trust-on-first-use).** Once you add
+  `@abc_user`, the contact is stored under their npub. If `@abc_user`
+  disconnects and a stranger later claims the same handle, that stranger is a
+  *different npub*: they show up as a separate, unverified entry, and they can
+  never read or receive the encrypted messages bound to the original key.
+- The UI therefore always shows the npub tail next to a handle, and the
+  opt-in path to *verified* unique names (NIP-05 DNS mapping) is future work.
 
 The **Progressive-Disclosure state machine** (`comrade_state`) gates which engines are active:
 
@@ -43,7 +66,9 @@ crates/
   comrade_ui/      Framework-agnostic view-model / service layer (UiService + DTOs)
   comrade_jni/     JNI bridge — compiled to libcomrade_jni.so for Android
 src/main.rs        Interactive CLI harness (development / testing)
-android/           Kotlin + Jetpack Compose Android app
+android/           Kotlin + Jetpack Compose app — Telegram-like shell:
+                   onboarding (@username + passcode → encrypted vault),
+                   Chats (E2E DMs), Feed (public Chitthis), Settings
 desktop/           Tauri 2 desktop shell (excluded from the workspace — see desktop/README.md)
 .github/workflows/ CI (test + lint) and manual APK release
 ```
@@ -191,10 +216,10 @@ Recognised commands (see `voice/VoiceCommand`): **post** _&lt;message&gt;_ ·
 **new identity** · **help**. Parsing and command dispatch are Android-free and
 unit-tested (`VoiceCommandTest`, `CommandDispatcherTest`).
 
-> **Current limitation.** `post` and `read my timeline` require an unlocked
-> vault, and the Android UI does not yet expose an unlock screen — those two
-> commands currently answer with a "vault is locked" error. The unlock flow is
-> tracked as task M2-1 in [`AUDIT.md`](AUDIT.md).
+> **Note.** `post` and `read my timeline` require an unlocked vault. The app's
+> onboarding flow (username + passcode) unlocks it at startup, so these work
+> once you're past the door; before unlocking they answer with a "vault is
+> locked" error.
 
 > **Honest scope.** This is an *app-scoped* wake word, not the OS-level
 > "Hey Google" hotword. Stock (non-rooted) Pixels reserve the always-on,

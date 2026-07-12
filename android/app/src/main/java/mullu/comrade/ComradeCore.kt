@@ -82,6 +82,43 @@ object ComradeCore {
      */
     external fun pollEvent(): String
 
+    // ── Chat, profile & contacts (Telegram-like flow) ────────────────────────
+
+    /**
+     * Send an E2E-encrypted DM to [target] (npub or hex pubkey); the message is
+     * also persisted to the offline history.
+     * @return stored message JSON, or `{"error":"…"}`.
+     */
+    external fun sendDm(target: String, content: String): String
+
+    /**
+     * Claim a display @handle for this identity (persisted locally, published
+     * to relays best-effort).
+     * @return profile JSON `{"npub":…,"username":…}` or `{"error":"…"}`.
+     */
+    external fun setUsername(name: String): String
+
+    /** The local profile JSON `{"npub":…,"username":…}` or `{"error":"…"}`. */
+    external fun currentProfile(): String
+
+    /**
+     * Best-effort people search by handle over NIP-50-capable relays.
+     * @return JSON array of `{"npub","name","about"}` (empty = nothing found).
+     */
+    external fun searchProfiles(query: String): String
+
+    /** Save (or re-alias) a contact pinned by npub. Returns the contact JSON. */
+    external fun addContact(npub: String, alias: String): String
+
+    /** All saved contacts as a JSON array of `{"npub","alias"}`. */
+    external fun listContacts(): String
+
+    /** The chat list (one entry per peer, newest first) as a JSON array. */
+    external fun listConversations(): String
+
+    /** Offline message history with [peer], oldest first, as a JSON array. */
+    external fun messagesWith(peer: String): String
+
     // ── Kotlin convenience wrappers ──────────────────────────────────────────
 
     data class Keypair(val npub: String, val nsec: String)
@@ -132,6 +169,118 @@ object ComradeCore {
         val content: String,
         val createdAt: Long,
         val replyTo: String?,
+    )
+
+    data class Profile(val npub: String, val username: String?)
+
+    data class FoundProfile(val npub: String, val name: String?, val about: String?)
+
+    data class ContactInfo(val npub: String, val alias: String)
+
+    data class ConversationInfo(
+        val peer: String,
+        val alias: String?,
+        val lastMessage: String,
+        val lastAt: Long,
+        val lastOutgoing: Boolean,
+    )
+
+    data class MessageInfo(
+        val id: String,
+        val peer: String,
+        val content: String,
+        val createdAt: Long,
+        val outgoing: Boolean,
+    )
+
+    private fun JSONObject.failOnError(what: String): JSONObject {
+        if (has("error")) error("$what failed: ${getString("error")}")
+        return this
+    }
+
+    private fun JSONObject.optNullableString(key: String): String? =
+        if (isNull(key)) null else optString(key)
+
+    /** Send a DM, returning the stored message or throwing the backend error. */
+    fun sendDmTyped(target: String, content: String): MessageInfo =
+        JSONObject(sendDm(target, content)).failOnError("Send").toMessage()
+
+    /** Claim a @handle, returning the updated profile or throwing. */
+    fun setUsernameTyped(name: String): Profile =
+        JSONObject(setUsername(name)).failOnError("Username").toProfile()
+
+    /** The local profile, or throwing while the vault is still locked. */
+    fun currentProfileTyped(): Profile =
+        JSONObject(currentProfile()).failOnError("Profile").toProfile()
+
+    /** Best-effort people search; an empty list is a normal outcome. */
+    fun searchProfilesTyped(query: String): List<FoundProfile> {
+        val parsed = JSONTokener(searchProfiles(query)).nextValue()
+        if (parsed is JSONObject) parsed.failOnError("Search")
+        val arr = parsed as JSONArray
+        return (0 until arr.length()).map { i ->
+            val o = arr.getJSONObject(i)
+            FoundProfile(
+                npub = o.getString("npub"),
+                name = o.optNullableString("name"),
+                about = o.optNullableString("about"),
+            )
+        }
+    }
+
+    /** Pin a contact by npub, returning the saved entry or throwing. */
+    fun addContactTyped(npub: String, alias: String): ContactInfo {
+        val o = JSONObject(addContact(npub, alias)).failOnError("Add contact")
+        return ContactInfo(npub = o.getString("npub"), alias = o.getString("alias"))
+    }
+
+    /** All saved contacts. */
+    fun contacts(): List<ContactInfo> {
+        val parsed = JSONTokener(listContacts()).nextValue()
+        if (parsed is JSONObject) parsed.failOnError("Contacts")
+        val arr = parsed as JSONArray
+        return (0 until arr.length()).map { i ->
+            val o = arr.getJSONObject(i)
+            ContactInfo(npub = o.getString("npub"), alias = o.getString("alias"))
+        }
+    }
+
+    /** The chat list, newest thread first. */
+    fun conversations(): List<ConversationInfo> {
+        val parsed = JSONTokener(listConversations()).nextValue()
+        if (parsed is JSONObject) parsed.failOnError("Conversations")
+        val arr = parsed as JSONArray
+        return (0 until arr.length()).map { i ->
+            val o = arr.getJSONObject(i)
+            ConversationInfo(
+                peer = o.getString("peer"),
+                alias = o.optNullableString("alias"),
+                lastMessage = o.getString("last_message"),
+                lastAt = o.getLong("last_at"),
+                lastOutgoing = o.getBoolean("last_outgoing"),
+            )
+        }
+    }
+
+    /** Message history with [peer], oldest first. */
+    fun messages(peer: String): List<MessageInfo> {
+        val parsed = JSONTokener(messagesWith(peer)).nextValue()
+        if (parsed is JSONObject) parsed.failOnError("Messages")
+        val arr = parsed as JSONArray
+        return (0 until arr.length()).map { i -> arr.getJSONObject(i).toMessage() }
+    }
+
+    private fun JSONObject.toProfile() = Profile(
+        npub = getString("npub"),
+        username = optNullableString("username"),
+    )
+
+    private fun JSONObject.toMessage() = MessageInfo(
+        id = getString("id"),
+        peer = getString("peer"),
+        content = getString("content"),
+        createdAt = getLong("created_at"),
+        outgoing = getBoolean("outgoing"),
     )
 
     /** The cached Sabha timeline as a list of [ChitthiInfo]. */

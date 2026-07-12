@@ -68,6 +68,15 @@ pub fn run() {
             commands::upload_and_send_media,
             commands::send_media_bytes,
             commands::download_and_decrypt_media,
+            // Direct messages, profile & contacts
+            commands::send_dm,
+            commands::conversations,
+            commands::messages_with,
+            commands::current_profile,
+            commands::set_username,
+            commands::add_contact,
+            commands::list_contacts,
+            commands::search_profiles,
             // View-model commands (existing frontend)
             commands::workspaces,
             commands::current_workspace,
