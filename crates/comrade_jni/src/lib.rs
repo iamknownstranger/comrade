@@ -555,6 +555,71 @@ pub extern "C" fn Java_mullu_comrade_ComradeCore_messagesWith<'local>(
     to_jstring(&mut env, &out)
 }
 
+// ── Journal (strictly local, never networked) ─────────────────────────────────
+
+/// Save a journal entry (`mood` may be empty for none). Returns the stored
+/// entry JSON or `{"error":"…"}`. The entry never leaves the device.
+#[no_mangle]
+pub extern "C" fn Java_mullu_comrade_ComradeCore_addJournalEntry<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    text: JString<'local>,
+    mood: JString<'local>,
+) -> jstring {
+    let (Some(text), Some(mood)) = (jni_string(&mut env, &text), jni_string(&mut env, &mood))
+    else {
+        return to_jstring(&mut env, &json!({"error":"invalid arguments"}).to_string());
+    };
+    let out = guard_json(move || {
+        let state = state();
+        let guard = state.blocking_read();
+        let mood = (!mood.trim().is_empty()).then_some(mood.as_str());
+        let entry = guard
+            .add_journal_entry(&text, mood)
+            .map_err(|e| e.to_string())?;
+        serde_json::to_value(entry).map_err(|e| e.to_string())
+    });
+    to_jstring(&mut env, &out)
+}
+
+/// All journal entries, newest first, as a JSON array or `{"error":"…"}`.
+#[no_mangle]
+pub extern "C" fn Java_mullu_comrade_ComradeCore_listJournal<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jstring {
+    let out = guard_json(move || {
+        let state = state();
+        let guard = state.blocking_read();
+        let entries = guard.journal_entries().map_err(|e| e.to_string())?;
+        serde_json::to_value(entries).map_err(|e| e.to_string())
+    });
+    to_jstring(&mut env, &out)
+}
+
+/// Delete a journal entry by id. Returns `{"removed":true|false}` or
+/// `{"error":"…"}`.
+#[no_mangle]
+pub extern "C" fn Java_mullu_comrade_ComradeCore_deleteJournalEntry<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    id: JString<'local>,
+) -> jstring {
+    let Some(id) = jni_string(&mut env, &id) else {
+        return to_jstring(
+            &mut env,
+            &json!({"error":"invalid id argument"}).to_string(),
+        );
+    };
+    let out = guard_json(move || {
+        let state = state();
+        let guard = state.blocking_read();
+        let removed = guard.delete_journal_entry(&id).map_err(|e| e.to_string())?;
+        Ok(json!({ "removed": removed }))
+    });
+    to_jstring(&mut env, &out)
+}
+
 /// Non-blocking drain of the next bridge event (incoming Chitthi / DM). Returns
 /// the event JSON, `{"empty":true}` when none is queued, or `{"error":"…"}`.
 #[no_mangle]

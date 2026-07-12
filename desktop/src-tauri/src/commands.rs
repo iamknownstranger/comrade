@@ -16,7 +16,8 @@ use std::sync::Arc;
 
 use comrade_ui::{
     ChitthiDto, ComradeRuntime, ContactDto, ConversationDto, FoundProfileDto, IdentityDto,
-    MediaBytesDto, MediaMessageDto, MessageDto, ProfileDto, UpiIntentDto, WorkspaceDto,
+    JournalEntryDto, MediaBytesDto, MediaMessageDto, MessageDto, ProfileDto, UpiIntentDto,
+    WorkspaceDto,
 };
 use tokio::sync::RwLock;
 
@@ -219,6 +220,43 @@ pub async fn search_profiles(
         .await
         .search_profiles(&query)
         .await
+        .map_err(|e| e.to_string())
+}
+
+// ── Journal (strictly local, never networked) ──────────────────────────────────
+
+/// Save a journal entry. The entry never leaves the device.
+#[tauri::command]
+pub async fn add_journal_entry(
+    state: tauri::State<'_, Runtime>,
+    text: String,
+    mood: Option<String>,
+) -> Result<JournalEntryDto, String> {
+    state
+        .read()
+        .await
+        .add_journal_entry(&text, mood.as_deref())
+        .map_err(|e| e.to_string())
+}
+
+/// All journal entries, newest first.
+#[tauri::command]
+pub async fn journal_entries(
+    state: tauri::State<'_, Runtime>,
+) -> Result<Vec<JournalEntryDto>, String> {
+    state.read().await.journal_entries().map_err(|e| e.to_string())
+}
+
+/// Delete a journal entry by id; returns whether one existed.
+#[tauri::command]
+pub async fn delete_journal_entry(
+    state: tauri::State<'_, Runtime>,
+    id: String,
+) -> Result<bool, String> {
+    state
+        .read()
+        .await
+        .delete_journal_entry(&id)
         .map_err(|e| e.to_string())
 }
 

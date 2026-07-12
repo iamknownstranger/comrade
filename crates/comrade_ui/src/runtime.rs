@@ -275,6 +275,29 @@ struct PeerProfileRecord {
     updated_at: u64,
 }
 
+/// A private journal entry as the frontend sees it. Journal entries are
+/// **strictly local**: they are never published to a relay or any network —
+/// the only copy lives sealed inside the encrypted store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournalEntryDto {
+    pub id: String,
+    pub text: String,
+    /// Optional self-reported mood marker (an emoji or short tag).
+    pub mood: Option<String>,
+    pub created_at: u64,
+}
+
+impl From<comrade_storage::JournalEntry> for JournalEntryDto {
+    fn from(e: comrade_storage::JournalEntry) -> Self {
+        Self {
+            id: e.id,
+            text: e.text,
+            mood: e.mood,
+            created_at: e.created_at,
+        }
+    }
+}
+
 /// A single direct message in a conversation, from the offline history.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageDto {
@@ -930,6 +953,59 @@ impl ComradeRuntime {
         self.profile_refresher()?.run().await
     }
 
+    // ── Journal (wellbeing pillar #1 — strictly local, never networked) ──────
+
+    /// Save a new journal entry. `mood` is an optional self-reported marker.
+    /// The entry never leaves the device: no relay, no network — only the
+    /// encrypted store.
+    pub fn add_journal_entry(
+        &self,
+        text: &str,
+        mood: Option<&str>,
+    ) -> Result<JournalEntryDto, UiError> {
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(UiError::Engine("journal entry is empty".into()));
+        }
+        let created_at = now_secs();
+        let entry = comrade_storage::JournalEntry {
+            id: journal_entry_id(created_at),
+            text: text.to_string(),
+            mood: mood
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .map(String::from),
+            created_at,
+        };
+        store
+            .save_journal_entry(&entry)
+            .and_then(|()| store.flush())
+            .map_err(|e| UiError::Storage(e.to_string()))?;
+        Ok(entry.into())
+    }
+
+    /// All journal entries, newest first.
+    pub fn journal_entries(&self) -> Result<Vec<JournalEntryDto>, UiError> {
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        Ok(store
+            .journal_entries()
+            .map_err(|e| UiError::Storage(e.to_string()))?
+            .into_iter()
+            .map(JournalEntryDto::from)
+            .collect())
+    }
+
+    /// Delete a journal entry by id. Returns whether one existed.
+    pub fn delete_journal_entry(&self, id: &str) -> Result<bool, UiError> {
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        let removed = store
+            .remove_journal_entry(id)
+            .map_err(|e| UiError::Storage(e.to_string()))?;
+        store.flush().map_err(|e| UiError::Storage(e.to_string()))?;
+        Ok(removed)
+    }
+
     // ── Encrypted media pipeline (NIP-94/96 · Blossom) ───────────────────────
 
     /// Encrypt `bytes` for `target_pubkey`, upload the opaque blob to Blossom,
@@ -1147,6 +1223,15 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or_default()
+}
+
+/// Store key for a journal entry: a zero-padded timestamp prefix (so ids sort
+/// chronologically) plus a random tail (so two entries in the same second
+/// never collide). The randomness comes from a throwaway secp256k1 key — no
+/// extra dependency, and cryptographically unpredictable.
+fn journal_entry_id(created_at: u64) -> String {
+    let tail = nostr_sdk::Keys::generate().public_key().to_hex();
+    format!("{created_at:020}-{}", &tail[..12])
 }
 
 /// The peer's published @handle from the local profile cache, if known.
@@ -1720,6 +1805,66 @@ mod tests {
             rt.set_contact_alias("junk", "x"),
             Err(UiError::Engine(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn journal_lifecycle_add_list_delete() {
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+
+        // Locked → typed errors, no panics.
+        assert!(matches!(
+            rt.add_journal_entry("hi", None),
+            Err(UiError::VaultLocked)
+        ));
+        assert!(matches!(rt.journal_entries(), Err(UiError::VaultLocked)));
+        assert!(matches!(
+            rt.delete_journal_entry("x"),
+            Err(UiError::VaultLocked)
+        ));
+
+        rt.unlock_vault(dir.path(), "pin").await.unwrap();
+
+        let first = rt
+            .add_journal_entry("  rough morning  ", Some("😕"))
+            .unwrap();
+        assert_eq!(first.text, "rough morning", "text is trimmed");
+        assert_eq!(first.mood.as_deref(), Some("😕"));
+        let second = rt.add_journal_entry("grateful today", Some("  ")).unwrap();
+        assert_eq!(second.mood, None, "blank mood normalises to none");
+        assert_ne!(first.id, second.id);
+
+        // Whitespace-only text is rejected.
+        assert!(matches!(
+            rt.add_journal_entry("   ", None),
+            Err(UiError::Engine(_))
+        ));
+
+        let entries = rt.journal_entries().unwrap();
+        assert_eq!(entries.len(), 2);
+        // Newest first; same-second entries fall back to id ordering.
+        assert!(entries[0].created_at >= entries[1].created_at);
+
+        assert!(rt.delete_journal_entry(&first.id).unwrap());
+        assert!(!rt.delete_journal_entry(&first.id).unwrap());
+        assert_eq!(rt.journal_entries().unwrap().len(), 1);
+
+        // Entries survive a restart (encrypted at rest).
+        drop(rt);
+        let mut rt2 = ComradeRuntime::new();
+        rt2.unlock_vault(dir.path(), "pin").await.unwrap();
+        let entries = rt2.journal_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].text, "grateful today");
+    }
+
+    #[test]
+    fn journal_ids_sort_chronologically_and_never_collide() {
+        let a = journal_entry_id(5);
+        let b = journal_entry_id(5);
+        let later = journal_entry_id(1_700_000_000);
+        assert_ne!(a, b, "same-second ids must differ");
+        assert!(a < later && b < later, "timestamp prefix sorts");
     }
 
     #[tokio::test]

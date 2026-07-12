@@ -60,6 +60,29 @@ val ArticleIcon: ImageVector = materialIcon(name = "Filled.Article") {
     }
 }
 
+/** Material "book" (filled) — the private journal. */
+val BookIcon: ImageVector = materialIcon(name = "Filled.Book") {
+    materialPath {
+        moveTo(18.0f, 2.0f)
+        horizontalLineTo(6.0f)
+        curveToRelative(-1.1f, 0.0f, -2.0f, 0.9f, -2.0f, 2.0f)
+        verticalLineToRelative(16.0f)
+        curveToRelative(0.0f, 1.1f, 0.9f, 2.0f, 2.0f, 2.0f)
+        horizontalLineToRelative(12.0f)
+        curveToRelative(1.1f, 0.0f, 2.0f, -0.9f, 2.0f, -2.0f)
+        verticalLineTo(4.0f)
+        curveToRelative(0.0f, -1.1f, -0.9f, -2.0f, -2.0f, -2.0f)
+        close()
+        moveTo(6.0f, 4.0f)
+        horizontalLineToRelative(5.0f)
+        verticalLineToRelative(8.0f)
+        lineToRelative(-2.5f, -1.5f)
+        lineTo(6.0f, 12.0f)
+        verticalLineTo(4.0f)
+        close()
+    }
+}
+
 /** Material "mic" (filled) — the voice assistant. */
 val MicIcon: ImageVector = materialIcon(name = "Filled.Mic") {
     materialPath {

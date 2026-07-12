@@ -372,6 +372,56 @@ phones) vs. none (template-based reflective prompts only) vs. cloud
 (fastest, but breaks the privacy promise for the most sensitive data a
 user has)? Owner call required before any companion code.
 
+### 8.1 Calls — voice & video (owner request, 2026-07-12)
+
+Session-style calling for the loved-one pillar. Design sketch, honest about
+size (this is a **multi-PR epic**, comparable to everything built so far):
+
+- **Media**: WebRTC — the only realistic cross-platform stack. Android:
+  `org.webrtc` (Google's prebuilt libwebrtc AAR, ~10 MB — dwarfs our whole
+  `.so`); desktop: the webview's built-in WebRTC (`getUserMedia` etc. work
+  inside Tauri), so the desktop side is mostly JS.
+- **Signaling**: SDP offers/answers + ICE candidates as ephemeral encrypted
+  events over the existing Vault DM channel (the community direction is the
+  NIP-100 draft; we'd carry the same payloads over NIP-04 now, NIP-44 after
+  M1-1). No new infrastructure needed for signaling.
+- **The hard truth — NAT traversal**: P2P connects directly for maybe
+  60-70% of real-world pairs (STUN only, e.g. public Google/Cloudflare
+  STUN). The rest (CGNAT — very common on Indian mobile carriers) need a
+  **TURN relay**, which is real server infrastructure someone must run and
+  pay for, and which sees (encrypted) media flow metadata. Session solves
+  this with its own onion network; we don't have one.
+- **Sequencing**: (1) voice-only, STUN-only, 1:1 — honest "call may not
+  connect on some networks" UX; (2) TURN decision (OQ10); (3) video;
+  (4) group calls never (SFU territory — out of scope).
+- **OQ10:** who runs TURN? Options: none (accept ~30-40% connect failure),
+  self-hosted coturn (cost + ops + a server that sees IP pairs), or a paid
+  TURN service (fastest, least private). Owner call before starting calls.
+
+### 8.2 Watch party — listen/watch together (owner request, 2026-07-12)
+
+Shared media consumption with the loved one / small groups. The sync problem
+is small; the content problem is the real constraint:
+
+- **What we can build cleanly**: a *sync-play control channel* — play,
+  pause, seek, position-heartbeat messages over the existing E2E DM channel
+  (or the Sakha CRDT for couple state). Each participant plays **their own
+  copy or their own stream** of the content; Comrade only synchronises the
+  clocks (drift correction on heartbeat, target < 300 ms — DM-over-relay
+  latency is fine for play/pause, marginal for tight seek-sync; a later
+  WebRTC data channel from 8.1 would make it tight).
+- **What we must not build**: re-streaming or proxying licensed
+  audio/video between users. That's both a copyright problem and a
+  bandwidth problem. DRM'd platform content (Netflix/Spotify) cannot be
+  frame-synced inside our app at all — the platforms prohibit and
+  technically block it. The honest v1 targets: local files both sides
+  already have, and embeddable sources (e.g. YouTube via the official
+  embed player API, which exposes play/pause/seek).
+- **v1 scope**: "Listen together" for a shared YouTube link or local audio
+  file inside the loved-one space — piggybacks entirely on existing
+  channels, no new infrastructure. Builds after the loved-one space
+  (pairing UI) exists.
+
 ---
 
 ## Appendix — Review coverage

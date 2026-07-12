@@ -207,6 +207,11 @@ frontends are the Tauri desktop shell and the CLI.
 3. Enter a version string (e.g. `1.0.0`) and optionally mark as pre-release
 4. The workflow runs tests → cross-compiles Rust → assembles APK → creates a Release with the APK attached
 
+> **Shipping to real users?** See [`RELEASING.md`](RELEASING.md) for the
+> keystore setup, the Play-ready App Bundle, distribution options
+> (Play / F-Droid / Obtainium), and an honest account of what Play Protect
+> will still say about sideloaded builds.
+
 ### APK signing (optional)
 
 Add these repository secrets (**Settings → Secrets → Actions**) for a production-signed build:

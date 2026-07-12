@@ -14,6 +14,9 @@ class ComradeCoreBackend : ComradeBackend {
     override fun post(text: String): Result<String> =
         runCatching { ComradeCore.broadcastChitthiTyped(text) }
 
+    override fun journal(text: String): Result<String> =
+        runCatching { ComradeCore.addJournalEntryTyped(text, null).id }
+
     override fun timeline(): Result<List<String>> =
         runCatching { ComradeCore.sabhaTimeline().map { it.content } }
 

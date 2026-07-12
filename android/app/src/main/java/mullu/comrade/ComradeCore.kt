@@ -141,6 +141,21 @@ object ComradeCore {
     /** Offline message history with [peer], oldest first, as a JSON array. */
     external fun messagesWith(peer: String): String
 
+    // ── Journal (strictly local, never networked) ────────────────────────────
+
+    /**
+     * Save a private journal entry ([mood] may be empty for none). The entry
+     * never leaves the device — sealed in the encrypted store only.
+     * @return stored entry JSON or `{"error":"…"}`.
+     */
+    external fun addJournalEntry(text: String, mood: String): String
+
+    /** All journal entries, newest first, as a JSON array. */
+    external fun listJournal(): String
+
+    /** Delete a journal entry. @return JSON `{"removed":true|false}`. */
+    external fun deleteJournalEntry(id: String): String
+
     // ── Kotlin convenience wrappers ──────────────────────────────────────────
 
     data class Keypair(val npub: String, val nsec: String)
@@ -220,6 +235,14 @@ object ComradeCore {
         val content: String,
         val createdAt: Long,
         val outgoing: Boolean,
+    )
+
+    /** A private journal entry — local-only, sealed by the passcode. */
+    data class JournalEntryInfo(
+        val id: String,
+        val text: String,
+        val mood: String?,
+        val createdAt: Long,
     )
 
     private fun JSONObject.failOnError(what: String): JSONObject {
@@ -315,6 +338,31 @@ object ComradeCore {
         if (parsed is JSONObject) parsed.failOnError("Messages")
         val arr = parsed as JSONArray
         return (0 until arr.length()).map { i -> arr.getJSONObject(i).toMessage() }
+    }
+
+    private fun JSONObject.toJournalEntry() = JournalEntryInfo(
+        id = getString("id"),
+        text = getString("text"),
+        mood = optNullableString("mood"),
+        createdAt = getLong("created_at"),
+    )
+
+    /** Save a journal entry, returning the stored record or throwing. */
+    fun addJournalEntryTyped(text: String, mood: String?): JournalEntryInfo =
+        JSONObject(addJournalEntry(text, mood ?: "")).failOnError("Journal").toJournalEntry()
+
+    /** All journal entries, newest first. */
+    fun journal(): List<JournalEntryInfo> {
+        val parsed = JSONTokener(listJournal()).nextValue()
+        if (parsed is JSONObject) parsed.failOnError("Journal")
+        val arr = parsed as JSONArray
+        return (0 until arr.length()).map { i -> arr.getJSONObject(i).toJournalEntry() }
+    }
+
+    /** Delete a journal entry; true if one existed. */
+    fun deleteJournalEntryTyped(id: String): Boolean {
+        val o = JSONObject(deleteJournalEntry(id)).failOnError("Journal delete")
+        return o.getBoolean("removed")
     }
 
     private fun JSONObject.toProfile() = Profile(

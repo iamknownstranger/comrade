@@ -60,10 +60,12 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import mullu.comrade.ui.ArticleIcon
+import mullu.comrade.ui.BookIcon
 import mullu.comrade.ui.ChatBubbleIcon
 import mullu.comrade.ui.ChatsScreen
 import mullu.comrade.ui.ConversationScreen
 import mullu.comrade.ui.FeedScreen
+import mullu.comrade.ui.JournalScreen
 import mullu.comrade.ui.NewChatScreen
 import mullu.comrade.ui.OnboardingScreen
 import mullu.comrade.ui.PeerAvatar
@@ -152,6 +154,7 @@ fun ComradeApp() {
 
 private enum class MainTab(val label: String, val icon: ImageVector) {
     Chats("Chats", ChatBubbleIcon),
+    Journal("Journal", BookIcon),
     Feed("Feed", ArticleIcon),
     Settings("Settings", Icons.Filled.Settings),
 }
@@ -307,6 +310,7 @@ private fun MainShell(
                         Text(
                             when (tab) {
                                 MainTab.Chats -> "Comrade"
+                                MainTab.Journal -> "Journal"
                                 MainTab.Feed -> "Feed"
                                 MainTab.Settings -> "Settings"
                             },
@@ -363,6 +367,7 @@ private fun MainShell(
                     modifier = content,
                 )
             }
+            MainTab.Journal -> JournalScreen(modifier = content)
             MainTab.Feed -> FeedScreen(
                 feedItems = feedItems,
                 onPosted = { addToFeed(it, front = true) },

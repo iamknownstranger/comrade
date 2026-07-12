@@ -43,3 +43,23 @@ fun relativeTime(epochSecs: Long): String {
         else -> "${d / 86_400}d"
     }
 }
+
+/**
+ * Human day header for journal grouping: "Today", "Yesterday", else
+ * "12 Jul 2026". [zone] is injectable so the rule is unit-testable.
+ */
+fun dayLabel(
+    epochSecs: Long,
+    nowEpochSecs: Long,
+    zone: java.time.ZoneId = java.time.ZoneId.systemDefault(),
+): String {
+    val day = java.time.Instant.ofEpochSecond(epochSecs).atZone(zone).toLocalDate()
+    val today = java.time.Instant.ofEpochSecond(nowEpochSecs).atZone(zone).toLocalDate()
+    return when (day) {
+        today -> "Today"
+        today.minusDays(1) -> "Yesterday"
+        else -> day.format(
+            java.time.format.DateTimeFormatter.ofPattern("d MMM yyyy", java.util.Locale.ENGLISH),
+        )
+    }
+}

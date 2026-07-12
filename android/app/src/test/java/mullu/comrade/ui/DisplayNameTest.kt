@@ -39,6 +39,15 @@ class DisplayNameTest {
     }
 
     @Test
+    fun dayLabelsGroupJournalEntriesHumanly() {
+        val utc = java.time.ZoneId.of("UTC")
+        val now = 1_752_303_600L // 2025-07-12T07:00:00Z
+        assertEquals("Today", dayLabel(now - 3600, now, utc))
+        assertEquals("Yesterday", dayLabel(now - 86_400, now, utc))
+        assertEquals("10 Jul 2025", dayLabel(now - 2 * 86_400, now, utc))
+    }
+
+    @Test
     fun avatarColorIsStableAndInBounds() {
         val first = avatarColorIndex(key, 8)
         assertEquals("same key → same colour", first, avatarColorIndex(key, 8))

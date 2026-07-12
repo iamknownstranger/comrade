@@ -80,6 +80,10 @@ pub fn run() {
             commands::refresh_peer_profiles,
             commands::list_contacts,
             commands::search_profiles,
+            // Journal (strictly local)
+            commands::add_journal_entry,
+            commands::journal_entries,
+            commands::delete_journal_entry,
             // View-model commands (existing frontend)
             commands::workspaces,
             commands::current_workspace,

@@ -19,6 +19,24 @@ class VoiceCommandTest {
     }
 
     @Test
+    fun `journal prefixes capture a private entry and never a post`() {
+        assertEquals(
+            VoiceCommand.Journal("felt calm after the walk"),
+            VoiceCommand.parse("journal felt calm after the walk"),
+        )
+        assertEquals(
+            VoiceCommand.Journal("call the doctor tomorrow"),
+            VoiceCommand.parse("write down call the doctor tomorrow"),
+        )
+        assertEquals(
+            VoiceCommand.Journal("i am grateful"),
+            VoiceCommand.parse("hey comrade dear diary i am grateful"),
+        )
+        // A bare "journal" has no body — must not become a Post or Unknown.
+        assertEquals(VoiceCommand.Empty, VoiceCommand.parse("journal"))
+    }
+
+    @Test
     fun `wake phrase is stripped before parsing`() {
         assertEquals(
             VoiceCommand.Post("running late"),
