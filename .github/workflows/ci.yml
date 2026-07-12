@@ -28,6 +28,15 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # comrade_py links against libpython at test time (its `extension-module`
+      # feature — required for the real wheel, see crates/comrade_py/Cargo.toml
+      # — is off by default precisely so this "cargo test" build can link a
+      # normal executable instead of a dlopen-only cdylib).
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
       - name: Cache Cargo
         uses: actions/cache@v4
         with:
@@ -124,6 +133,73 @@ jobs:
       - name: gradlew test
         working-directory: android
         run: ./gradlew test --no-daemon
+
+  # Builds the real artifact (a maturin wheel) and smoke-tests it in a fresh
+  # venv — the "rust" lane's `cargo test -p comrade_py` only covers the pure
+  # logic behind the FFI boundary (see that crate's test module comment), so
+  # this is what actually proves the compiled `.so` loads and works in
+  # Python, mirroring how android-apk.yml smoke-tests the JNI `.so`.
+  python:
+    name: Python bindings — build wheel + smoke test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-py-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-py-
+
+      - name: Install maturin
+        run: pip install "maturin>=1.7,<2.0"
+
+      - name: Build wheel
+        working-directory: crates/comrade_py
+        run: maturin build --release --locked --out dist
+
+      - name: Install wheel and smoke test
+        working-directory: crates/comrade_py
+        run: |
+          pip install dist/*.whl
+          python - <<'PY'
+          import tempfile
+          import comrade_py
+
+          kp = comrade_py.generate_keypair()
+          assert kp["npub"].startswith("npub1"), kp
+          assert comrade_py.npub_from_nsec(kp["nsec"]) == kp["npub"]
+
+          client = comrade_py.ComradeClient()
+          with tempfile.TemporaryDirectory() as store_dir:
+              identity = client.unlock_vault(store_dir, "ci-smoke-test-passphrase")
+              assert identity["npub"].startswith("npub1"), identity
+              assert client.is_unlocked is True
+              assert client.fetch_sabha_timeline() == []
+              assert client.conversations() == []
+
+          try:
+              client.send_dm("not-a-valid-pubkey", "hi")
+              raise SystemExit("send_dm should have rejected an invalid target")
+          except comrade_py.ComradeError:
+              pass
+
+          print("comrade_py wheel smoke test OK")
+          PY
 
   # Supply-chain gate: RUSTSEC advisories, duplicate/banned crates, and
   # dependency license allowlist (see deny.toml).

@@ -90,6 +90,7 @@ crates/
   comrade_storage/ Encrypted-at-rest persistence (redb + Argon2id + AES-256-GCM)
   comrade_ui/      Framework-agnostic view-model / service layer (UiService + DTOs)
   comrade_jni/     JNI bridge — compiled to libcomrade_jni.so for Android
+  comrade_py/      PyO3 bridge — Python bindings (pip/maturin) for local scripting
 src/main.rs        Interactive CLI harness (development / testing)
 android/           Kotlin + Jetpack Compose app — Telegram-like shell:
                    onboarding (@username + passcode → encrypted vault),
@@ -99,7 +100,9 @@ desktop/           Tauri 2 desktop shell (excluded from the workspace — see de
 ```
 
 The bridge logic lives once in **`comrade_ui`** and backs the Android app (via
-`comrade_jni`) and the desktop app (via `#[tauri::command]` wrappers in `desktop/`).
+`comrade_jni`), the desktop app (via `#[tauri::command]` wrappers in `desktop/`),
+and external Python scripts (via `comrade_py`, covering the Sabha/Vault subset —
+see [`crates/comrade_py/README.md`](crates/comrade_py/README.md)).
 This keeps the bridged UI contract unit-testable without a display server.
 The CLI harness currently drives the core crates directly rather than going
 through `comrade_ui`; unifying it is tracked in `AUDIT.md`.
@@ -173,11 +176,25 @@ cd desktop/src-tauri
 cargo tauri dev      # run; or `cargo tauri build` for a distributable bundle
 ```
 
+### Build the Python bindings
+
+`crates/comrade_py` exposes the Sabha (public feed) and Vault (E2E DM) engines
+to Python — fetch/publish only, see [its README](crates/comrade_py/README.md)
+for the full scope and a usage example.
+
+```sh
+cd crates/comrade_py
+python -m venv .venv && source .venv/bin/activate
+pip install maturin
+maturin develop            # build + install into the active venv
+# or: maturin build --release   # wheel → target/wheels/
+```
+
 ## CI / Releases
 
 | Workflow | Trigger | What it does |
 |----------|---------|--------------|
-| **CI** | Every push | Rust lane (`cargo fmt --check`, `clippy -D warnings`, `cargo test --workspace --locked`) · Desktop lane (`clippy` on `desktop/src-tauri`) · Android lane (`./gradlew test`) · Supply-chain lane (`cargo-deny`: advisories, bans, sources, licenses) |
+| **CI** | Every push | Rust lane (`cargo fmt --check`, `clippy -D warnings`, `cargo test --workspace --locked`) · Desktop lane (`clippy` on `desktop/src-tauri`) · Android lane (`./gradlew test`) · Python lane (builds the `comrade_py` wheel with maturin and smoke-tests importing it) · Supply-chain lane (`cargo-deny`: advisories, bans, sources, licenses) |
 | **Android APK** | Push touching `android/`, `crates/`, `Cargo.*` · manual | Cross-compiles `libcomrade_jni.so` (arm64-v8a for handsets, x86_64 for emulators), assembles a sideloadable debug APK artifact, and runs the on-device smoke suite (`connectedDebugAndroidTest`) on two emulator lanes — Pixel 9 and Pixel 9 Pro XL (Android 15 / API 35) |
 | **Release APK** | Manual — Actions → "Release APK" → Run workflow (also reusable via `workflow_call`) | Builds `.so` libs for arm64-v8a / armeabi-v7a / x86_64, assembles APK + AAB, creates GitHub Release |
 | **Auto Release** | Every push to `main` (each merged PR) | Bumps the patch version `X.Y.Z → X.Y.(Z+1)` from the newest `v*` tag (seeds at `0.0.2`), then calls **Release APK** to build + publish. Put `[skip release]` in the merge commit to skip |

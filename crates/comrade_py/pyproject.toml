@@ -1,0 +1,25 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "comrade_py"
+description = "Python bindings for Comrade's Sabha (public feed) and Vault (E2E DM) engines — local data fetching and message publishing."
+readme = "README.md"
+requires-python = ">=3.9"
+dynamic = ["version"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+Repository = "https://github.com/iamknownstranger/comrade"
+
+[tool.maturin]
+# Only active for the actual wheel build — see the matching comment on the
+# `extension-module` feature in Cargo.toml. Without this, `maturin build`
+# would link `comrade_py` like a normal executable instead of a Python
+# extension module.
+features = ["extension-module"]

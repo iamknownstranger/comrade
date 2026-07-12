@@ -3,6 +3,7 @@ members = [
     ".",
     "crates/comrade_core",
     "crates/comrade_jni",
+    "crates/comrade_py",
     "crates/comrade_state",
     "crates/comrade_storage",
     "crates/comrade_ui",
@@ -41,6 +42,8 @@ sled           = "0.34"
 argon2         = "0.5"
 zeroize        = { version = "1",      features = ["derive"] }
 tempfile       = "3"
+pyo3           = "0.29"
+pythonize      = "0.29"
 
 # ── Release profile ─────────────────────────────────────────────────────────
 # Tuned for the artifacts users actually launch — above all the Android
