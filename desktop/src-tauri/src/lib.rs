@@ -75,6 +75,9 @@ pub fn run() {
             commands::current_profile,
             commands::set_username,
             commands::add_contact,
+            commands::set_contact_alias,
+            commands::remove_contact,
+            commands::refresh_peer_profiles,
             commands::list_contacts,
             commands::search_profiles,
             // View-model commands (existing frontend)

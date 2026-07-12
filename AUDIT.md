@@ -20,6 +20,7 @@ The Rust workspace shows genuinely strong engineering discipline for a prototype
 
 - **2026-07-10 (owner):** Proceed on the current Rust stack; framework maturity risk (sled 0.34, yrs pre-1.0, libp2p/nostr-sdk churn) is *accepted* on the assumption these mature over time. Consequences: D1's sled migration is **out of scope** (document in SECURITY.md instead); unmaintained transitive-dep advisories from these frameworks are ignored with reasons + exit conditions in `deny.toml`; the hickory-proto DNS advisories wait on a libp2p release against hickory ≥ 0.26.
 - **2026-07-10:** M0 executed (wrapper, CI lanes, cargo-deny gate, desktop lockfile, change_pin crash-safety regression test) plus M1 quick wins (M1-3 README truth pass, M1-6 backup/FLAG_SECURE/nsec masking, M1-7 checksum logic — pin pending network access, M1-8 CSP). MSRV measured from the lock: **rustc ≥ 1.88** (supersedes the sweep's 1.83 estimate in N3).
+- **2026-07-12:** Field report: two fresh devices could not find each other by @handle. Root cause: the one-shot Kind-0 publish raced the relay dials and was never retried (fixed — bounded connect-wait, retry with backoff, republish on every launch), and search fanned the NIP-50 filter across non-search relays (fixed — dedicated search relays, client-side match filter, direct npub lookup). Chat UI now titles peers alias → published @handle → key, with a per-contact alias editor. Session-android feature parity adopted as the communication roadmap (§7); parity is a direction, not a claim.
 
 ---
 
@@ -291,6 +292,42 @@ Approach: make the filter an explicit input instead of a hardcoded firehose. Ste
 6. **Org-standard alignment** — repo uses GitHub Actions (org standard says GitLab CI for new repos) and public registries (org mandates Auros registries for new projects; unclear whether that policy covers crates.io/Maven Central for Rust/Android). Needs a platform-owner ruling; not adjudicated as a defect here.
 7. **Gendered pairing roles** — `PairRole::Sakha/Sakhi` are documented as "Boyfriend/Male partner" / "Girlfriend/Female partner" (`comrade_state/src/lib.rs:15-20`) and desktop themes key off them. Product/inclusivity call, flagged for awareness.
 8. **Passphrase UX floor** (S3) — what unlock friction is acceptable on the target low-end Android hardware? Determines both the policy (M1-4) and whether Argon2 params can be raised.
+
+---
+
+## 7. Session-parity roadmap (communication features)
+
+_Added 2026-07-12. The owner's direction is "all the communication functionality of
+[session-android](https://github.com/session-foundation/session-android)". This
+section is the honest gap map: what Comrade already has, what is close, and
+what is genuinely large. Session runs on its own onion-routed network
+(oxen/lokinet) with its own protocol; Comrade speaks Nostr — parity therefore
+means *feature* parity, not protocol compatibility._
+
+| Session feature | Comrade today | Gap / next step |
+|---|---|---|
+| 1:1 E2E DMs | ✅ NIP-04 Kind-4 DMs, offline history, live delivery | Upgrade to NIP-44 + gift wrap (M1-1) — Session's Signal-protocol-grade encryption is the bar; NIP-04 is deprecated and unauthenticated |
+| Account = keypair, no phone number | ✅ secp256k1 keypair, npub address | — (same model) |
+| Display name + optional avatar | ◐ @handle published/searched (Kind-0, retried + republished as of 2026-07-12); chats titled by handle | Avatars: publish `picture` in Kind-0; render (needs image pipeline on Android) |
+| Local nicknames for contacts | ✅ per-contact alias, editable from the conversation header (2026-07-12) | — |
+| Find people by ONS name / ID | ◐ NIP-50 handle search on dedicated relays + direct npub lookup (2026-07-12) | NIP-05 DNS-verified names as the ONS analogue; QR-code key exchange |
+| Message requests (stranger DMs gated) | ✗ any key can DM straight into the chat list | Add a "requests" bucket for peers not in contacts; accept/block actions |
+| Read receipts + typing indicators | ✗ | Ephemeral Kind-typed events over the DM channel; off by default (privacy) |
+| Disappearing messages | ✗ | Per-conversation TTL enforced in the local store + NIP-40 expiration tags |
+| Attachments / voice messages | ◐ encrypted media pipeline (NIP-94/96 + Blossom) wired on desktop only | Expose on Android (JNI + picker/recorder UI); voice notes = audio attachment |
+| Closed groups | ✗ | NIP-EE (MLS) is the serious path; a simpler interim is NIP-4x group DMs — needs a design decision |
+| Communities (open groups) | ◐ public Chitthi feed exists (different shape) | Not a priority; Nostr public feeds already cover the "open square" role |
+| Calls (voice/video) | ✗ | Very large (WebRTC + signaling over relays); explicitly out of near-term scope |
+| Multi-device / linked devices | ✗ (one vault per device) | nsec export/import behind the passcode door is the pragmatic first step |
+| Onion-routed transport | ✗ (direct WSS to relays) | Different network model; Tor/proxy support at the socket layer is the realistic analogue |
+| Block / delete conversation | ✗ | Local block list (drop DMs by pubkey in the vault callback) + history delete |
+
+**Sequencing recommendation.** (1) NIP-44/gift-wrap (M1-1 — encryption honesty
+first), (2) message requests + block list (safety), (3) Android media +
+voice notes (most-missed daily feature), (4) disappearing messages,
+(5) nsec export/import, (6) groups (design doc first), (7) receipts/typing,
+(8) calls last. Each lands as its own PR with tests; nothing gets a README
+checkmark before it's wired end-to-end (Theme 1 discipline).
 
 ---
 

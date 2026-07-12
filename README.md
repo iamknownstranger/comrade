@@ -9,7 +9,7 @@ view-model layer driving an Android (Kotlin/Compose), desktop (Tauri), or CLI fr
 |--------|----------|---------|--------|
 | **Sabha** | Nostr Kind-1 + NIP-10 | Public microblogging — the **Chitthi Feed**, with nested `ChitthiThread` reply trees | ✅ Wired (desktop + Android: broadcast + live feed; reply threading in live feed pending) |
 | **Vault** | Nostr Kind-4 + NIP-04 | End-to-end encrypted direct messages; `/pay` UPI intent detection | ✅ Send + receive wired (desktop + Android), offline chat history persisted; NIP-44 migration planned |
-| **Profiles** | Nostr Kind-0 + NIP-50 | @username display handles: published for discovery, searched via relay full-text search; identity itself stays the keypair (see below) | ✅ Wired (Android onboarding + settings; desktop backend commands) |
+| **Profiles** | Nostr Kind-0 + NIP-50 | @username display handles: published with retry **and republished on every launch**, searched on dedicated NIP-50 relays; peers' handles cached locally so chats are titled by name; per-contact aliases | ✅ Wired (Android onboarding + settings + chat UI; desktop backend commands) |
 | **Saathi** | libp2p mDNS + Gossipsub | Off-grid local mesh — works without internet | 🧪 Experimental — engine + tests only, not started by any frontend |
 | **Sakha/Sakhi** | Yrs CRDT + AES-256-GCM | Cryptographically isolated shared ledger for couples | 🧪 Engine built; pairing handshake not yet reachable from any UI |
 | **Relay gossip** | NIP-65 | Dynamic relay discovery + outbox-model routing | 🧪 Experimental — routing library + CLI demo only |
@@ -40,13 +40,27 @@ unreliable. The model instead:
 - **Username = a display alias.** At first launch the app asks for a
   `@handle`, stores it with the identity, and publishes it as Kind-0 metadata
   so people can find you by name (NIP-50 relay search, best-effort).
+  Publication retries with backoff and is **re-published on every launch** —
+  a claim made offline (or during the onboarding connect race) heals itself
+  the next time a relay is reachable.
+- **Discovery is honest about its limits.** Search queries go to dedicated
+  NIP-50 relays (`relay.nostr.band`, `search.nos.today`) and results are
+  filtered against the query client-side; new profiles can take a little
+  while to be indexed by the search relays. Pasting an `npub` key looks that
+  identity up directly. The reliable path is always swapping keys.
 - **Contacts pin the key, not the name (trust-on-first-use).** Once you add
   `@abc_user`, the contact is stored under their npub. If `@abc_user`
   disconnects and a stranger later claims the same handle, that stranger is a
   *different npub*: they show up as a separate, unverified entry, and they can
   never read or receive the encrypted messages bound to the original key.
-- The UI therefore always shows the npub tail next to a handle, and the
-  opt-in path to *verified* unique names (NIP-05 DNS mapping) is future work.
+- **Chats are titled by name, in trust order.** A conversation shows (1) the
+  alias *you* set for that contact, else (2) the `@handle` *they* published
+  (fetched and cached locally, refreshed in the background), else (3) the
+  shortened key. The open-conversation header always shows the npub tail —
+  handles are claims, keys are identity. Aliases are edited from the pencil
+  icon in the conversation header; an empty alias falls back to the handle.
+- The opt-in path to *verified* unique names (NIP-05 DNS mapping) is future
+  work.
 
 The **Progressive-Disclosure state machine** (`comrade_state`) gates which engines are active:
 

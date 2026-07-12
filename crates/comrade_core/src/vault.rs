@@ -17,6 +17,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use crate::error::VaultError;
+use crate::sabha::{wait_for_any_relay, CONNECT_WAIT};
 
 // ── UPI payment intent ───────────────────────────────────────────────────────
 
@@ -123,11 +124,21 @@ impl VaultEngine {
             .sign_with_keys(&self.our_keys)
             .map_err(|e| VaultError::EncryptionFailed(e.to_string()))?;
 
+        // A send right after unlock races the relay dials: the pool "succeeds"
+        // against zero relays and the message is silently lost while the UI
+        // marks it sent. Wait for one live relay and require an acceptance so
+        // the failure is loud and the user can retry.
+        wait_for_any_relay(&self.client, CONNECT_WAIT).await;
         let output = self
             .client
             .send_event(&event)
             .await
             .map_err(|e| VaultError::EncryptionFailed(e.to_string()))?;
+        if output.success.is_empty() {
+            return Err(VaultError::EncryptionFailed(
+                "no relay accepted the message — check your connection and try again".into(),
+            ));
+        }
 
         info!(event_id = %output.id(), recipient = %recipient, "Vault DM sent");
         Ok(*output.id())

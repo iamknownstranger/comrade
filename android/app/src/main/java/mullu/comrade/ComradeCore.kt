@@ -107,10 +107,32 @@ object ComradeCore {
      */
     external fun searchProfiles(query: String): String
 
-    /** Save (or re-alias) a contact pinned by npub. Returns the contact JSON. */
+    /**
+     * Save a contact pinned by npub (trust-on-first-use). An empty alias keeps
+     * any alias already set. Returns the contact JSON.
+     */
     external fun addContact(npub: String, alias: String): String
 
-    /** All saved contacts as a JSON array of `{"npub","alias"}`. */
+    /**
+     * Set (non-empty) or clear (empty) the user-chosen alias for a contact.
+     * Returns the contact JSON.
+     */
+    external fun setContactAlias(npub: String, alias: String): String
+
+    /**
+     * Remove a saved contact (message history stays).
+     * @return JSON `{"removed":true|false}` or `{"error":"…"}`.
+     */
+    external fun removeContact(npub: String): String
+
+    /**
+     * Refresh the cached @handles of conversation peers and contacts from the
+     * relays (bounded, TTL-gated).
+     * @return JSON `{"changed":n}` — reload the chat list when n > 0.
+     */
+    external fun refreshPeerProfiles(): String
+
+    /** All saved contacts as a JSON array of `{"npub","alias","name"}`. */
     external fun listContacts(): String
 
     /** The chat list (one entry per peer, newest first) as a JSON array. */
@@ -175,11 +197,18 @@ object ComradeCore {
 
     data class FoundProfile(val npub: String, val name: String?, val about: String?)
 
-    data class ContactInfo(val npub: String, val alias: String)
+    /**
+     * A pinned contact. [alias] is the name *you* chose (blank = none);
+     * [name] is the @handle *they* published, from the local profile cache.
+     */
+    data class ContactInfo(val npub: String, val alias: String, val name: String?)
 
     data class ConversationInfo(
         val peer: String,
+        /** User-chosen alias for the peer, when one exists. */
         val alias: String?,
+        /** The peer's own published @handle, from the local profile cache. */
+        val peerName: String?,
         val lastMessage: String,
         val lastAt: Long,
         val lastOutgoing: Boolean,
@@ -228,10 +257,30 @@ object ComradeCore {
         }
     }
 
+    private fun JSONObject.toContact() = ContactInfo(
+        npub = getString("npub"),
+        alias = getString("alias"),
+        name = optNullableString("name"),
+    )
+
     /** Pin a contact by npub, returning the saved entry or throwing. */
-    fun addContactTyped(npub: String, alias: String): ContactInfo {
-        val o = JSONObject(addContact(npub, alias)).failOnError("Add contact")
-        return ContactInfo(npub = o.getString("npub"), alias = o.getString("alias"))
+    fun addContactTyped(npub: String, alias: String): ContactInfo =
+        JSONObject(addContact(npub, alias)).failOnError("Add contact").toContact()
+
+    /** Set (non-empty) or clear (empty) a contact's alias, or throw. */
+    fun setContactAliasTyped(npub: String, alias: String): ContactInfo =
+        JSONObject(setContactAlias(npub, alias)).failOnError("Set alias").toContact()
+
+    /** Remove a saved contact; true if one existed. Throws on backend error. */
+    fun removeContactTyped(npub: String): Boolean {
+        val o = JSONObject(removeContact(npub)).failOnError("Remove contact")
+        return o.getBoolean("removed")
+    }
+
+    /** Refresh cached peer @handles; returns how many display names changed. */
+    fun refreshPeerProfilesTyped(): Int {
+        val o = JSONObject(refreshPeerProfiles()).failOnError("Profile refresh")
+        return o.getInt("changed")
     }
 
     /** All saved contacts. */
@@ -239,10 +288,7 @@ object ComradeCore {
         val parsed = JSONTokener(listContacts()).nextValue()
         if (parsed is JSONObject) parsed.failOnError("Contacts")
         val arr = parsed as JSONArray
-        return (0 until arr.length()).map { i ->
-            val o = arr.getJSONObject(i)
-            ContactInfo(npub = o.getString("npub"), alias = o.getString("alias"))
-        }
+        return (0 until arr.length()).map { i -> arr.getJSONObject(i).toContact() }
     }
 
     /** The chat list, newest thread first. */
@@ -255,6 +301,7 @@ object ComradeCore {
             ConversationInfo(
                 peer = o.getString("peer"),
                 alias = o.optNullableString("alias"),
+                peerName = o.optNullableString("peer_name"),
                 lastMessage = o.getString("last_message"),
                 lastAt = o.getLong("last_at"),
                 lastOutgoing = o.getBoolean("last_outgoing"),

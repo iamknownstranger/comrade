@@ -27,6 +27,44 @@ pub const DEFAULT_RELAYS: &[&str] = &[
     "wss://nos.lol",
 ];
 
+/// Relays known to answer NIP-50 full-text `search` filters. Profile search
+/// queries go to these directly: a non-search relay either ignores the
+/// `search` field (returning arbitrary profiles) or returns nothing at all,
+/// so fanning the query across the whole pool produces garbage or silence.
+/// `relay.nostr.band` doubles as a normal read/write relay in
+/// [`DEFAULT_RELAYS`], which also makes profiles *published* there findable.
+pub const SEARCH_RELAYS: &[&str] = &["wss://relay.nostr.band", "wss://search.nos.today"];
+
+/// How long to wait for at least one relay connection before a publish/fetch.
+/// Covers the onboarding race where engines were just built and `connect()`
+/// has only *initiated* the dials.
+pub(crate) const CONNECT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Wait (bounded) until at least **one** relay in the pool is connected.
+/// Returns whether any relay is connected when it returns.
+///
+/// Deliberately not `Client::wait_for_connection`: that joins a per-relay
+/// wait across the *whole* pool, so one flaky relay (e.g. a search relay
+/// cycling reconnects) taxes every publish/fetch with the full timeout even
+/// while the main relays are already up. One live relay is all a send needs.
+pub(crate) async fn wait_for_any_relay(client: &Client, timeout: std::time::Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if client
+            .relays()
+            .await
+            .values()
+            .any(|r| r.status() == RelayStatus::Connected)
+        {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
 // ── NIP-10 thread-tree structures ────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,10 +238,13 @@ pub type ChitthiCallback = Box<dyn Fn(Event) + Send + Sync + 'static>;
 /// Connects to Nostr relays and streams Kind-1 text notes as public Chitthis.
 pub struct SabhaEngine {
     client: Client,
+    /// Our own public key — the author of everything this engine publishes.
+    our_pk: PublicKey,
 }
 
 impl SabhaEngine {
     pub async fn new(keys: &Keys) -> Result<Self, SabhaError> {
+        let our_pk = keys.public_key();
         let client = Client::new(keys.clone());
         for relay in DEFAULT_RELAYS {
             client
@@ -211,7 +252,17 @@ impl SabhaEngine {
                 .await
                 .map_err(|e| SabhaError::RelayError(e.to_string()))?;
         }
-        Ok(Self { client })
+        // Search relays join read-only: we query them for NIP-50 profile
+        // lookups but never publish feed events or subscribe writes to them.
+        for relay in SEARCH_RELAYS {
+            if !DEFAULT_RELAYS.contains(relay) {
+                client
+                    .add_read_relay(*relay)
+                    .await
+                    .map_err(|e| SabhaError::RelayError(e.to_string()))?;
+            }
+        }
+        Ok(Self { client, our_pk })
     }
 
     pub async fn add_relay(&self, url: &str) -> Result<(), SabhaError> {
@@ -252,17 +303,32 @@ impl SabhaEngine {
                 .map_err(|e| SabhaError::ParseError(e.to_string()))?;
             builder = builder.tags([tag]);
         }
+        // Same silent-void race as profile publishing: right after unlock the
+        // dials may still be in flight, and the pool "succeeds" against zero
+        // relays. Wait for one live relay and require an acceptance.
+        wait_for_any_relay(&self.client, CONNECT_WAIT).await;
         let output = self
             .client
             .send_event_builder(builder)
             .await
             .map_err(|e| SabhaError::RelayError(e.to_string()))?;
+        if output.success.is_empty() {
+            return Err(SabhaError::RelayError(
+                "no relay accepted the chitthi".into(),
+            ));
+        }
         info!(event_id = %output.id(), reply = reply_to.is_some(), "Chitthi broadcast to Sabha");
         Ok(*output.id())
     }
 
     /// Publish (or update) our public profile — a Kind-0 metadata event carrying
     /// the chosen @handle — so peers can discover this identity by name.
+    ///
+    /// Kind-0 is *replaceable* (newest wins), and this runs on every launch —
+    /// so the current published profile is fetched first and only the handle
+    /// fields are overwritten. Without the merge, a user who set a bio/avatar
+    /// from another Nostr client on the same keypair would have it wiped by
+    /// every Comrade start.
     ///
     /// Handles are display names, not unique identifiers: the network cannot
     /// stop two people from publishing the same handle. Identity remains the
@@ -272,22 +338,66 @@ impl SabhaEngine {
         name: &str,
         about: Option<&str>,
     ) -> Result<EventId, SabhaError> {
-        let mut metadata = Metadata::new().name(name).display_name(name);
-        if let Some(about) = about {
-            metadata = metadata.about(about);
-        }
+        // At onboarding this runs moments after `connect()` merely *initiated*
+        // the relay dials; sending immediately would reach zero relays and the
+        // handle would silently never become discoverable. Wait (bounded) for
+        // at least one live connection first — a no-op once connected.
+        wait_for_any_relay(&self.client, CONNECT_WAIT).await;
+        // Best-effort: a missing/unreachable current profile merges from empty.
+        let existing = self.fetch_profile(&self.our_pk).await.unwrap_or_default();
+        let metadata = merged_metadata(existing, name, about);
         let output = self
             .client
             .send_event_builder(EventBuilder::metadata(&metadata))
             .await
             .map_err(|e| SabhaError::RelayError(e.to_string()))?;
-        info!(event_id = %output.id(), name, "profile published");
+        if output.success.is_empty() {
+            return Err(SabhaError::RelayError(
+                "no relay accepted the profile event".into(),
+            ));
+        }
+        info!(event_id = %output.id(), name, relays = output.success.len(), "profile published");
         Ok(*output.id())
     }
 
+    /// Fetch a single author's newest Kind-0 profile from the relay pool.
+    /// `None` means no relay knew a profile for that key.
+    pub async fn fetch_profile(&self, author: &PublicKey) -> Result<Option<Metadata>, SabhaError> {
+        let mut found = self.fetch_profiles(std::slice::from_ref(author)).await?;
+        Ok(found.remove(author))
+    }
+
+    /// Fetch the newest Kind-0 profile for each of `authors` in **one** relay
+    /// round-trip. Authors with no known profile are absent from the map.
+    pub async fn fetch_profiles(
+        &self,
+        authors: &[PublicKey],
+    ) -> Result<HashMap<PublicKey, Metadata>, SabhaError> {
+        if authors.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let filter = Filter::new()
+            .kind(Kind::Metadata)
+            .authors(authors.iter().copied())
+            .limit(authors.len() * 2);
+        wait_for_any_relay(&self.client, CONNECT_WAIT).await;
+        let events = self
+            .client
+            .fetch_events(filter, std::time::Duration::from_secs(8))
+            .await
+            .map_err(|e| SabhaError::RelayError(e.to_string()))?;
+        let wanted: std::collections::HashSet<&PublicKey> = authors.iter().collect();
+        Ok(newest_metadata_per_author(
+            events.into_iter().filter(|e| wanted.contains(&e.pubkey)),
+        ))
+    }
+
     /// Best-effort people search: query Kind-0 profiles via NIP-50 full-text
-    /// search on whichever connected relays support it (relay.nostr.band in the
-    /// default set does; the rest silently return nothing).
+    /// search, directed at the [`SEARCH_RELAYS`] that actually implement it.
+    ///
+    /// Results are additionally filtered client-side against the query — a
+    /// relay that ignores the `search` field would otherwise inject arbitrary
+    /// unrelated profiles into the list.
     ///
     /// Returns at most `limit` profiles, newest metadata per author, as
     /// `(author, metadata)` pairs. An empty result is normal — it means no
@@ -301,25 +411,20 @@ impl SabhaEngine {
             .kind(Kind::Metadata)
             .search(query)
             .limit(limit * 3); // headroom: duplicates collapse per author below
+        wait_for_any_relay(&self.client, CONNECT_WAIT).await;
         let events = self
             .client
-            .fetch_events(filter, std::time::Duration::from_secs(8))
+            .fetch_events_from(
+                SEARCH_RELAYS.iter().copied(),
+                filter,
+                std::time::Duration::from_secs(8),
+            )
             .await
             .map_err(|e| SabhaError::RelayError(e.to_string()))?;
 
-        // Keep only the newest Kind-0 per author.
-        let mut newest: HashMap<PublicKey, Event> = HashMap::new();
-        for event in events.into_iter() {
-            match newest.get(&event.pubkey) {
-                Some(existing) if existing.created_at >= event.created_at => {}
-                _ => {
-                    newest.insert(event.pubkey, event);
-                }
-            }
-        }
-        let mut profiles: Vec<(PublicKey, Metadata)> = newest
-            .into_values()
-            .filter_map(|e| Metadata::from_json(&e.content).ok().map(|m| (e.pubkey, m)))
+        let mut profiles: Vec<(PublicKey, Metadata)> = newest_metadata_per_author(events)
+            .into_iter()
+            .filter(|(_, m)| metadata_matches(m, query))
             .collect();
         profiles.sort_by_key(|a| profile_sort_key(&a.1));
         profiles.truncate(limit);
@@ -365,6 +470,68 @@ impl SabhaEngine {
 /// Stable ordering for search results: named profiles first, then by name.
 fn profile_sort_key(m: &Metadata) -> String {
     m.name.clone().unwrap_or_else(|| "\u{10FFFF}".to_string())
+}
+
+/// The one displayable-handle rule: `name`, else `display_name`. Every layer
+/// that titles a peer by their published profile goes through this, so the
+/// search list and the chat list can never disagree about the same Kind-0.
+pub fn display_name_of(m: &Metadata) -> Option<String> {
+    m.name.clone().or_else(|| m.display_name.clone())
+}
+
+/// Reduce a stream of Kind-0 events to the newest parseable Metadata per
+/// author. Shared by search and (batch) profile fetch so tie-breaking and
+/// parse-failure handling cannot drift between the two paths.
+fn newest_metadata_per_author(
+    events: impl IntoIterator<Item = Event>,
+) -> HashMap<PublicKey, Metadata> {
+    let mut newest: HashMap<PublicKey, Event> = HashMap::new();
+    for event in events {
+        match newest.get(&event.pubkey) {
+            Some(existing) if existing.created_at >= event.created_at => {}
+            _ => {
+                newest.insert(event.pubkey, event);
+            }
+        }
+    }
+    newest
+        .into_values()
+        .filter_map(|e| Metadata::from_json(&e.content).ok().map(|m| (e.pubkey, m)))
+        .collect()
+}
+
+/// Overlay the handle (and optional about) onto the currently published
+/// profile, preserving every other field (picture, banner, nip05, lud16,
+/// custom fields, …) — Kind-0 replaces wholesale, so publishing a stub would
+/// wipe whatever the user set from other Nostr clients on the same keypair.
+fn merged_metadata(existing: Option<Metadata>, name: &str, about: Option<&str>) -> Metadata {
+    let mut metadata = existing.unwrap_or_default();
+    metadata.name = Some(name.to_string());
+    metadata.display_name = Some(name.to_string());
+    if let Some(about) = about {
+        metadata.about = Some(about.to_string());
+    }
+    metadata
+}
+
+/// Whether a profile plausibly matches the search query. Guards against
+/// relays that ignore the NIP-50 `search` field and return arbitrary Kind-0
+/// events. `about` is included so legitimate relay-side bio matches (NIP-50
+/// searches all content) survive the client-side check.
+fn metadata_matches(m: &Metadata, query: &str) -> bool {
+    let q = query.trim().trim_start_matches('@').to_lowercase();
+    if q.is_empty() {
+        return false;
+    }
+    [
+        m.name.as_deref(),
+        m.display_name.as_deref(),
+        m.nip05.as_deref(),
+        m.about.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|v| v.to_lowercase().contains(&q))
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -428,5 +595,98 @@ mod tests {
         let child = make_bare_event(Some(&orphan_id), Some("reply"));
         let tree = build_chitthi_thread(vec![child]);
         assert_eq!(tree.roots.len(), 1);
+    }
+
+    #[test]
+    fn metadata_match_guards_against_non_search_relays() {
+        let named = Metadata::new().name("charlie");
+        assert!(metadata_matches(&named, "charlie"));
+        assert!(metadata_matches(&named, "@Charlie"), "case + @ insensitive");
+        assert!(metadata_matches(&named, "charl"), "substring matches");
+        assert!(
+            !metadata_matches(&named, "bob"),
+            "unrelated profile dropped"
+        );
+        assert!(
+            !metadata_matches(&named, "  @ "),
+            "blank query never matches"
+        );
+
+        let display_only = Metadata::new().display_name("Charlie B");
+        assert!(metadata_matches(&display_only, "charlie"));
+
+        // NIP-50 searches all profile content — a legitimate relay match on
+        // the bio must survive the client-side guard.
+        let bio = Metadata::new().name("sunita_r").about("climate researcher");
+        assert!(metadata_matches(&bio, "climate"));
+
+        let unrelated = Metadata::new().about("gardening");
+        assert!(
+            !metadata_matches(&unrelated, "charlie"),
+            "profiles matching nowhere are dropped"
+        );
+    }
+
+    #[test]
+    fn merged_metadata_preserves_foreign_profile_fields() {
+        // Kind-0 replaces wholesale: republishing the handle must not wipe a
+        // bio/avatar/nip05 the user set from another client on this keypair.
+        let mut published = Metadata::new()
+            .name("old_name")
+            .about("my bio")
+            .nip05("me@example.com");
+        published.picture = Some("https://example.com/me.png".into());
+        published.lud16 = Some("me@wallet.example".into());
+
+        let merged = merged_metadata(Some(published), "new_name", None);
+        assert_eq!(merged.name.as_deref(), Some("new_name"));
+        assert_eq!(merged.display_name.as_deref(), Some("new_name"));
+        assert_eq!(merged.about.as_deref(), Some("my bio"), "bio preserved");
+        assert_eq!(
+            merged.picture.as_deref(),
+            Some("https://example.com/me.png"),
+            "avatar preserved"
+        );
+        assert_eq!(merged.nip05.as_deref(), Some("me@example.com"));
+        assert_eq!(merged.lud16.as_deref(), Some("me@wallet.example"));
+
+        // No published profile yet → clean two-field start (+ about if given).
+        let fresh = merged_metadata(None, "charlie", Some("hi"));
+        assert_eq!(fresh.name.as_deref(), Some("charlie"));
+        assert_eq!(fresh.about.as_deref(), Some("hi"));
+        assert_eq!(fresh.picture, None);
+    }
+
+    #[test]
+    fn newest_metadata_per_author_keeps_latest_kind0() {
+        let keys = Keys::generate();
+        let old = EventBuilder::metadata(&Metadata::new().name("old"))
+            .custom_created_at(Timestamp::from(100))
+            .sign_with_keys(&keys)
+            .unwrap();
+        let new = EventBuilder::metadata(&Metadata::new().name("new"))
+            .custom_created_at(Timestamp::from(200))
+            .sign_with_keys(&keys)
+            .unwrap();
+        let other = EventBuilder::metadata(&Metadata::new().name("other"))
+            .custom_created_at(Timestamp::from(150))
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+
+        let map = newest_metadata_per_author(vec![new.clone(), old, other]);
+        assert_eq!(map.len(), 2);
+        assert_eq!(map[&keys.public_key()].name.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn display_name_prefers_name_over_display_name() {
+        let both = Metadata::new().name("handle").display_name("Fancy Name");
+        assert_eq!(display_name_of(&both).as_deref(), Some("handle"));
+        let display_only = Metadata::new().display_name("Fancy Name");
+        assert_eq!(
+            display_name_of(&display_only).as_deref(),
+            Some("Fancy Name")
+        );
+        assert_eq!(display_name_of(&Metadata::new()), None);
     }
 }

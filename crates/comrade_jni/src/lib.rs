@@ -432,7 +432,78 @@ pub extern "C" fn Java_mullu_comrade_ComradeCore_addContact<'local>(
     to_jstring(&mut env, &out)
 }
 
-/// All saved contacts as a JSON array of `{"npub","alias"}`.
+/// Set (non-empty) or clear (empty) the user-chosen alias for a contact.
+/// Returns the contact JSON or `{"error":"…"}`.
+#[no_mangle]
+pub extern "C" fn Java_mullu_comrade_ComradeCore_setContactAlias<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    npub: JString<'local>,
+    alias: JString<'local>,
+) -> jstring {
+    let (Some(npub), Some(alias)) = (jni_string(&mut env, &npub), jni_string(&mut env, &alias))
+    else {
+        return to_jstring(&mut env, &json!({"error":"invalid arguments"}).to_string());
+    };
+    let out = guard_json(move || {
+        let state = state();
+        let guard = state.blocking_read();
+        let contact = guard
+            .set_contact_alias(&npub, &alias)
+            .map_err(|e| e.to_string())?;
+        serde_json::to_value(contact).map_err(|e| e.to_string())
+    });
+    to_jstring(&mut env, &out)
+}
+
+/// Remove a saved contact (the message history stays). Returns
+/// `{"removed":true|false}` or `{"error":"…"}`.
+#[no_mangle]
+pub extern "C" fn Java_mullu_comrade_ComradeCore_removeContact<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    npub: JString<'local>,
+) -> jstring {
+    let Some(npub) = jni_string(&mut env, &npub) else {
+        return to_jstring(
+            &mut env,
+            &json!({"error":"invalid npub argument"}).to_string(),
+        );
+    };
+    let out = guard_json(move || {
+        let state = state();
+        let guard = state.blocking_read();
+        let removed = guard.remove_contact(&npub).map_err(|e| e.to_string())?;
+        Ok(json!({ "removed": removed }))
+    });
+    to_jstring(&mut env, &out)
+}
+
+/// Refresh the cached Kind-0 profiles of conversation peers and contacts
+/// (bounded, TTL-gated). Returns `{"changed":n}` — reload the chat list when
+/// n > 0 — or `{"error":"…"}`.
+#[no_mangle]
+pub extern "C" fn Java_mullu_comrade_ComradeCore_refreshPeerProfiles<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jstring {
+    let out = guard_json(move || {
+        let rt = runtime().ok_or_else(|| "failed to initialise async runtime".to_string())?;
+        let state = state();
+        rt.block_on(async move {
+            // Detach the refresher under a briefly-held guard, then do the
+            // slow relay work guard-free — holding the shared lock across
+            // network awaits would stall every other bridge call (AUDIT P2).
+            let refresher =
+                { state.read().await.profile_refresher() }.map_err(|e| e.to_string())?;
+            let changed = refresher.run().await.map_err(|e| e.to_string())?;
+            Ok(json!({ "changed": changed }))
+        })
+    });
+    to_jstring(&mut env, &out)
+}
+
+/// All saved contacts as a JSON array of `{"npub","alias","name"}`.
 #[no_mangle]
 pub extern "C" fn Java_mullu_comrade_ComradeCore_listContacts<'local>(
     mut env: JNIEnv<'local>,

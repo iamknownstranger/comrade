@@ -78,7 +78,7 @@ fun SettingsScreen(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
-                    PeerAvatar(profile.username ?: profile.npub)
+                    PeerAvatar(profile.username ?: profile.npub, seed = profile.npub)
                     Column(Modifier.weight(1f)) {
                         Text(
                             profile.username?.let { "@$it" } ?: "No username yet",

@@ -157,7 +157,8 @@ pub async fn set_username(
         .map_err(|e| e.to_string())
 }
 
-/// Save (or re-alias) a contact pinned by npub (trust-on-first-use).
+/// Save a contact pinned by npub (trust-on-first-use). An empty alias keeps
+/// any alias already set.
 #[tauri::command]
 pub async fn add_contact(
     state: tauri::State<'_, Runtime>,
@@ -165,6 +166,40 @@ pub async fn add_contact(
     alias: String,
 ) -> Result<ContactDto, String> {
     state.read().await.add_contact(&npub, &alias).map_err(|e| e.to_string())
+}
+
+/// Set (non-empty) or clear (empty) the user-chosen alias for a contact.
+#[tauri::command]
+pub async fn set_contact_alias(
+    state: tauri::State<'_, Runtime>,
+    npub: String,
+    alias: String,
+) -> Result<ContactDto, String> {
+    state
+        .read()
+        .await
+        .set_contact_alias(&npub, &alias)
+        .map_err(|e| e.to_string())
+}
+
+/// Remove a saved contact (message history stays). Returns whether one existed.
+#[tauri::command]
+pub async fn remove_contact(
+    state: tauri::State<'_, Runtime>,
+    npub: String,
+) -> Result<bool, String> {
+    state.read().await.remove_contact(&npub).map_err(|e| e.to_string())
+}
+
+/// Refresh cached peer profiles (bounded, TTL-gated). Returns how many
+/// display names changed; reload the chat list when > 0.
+#[tauri::command]
+pub async fn refresh_peer_profiles(state: tauri::State<'_, Runtime>) -> Result<usize, String> {
+    // Detach the refresher under a briefly-held guard, then run guard-free:
+    // holding the shared lock across relay round-trips would block every
+    // other command (AUDIT P2: no guard held across network awaits).
+    let refresher = { state.read().await.profile_refresher().map_err(|e| e.to_string())? };
+    refresher.run().await.map_err(|e| e.to_string())
 }
 
 /// All saved contacts, alias-sorted.

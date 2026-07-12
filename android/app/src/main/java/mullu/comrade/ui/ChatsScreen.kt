@@ -1,5 +1,6 @@
 package mullu.comrade.ui
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -21,9 +22,9 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -38,48 +39,59 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import mullu.comrade.ComradeCore
 
-/** Short display form of an npub: `npub1abcd…wxyz`. */
-fun shortNpub(npub: String): String =
-    if (npub.length > 16) "${npub.take(10)}…${npub.takeLast(4)}" else npub
-
-/** Display title for a peer: saved alias if any, else the shortened key. */
-fun peerTitle(peer: String, alias: String?): String = alias ?: shortNpub(peer)
-
-/** Rough relative timestamp for list rows. */
-fun relativeTime(epochSecs: Long): String {
-    val d = System.currentTimeMillis() / 1000 - epochSecs
-    return when {
-        d < 60 -> "now"
-        d < 3600 -> "${d / 60}m"
-        d < 86_400 -> "${d / 3600}h"
-        else -> "${d / 86_400}d"
-    }
-}
+/**
+ * Identity-stable avatar hues: the same key renders the same colour on every
+ * device (Telegram-style), so people become recognisable at a glance.
+ */
+private val AvatarPalette = listOf(
+    Color(0xFF6366F1), // indigo
+    Color(0xFF0EA5E9), // sky
+    Color(0xFF10B981), // emerald
+    Color(0xFFF59E0B), // amber
+    Color(0xFFEF4444), // coral
+    Color(0xFF8B5CF6), // violet
+    Color(0xFFEC4899), // rose
+    Color(0xFF14B8A6), // teal
+)
 
 @Composable
-fun PeerAvatar(title: String, modifier: Modifier = Modifier) {
-    Surface(
-        shape = CircleShape,
-        color = MaterialTheme.colorScheme.primaryContainer,
-        modifier = modifier.size(44.dp),
+fun PeerAvatar(
+    title: String,
+    modifier: Modifier = Modifier,
+    seed: String = title,
+    size: Dp = 46.dp,
+) {
+    val base = AvatarPalette[avatarColorIndex(seed, AvatarPalette.size)]
+    Box(
+        modifier = modifier
+            .size(size)
+            .clip(CircleShape)
+            .background(
+                Brush.verticalGradient(listOf(base.copy(alpha = 0.82f), base)),
+            ),
+        contentAlignment = Alignment.Center,
     ) {
-        Box(contentAlignment = Alignment.Center) {
-            Text(
-                text = title.trimStart('@').take(1).uppercase().ifEmpty { "?" },
-                style = MaterialTheme.typography.titleMedium,
-                color = MaterialTheme.colorScheme.onPrimaryContainer,
-            )
-        }
+        Text(
+            text = title.trimStart('@').take(1).uppercase().ifEmpty { "?" },
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.Bold,
+            color = Color.White,
+        )
     }
 }
 
@@ -88,7 +100,7 @@ fun PeerAvatar(title: String, modifier: Modifier = Modifier) {
 @Composable
 fun ChatsScreen(
     chatTick: Int,
-    onOpen: (peer: String, alias: String?) -> Unit,
+    onOpen: (peer: String, alias: String?, username: String?) -> Unit,
     onNewChat: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -123,26 +135,26 @@ fun ChatsScreen(
         }
         else -> LazyColumn(modifier = modifier.fillMaxSize()) {
             items(list, key = { it.peer }) { convo ->
-                val title = peerTitle(convo.peer, convo.alias)
+                val title = peerTitle(convo.peer, convo.alias, convo.peerName)
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clickable { onOpen(convo.peer, convo.alias) }
-                        .padding(horizontal = 16.dp, vertical = 10.dp),
+                        .clickable { onOpen(convo.peer, convo.alias, convo.peerName) }
+                        .padding(horizontal = 16.dp, vertical = 11.dp),
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    horizontalArrangement = Arrangement.spacedBy(14.dp),
                 ) {
-                    PeerAvatar(title)
+                    PeerAvatar(title, seed = convo.peer)
                     Column(Modifier.weight(1f)) {
                         Text(
                             title,
-                            style = MaterialTheme.typography.titleSmall,
+                            style = MaterialTheme.typography.titleMedium,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                         )
                         Text(
                             text = (if (convo.lastOutgoing) "You: " else "") + convo.lastMessage,
-                            style = MaterialTheme.typography.bodySmall,
+                            style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
@@ -154,7 +166,10 @@ fun ChatsScreen(
                         color = MaterialTheme.colorScheme.outline,
                     )
                 }
-                HorizontalDivider(modifier = Modifier.padding(start = 72.dp))
+                HorizontalDivider(
+                    modifier = Modifier.padding(start = 76.dp),
+                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f),
+                )
             }
         }
     }
@@ -164,7 +179,7 @@ fun ChatsScreen(
 
 @Composable
 fun NewChatScreen(
-    onOpen: (peer: String, alias: String?) -> Unit,
+    onOpen: (peer: String, alias: String?, username: String?) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var query by remember { mutableStateOf("") }
@@ -202,15 +217,17 @@ fun NewChatScreen(
         }
     }
 
-    fun startChat(npub: String, alias: String?) {
+    fun startChat(npub: String, username: String?) {
         scope.launch {
+            // Pin the key only (trust-on-first-use). The published @handle is
+            // cached by the search itself; an alias stays the user's to set.
             val saved = withContext(Dispatchers.IO) {
-                runCatching { ComradeCore.addContactTyped(npub, alias ?: "") }.getOrNull()
+                runCatching { ComradeCore.addContactTyped(npub, "") }.getOrNull()
             }
             if (saved == null) {
                 error = "That doesn't look like a valid key."
             } else {
-                onOpen(saved.npub, saved.alias)
+                onOpen(saved.npub, saved.alias.ifBlank { null }, username ?: saved.name)
             }
         }
     }
@@ -279,7 +296,7 @@ fun NewChatScreen(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
             ) {
-                PeerAvatar(title)
+                PeerAvatar(title, seed = found.npub)
                 Column(Modifier.weight(1f)) {
                     Text(title, style = MaterialTheme.typography.titleSmall)
                     Text(
@@ -303,17 +320,20 @@ fun NewChatScreen(
                 )
             }
             items(contacts, key = { "c:" + it.npub }) { contact ->
+                val title = peerTitle(contact.npub, contact.alias, contact.name)
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clickable { onOpen(contact.npub, contact.alias) }
+                        .clickable {
+                            onOpen(contact.npub, contact.alias.ifBlank { null }, contact.name)
+                        }
                         .padding(vertical = 6.dp),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
-                    PeerAvatar(contact.alias)
+                    PeerAvatar(title, seed = contact.npub)
                     Column {
-                        Text(contact.alias, style = MaterialTheme.typography.titleSmall)
+                        Text(title, style = MaterialTheme.typography.titleSmall)
                         Text(
                             shortNpub(contact.npub),
                             style = MaterialTheme.typography.bodySmall,
@@ -396,24 +416,28 @@ fun ConversationScreen(
                 ) {
                     Surface(
                         shape = RoundedCornerShape(
-                            topStart = 16.dp,
-                            topEnd = 16.dp,
-                            bottomStart = if (msg.outgoing) 16.dp else 4.dp,
-                            bottomEnd = if (msg.outgoing) 4.dp else 16.dp,
+                            topStart = 18.dp,
+                            topEnd = 18.dp,
+                            bottomStart = if (msg.outgoing) 18.dp else 6.dp,
+                            bottomEnd = if (msg.outgoing) 6.dp else 18.dp,
                         ),
                         color = if (msg.outgoing) {
                             MaterialTheme.colorScheme.primaryContainer
                         } else {
                             MaterialTheme.colorScheme.surfaceVariant
                         },
+                        tonalElevation = 1.dp,
                         modifier = Modifier.widthIn(max = 300.dp),
                     ) {
-                        Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
-                            Text(msg.content, style = MaterialTheme.typography.bodyMedium)
+                        Column(Modifier.padding(horizontal = 14.dp, vertical = 9.dp)) {
+                            Text(msg.content, style = MaterialTheme.typography.bodyLarge)
                             Text(
                                 relativeTime(msg.createdAt),
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.outline,
+                                modifier = Modifier
+                                    .align(Alignment.End)
+                                    .padding(top = 2.dp),
                             )
                         }
                     }
@@ -430,31 +454,34 @@ fun ConversationScreen(
             )
         }
 
+        // Composer: pill input + filled send, Telegram-style.
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 12.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
+            verticalAlignment = Alignment.Bottom,
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             OutlinedTextField(
                 value = draft,
                 onValueChange = { draft = it },
                 placeholder = { Text("Message") },
+                shape = RoundedCornerShape(26.dp),
                 modifier = Modifier
                     .weight(1f)
                     .testTag("dm-input"),
                 maxLines = 4,
             )
-            IconButton(
+            FilledIconButton(
                 onClick = { send() },
                 enabled = draft.isNotBlank() && !sending,
-                modifier = Modifier.testTag("dm-send"),
+                modifier = Modifier
+                    .size(52.dp)
+                    .testTag("dm-send"),
             ) {
                 Icon(
                     Icons.AutoMirrored.Filled.Send,
                     contentDescription = "Send",
-                    tint = MaterialTheme.colorScheme.primary,
                 )
             }
         }

@@ -208,12 +208,13 @@ fun OnboardingScreen(
             )
         }
 
-        Spacer(Modifier.height(4.dp))
+        Spacer(Modifier.height(8.dp))
         Button(
             onClick = { submit() },
             enabled = !busy,
             modifier = Modifier
                 .fillMaxWidth()
+                .height(52.dp)
                 .testTag("onboarding-submit"),
         ) {
             if (busy) {
