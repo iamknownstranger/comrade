@@ -1,0 +1,36 @@
+[package]
+name    = "comrade_py"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Python bindings (PyO3 + maturin) exposing the Sabha public-feed and Vault
+# DM engines to external Python tooling. See pyproject.toml for the wheel
+# build config.
+
+[lib]
+name      = "comrade_py"
+crate-type = ["cdylib"]
+
+[dependencies]
+comrade_core = { path = "../comrade_core" }
+comrade_ui   = { path = "../comrade_ui" }
+# abi3-py39: build against the stable Python C ABI (3.9+) so maturin outputs
+# one `cp39-abi3` wheel per platform instead of one per interpreter minor
+# version — the "clean wheel" a downstream script can just `pip install`.
+pyo3         = { workspace = true, features = ["abi3-py39"] }
+pythonize    = { workspace = true }
+serde        = { workspace = true }
+tokio        = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[features]
+default = []
+# Off by default so `cargo test`/`cargo check --workspace` can link a plain
+# executable (pyo3's `extension-module` deliberately leaves libpython's
+# symbols unresolved, which is only valid for a `cdylib` a Python interpreter
+# dlopen()s — see the pyo3 FAQ on `cargo test` link errors). `maturin` turns
+# this on for the real wheel build via `pyproject.toml`'s `[tool.maturin]`.
+extension-module = ["pyo3/extension-module"]
