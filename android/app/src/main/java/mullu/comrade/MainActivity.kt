@@ -2,11 +2,14 @@ package mullu.comrade
 
 import android.app.Activity
 import android.content.Context
+import android.os.Build
 import android.os.Bundle
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -69,6 +72,7 @@ import mullu.comrade.ui.JournalScreen
 import mullu.comrade.ui.NewChatScreen
 import mullu.comrade.ui.OnboardingScreen
 import mullu.comrade.ui.PeerAvatar
+import mullu.comrade.ui.RequestsScreen
 import mullu.comrade.ui.SettingsScreen
 import mullu.comrade.ui.peerTitle
 import mullu.comrade.ui.shortNpub
@@ -163,6 +167,7 @@ private enum class MainTab(val label: String, val icon: ImageVector) {
 private sealed interface ChatNav {
     data object List : ChatNav
     data object NewChat : ChatNav
+    data object Requests : ChatNav
     data class Open(
         val peer: String,
         /** User-chosen alias for the peer, when one exists. */
@@ -175,7 +180,15 @@ private sealed interface ChatNav {
 /** Events drained from the native bridge, reduced to what the shell reacts to. */
 private sealed interface PumpEvent {
     data class Chitthi(val info: ComradeCore.ChitthiInfo) : PumpEvent
-    data object DmChanged : PumpEvent
+
+    /** A DM from an accepted conversation — reload + notify. */
+    data class IncomingDm(val peer: String, val preview: String) : PumpEvent
+
+    /** A stranger's gated DM — refresh requests + notify. */
+    data class Request(val peer: String, val preview: String) : PumpEvent
+
+    /** Media / receipt / profile update — just reload the chat lists. */
+    data object HistoryChanged : PumpEvent
 }
 
 /** Bound on the in-memory public feed (the relay stream is unbounded). */
@@ -190,12 +203,27 @@ private fun MainShell(
     profile: ComradeCore.Profile,
     onProfileChange: (ComradeCore.Profile) -> Unit,
 ) {
+    val context = LocalContext.current
     var tab by rememberSaveable { mutableStateOf(MainTab.Chats) }
     var chatNav by remember { mutableStateOf<ChatNav>(ChatNav.List) }
     // Bumped whenever the DM history changed; list + open thread reload on it.
     var chatTick by remember { mutableStateOf(0) }
+    // Bumped when a new message request arrives; the requests list reloads on it.
+    var requestTick by remember { mutableStateOf(0) }
     val feedItems = remember { mutableStateListOf<ComradeCore.ChitthiInfo>() }
     val seenFeedIds = remember { HashSet<String>() }
+
+    // Notification channels + runtime permission (Android 13+). Notifications
+    // fire for incoming DMs/requests while the app process is alive.
+    val notifPermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { }
+    LaunchedEffect(Unit) {
+        Notifier.ensureChannels(context)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !Notifier.hasPermission(context)) {
+            notifPermission.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
 
     fun addToFeed(item: ComradeCore.ChitthiInfo, front: Boolean) {
         if (!seenFeedIds.add(item.id)) return
@@ -239,14 +267,31 @@ private fun MainShell(
 
         while (isActive) {
             val events = withContext(Dispatchers.IO) { drainEvents() }
-            var dmChanged = false
+            var historyChanged = false
             for (event in events) {
                 when (event) {
                     is PumpEvent.Chitthi -> addToFeed(event.info, front = true)
-                    PumpEvent.DmChanged -> dmChanged = true
+                    is PumpEvent.IncomingDm -> {
+                        historyChanged = true
+                        // Suppress a notification for the conversation on screen.
+                        val openPeer = (chatNav as? ChatNav.Open)?.peer
+                        if (event.peer != openPeer) {
+                            Notifier.notifyMessage(
+                                context,
+                                event.peer,
+                                shortNpub(event.peer),
+                                event.preview,
+                            )
+                        }
+                    }
+                    is PumpEvent.Request -> {
+                        requestTick++
+                        Notifier.notifyRequest(context, event.peer, event.preview)
+                    }
+                    PumpEvent.HistoryChanged -> historyChanged = true
                 }
             }
-            if (dmChanged) {
+            if (historyChanged) {
                 chatTick++
                 // A DM from an unknown key may now be nameable.
                 maybeRefreshNames()
@@ -305,6 +350,14 @@ private fun MainShell(
                     },
                     title = { Text("New chat") },
                 )
+                tab == MainTab.Chats && chatNav == ChatNav.Requests -> TopAppBar(
+                    navigationIcon = {
+                        IconButton(onClick = { chatNav = ChatNav.List }) {
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                        }
+                    },
+                    title = { Text("Message requests") },
+                )
                 else -> CenterAlignedTopAppBar(
                     title = {
                         Text(
@@ -349,13 +402,22 @@ private fun MainShell(
             MainTab.Chats -> when (val nav = chatNav) {
                 ChatNav.List -> ChatsScreen(
                     chatTick = chatTick,
+                    requestTick = requestTick,
                     onOpen = { peer, alias, username ->
                         chatNav = ChatNav.Open(peer, alias, username)
                     },
                     onNewChat = { chatNav = ChatNav.NewChat },
+                    onOpenRequests = { chatNav = ChatNav.Requests },
                     modifier = content,
                 )
                 ChatNav.NewChat -> NewChatScreen(
+                    onOpen = { peer, alias, username ->
+                        chatNav = ChatNav.Open(peer, alias, username)
+                    },
+                    modifier = content,
+                )
+                ChatNav.Requests -> RequestsScreen(
+                    chatTick = requestTick,
                     onOpen = { peer, alias, username ->
                         chatNav = ChatNav.Open(peer, alias, username)
                     },
@@ -501,7 +563,22 @@ private fun drainEvents(max: Int = 200): List<PumpEvent> {
                             replyTo = null,
                         ),
                     )
-                "incoming_direct_message", "incoming_media" -> out += PumpEvent.DmChanged
+                "incoming_direct_message" -> out += PumpEvent.IncomingDm(
+                    peer = obj.optString("sender"),
+                    preview = obj.optString("content").ifBlank { "New message" },
+                )
+                "incoming_message_request" -> out += PumpEvent.Request(
+                    peer = obj.optString("peer"),
+                    preview = obj.optString("last_message").ifBlank { "New message request" },
+                )
+                "incoming_media" -> out += PumpEvent.IncomingDm(
+                    peer = obj.optString("sender"),
+                    preview = "📎 Attachment",
+                )
+                // Receipt + profile updates only need a chat-list reload (ticks,
+                // titles). Call signals are handled by the desktop/native call
+                // layer, not this messaging pump.
+                "message_status", "peer_profile_updated" -> out += PumpEvent.HistoryChanged
             }
         }
     }

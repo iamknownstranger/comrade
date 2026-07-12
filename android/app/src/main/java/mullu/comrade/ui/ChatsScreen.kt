@@ -1,7 +1,12 @@
 package mullu.comrade.ui
 
+import android.util.Base64
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -25,11 +30,13 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -42,6 +49,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -53,6 +61,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import mullu.comrade.ComradeCore
+import mullu.comrade.Notifier
 
 /**
  * Identity-stable avatar hues: the same key renders the same colour on every
@@ -100,15 +109,45 @@ fun PeerAvatar(
 @Composable
 fun ChatsScreen(
     chatTick: Int,
+    requestTick: Int,
     onOpen: (peer: String, alias: String?, username: String?) -> Unit,
     onNewChat: () -> Unit,
+    onOpenRequests: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var conversations by remember { mutableStateOf<List<ComradeCore.ConversationInfo>?>(null) }
+    var requestCount by remember { mutableStateOf(0) }
 
     LaunchedEffect(chatTick) {
         conversations = withContext(Dispatchers.IO) {
             runCatching { ComradeCore.conversations() }.getOrDefault(emptyList())
+        }
+    }
+    LaunchedEffect(chatTick, requestTick) {
+        requestCount = withContext(Dispatchers.IO) {
+            runCatching { ComradeCore.messageRequests().size }.getOrDefault(0)
+        }
+    }
+
+    @Composable
+    fun RequestsBanner() {
+        if (requestCount <= 0) return
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { onOpenRequests() }
+                .background(MaterialTheme.colorScheme.secondaryContainer)
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Text("✉", style = MaterialTheme.typography.titleMedium)
+            Text(
+                "Message requests ($requestCount)",
+                style = MaterialTheme.typography.titleSmall,
+                modifier = Modifier.weight(1f),
+            )
+            Text("›", style = MaterialTheme.typography.titleMedium)
         }
     }
 
@@ -118,22 +157,13 @@ fun ChatsScreen(
             CircularProgressIndicator(Modifier.size(28.dp))
         }
         list.isEmpty() -> Column(
-            modifier = modifier
-                .fillMaxSize()
-                .padding(32.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center,
+            modifier = modifier.fillMaxSize(),
         ) {
-            Text("No chats yet", style = MaterialTheme.typography.titleMedium)
-            Text(
-                "Find someone by username, or share your key so they can find you.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(top = 4.dp, bottom = 16.dp),
-            )
-            Button(onClick = onNewChat) { Text("Start a chat") }
+            RequestsBanner()
+            EmptyChats(onNewChat)
         }
         else -> LazyColumn(modifier = modifier.fillMaxSize()) {
+            item { RequestsBanner() }
             items(list, key = { it.peer }) { convo ->
                 val title = peerTitle(convo.peer, convo.alias, convo.peerName)
                 Row(
@@ -172,6 +202,27 @@ fun ChatsScreen(
                 )
             }
         }
+    }
+}
+
+/** Empty-state prompt for the chat list. */
+@Composable
+private fun EmptyChats(onNewChat: () -> Unit) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(32.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        Text("No chats yet", style = MaterialTheme.typography.titleMedium)
+        Text(
+            "Find someone by username, or share your key so they can find you.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(top = 4.dp, bottom = 16.dp),
+        )
+        Button(onClick = onNewChat) { Text("Start a chat") }
     }
 }
 
@@ -349,6 +400,13 @@ fun NewChatScreen(
 
 // ── Conversation ─────────────────────────────────────────────────────────────
 
+/** Delivery-status glyph shown on outgoing bubbles: ✓ sent, ✓✓ delivered/read. */
+private fun statusGlyph(status: String?): String = when (status) {
+    "read", "delivered" -> "✓✓"
+    else -> "✓"
+}
+
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun ConversationScreen(
     peer: String,
@@ -359,8 +417,14 @@ fun ConversationScreen(
     var draft by remember { mutableStateOf("") }
     var sending by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
+    var replyingTo by remember { mutableStateOf<ComradeCore.MessageInfo?>(null) }
+    var attaching by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val listState = rememberLazyListState()
+    val context = LocalContext.current
+
+    // Quick lookup so a bubble carrying reply_to can show a quoted preview.
+    val byId = remember(messages) { messages.associateBy { it.id } }
 
     LaunchedEffect(peer, chatTick) {
         messages = withContext(Dispatchers.IO) {
@@ -369,22 +433,72 @@ fun ConversationScreen(
         if (messages.isNotEmpty()) listState.scrollToItem(messages.size - 1)
     }
 
+    // Opening the thread marks it read (sends a read receipt) and clears any
+    // pending notification for this peer.
+    LaunchedEffect(peer) {
+        Notifier.clearForPeer(context, peer)
+        withContext(Dispatchers.IO) {
+            runCatching { ComradeCore.markConversationReadTyped(peer) }
+        }
+    }
+
     fun send() {
         val text = draft.trim()
         if (text.isEmpty() || sending) return
         sending = true
         error = null
+        val replyId = replyingTo?.id
         scope.launch {
             runCatching {
-                withContext(Dispatchers.IO) { ComradeCore.sendDmTyped(peer, text) }
+                withContext(Dispatchers.IO) { ComradeCore.sendDmReplyTyped(peer, text, replyId) }
             }.onSuccess { sent ->
                 draft = ""
+                replyingTo = null
                 sending = false
                 messages = messages + sent
                 scope.launch { listState.scrollToItem(messages.size - 1) }
             }.onFailure {
                 sending = false
                 error = it.message ?: "Could not send."
+            }
+        }
+    }
+
+    // Encrypt + send a picked file as an attachment (NIP-94 over the DM channel).
+    val pickMedia = rememberLauncherForActivityResult(
+        ActivityResultContracts.GetContent(),
+    ) { uri ->
+        if (uri == null || attaching) return@rememberLauncherForActivityResult
+        attaching = true
+        error = null
+        scope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                        ?: throw IllegalStateException("Could not read the file.")
+                    if (bytes.size > 10 * 1024 * 1024) {
+                        throw IllegalStateException("Attachments are limited to 10 MB.")
+                    }
+                    val mime = context.contentResolver.getType(uri) ?: "application/octet-stream"
+                    val b64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
+                    ComradeCore.sendMediaBytesTyped(peer, mime, "", b64)
+                }
+            }.onSuccess {
+                attaching = false
+                // Media isn't part of the text history; show a local marker line.
+                messages = messages + ComradeCore.MessageInfo(
+                    id = "media:${it.eventId}",
+                    peer = peer,
+                    content = "📎 ${it.mimeType}",
+                    createdAt = it.createdAt,
+                    outgoing = true,
+                    status = "sent",
+                    replyTo = null,
+                )
+                scope.launch { listState.scrollToItem(messages.size - 1) }
+            }.onFailure {
+                attaching = false
+                error = it.message ?: "Could not send the attachment."
             }
         }
     }
@@ -410,8 +524,14 @@ fun ConversationScreen(
                 }
             }
             items(messages, key = { it.id }) { msg ->
+                val quoted = msg.replyTo?.let { byId[it] }
                 Row(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .combinedClickable(
+                            onClick = {},
+                            onLongClick = { replyingTo = msg },
+                        ),
                     horizontalArrangement = if (msg.outgoing) Arrangement.End else Arrangement.Start,
                 ) {
                     Surface(
@@ -430,15 +550,34 @@ fun ConversationScreen(
                         modifier = Modifier.widthIn(max = 300.dp),
                     ) {
                         Column(Modifier.padding(horizontal = 14.dp, vertical = 9.dp)) {
+                            if (quoted != null) {
+                                QuotedPreview(quoted.content)
+                            }
                             Text(msg.content, style = MaterialTheme.typography.bodyLarge)
-                            Text(
-                                relativeTime(msg.createdAt),
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.outline,
+                            Row(
                                 modifier = Modifier
                                     .align(Alignment.End)
                                     .padding(top = 2.dp),
-                            )
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            ) {
+                                Text(
+                                    relativeTime(msg.createdAt),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.outline,
+                                )
+                                if (msg.outgoing) {
+                                    Text(
+                                        statusGlyph(msg.status),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = if (msg.status == "read") {
+                                            MaterialTheme.colorScheme.primary
+                                        } else {
+                                            MaterialTheme.colorScheme.outline
+                                        },
+                                    )
+                                }
+                            }
                         }
                     }
                 }
@@ -454,7 +593,32 @@ fun ConversationScreen(
             )
         }
 
-        // Composer: pill input + filled send, Telegram-style.
+        // "Replying to…" chip above the composer.
+        replyingTo?.let { r ->
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Text(
+                        "↩ " + r.content,
+                        style = MaterialTheme.typography.bodySmall,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                    )
+                }
+                TextButton(onClick = { replyingTo = null }) { Text("✕") }
+            }
+        }
+
+        // Composer: attach + pill input + filled send, Telegram-style.
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -462,6 +626,13 @@ fun ConversationScreen(
             verticalAlignment = Alignment.Bottom,
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
+            IconButton(
+                onClick = { if (!attaching) pickMedia.launch("*/*") },
+                enabled = !attaching,
+                modifier = Modifier.size(48.dp).testTag("dm-attach"),
+            ) {
+                Text(if (attaching) "…" else "📎", style = MaterialTheme.typography.titleLarge)
+            }
             OutlinedTextField(
                 value = draft,
                 onValueChange = { draft = it },
@@ -483,6 +654,129 @@ fun ConversationScreen(
                     Icons.AutoMirrored.Filled.Send,
                     contentDescription = "Send",
                 )
+            }
+        }
+    }
+}
+
+/** A small quoted line rendered above a reply's own text. */
+@Composable
+private fun QuotedPreview(text: String) {
+    Surface(
+        shape = RoundedCornerShape(8.dp),
+        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.6f),
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(bottom = 4.dp),
+    ) {
+        Text(
+            text,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+        )
+    }
+}
+
+// ── Message requests (gate strangers until accepted) ──────────────────────────
+
+/**
+ * The message-requests inbox: strangers' first DMs, gated out of the chat list.
+ * Accepting shares your @handle with them and moves the thread into Chats;
+ * blocking drops their future messages.
+ */
+@Composable
+fun RequestsScreen(
+    chatTick: Int,
+    onOpen: (peer: String, alias: String?, username: String?) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    var requests by remember { mutableStateOf<List<ComradeCore.MessageRequestInfo>?>(null) }
+    var reloadTick by remember { mutableStateOf(0) }
+    val scope = rememberCoroutineScope()
+
+    LaunchedEffect(chatTick, reloadTick) {
+        requests = withContext(Dispatchers.IO) {
+            runCatching { ComradeCore.messageRequests() }.getOrDefault(emptyList())
+        }
+    }
+
+    val list = requests
+    when {
+        list == null -> Box(modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            CircularProgressIndicator(Modifier.size(28.dp))
+        }
+        list.isEmpty() -> Box(
+            modifier.fillMaxSize().padding(32.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                "No message requests.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        else -> LazyColumn(modifier.fillMaxSize()) {
+            items(list, key = { it.peer }) { req ->
+                Column(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 10.dp),
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(14.dp),
+                    ) {
+                        PeerAvatar(shortNpub(req.peer), seed = req.peer)
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                shortNpub(req.peer),
+                                style = MaterialTheme.typography.titleSmall,
+                                fontFamily = FontFamily.Monospace,
+                            )
+                            Text(
+                                req.lastMessage,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    }
+                    Row(
+                        Modifier.fillMaxWidth().padding(top = 6.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        OutlinedButton(
+                            onClick = {
+                                scope.launch {
+                                    withContext(Dispatchers.IO) {
+                                        runCatching { ComradeCore.blockConversationTyped(req.peer) }
+                                    }
+                                    reloadTick++
+                                }
+                            },
+                        ) { Text("Block") }
+                        Button(
+                            onClick = {
+                                scope.launch {
+                                    val ok = withContext(Dispatchers.IO) {
+                                        runCatching { ComradeCore.acceptRequestTyped(req.peer) }
+                                            .isSuccess
+                                    }
+                                    reloadTick++
+                                    if (ok) onOpen(req.peer, null, null)
+                                }
+                            },
+                        ) { Text("Accept") }
+                    }
+                    HorizontalDivider(
+                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f),
+                        modifier = Modifier.padding(top = 8.dp),
+                    )
+                }
             }
         }
     }

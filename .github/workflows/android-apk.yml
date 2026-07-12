@@ -107,11 +107,13 @@ jobs:
           echo "Using NDK at: $ndk"
 
       - name: Build comrade_jni for ${{ matrix.abi }}
+        # media-http enables the attachment pipeline so the sideloadable APK can
+        # send/receive media (matches the release build).
         run: |
           cargo ndk \
             --target ${{ matrix.target }} \
             --output-dir android/app/src/main/jniLibs \
-            -- build --release -p comrade_jni
+            -- build --release -p comrade_jni --features media-http
 
       - name: Upload JNI .so artifact
         uses: actions/upload-artifact@v4

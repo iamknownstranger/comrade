@@ -17,12 +17,14 @@ entirely in Rust, with a shared view-model layer driving an Android
 | Engine | Protocol | Feature | Status |
 |--------|----------|---------|--------|
 | **Sabha** | Nostr Kind-1 + NIP-10 | Public microblogging — the **Chitthi Feed**, with nested `ChitthiThread` reply trees | ✅ Wired (desktop + Android: broadcast + live feed; reply threading in live feed pending) |
-| **Vault** | Nostr Kind-4 + NIP-04 | End-to-end encrypted direct messages; `/pay` UPI intent detection | ✅ Send + receive wired (desktop + Android), offline chat history persisted; NIP-44 migration planned |
+| **Vault** | Nostr Kind-4 + NIP-04 | End-to-end encrypted direct messages; replies (NIP-10 `e` tag), delivered/read receipts, `/pay` UPI intent detection | ✅ Send + receive wired (desktop + Android), offline chat history persisted; NIP-44 migration planned |
+| **Message requests** | Conversation gate + Kind-4 profile share | A stranger's DM lands in a *requests* bucket, not your chat list; **your @handle is shared only when you accept**; accept / block; blocked keys are dropped | ✅ Engine + bridges tested; UI wired (desktop + Android) |
 | **Profiles** | Nostr Kind-0 + NIP-50 | @username display handles: published with retry **and republished on every launch**, searched on dedicated NIP-50 relays; peers' handles cached locally so chats are titled by name; per-contact aliases | ✅ Wired (Android onboarding + settings + chat UI; desktop backend commands) |
 | **Saathi** | libp2p mDNS + Gossipsub | Off-grid local mesh — works without internet | 🧪 Experimental — engine + tests only, not started by any frontend |
 | **Sakha/Sakhi** | Yrs CRDT + AES-256-GCM | Cryptographically isolated shared ledger for couples | 🧪 Engine built; pairing handshake not yet reachable from any UI |
 | **Relay gossip** | NIP-65 | Dynamic relay discovery + outbox-model routing | 🧪 Experimental — routing library + CLI demo only |
-| **Media** | NIP-94 / NIP-96 | Encrypted file staging + pluggable decentralized upload | ⚠️ Wired on desktop (send + download-and-decrypt over Blossom, `media-http` feature); not yet exposed on Android/CLI |
+| **Media** | NIP-94 / NIP-96 | Encrypted file staging + pluggable decentralized upload | ⚠️ Send + download-and-decrypt over Blossom (`media-http` feature) — desktop **and Android** (attach button); rich in-thread rendering of received media is Android follow-up; not on CLI |
+| **Calls** | WebRTC + signaling over the Vault DM channel (NIP-100 direction) | 1:1 **voice & video** — SDP/ICE ride encrypted DMs; public STUN by default, configurable TURN; call log | ⚠️ Signaling engine + call log tested; desktop wired (webview WebRTC); Android native (`org.webrtc`) is a documented follow-up — see [`AUDIT.md` §8.1](AUDIT.md). Connection not guaranteed on CGNAT without TURN |
 | **Storage** | sled + Argon2id + AES-256-GCM | Encrypted-at-rest persistence (identity, ChitthiCache, VaultCache, LedgerState) unlocked by a passphrase | ✅ Wired (identity + own posts; incoming-message persistence planned) |
 | **Voice** | Vosk (offline) + Android TTS | "Hey Comrade" wake word, tap-to-talk, and assist-app role — all on-device, no cloud | ⚠️ Recognition/dispatch work; `post`/`read timeline` need a vault-unlock screen the Android UI doesn't have yet |
 
@@ -177,7 +179,8 @@ cargo tauri dev      # run; or `cargo tauri build` for a distributable bundle
 |----------|---------|--------------|
 | **CI** | Every push | Rust lane (`cargo fmt --check`, `clippy -D warnings`, `cargo test --workspace --locked`) · Desktop lane (`clippy` on `desktop/src-tauri`) · Android lane (`./gradlew test`) · Supply-chain lane (`cargo-deny`: advisories, bans, sources, licenses) |
 | **Android APK** | Push touching `android/`, `crates/`, `Cargo.*` · manual | Cross-compiles `libcomrade_jni.so` (arm64-v8a for handsets, x86_64 for emulators), assembles a sideloadable debug APK artifact, and runs the on-device smoke suite (`connectedDebugAndroidTest`) on two emulator lanes — Pixel 9 and Pixel 9 Pro XL (Android 15 / API 35) |
-| **Release APK** | Manual — Actions → "Release APK" → Run workflow | Builds `.so` libs for arm64-v8a / armeabi-v7a / x86_64, assembles APK, creates GitHub Release |
+| **Release APK** | Manual — Actions → "Release APK" → Run workflow (also reusable via `workflow_call`) | Builds `.so` libs for arm64-v8a / armeabi-v7a / x86_64, assembles APK + AAB, creates GitHub Release |
+| **Auto Release** | Every push to `main` (each merged PR) | Bumps the patch version `X.Y.Z → X.Y.(Z+1)` from the newest `v*` tag (seeds at `0.0.2`), then calls **Release APK** to build + publish. Put `[skip release]` in the merge commit to skip |
 
 ### On-device APK testing
 
