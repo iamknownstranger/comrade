@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Exposes app-private cache files (decrypted media attachments — see
+     MediaAttachment.kt) to other apps via a content:// URI, scoped to the
+     one subdirectory those files are ever written into. -->
+<paths>
+    <cache-path name="media" path="media/" />
+</paths>

@@ -64,6 +64,11 @@ pub fn run() {
             commands::broadcast_chitthi,
             commands::sync_ledger,
             commands::toggle_app_workspace,
+            // Sakha/Sakhi pairing handshake + shared ledger
+            commands::pair_sakha,
+            commands::sakha_status,
+            commands::sakha_add_entry,
+            commands::sakha_read_ledger,
             // Encrypted media pipeline
             commands::upload_and_send_media,
             commands::send_media_bytes,
@@ -73,6 +78,7 @@ pub fn run() {
             commands::send_dm_reply,
             commands::conversations,
             commands::messages_with,
+            commands::media_with,
             commands::current_profile,
             commands::set_username,
             commands::add_contact,

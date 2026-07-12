@@ -221,7 +221,44 @@
             A cryptographically isolated CRDT ledger shared only between paired
             partners. Encrypted end-to-end; relays see opaque ciphertext.
           </p>
-          <div id="ledger-status" class="ledger-status">Not yet synced.</div>
+
+          <form id="ledger-entry-form" class="ledger-entry-form">
+            <input
+              id="ledger-desc"
+              class="input"
+              type="text"
+              placeholder="What was it for?"
+              maxlength="120"
+              disabled
+              required
+            />
+            <input
+              id="ledger-amount"
+              class="input ledger-amount"
+              type="number"
+              inputmode="decimal"
+              placeholder="₹ amount"
+              min="0"
+              step="0.01"
+              disabled
+              required
+            />
+            <input
+              id="ledger-paid-by"
+              class="input ledger-paid-by"
+              type="text"
+              placeholder="Paid by"
+              maxlength="40"
+              disabled
+              required
+            />
+            <button id="ledger-add-btn" type="submit" class="btn btn-primary" disabled>
+              <span class="btn-label">Add entry</span>
+              <span class="spinner" hidden></span>
+            </button>
+          </form>
+
+          <div id="ledger-status" class="ledger-status">Not yet paired.</div>
         </div>
 
         <div class="ledger-panel">
@@ -246,34 +283,55 @@
           <h3 id="modal-partner-title">Open the Partner Portal</h3>
           <button id="partner-cancel" class="icon-btn" aria-label="Close">✕</button>
         </div>
-        <p class="muted">
-          Scan or paste your partner's cryptographic pairing payload to enter the
-          shared Sakha/Sakhi sandbox.
-        </p>
 
-        <div class="qr-target" aria-hidden="true">
-          <div class="qr-grid"></div>
-          <span class="qr-caption">pairing payload</span>
+        <!-- Shown instead of the pairing form when this device already
+             completed a handshake — pairing survives a relaunch, so a
+             returning couple shouldn't have to swap keys again. -->
+        <div id="pair-existing" class="pair-existing" hidden>
+          <p class="muted">
+            Already paired with <code id="pair-existing-npub"></code> as
+            <strong id="pair-existing-role"></strong>.
+          </p>
+          <button id="pair-continue" class="btn btn-primary btn-block">
+            <span class="btn-label">Continue to the shared ledger</span>
+            <span class="spinner" hidden></span>
+          </button>
+          <button id="pair-again" class="btn btn-ghost btn-block">Pair with a different key</button>
         </div>
 
-        <label class="field-label" for="pair-payload">Pairing payload</label>
-        <textarea
-          id="pair-payload"
-          class="textarea"
-          rows="3"
-          placeholder="npub1… or a comrade pairing token"
-        ></textarea>
+        <div id="pair-form" class="pair-form">
+          <p class="muted">
+            Paste your partner's Nostr public key (<code>npub1…</code>) to
+            perform a Diffie-Hellman key exchange and open your shared,
+            end-to-end encrypted Sakha/Sakhi ledger. Relays only ever see
+            opaque ciphertext.
+          </p>
 
-        <fieldset class="role-picker">
-          <legend class="field-label">Enter as</legend>
-          <label class="radio"><input type="radio" name="pair-role" value="sakha" checked /> Sakha</label>
-          <label class="radio"><input type="radio" name="pair-role" value="sakhi" /> Sakhi</label>
-        </fieldset>
+          <div class="qr-target" aria-hidden="true">
+            <div class="qr-grid"></div>
+            <span class="qr-caption">partner's public key</span>
+          </div>
 
-        <button id="pair-submit" class="btn btn-primary btn-block">
-          <span class="btn-label">Validate &amp; enter</span>
-          <span class="spinner" hidden></span>
-        </button>
+          <label class="field-label" for="pair-payload">Partner's public key</label>
+          <textarea
+            id="pair-payload"
+            class="textarea"
+            rows="2"
+            placeholder="npub1…"
+            spellcheck="false"
+          ></textarea>
+
+          <fieldset class="role-picker">
+            <legend class="field-label">Enter as</legend>
+            <label class="radio"><input type="radio" name="pair-role" value="sakha" checked /> Sakha</label>
+            <label class="radio"><input type="radio" name="pair-role" value="sakhi" /> Sakhi</label>
+          </fieldset>
+
+          <button id="pair-submit" class="btn btn-primary btn-block">
+            <span class="btn-label">Pair &amp; enter</span>
+            <span class="spinner" hidden></span>
+          </button>
+        </div>
       </div>
     </div>
 
