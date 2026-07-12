@@ -252,6 +252,64 @@ pub fn default_ice_servers() -> Vec<IceServer> {
     ]
 }
 
+// ── STUN-first, TURN-on-failure ──────────────────────────────────────────────
+
+/// Which ICE candidate types a connection attempt should gather.
+///
+/// A TURN relay sees the (encrypted) media's packet timing/size and both
+/// parties' IP addresses — a cost a privacy-first app should only pay when it
+/// has to. Comrade therefore tries [`Self::StunOnly`] first on every call; a
+/// frontend that observes its `RTCPeerConnection` fail to reach a connected
+/// ICE state (the CGNAT case: STUN discovers a public address but no direct
+/// or server-reflexive candidate pair actually connects) calls
+/// [`ice_servers_for`] with [`Self::StunAndTurn`] and restarts ICE with that
+/// widened server list — see `comrade_ui::ComradeRuntime::call_ice_servers_for`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IceStrategy {
+    /// Every call's first attempt: public STUN only.
+    StunOnly,
+    /// Fallback after a `StunOnly` attempt failed to connect: STUN plus the
+    /// configured TURN relay, if any.
+    StunAndTurn,
+}
+
+impl IceStrategy {
+    /// Stable wire/string form, for the FFI bridges.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IceStrategy::StunOnly => "stun_only",
+            IceStrategy::StunAndTurn => "stun_and_turn",
+        }
+    }
+
+    /// Parse the wire/string form; anything unrecognised falls back to
+    /// `StunOnly` — the safe default that never contacts a TURN relay by
+    /// accident on malformed input.
+    pub fn from_str_lenient(s: &str) -> Self {
+        match s.trim().to_lowercase().as_str() {
+            "stun_and_turn" => IceStrategy::StunAndTurn,
+            _ => IceStrategy::StunOnly,
+        }
+    }
+}
+
+/// Build the ICE server list for one connection attempt under `strategy`.
+///
+/// `turn` is the caller's configured TURN relay, if one has been set (see
+/// `comrade_ui`'s `set_turn_server`). With `StunAndTurn` but no TURN
+/// configured, this degrades to the same STUN-only list — an honest "no
+/// relay available to fall back to" rather than silently doing nothing.
+pub fn ice_servers_for(strategy: IceStrategy, turn: Option<&IceServer>) -> Vec<IceServer> {
+    let mut servers = default_ice_servers();
+    if strategy == IceStrategy::StunAndTurn {
+        if let Some(turn) = turn {
+            servers.push(turn.clone());
+        }
+    }
+    servers
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -418,5 +476,45 @@ mod tests {
         let json = serde_json::to_string(&t).unwrap();
         assert!(json.contains("\"username\":\"user\""));
         assert!(json.contains("\"credential\":\"pass\""));
+    }
+
+    #[test]
+    fn stun_only_strategy_never_includes_turn_even_if_configured() {
+        let turn = IceServer::turn("turn:turn.example.com:3478", "u", "p");
+        let servers = ice_servers_for(IceStrategy::StunOnly, Some(&turn));
+        assert_eq!(servers, default_ice_servers());
+        assert!(servers.iter().all(|s| s.username.is_none()));
+    }
+
+    #[test]
+    fn stun_and_turn_strategy_appends_the_configured_relay() {
+        let turn = IceServer::turn("turn:turn.example.com:3478", "u", "p");
+        let servers = ice_servers_for(IceStrategy::StunAndTurn, Some(&turn));
+        assert_eq!(servers.len(), default_ice_servers().len() + 1);
+        assert_eq!(servers.last(), Some(&turn));
+    }
+
+    #[test]
+    fn stun_and_turn_strategy_degrades_honestly_with_no_turn_configured() {
+        // No relay to fall back to — must not silently claim one.
+        let servers = ice_servers_for(IceStrategy::StunAndTurn, None);
+        assert_eq!(servers, default_ice_servers());
+    }
+
+    #[test]
+    fn ice_strategy_string_forms_round_trip_and_default_to_stun_only() {
+        assert_eq!(
+            IceStrategy::from_str_lenient(IceStrategy::StunOnly.as_str()),
+            IceStrategy::StunOnly
+        );
+        assert_eq!(
+            IceStrategy::from_str_lenient(IceStrategy::StunAndTurn.as_str()),
+            IceStrategy::StunAndTurn
+        );
+        // Unknown input never accidentally opts into contacting a TURN relay.
+        assert_eq!(
+            IceStrategy::from_str_lenient("garbage"),
+            IceStrategy::StunOnly
+        );
     }
 }

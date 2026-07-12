@@ -5,6 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
+redb       = { workspace = true }
 sled       = { workspace = true }
 aes-gcm    = { workspace = true }
 argon2     = { workspace = true }

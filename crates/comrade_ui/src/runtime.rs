@@ -28,8 +28,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use comrade_core::call::{
-    default_ice_servers, new_call_id, parse_call_envelope, CallEnvelope, CallMediaKind, CallSignal,
-    HangupReason, IceServer,
+    ice_servers_for, new_call_id, parse_call_envelope, CallEnvelope, CallMediaKind, CallSignal,
+    HangupReason, IceServer, IceStrategy,
 };
 use comrade_core::crypto::derive_media_key;
 use comrade_core::dm::{parse_profile_share, parse_receipt, ProfileShare, Receipt, ReceiptKind};
@@ -1043,18 +1043,47 @@ impl ComradeRuntime {
 
     // ── Calls (voice/video · WebRTC signalled over the DM channel) ────────────
 
+    /// The configured TURN relay, if any (see [`Self::set_turn_server`]).
+    fn configured_turn_server(&self) -> Option<IceServer> {
+        let store = self.ui.store_ref()?;
+        let turn = store
+            .get::<TurnConfig>(SETTINGS_TREE, TURN_CONFIG_KEY)
+            .ok()??;
+        (!turn.url.trim().is_empty())
+            .then(|| IceServer::turn(turn.url, turn.username, turn.credential))
+    }
+
     /// The ICE servers to hand a frontend `RTCPeerConnection`: public STUN by
     /// default, plus a user-configured TURN relay if one has been set.
+    ///
+    /// This is the "give me everything" list; [`Self::call_ice_servers_for`]
+    /// exposes the STUN-first, TURN-on-failure strategy new calls should use.
     pub fn call_ice_servers(&self) -> Vec<IceServerDto> {
-        let mut servers = default_ice_servers();
-        if let Some(store) = self.ui.store_ref() {
-            if let Ok(Some(turn)) = store.get::<TurnConfig>(SETTINGS_TREE, TURN_CONFIG_KEY) {
-                if !turn.url.trim().is_empty() {
-                    servers.push(IceServer::turn(turn.url, turn.username, turn.credential));
-                }
-            }
-        }
-        servers.into_iter().map(IceServerDto::from).collect()
+        ice_servers_for(
+            IceStrategy::StunAndTurn,
+            self.configured_turn_server().as_ref(),
+        )
+        .into_iter()
+        .map(IceServerDto::from)
+        .collect()
+    }
+
+    /// The ICE servers for one connection attempt under `strategy`
+    /// (`"stun_only"` or `"stun_and_turn"`, see [`comrade_core::call::IceStrategy`]).
+    ///
+    /// Every call should start with `"stun_only"` (what [`Self::place_call`]
+    /// uses): STUN is free and blind to the call, unlike a TURN relay. If the
+    /// frontend's `RTCPeerConnection` reports its ICE connection state never
+    /// reaches `connected`/`completed` — the CGNAT case a TURN server exists
+    /// for — it calls this again with `"stun_and_turn"` and restarts ICE with
+    /// the widened server list, now actually routing through the configured
+    /// relay.
+    pub fn call_ice_servers_for(&self, strategy: &str) -> Vec<IceServerDto> {
+        let strategy = IceStrategy::from_str_lenient(strategy);
+        ice_servers_for(strategy, self.configured_turn_server().as_ref())
+            .into_iter()
+            .map(IceServerDto::from)
+            .collect()
     }
 
     /// Configure (or, with a blank `url`, clear) the TURN relay used for calls
@@ -1087,6 +1116,11 @@ impl ComradeRuntime {
     /// frontend needs (id, peer, media kind, ICE servers). No signal is sent
     /// yet — the frontend creates the WebRTC offer, then calls
     /// [`Self::send_call_signal`]. `media` is `"audio"` or `"video"`.
+    ///
+    /// `ice_servers` starts STUN-only (see [`Self::call_ice_servers_for`]) —
+    /// if the connection can't complete, the frontend retries with
+    /// `call_ice_servers_for("stun_and_turn")` before falling back to a
+    /// `HangupReason::Failed`.
     pub fn place_call(&self, peer: &str, media: &str) -> Result<CallSessionDto, UiError> {
         if self.vault.is_none() {
             return Err(UiError::VaultLocked);
@@ -1096,7 +1130,7 @@ impl ComradeRuntime {
             call_id: new_call_id(),
             peer: to_npub(peer),
             media: CallMediaKind::from_str_lenient(media).as_str().to_string(),
-            ice_servers: self.call_ice_servers(),
+            ice_servers: self.call_ice_servers_for(IceStrategy::StunOnly.as_str()),
         })
     }
 
@@ -2950,6 +2984,45 @@ mod tests {
         assert_eq!(with_turn.last().unwrap().username.as_deref(), Some("u"));
         rt.set_turn_server("", "", "").unwrap();
         assert_eq!(rt.call_ice_servers().len(), defaults.len());
+    }
+
+    #[tokio::test]
+    async fn call_ice_servers_for_stun_only_never_leaks_turn_credentials() {
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+        rt.unlock_vault(dir.path(), "pin").await.unwrap();
+        rt.set_turn_server("turn:turn.example.com:3478", "u", "p")
+            .unwrap();
+
+        // Even with a TURN relay configured, an explicit stun_only ask (what
+        // place_call uses) must never include it.
+        let stun_only = rt.call_ice_servers_for("stun_only");
+        assert!(stun_only.iter().all(|s| s.username.is_none()));
+
+        // The fallback a frontend calls after ICE fails to connect does
+        // include it.
+        let fallback = rt.call_ice_servers_for("stun_and_turn");
+        assert_eq!(fallback.last().unwrap().username.as_deref(), Some("u"));
+        assert_eq!(fallback.len(), stun_only.len() + 1);
+
+        // Garbage input defaults to the private stun_only behavior.
+        assert_eq!(rt.call_ice_servers_for("nonsense").len(), stun_only.len());
+    }
+
+    #[tokio::test]
+    async fn place_call_starts_stun_only_even_with_turn_configured() {
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+        rt.unlock_vault(dir.path(), "pin").await.unwrap();
+        rt.set_turn_server("turn:turn.example.com:3478", "u", "p")
+            .unwrap();
+
+        let (_hex, peer) = stranger();
+        let session = rt.place_call(&peer, "audio").unwrap();
+        assert!(
+            session.ice_servers.iter().all(|s| s.username.is_none()),
+            "the initial offer must not contact the TURN relay unless STUN fails"
+        );
     }
 
     #[tokio::test]

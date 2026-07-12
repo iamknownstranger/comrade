@@ -2,7 +2,12 @@
  * Milestone 3b — Vault: End-to-End Encrypted Messaging Engine
  *
  * Implements:
- *  • NIP-04 (Kind 4) E2E direct-message pipeline
+ *  • NIP-44 encrypted rumors wrapped per NIP-17/NIP-59 ("Private Direct
+ *    Message" / "Gift Wrap") for all new direct messages — content *and*
+ *    metadata (real sender, exact timestamp) stay hidden from relays; only
+ *    the outer wrapper's recipient `p` tag and a randomized timestamp are
+ *    public. NIP-04 (Kind 4) decryption is kept, read-only, so DMs a peer
+ *    sent before this upgrade still open (AUDIT.md task M1-1).
  *  • On-device regex processor that detects `/pay <amount> to <vpa>` patterns
  *    and compiles them to standard UPI payment string intents.
  */
@@ -72,14 +77,17 @@ pub struct VaultMessage {
     pub reply_to: Option<String>,
 }
 
-/// Extract the reply-target event id (hex) from an incoming DM's NIP-10 `e`
-/// tags. Prefers an explicit `reply` marker, then `root`, then the last `e`
-/// tag — mirroring the Sabha thread resolver so DM and feed replies agree.
+/// Extract the reply-target event id (hex) from a DM's NIP-10 `e` tags.
+/// Prefers an explicit `reply` marker, then `root`, then the last `e` tag —
+/// mirroring the Sabha thread resolver so DM and feed replies agree.
 ///
-/// Read from the event's canonical JSON so it is robust across nostr-sdk tag
-/// representations (the same approach the Sabha thread parser uses).
-fn reply_target(event: &Event) -> Option<String> {
-    let val = serde_json::to_value(event).ok()?;
+/// Generic over anything tag-bearing and `Serialize` so it works both for a
+/// legacy signed [`Event`] (NIP-04) and an [`UnsignedEvent`] rumor
+/// (NIP-44/NIP-17), whose canonical JSON shapes the tags identically. Reading
+/// via JSON keeps this robust across nostr-sdk tag representations (the same
+/// approach the Sabha thread parser uses).
+fn reply_target(tagged: &impl Serialize) -> Option<String> {
+    let val = serde_json::to_value(tagged).ok()?;
     let tags = val.get("tags")?.as_array()?;
     let mut e_tags: Vec<(String, String)> = Vec::new(); // (id, marker)
     for tag in tags {
@@ -113,12 +121,70 @@ fn reply_target(event: &Event) -> Option<String> {
     e_tags.last().map(|(id, _)| id.clone())
 }
 
+/// Upper bound of NIP-59's random timestamp tweak applied to gift-wrap
+/// events (`nip59::RANGE_RANDOM_TIMESTAMP_TWEAK` is 0..2 days) — a wrapper
+/// sent this instant can carry a `created_at` up to this far in the past.
+const GIFT_WRAP_TIMESTAMP_SKEW_SECS: u64 = 172_800;
+
+/// Unwrap and decrypt a NIP-17 gift-wrapped (Kind-1059) DM, returning the
+/// [`VaultMessage`] with `upi_intents` left empty (the caller fills it in —
+/// extraction needs the shared regex, which this free function doesn't have).
+/// Returns `None` (after logging) on any decrypt/verify failure — a bad or
+/// foreign gift wrap must never crash the notification loop.
+async fn decrypt_gift_wrapped_dm(our_keys: &Keys, event: &Event) -> Option<VaultMessage> {
+    let unwrapped = match UnwrappedGift::from_gift_wrap(our_keys, event).await {
+        Ok(u) => u,
+        Err(e) => {
+            warn!(event_id = %event.id, "Vault: failed to unwrap gift-wrapped DM: {e}");
+            return None;
+        }
+    };
+    if unwrapped.rumor.kind != Kind::PrivateDirectMessage {
+        debug!(event_id = %event.id, kind = %unwrapped.rumor.kind, "Vault: ignoring non-DM rumor");
+        return None;
+    }
+    debug!(event_id = %event.id, sender = %unwrapped.sender, "Vault DM (NIP-44) decrypted");
+    Some(VaultMessage {
+        event_id: event.id.to_hex(),
+        sender_pubkey: unwrapped.sender.to_hex(),
+        content: unwrapped.rumor.content.clone(),
+        // The rumor's own timestamp is the true send time; the outer
+        // wrapper's is deliberately randomized for privacy (see above).
+        created_at: unwrapped.rumor.created_at.as_secs(),
+        upi_intents: Vec::new(),
+        reply_to: reply_target(&unwrapped.rumor),
+    })
+}
+
+/// Decrypt a legacy NIP-04 (Kind-4) DM, kept read-only for backward
+/// compatibility with peers who haven't sent a NIP-44 message yet (AUDIT.md
+/// task M1-1). Returns `None` (after logging) on decrypt failure.
+fn decrypt_legacy_nip04_dm(our_keys: &Keys, event: &Event) -> Option<VaultMessage> {
+    let decrypted =
+        match nip04::decrypt(our_keys.secret_key(), &event.pubkey, event.content.clone()) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(event_id = %event.id, "Vault: failed to decrypt legacy NIP-04 DM: {e}");
+                return None;
+            }
+        };
+    debug!(event_id = %event.id, sender = %event.pubkey, "Vault DM (legacy NIP-04) decrypted");
+    Some(VaultMessage {
+        event_id: event.id.to_hex(),
+        sender_pubkey: event.pubkey.to_hex(),
+        content: decrypted,
+        created_at: event.created_at.as_secs(),
+        upi_intents: Vec::new(),
+        reply_to: reply_target(event),
+    })
+}
+
 // ── Vault Engine ─────────────────────────────────────────────────────────────
 
 /// Callback invoked for every successfully decrypted incoming DM. Used by the
-/// IPC bridge to push `Kind::EncryptedDirectMessage` events across the webview /
-/// JNI boundary as they arrive. Must be `Send + Sync` to live inside the Tokio
-/// notification loop.
+/// IPC bridge to push decoded DM events across the webview / JNI boundary as
+/// they arrive. Must be `Send + Sync` to live inside the Tokio notification
+/// loop.
 pub type VaultCallback = Box<dyn Fn(VaultMessage) + Send + Sync + 'static>;
 
 pub struct VaultEngine {
@@ -155,7 +221,8 @@ impl VaultEngine {
         self.client.disconnect().await;
     }
 
-    /// Send an E2E encrypted direct message (NIP-04, Kind 4) to `recipient`.
+    /// Send an E2E encrypted direct message (NIP-44, gift-wrapped per NIP-17)
+    /// to `recipient`.
     pub async fn send_dm(
         &self,
         recipient: &PublicKey,
@@ -166,32 +233,34 @@ impl VaultEngine {
 
     /// Send an E2E encrypted DM, optionally as a reply to a prior message.
     ///
+    /// The message is a NIP-17 "Private Direct Message": a Kind-14 rumor
+    /// (never signed or sent on its own) is NIP-44-encrypted into a Kind-13
+    /// seal, which is itself NIP-44-encrypted and signed by a fresh, one-time
+    /// key into the Kind-1059 event actually published (NIP-59 gift wrap).
+    /// The only metadata a relay observer learns is the recipient's `p` tag
+    /// and a timestamp randomized by up to two days — the real sender and
+    /// send time live inside the encrypted rumor.
+    ///
     /// When `reply_to` is `Some(event_id_hex)`, a NIP-10 `["e", <id>, "",
-    /// "reply"]` tag is attached so the recipient can render a quoted preview.
-    /// The message body stays plain ciphertext — no envelope — so ordinary
-    /// Nostr clients still show the text; only the thread link is metadata.
+    /// "reply"]` tag is attached to the *rumor* (so it travels encrypted,
+    /// same as the message body) so the recipient can render a quoted
+    /// preview. Junk reply ids are dropped rather than failing the send — a
+    /// broken quote link must never cost the user their message.
     pub async fn send_dm_reply(
         &self,
         recipient: &PublicKey,
         plaintext: &str,
         reply_to: Option<&str>,
     ) -> Result<EventId, VaultError> {
-        let encrypted = nip04::encrypt(self.our_keys.secret_key(), recipient, plaintext.as_bytes())
-            .map_err(|e| VaultError::EncryptionFailed(e.to_string()))?;
-
-        // The single `p` tag stays the unambiguous NIP-04 recipient; a reply
-        // adds one `e` tag. Junk reply ids are dropped rather than failing the
-        // send — a broken quote link must never cost the user their message.
-        let mut builder = EventBuilder::new(Kind::EncryptedDirectMessage, encrypted)
-            .tag(Tag::public_key(*recipient));
+        let mut rumor_tags = Vec::new();
         if let Some(id) = reply_to.filter(|s| !s.is_empty()) {
             match Tag::parse(["e", id, "", "reply"]) {
-                Ok(tag) => builder = builder.tag(tag),
+                Ok(tag) => rumor_tags.push(tag),
                 Err(e) => warn!("dropping invalid reply tag {id}: {e}"),
             }
         }
-        let event = builder
-            .sign_with_keys(&self.our_keys)
+        let event = EventBuilder::private_msg(&self.our_keys, *recipient, plaintext, rumor_tags)
+            .await
             .map_err(|e| VaultError::EncryptionFailed(e.to_string()))?;
 
         // A send right after unlock races the relay dials: the pool "succeeds"
@@ -232,10 +301,16 @@ impl VaultEngine {
         callback: VaultCallback,
     ) -> Result<(), VaultError> {
         let our_pk = self.our_keys.public_key();
+        // Gift-wrapped (NIP-17/59) events carry a randomized `created_at` up
+        // to `GIFT_WRAP_TIMESTAMP_SKEW` in the past (see `send_dm_reply`), so
+        // a naive `since(now())` would drop messages sent this instant. Widen
+        // the window by the same amount; legacy Kind-4 DMs are unaffected —
+        // they just get a slightly wider (harmless) backfill too.
+        let since = Timestamp::now() - GIFT_WRAP_TIMESTAMP_SKEW_SECS;
         let filter = Filter::new()
-            .kind(Kind::EncryptedDirectMessage)
+            .kinds([Kind::GiftWrap, Kind::EncryptedDirectMessage])
             .pubkey(our_pk)
-            .since(Timestamp::now());
+            .since(since);
 
         self.client
             .subscribe(filter, None)
@@ -258,42 +333,30 @@ impl VaultEngine {
 
                 async move {
                     if let RelayPoolNotification::Event { event, .. } = notification {
-                        if event.kind != Kind::EncryptedDirectMessage {
-                            return Ok::<bool, Box<dyn std::error::Error>>(false);
-                        }
-
-                        let sender_pk = event.pubkey;
-                        let decrypted = match nip04::decrypt(
-                            our_keys.secret_key(),
-                            &sender_pk,
-                            event.content.clone(),
-                        ) {
-                            Ok(d) => d,
-                            Err(e) => {
-                                warn!(event_id = %event.id, "Vault: failed to decrypt DM: {e}");
-                                return Ok::<bool, Box<dyn std::error::Error>>(false);
+                        let msg = match event.kind {
+                            Kind::GiftWrap => {
+                                match decrypt_gift_wrapped_dm(&our_keys, &event).await {
+                                    Some(m) => m,
+                                    None => return Ok::<bool, Box<dyn std::error::Error>>(false),
+                                }
                             }
+                            Kind::EncryptedDirectMessage => {
+                                match decrypt_legacy_nip04_dm(&our_keys, &event) {
+                                    Some(m) => m,
+                                    None => return Ok::<bool, Box<dyn std::error::Error>>(false),
+                                }
+                            }
+                            _ => return Ok::<bool, Box<dyn std::error::Error>>(false),
                         };
 
-                        debug!(event_id = %event.id, sender = %sender_pk, "Vault DM decrypted");
-
-                        let upi_intents = extract_upi_intents(&decrypted, &pay_regex);
+                        let upi_intents = extract_upi_intents(&msg.content, &pay_regex);
                         if !upi_intents.is_empty() {
                             info!(
                                 count = upi_intents.len(),
                                 "Vault: UPI payment intents detected"
                             );
                         }
-
-                        let reply_to = reply_target(&event);
-                        let msg = VaultMessage {
-                            event_id: event.id.to_hex(),
-                            sender_pubkey: sender_pk.to_hex(),
-                            content: decrypted,
-                            created_at: event.created_at.as_secs(),
-                            upi_intents,
-                            reply_to,
-                        };
+                        let msg = VaultMessage { upi_intents, ..msg };
 
                         inbox.write().await.push(msg.clone());
                         callback(msg);
@@ -373,6 +436,9 @@ mod tests {
 
     #[test]
     fn nip04_roundtrip_encrypts_and_decrypts() {
+        // The legacy primitive itself, kept alive read-only for M1-1
+        // backward compat — exercised end-to-end below via
+        // `decrypt_legacy_nip04_dm`.
         let alice = Keys::generate();
         let bob = Keys::generate();
         let plaintext = "Hello from Alice to Bob";
@@ -384,6 +450,24 @@ mod tests {
             nip04::decrypt(bob.secret_key(), &alice.public_key(), encrypted).expect("decrypt");
 
         assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn legacy_nip04_dm_decrypts_with_sender_and_content() {
+        let alice = Keys::generate();
+        let bob = Keys::generate();
+
+        let encrypted =
+            nip04::encrypt(alice.secret_key(), &bob.public_key(), b"legacy hello").unwrap();
+        let event = EventBuilder::new(Kind::EncryptedDirectMessage, encrypted)
+            .tag(Tag::public_key(bob.public_key()))
+            .sign_with_keys(&alice)
+            .unwrap();
+
+        let msg = decrypt_legacy_nip04_dm(&bob, &event).expect("decrypts");
+        assert_eq!(msg.content, "legacy hello");
+        assert_eq!(msg.sender_pubkey, alice.public_key().to_hex());
+        assert_eq!(msg.event_id, event.id.to_hex());
     }
 
     #[test]
@@ -405,5 +489,55 @@ mod tests {
             .sign_with_keys(&keys)
             .unwrap();
         assert_eq!(reply_target(&plain), None);
+    }
+
+    #[test]
+    fn reply_target_also_reads_the_e_tag_from_an_unsigned_rumor() {
+        // NIP-44/NIP-17 replies carry the e-tag on the *rumor*, not the outer
+        // gift wrap — `reply_target` must work on an `UnsignedEvent` too.
+        let keys = Keys::generate();
+        let parent = "c".repeat(64);
+        let rumor = EventBuilder::private_msg_rumor(keys.public_key(), "hi")
+            .tag(Tag::parse(["e", parent.as_str(), "", "reply"]).unwrap())
+            .build(keys.public_key());
+        assert_eq!(reply_target(&rumor).as_deref(), Some(parent.as_str()));
+    }
+
+    #[tokio::test]
+    async fn gift_wrapped_dm_roundtrips_content_sender_and_reply_tag() {
+        let alice = Keys::generate();
+        let bob = Keys::generate();
+        let parent = "a".repeat(64);
+        let reply_tag = Tag::parse(["e", parent.as_str(), "", "reply"]).unwrap();
+
+        let wrapped = EventBuilder::private_msg(&alice, bob.public_key(), "hi bob", [reply_tag])
+            .await
+            .expect("gift wrap");
+
+        // The outer wrapper leaks nothing about Alice: it's signed by a
+        // one-time key, not hers.
+        assert_ne!(wrapped.pubkey, alice.public_key());
+        assert_eq!(wrapped.kind, Kind::GiftWrap);
+
+        let msg = decrypt_gift_wrapped_dm(&bob, &wrapped)
+            .await
+            .expect("bob can unwrap and decrypt");
+        assert_eq!(msg.content, "hi bob");
+        assert_eq!(msg.sender_pubkey, alice.public_key().to_hex());
+        assert_eq!(msg.event_id, wrapped.id.to_hex());
+        assert_eq!(msg.reply_to.as_deref(), Some(parent.as_str()));
+    }
+
+    #[tokio::test]
+    async fn gift_wrapped_dm_meant_for_someone_else_does_not_decrypt() {
+        let alice = Keys::generate();
+        let bob = Keys::generate();
+        let eve = Keys::generate();
+
+        let wrapped = EventBuilder::private_msg(&alice, bob.public_key(), "secret", [])
+            .await
+            .unwrap();
+
+        assert!(decrypt_gift_wrapped_dm(&eve, &wrapped).await.is_none());
     }
 }

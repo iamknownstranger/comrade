@@ -1,5 +1,7 @@
 # Rust build output
 src-tauri/target/
+# Capability/ACL schemas tauri-build regenerates on every build
+src-tauri/gen/
 
 # Frontend tooling (this scaffold uses a no-build static frontend, but keep
 # these ignored in case a bundler is added later)
