@@ -306,18 +306,18 @@ means *feature* parity, not protocol compatibility._
 
 | Session feature | Comrade today | Gap / next step |
 |---|---|---|
-| 1:1 E2E DMs | ✅ NIP-04 Kind-4 DMs, offline history, live delivery | Upgrade to NIP-44 + gift wrap (M1-1) — Session's Signal-protocol-grade encryption is the bar; NIP-04 is deprecated and unauthenticated |
+| 1:1 E2E DMs | ✅ NIP-04 Kind-4 DMs, offline history, live delivery, **replies** (NIP-10 `e` tag) + **delivered/read receipts** | Upgrade to NIP-44 + gift wrap (M1-1) — Session's Signal-protocol-grade encryption is the bar; NIP-04 is deprecated and unauthenticated |
 | Account = keypair, no phone number | ✅ secp256k1 keypair, npub address | — (same model) |
 | Display name + optional avatar | ◐ @handle published/searched (Kind-0, retried + republished as of 2026-07-12); chats titled by handle | Avatars: publish `picture` in Kind-0; render (needs image pipeline on Android) |
 | Local nicknames for contacts | ✅ per-contact alias, editable from the conversation header (2026-07-12) | — |
 | Find people by ONS name / ID | ◐ NIP-50 handle search on dedicated relays + direct npub lookup (2026-07-12) | NIP-05 DNS-verified names as the ONS analogue; QR-code key exchange |
-| Message requests (stranger DMs gated) | ✗ any key can DM straight into the chat list | Add a "requests" bucket for peers not in contacts; accept/block actions |
-| Read receipts + typing indicators | ✗ | Ephemeral Kind-typed events over the DM channel; off by default (privacy) |
+| Message requests (stranger DMs gated) | ✅ strangers land in a *requests* bucket, not the chat list; accept shares your @handle + acks their messages, block drops future DMs (engine + bridges tested; UI wired desktop + Android) | — |
+| Read receipts + typing indicators | ◐ **delivered + read receipts** wired (control envelopes over the DM channel, accepted conversations only; status ticks on outgoing bubbles) | Typing indicators; a privacy toggle to disable receipts |
 | Disappearing messages | ✗ | Per-conversation TTL enforced in the local store + NIP-40 expiration tags |
-| Attachments / voice messages | ◐ encrypted media pipeline (NIP-94/96 + Blossom) wired on desktop only | Expose on Android (JNI + picker/recorder UI); voice notes = audio attachment |
+| Attachments / voice messages | ◐ media pipeline (NIP-94/96 + Blossom) wired on desktop **and Android send** (picker → encrypt → upload → deliver) | In-thread rendering of received media on Android; a dedicated voice-note recorder |
 | Closed groups | ✗ | NIP-EE (MLS) is the serious path; a simpler interim is NIP-4x group DMs — needs a design decision |
 | Communities (open groups) | ◐ public Chitthi feed exists (different shape) | Not a priority; Nostr public feeds already cover the "open square" role |
-| Calls (voice/video) | ✗ | Very large (WebRTC + signaling over relays); explicitly out of near-term scope |
+| Calls (voice/video) | ◐ signaling engine + call log **tested**; desktop wired (webview WebRTC); STUN default + configurable TURN | Android `org.webrtc` native media (§8.1); group calls stay out of scope (SFU) |
 | Multi-device / linked devices | ✗ (one vault per device) | nsec export/import behind the passcode door is the pragmatic first step |
 | Onion-routed transport | ✗ (direct WSS to relays) | Different network model; Tor/proxy support at the socket layer is the realistic analogue |
 | Block / delete conversation | ✗ | Local block list (drop DMs by pubkey in the vault callback) + history delete |
@@ -373,6 +373,16 @@ phones) vs. none (template-based reflective prompts only) vs. cloud
 user has)? Owner call required before any companion code.
 
 ### 8.1 Calls — voice & video (owner request, 2026-07-12)
+
+> **Status (landed).** The **signaling layer is built and tested**: a
+> `CallEnvelope` (SDP offer/answer, trickled ICE, ringing/busy/hangup) rides the
+> encrypted Vault DM channel exactly as sketched below, gated so strangers can't
+> ring you before their message request is accepted. `comrade_ui` exposes
+> `place_call` / `send_call_signal` / `hangup_call` / `log_call` / `call_history`
+> and configurable ICE (`call_ice_servers` / `set_turn_server`, public STUN by
+> default). Both bridges (JNI + Tauri) carry it. **Desktop** drives real WebRTC
+> in the webview. **Android `org.webrtc`** native media is the remaining piece
+> (voice → video → the TURN decision, in that order). OQ10 (below) is still open.
 
 Session-style calling for the loved-one pillar. Design sketch, honest about
 size (this is a **multi-PR epic**, comparable to everything built so far):

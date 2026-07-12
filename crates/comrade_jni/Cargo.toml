@@ -14,6 +14,15 @@ comrade_state = { path = "../comrade_state" }
 comrade_ui    = { path = "../comrade_ui" }
 jni           = { workspace = true }
 serde_json    = { workspace = true }
+# Decoding base64 media bytes handed down from the Kotlin file picker.
+base64        = { workspace = true }
 # A multi-thread Tokio runtime, owned by a process-global, keeps the async core
 # alive across JNI call boundaries (JNI invocations are synchronous from Java).
 tokio         = { workspace = true }
+
+[features]
+default = []
+# Turn on the real HTTP media pipeline (Blossom upload + fetch-and-decrypt) so
+# the Android build can actually send/receive attachments. The APK workflows
+# pass `--features media-http`; the lean workspace test build leaves it off.
+media-http = ["comrade_ui/media-http"]

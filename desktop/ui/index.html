@@ -87,6 +87,10 @@
           <button id="partner-btn" class="btn btn-ghost partner-btn" title="Open Partner Portal">
             <span aria-hidden="true">❤</span> Partner Portal
           </button>
+
+          <button id="call-settings-btn" class="btn btn-ghost partner-btn" title="Configure a TURN relay for calls">
+            <span aria-hidden="true">📞</span> Call settings
+          </button>
         </div>
 
         <div class="sidebar-foot">
@@ -139,6 +143,12 @@
         <!-- Vault DMs -->
         <section id="view-vault" class="view view-vault" role="tabpanel" hidden>
           <aside class="contacts">
+            <section id="requests-section" class="requests-section" aria-label="Message requests" hidden>
+              <div class="contacts-head">
+                Requests <span id="requests-count" class="req-badge"></span>
+              </div>
+              <ul id="requests-list" class="request-list"></ul>
+            </section>
             <div class="contacts-head">Conversations</div>
             <ul id="contact-list" class="contact-list"></ul>
             <div id="contacts-empty" class="empty sm">
@@ -154,6 +164,13 @@
             <div id="chat-log" class="chat-log" aria-live="polite"></div>
             <div class="chat-composer">
               <div id="dm-upi-preview" class="upi-preview" hidden></div>
+              <div id="dm-reply-chip" class="reply-chip" hidden>
+                <div class="reply-chip-body">
+                  <span class="reply-chip-label">Replying to</span>
+                  <span id="dm-reply-text" class="reply-chip-text"></span>
+                </div>
+                <button id="dm-reply-cancel" class="icon-btn" title="Cancel reply" aria-label="Cancel reply">✕</button>
+              </div>
               <div class="field-row">
                 <button id="dm-attach" class="icon-btn" title="Attach encrypted media (max 10 MB)" disabled>📎</button>
                 <input id="dm-file" type="file" accept="image/*,audio/*" hidden />
@@ -257,6 +274,85 @@
           <span class="btn-label">Validate &amp; enter</span>
           <span class="spinner" hidden></span>
         </button>
+      </div>
+    </div>
+
+    <!-- ───────────────────────── Call settings (TURN relay) modal ───────────── -->
+    <div id="modal-turn" class="modal-overlay" hidden>
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-turn-title">
+        <div class="modal-head">
+          <h3 id="modal-turn-title">Call settings — TURN relay</h3>
+          <button id="turn-cancel" class="icon-btn" aria-label="Close">✕</button>
+        </div>
+        <p class="muted">
+          Optional. A TURN server relays call audio/video when a direct
+          peer-to-peer connection can't be established (e.g. strict
+          NATs/firewalls). Leave the URL blank to clear a saved relay.
+        </p>
+
+        <label class="field-label" for="turn-url">TURN URL</label>
+        <input
+          id="turn-url"
+          class="input"
+          type="text"
+          placeholder="turn:turn.example.com:3478"
+          spellcheck="false"
+          autocomplete="off"
+        />
+        <label class="field-label" for="turn-username">Username</label>
+        <input
+          id="turn-username"
+          class="input"
+          type="text"
+          placeholder="(optional)"
+          spellcheck="false"
+          autocomplete="off"
+        />
+        <label class="field-label" for="turn-credential">Credential</label>
+        <input
+          id="turn-credential"
+          class="input"
+          type="password"
+          placeholder="(optional)"
+          spellcheck="false"
+          autocomplete="off"
+        />
+        <button id="turn-save" class="btn btn-primary btn-block">
+          <span class="btn-label">Save</span>
+          <span class="spinner" hidden></span>
+        </button>
+      </div>
+    </div>
+
+    <!-- ───────────────────────── Incoming call (ringing) overlay ─────────────── -->
+    <div id="call-ring" class="call-overlay call-ring" hidden>
+      <div class="call-ring-card" role="dialog" aria-modal="true" aria-label="Incoming call">
+        <div class="call-ring-emoji" aria-hidden="true">📞</div>
+        <div id="ring-peer" class="ring-peer mono"></div>
+        <div id="ring-media" class="ring-media"></div>
+        <div class="call-ring-actions">
+          <button id="ring-decline" class="call-round call-decline" title="Decline" aria-label="Decline call">✖</button>
+          <button id="ring-accept" class="call-round call-accept" title="Accept" aria-label="Accept call">✓</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ───────────────────────── In-call overlay ───────────────────────────── -->
+    <div id="call-active" class="call-overlay call-active" hidden>
+      <div class="call-stage">
+        <video id="call-remote-video" class="call-remote" autoplay playsinline></video>
+        <div id="call-avatar" class="call-avatar" aria-hidden="true">👤</div>
+        <video id="call-local-video" class="call-local" autoplay playsinline muted hidden></video>
+        <div class="call-info">
+          <div id="call-peer" class="call-peer mono"></div>
+          <div id="call-media-label" class="call-media-label"></div>
+          <div id="call-status" class="call-status"></div>
+          <div id="call-timer" class="call-timer" hidden></div>
+        </div>
+      </div>
+      <div class="call-controls">
+        <button id="call-mute" class="call-btn" title="Mute microphone" aria-label="Mute microphone">🎙</button>
+        <button id="call-hangup" class="call-btn call-btn-end" title="Hang up" aria-label="Hang up">📵</button>
       </div>
     </div>
 

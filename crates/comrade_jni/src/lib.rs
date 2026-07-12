@@ -641,6 +641,381 @@ pub extern "C" fn Java_mullu_comrade_ComradeCore_pollEvent<'local>(
     to_jstring(&mut env, &out)
 }
 
+// ── Replies, message requests & receipts (Session-parity messaging) ──────────
+
+/// Send an E2E DM as a reply to a prior message. `replyTo` is the replied
+/// message's event id (hex), or empty for a normal message.
+#[no_mangle]
+pub extern "C" fn Java_mullu_comrade_ComradeCore_sendDmReply<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    target: JString<'local>,
+    content: JString<'local>,
+    reply_to: JString<'local>,
+) -> jstring {
+    let (Some(target), Some(content)) = (
+        jni_string(&mut env, &target),
+        jni_string(&mut env, &content),
+    ) else {
+        return to_jstring(&mut env, &json!({"error":"invalid arguments"}).to_string());
+    };
+    let reply_to = jni_string(&mut env, &reply_to).filter(|s| !s.is_empty());
+    let out = guard_json(move || {
+        let rt = runtime().ok_or_else(|| "failed to initialise async runtime".to_string())?;
+        let state = state();
+        rt.block_on(async move {
+            let guard = state.read().await;
+            let msg = guard
+                .send_dm_reply(&target, &content, reply_to.as_deref())
+                .await
+                .map_err(|e| e.to_string())?;
+            serde_json::to_value(msg).map_err(|e| e.to_string())
+        })
+    });
+    to_jstring(&mut env, &out)
+}
+
+/// Pending message requests as a JSON array of `{"peer","last_message","last_at"}`.
+#[no_mangle]
+pub extern "C" fn Java_mullu_comrade_ComradeCore_messageRequests<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jstring {
+    let out = guard_json(move || {
+        let state = state();
+        let guard = state.blocking_read();
+        let reqs = guard.message_requests().map_err(|e| e.to_string())?;
+        serde_json::to_value(reqs).map_err(|e| e.to_string())
+    });
+    to_jstring(&mut env, &out)
+}
+
+/// Accept a message request: move it into the chat list, share our handle with
+/// the peer, and acknowledge their messages. Returns `{"accepted":true}`.
+#[no_mangle]
+pub extern "C" fn Java_mullu_comrade_ComradeCore_acceptRequest<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    peer: JString<'local>,
+) -> jstring {
+    let Some(peer) = jni_string(&mut env, &peer) else {
+        return to_jstring(&mut env, &json!({"error":"invalid peer"}).to_string());
+    };
+    let out = guard_json(move || {
+        let rt = runtime().ok_or_else(|| "failed to initialise async runtime".to_string())?;
+        let state = state();
+        // Run inside the runtime so the accept's background profile/receipt
+        // sends have a reactor to spawn onto.
+        rt.block_on(async move {
+            let guard = state.read().await;
+            guard.accept_request(&peer).map_err(|e| e.to_string())?;
+            Ok(json!({ "accepted": true }))
+        })
+    });
+    to_jstring(&mut env, &out)
+}
+
+/// Block a peer (hide + drop future DMs). Returns `{"blocked":true}`.
+#[no_mangle]
+pub extern "C" fn Java_mullu_comrade_ComradeCore_blockConversation<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    peer: JString<'local>,
+) -> jstring {
+    let Some(peer) = jni_string(&mut env, &peer) else {
+        return to_jstring(&mut env, &json!({"error":"invalid peer"}).to_string());
+    };
+    let out = guard_json(move || {
+        let state = state();
+        let guard = state.blocking_read();
+        guard.block_conversation(&peer).map_err(|e| e.to_string())?;
+        Ok(json!({ "blocked": true }))
+    });
+    to_jstring(&mut env, &out)
+}
+
+/// Send a read receipt for a conversation (call when the thread is opened).
+/// Returns `{"ok":true}`.
+#[no_mangle]
+pub extern "C" fn Java_mullu_comrade_ComradeCore_markConversationRead<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    peer: JString<'local>,
+) -> jstring {
+    let Some(peer) = jni_string(&mut env, &peer) else {
+        return to_jstring(&mut env, &json!({"error":"invalid peer"}).to_string());
+    };
+    let out = guard_json(move || {
+        let rt = runtime().ok_or_else(|| "failed to initialise async runtime".to_string())?;
+        let state = state();
+        rt.block_on(async move {
+            let guard = state.read().await;
+            guard
+                .mark_conversation_read(&peer)
+                .map_err(|e| e.to_string())?;
+            Ok(json!({ "ok": true }))
+        })
+    });
+    to_jstring(&mut env, &out)
+}
+
+// ── Encrypted media (send/receive on Android) ────────────────────────────────
+
+/// Encrypt + upload media (base64 bytes) and deliver the NIP-94 reference to
+/// `targetPubkey` over the DM channel. Returns the media message JSON.
+#[no_mangle]
+pub extern "C" fn Java_mullu_comrade_ComradeCore_sendMediaBytes<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    target: JString<'local>,
+    mime_type: JString<'local>,
+    caption: JString<'local>,
+    base64: JString<'local>,
+) -> jstring {
+    let (Some(target), Some(mime_type), Some(caption), Some(b64)) = (
+        jni_string(&mut env, &target),
+        jni_string(&mut env, &mime_type),
+        jni_string(&mut env, &caption),
+        jni_string(&mut env, &base64),
+    ) else {
+        return to_jstring(&mut env, &json!({"error":"invalid arguments"}).to_string());
+    };
+    let out = guard_json(move || {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        let bytes = B64
+            .decode(b64.as_bytes())
+            .map_err(|e| format!("invalid base64: {e}"))?;
+        let rt = runtime().ok_or_else(|| "failed to initialise async runtime".to_string())?;
+        let state = state();
+        rt.block_on(async move {
+            let guard = state.read().await;
+            let dto = guard
+                .upload_and_send_media(&target, bytes, &mime_type, &caption)
+                .await
+                .map_err(|e| e.to_string())?;
+            serde_json::to_value(dto).map_err(|e| e.to_string())
+        })
+    });
+    to_jstring(&mut env, &out)
+}
+
+/// Resolve a NIP-94 reference by event id and decrypt the blob. Returns
+/// `{"mime_type","base64"}` or `{"error":"…"}`.
+#[no_mangle]
+pub extern "C" fn Java_mullu_comrade_ComradeCore_downloadMedia<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    event_id: JString<'local>,
+) -> jstring {
+    let Some(event_id) = jni_string(&mut env, &event_id) else {
+        return to_jstring(&mut env, &json!({"error":"invalid event id"}).to_string());
+    };
+    let out = guard_json(move || {
+        let rt = runtime().ok_or_else(|| "failed to initialise async runtime".to_string())?;
+        let state = state();
+        rt.block_on(async move {
+            let guard = state.read().await;
+            let dto = guard
+                .download_and_decrypt_media(&event_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            serde_json::to_value(dto).map_err(|e| e.to_string())
+        })
+    });
+    to_jstring(&mut env, &out)
+}
+
+// ── Calls (voice/video signaling) ────────────────────────────────────────────
+
+/// The ICE servers for the WebRTC layer as a JSON array.
+#[no_mangle]
+pub extern "C" fn Java_mullu_comrade_ComradeCore_callIceServers<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jstring {
+    let out = guard_json(move || {
+        let state = state();
+        let guard = state.blocking_read();
+        serde_json::to_value(guard.call_ice_servers()).map_err(|e| e.to_string())
+    });
+    to_jstring(&mut env, &out)
+}
+
+/// Configure (or clear, with an empty url) the TURN relay. Returns `{"ok":true}`.
+#[no_mangle]
+pub extern "C" fn Java_mullu_comrade_ComradeCore_setTurnServer<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    url: JString<'local>,
+    username: JString<'local>,
+    credential: JString<'local>,
+) -> jstring {
+    let (Some(url), Some(username), Some(credential)) = (
+        jni_string(&mut env, &url),
+        jni_string(&mut env, &username),
+        jni_string(&mut env, &credential),
+    ) else {
+        return to_jstring(&mut env, &json!({"error":"invalid arguments"}).to_string());
+    };
+    let out = guard_json(move || {
+        let state = state();
+        let guard = state.blocking_read();
+        guard
+            .set_turn_server(&url, &username, &credential)
+            .map_err(|e| e.to_string())?;
+        Ok(json!({ "ok": true }))
+    });
+    to_jstring(&mut env, &out)
+}
+
+/// Begin a call to `peer` (`media` = "audio"/"video"). Returns the call session
+/// JSON `{"call_id","peer","media","ice_servers":[…]}`.
+#[no_mangle]
+pub extern "C" fn Java_mullu_comrade_ComradeCore_placeCall<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    peer: JString<'local>,
+    media: JString<'local>,
+) -> jstring {
+    let (Some(peer), Some(media)) = (jni_string(&mut env, &peer), jni_string(&mut env, &media))
+    else {
+        return to_jstring(&mut env, &json!({"error":"invalid arguments"}).to_string());
+    };
+    let out = guard_json(move || {
+        let state = state();
+        let guard = state.blocking_read();
+        let session = guard.place_call(&peer, &media).map_err(|e| e.to_string())?;
+        serde_json::to_value(session).map_err(|e| e.to_string())
+    });
+    to_jstring(&mut env, &out)
+}
+
+/// Send one call-signaling payload (`signalJson` = a CallSignal, e.g.
+/// `{"kind":"offer","sdp":"…"}`) to `peer`. Returns `{"ok":true}`.
+#[no_mangle]
+pub extern "C" fn Java_mullu_comrade_ComradeCore_sendCallSignal<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    peer: JString<'local>,
+    call_id: JString<'local>,
+    media: JString<'local>,
+    signal_json: JString<'local>,
+) -> jstring {
+    let (Some(peer), Some(call_id), Some(media), Some(signal_json)) = (
+        jni_string(&mut env, &peer),
+        jni_string(&mut env, &call_id),
+        jni_string(&mut env, &media),
+        jni_string(&mut env, &signal_json),
+    ) else {
+        return to_jstring(&mut env, &json!({"error":"invalid arguments"}).to_string());
+    };
+    let out = guard_json(move || {
+        let rt = runtime().ok_or_else(|| "failed to initialise async runtime".to_string())?;
+        let state = state();
+        rt.block_on(async move {
+            let guard = state.read().await;
+            guard
+                .send_call_signal(&peer, &call_id, &media, &signal_json)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!({ "ok": true }))
+        })
+    });
+    to_jstring(&mut env, &out)
+}
+
+/// Send a call `Hangup` with `reason` and end negotiation. Returns `{"ok":true}`.
+#[no_mangle]
+pub extern "C" fn Java_mullu_comrade_ComradeCore_hangupCall<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    peer: JString<'local>,
+    call_id: JString<'local>,
+    media: JString<'local>,
+    reason: JString<'local>,
+) -> jstring {
+    let (Some(peer), Some(call_id), Some(media), Some(reason)) = (
+        jni_string(&mut env, &peer),
+        jni_string(&mut env, &call_id),
+        jni_string(&mut env, &media),
+        jni_string(&mut env, &reason),
+    ) else {
+        return to_jstring(&mut env, &json!({"error":"invalid arguments"}).to_string());
+    };
+    let out = guard_json(move || {
+        let rt = runtime().ok_or_else(|| "failed to initialise async runtime".to_string())?;
+        let state = state();
+        rt.block_on(async move {
+            let guard = state.read().await;
+            guard
+                .hangup_call(&peer, &call_id, &media, &reason)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!({ "ok": true }))
+        })
+    });
+    to_jstring(&mut env, &out)
+}
+
+/// Persist a finished call to the call log. Returns the call record JSON.
+#[no_mangle]
+pub extern "C" fn Java_mullu_comrade_ComradeCore_logCall<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    peer: JString<'local>,
+    call_id: JString<'local>,
+    media: JString<'local>,
+    incoming: jni::sys::jboolean,
+    outcome: JString<'local>,
+    started_at: jni::sys::jlong,
+    duration_secs: jni::sys::jlong,
+) -> jstring {
+    let (Some(peer), Some(call_id), Some(media), Some(outcome)) = (
+        jni_string(&mut env, &peer),
+        jni_string(&mut env, &call_id),
+        jni_string(&mut env, &media),
+        jni_string(&mut env, &outcome),
+    ) else {
+        return to_jstring(&mut env, &json!({"error":"invalid arguments"}).to_string());
+    };
+    let out = guard_json(move || {
+        let state = state();
+        let guard = state.blocking_read();
+        let rec = guard
+            .log_call(
+                &peer,
+                &call_id,
+                &media,
+                incoming != 0,
+                &outcome,
+                started_at.max(0) as u64,
+                duration_secs.max(0) as u64,
+            )
+            .map_err(|e| e.to_string())?;
+        serde_json::to_value(rec).map_err(|e| e.to_string())
+    });
+    to_jstring(&mut env, &out)
+}
+
+/// The call log as a JSON array. `peer` empty ⇒ all peers; else that peer only.
+#[no_mangle]
+pub extern "C" fn Java_mullu_comrade_ComradeCore_callHistory<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    peer: JString<'local>,
+) -> jstring {
+    let peer = jni_string(&mut env, &peer).filter(|s| !s.is_empty());
+    let out = guard_json(move || {
+        let state = state();
+        let guard = state.blocking_read();
+        let calls = guard
+            .call_history(peer.as_deref())
+            .map_err(|e| e.to_string())?;
+        serde_json::to_value(calls).map_err(|e| e.to_string())
+    });
+    to_jstring(&mut env, &out)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 //
 // The `extern "C"` wrappers need a live JVM to exercise, but the payloads they

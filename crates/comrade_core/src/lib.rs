@@ -5,13 +5,17 @@
  *   crypto  — keypair generation, Bech32, DH shared secret, HKDF key derivation
  *   sabha   — NIP-10 ChitthiThread parser + public relay engine (Chitthi Feed)
  *   vault   — NIP-04 E2E DM engine + UPI /pay regex processor
+ *   dm      — DM control envelopes (profile-share on accept, read/delivered receipts)
+ *   call    — voice/video call signaling (WebRTC over the Vault DM channel)
  *   saathi  — Off-grid libp2p mesh (mDNS + Gossipsub)
  *   sakha   — Yrs CRDT shared ledger + DH-encrypted Nostr sync
  *   relay   — NIP-65 relay-list metadata + outbox-model routing
  *   media   — NIP-94/96 encrypted media staging + pluggable uploaders
  */
 
+pub mod call;
 pub mod crypto;
+pub mod dm;
 pub mod error;
 pub mod media;
 pub mod relay;

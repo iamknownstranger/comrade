@@ -106,4 +106,7 @@ dependencies {
     // defaultConfig — neither is guaranteed transitively by ext:junit/espresso.
     androidTestImplementation("androidx.test:core:1.5.0")
     androidTestImplementation("androidx.test:runner:1.5.2")
+    // GrantPermissionRule — pre-grant POST_NOTIFICATIONS so the app's first-run
+    // notification prompt never pops a system dialog over the UI mid-test.
+    androidTestImplementation("androidx.test:rules:1.5.0")
 }

@@ -53,6 +53,8 @@ fn full_state_survives_a_reboot_uncorrupted() {
             content: "encrypted hello".into(),
             created_at: 150,
             outgoing: false,
+            status: None,
+            reply_to: None,
         })
         .unwrap();
 
@@ -169,6 +171,8 @@ fn wrong_passphrase_returns_error_not_panic() {
             content: "secret".into(),
             created_at: 1,
             outgoing: true,
+            status: Some("sent".into()),
+            reply_to: None,
         })
         .unwrap();
         s.flush().unwrap();

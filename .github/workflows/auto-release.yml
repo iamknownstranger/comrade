@@ -1,0 +1,63 @@
+name: Auto Release (patch bump on main)
+
+# Every push to main (i.e. every merged PR) cuts a new patch release:
+# the version is bumped X.Y.Z -> X.Y.(Z+1) from the newest `v*` git tag
+# (seeding at 0.0.2 when no release tag exists yet), then the reusable
+# Release APK workflow builds the APK/AAB and publishes a GitHub Release.
+#
+# Skip a release for a given merge by putting `[skip release]` in the commit
+# message (e.g. docs-only changes).
+on:
+  push:
+    branches: [main]
+
+# Serialise releases so two quick merges can't race to the same tag.
+concurrency:
+  group: auto-release
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Compute next patch version
+    runs-on: ubuntu-latest
+    if: ${{ !contains(github.event.head_commit.message, '[skip release]') }}
+    outputs:
+      version: ${{ steps.next.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Full history + tags so we can find the latest release tag.
+          fetch-depth: 0
+
+      - name: Compute next patch version
+        id: next
+        run: |
+          set -euo pipefail
+          git fetch --tags --force --quiet || true
+          # Highest semver among v* tags (strip the leading v), else empty.
+          latest="$(git tag -l 'v*' \
+            | sed 's/^v//' \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -V \
+            | tail -n1 || true)"
+          if [ -z "$latest" ]; then
+            # No release tag yet — the owner's baseline is 0.0.1, so the first
+            # automated bug-fix release is 0.0.2.
+            next="0.0.2"
+          else
+            IFS=. read -r major minor patch <<< "$latest"
+            next="${major}.${minor}.$((patch + 1))"
+          fi
+          echo "version=$next" >> "$GITHUB_OUTPUT"
+          echo "Latest tag: ${latest:-<none>} → next release: $next"
+
+  release:
+    name: Build & publish release
+    needs: version
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      version: ${{ needs.version.outputs.version }}
+      pre_release: "false"
+    secrets: inherit

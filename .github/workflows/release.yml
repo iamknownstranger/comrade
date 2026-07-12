@@ -1,8 +1,10 @@
 name: Release APK
 
-# Trigger manually from the GitHub Actions UI.
-# Go to Actions → "Release APK" → "Run workflow", enter a version string,
-# and the workflow builds the APK and creates a GitHub Release automatically.
+# Two entry points:
+#  • Manual — Actions → "Release APK" → "Run workflow", enter a version string.
+#  • Reusable — called by auto-release.yml on every push to main, which computes
+#    the next patch version and passes it in (workflow_call).
+# Both build the APK/AAB and create a GitHub Release for the given version.
 on:
   workflow_dispatch:
     inputs:
@@ -18,6 +20,17 @@ on:
         options:
           - "false"
           - "true"
+  workflow_call:
+    inputs:
+      version:
+        description: "Release version (e.g. 1.2.0)"
+        required: true
+        type: string
+      pre_release:
+        description: "Mark as pre-release"
+        required: false
+        default: "false"
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
@@ -114,11 +127,13 @@ jobs:
           echo "Using NDK at: $ndk"
 
       - name: Build comrade_jni for ${{ matrix.abi }}
+        # media-http turns on the real Blossom upload / fetch-and-decrypt pipeline
+        # so the shipped APK can actually send and receive attachments.
         run: |
           cargo ndk \
             --target ${{ matrix.target }} \
             --output-dir android/app/src/main/jniLibs \
-            -- build --release -p comrade_jni
+            -- build --release -p comrade_jni --features media-http
 
       - name: Upload JNI .so artifact
         uses: actions/upload-artifact@v4

@@ -42,8 +42,8 @@ use zeroize::Zeroizing;
 
 pub use error::StorageError;
 pub use repository::{
-    Chitthi, ChitthiCache, Contact, JournalEntry, LedgerState, StoredIdentity, StoredMessage,
-    VaultCache,
+    CallRecord, Chitthi, ChitthiCache, Contact, ConversationMeta, JournalEntry, LedgerState,
+    StoredIdentity, StoredMessage, VaultCache,
 };
 
 // ── Constants ─────────────────────────────────────────────────────────────────

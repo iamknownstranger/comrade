@@ -70,6 +70,7 @@ pub fn run() {
             commands::download_and_decrypt_media,
             // Direct messages, profile & contacts
             commands::send_dm,
+            commands::send_dm_reply,
             commands::conversations,
             commands::messages_with,
             commands::current_profile,
@@ -80,6 +81,19 @@ pub fn run() {
             commands::refresh_peer_profiles,
             commands::list_contacts,
             commands::search_profiles,
+            // Message requests + read/delivered receipts
+            commands::message_requests,
+            commands::accept_request,
+            commands::block_conversation,
+            commands::mark_conversation_read,
+            // Calls (voice/video signalling over the DM channel)
+            commands::call_ice_servers,
+            commands::set_turn_server,
+            commands::place_call,
+            commands::send_call_signal,
+            commands::hangup_call,
+            commands::log_call,
+            commands::call_history,
             // Journal (strictly local)
             commands::add_journal_entry,
             commands::journal_entries,

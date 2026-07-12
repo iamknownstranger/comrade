@@ -536,6 +536,7 @@ dependencies = [
 name = "comrade_jni"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "comrade_core",
  "comrade_state",
  "comrade_ui",
