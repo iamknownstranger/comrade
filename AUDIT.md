@@ -21,6 +21,7 @@ The Rust workspace shows genuinely strong engineering discipline for a prototype
 - **2026-07-10 (owner):** Proceed on the current Rust stack; framework maturity risk (sled 0.34, yrs pre-1.0, libp2p/nostr-sdk churn) is *accepted* on the assumption these mature over time. Consequences: D1's sled migration is **out of scope** (document in SECURITY.md instead); unmaintained transitive-dep advisories from these frameworks are ignored with reasons + exit conditions in `deny.toml`; the hickory-proto DNS advisories wait on a libp2p release against hickory ≥ 0.26.
 - **2026-07-10:** M0 executed (wrapper, CI lanes, cargo-deny gate, desktop lockfile, change_pin crash-safety regression test) plus M1 quick wins (M1-3 README truth pass, M1-6 backup/FLAG_SECURE/nsec masking, M1-7 checksum logic — pin pending network access, M1-8 CSP). MSRV measured from the lock: **rustc ≥ 1.88** (supersedes the sweep's 1.83 estimate in N3).
 - **2026-07-12:** Field report: two fresh devices could not find each other by @handle. Root cause: the one-shot Kind-0 publish raced the relay dials and was never retried (fixed — bounded connect-wait, retry with backoff, republish on every launch), and search fanned the NIP-50 filter across non-search relays (fixed — dedicated search relays, client-side match filter, direct npub lookup). Chat UI now titles peers alias → published @handle → key, with a per-contact alias editor. Session-android feature parity adopted as the communication roadmap (§7); parity is a direction, not a claim.
+- **2026-07-12 (owner, supersedes the 2026-07-10 entry above):** D1's sled migration is back in scope and has landed — `comrade_storage` now persists to `redb` instead of `sled`, keeping the identical Argon2id + AES-256-GCM envelope. `EncryptedStore::open` transparently migrates a pre-existing sled store in place on first open (decrypt under the caller's PIN, re-ingest into a fresh redb file, archive the old sled files under `sled-archive/` inside the same directory) — no caller (CLI, JNI, Tauri) changes. `sled` stays a dependency *only* for that one-time migration reader (`comrade_storage::migrate`); it is no longer used for the live store, so `deny.toml`'s sled-transitive-dep ignores now carry an updated exit condition (remove once the migration reader itself is retired). A useful side effect: because redb's write transactions are atomic, `change_pin` now runs the whole rekey in a single transaction and is genuinely crash-safe — this closes finding **S2** for real (the regression test that used to be `#[ignore]`d as a known-bug xfail now passes unconditionally); M1-2 is done.
 
 ---
 
@@ -28,7 +29,7 @@ The Rust workspace shows genuinely strong engineering discipline for a prototype
 
 **Purpose.** "Comrade" — a privacy-first, cross-platform social client over Nostr, with an off-grid libp2p mesh mode and an encrypted couple's shared ledger. Hindi-derived nomenclature: public post = *Chitthi*, engines = *Sabha* (public feed), *Vault* (E2E DMs), *Saathi* (mesh), *Sakha/Sakhi* (couple CRDT ledger).
 
-**Stack.** Rust 2021 workspace (tokio, nostr-sdk 0.44, libp2p 0.56, yrs 0.21, sled 0.34, aes-gcm/argon2/secp256k1) · Kotlin + Jetpack Compose Android app with an offline Vosk voice assistant · Tauri 2 desktop shell with a no-build vanilla-JS SPA · interactive CLI harness. ~11k lines total. Built through a series of AI-assisted PRs (milestone-labeled commits), no releases yet.
+**Stack.** Rust 2021 workspace (tokio, nostr-sdk 0.44, libp2p 0.56, yrs 0.21, redb 4, aes-gcm/argon2/secp256k1) · Kotlin + Jetpack Compose Android app with an offline Vosk voice assistant · Tauri 2 desktop shell with a no-build vanilla-JS SPA · interactive CLI harness. ~11k lines total. Built through a series of AI-assisted PRs (milestone-labeled commits), no releases yet.
 
 **Architecture sketch.**
 
@@ -40,7 +41,7 @@ The Rust workspace shows genuinely strong engineering discipline for a prototype
                     ┌───────────────┴────────────────────────┐
         comrade_core (crypto, sabha, vault, sakha, saathi*, relay*, media*)
         comrade_state (pure workspace state machine)
-        comrade_storage (sled + Argon2id + AES-256-GCM)
+        comrade_storage (redb + Argon2id + AES-256-GCM)
                                           * = built & tested but never wired to a frontend
 ```
 
@@ -144,7 +145,7 @@ Severity: **C**ritical / **H**igh / **M**edium / **L**ow. Each finding is labele
 
 | # | Sev | Finding |
 |---|---|---|
-| D1 | M | **[fact] `sled 0.34.7`** (`Cargo.lock`) — last stable release 2021; the project has been in a years-long 1.0-alpha limbo with known unresolved crash-recovery and memory issues. As the foundation of the encrypted store this is a real liability; `redb` (maintained, stable format) is the drop-in-shaped alternative. The README's encrypted-at-rest story never mentions this. |
+| D1 | ~~M~~ | **[fact, resolved 2026-07-12]** `sled 0.34.7` was the foundation of the encrypted store, in a years-long 1.0-alpha limbo with known unresolved crash-recovery and memory issues. `comrade_storage` now persists to `redb` instead (see the decision log entry above); `sled` remains only as a one-time legacy-migration reader. |
 | D2 | M | **[fact] No LICENSE file and no `license` field in any Cargo.toml** (verified by search). Legally "all rights reserved" — blocks any external contribution or reuse decision, and violates the org's new-repo standard. The APK build also strips upstream license notices (`build.gradle.kts:66` excludes `META-INF/{AL2.0,LGPL2.1}`) with no NOTICE strategy. |
 | D3 | M | **[fact] Reproducibility gaps.** No Gradle wrapper committed (builds need a hand-matched system Gradle 8.5, `README.md:58`); `desktop/src-tauri` has **no Cargo.lock at all** (excluded from the workspace, never built); CI's cargo steps run without `--locked`. |
 | D4 | L | **[fact] Minor version hygiene.** Duplicate `rand 0.8.6` + `0.9.4` in the lock (transitive); loose `"1"`-style version reqs (acceptable with a committed lockfile); Android toolchain a generation behind (Kotlin 1.9.22, Compose BOM 2024.02 — dated, not risky). No cargo-audit/cargo-deny gate exists (see O2). |
@@ -187,7 +188,7 @@ Severity: **C**ritical / **H**igh / **M**edium / **L**ow. Each finding is labele
 **Done signals:** README table has an explicit status column; the Off-Grid toggle really disconnects (verifiable with `netstat`); Android can unlock + post + read timeline end-to-end; `sync_ledger` succeeds after a real pairing flow; engines with no non-test call sites are flagged experimental and out of the feature table.
 
 ### Theme 2 — Make the crypto match the marketing (S1, S2, S3, S8, N2)
-**Target state:** DMs on NIP-44 (send + receive; NIP-04 kept read-only for backward compat), crash-safe re-keying, a passphrase policy with strength feedback, and a `SECURITY.md` threat model that states plainly what is and isn't protected (plaintext keys in sled trees, no forward secrecy for Sakha, LAN-visible mesh).
+**Target state:** DMs on NIP-44 (send + receive; NIP-04 kept read-only for backward compat), crash-safe re-keying (done — see D1/M1-2), a passphrase policy with strength feedback, and a `SECURITY.md` threat model that states plainly what is and isn't protected (plaintext keys in storage tables, no forward secrecy for Sakha, LAN-visible mesh).
 **Principle:** composing audited primitives (which this codebase already does well) is necessary but not sufficient — protocol choice and key-management lifecycle are where privacy products actually fail.
 **Trade-off:** skip a Sakha ratchet (Signal-style forward secrecy) for now — document it instead; it's XL work with low prototype payoff. **Do NOT** raise Argon2 params before profiling on the low-end Android target (unlock latency is UX-visible).
 **Done signals:** new DMs are NIP-44-encrypted (gift-wrap decision recorded); a kill-the-process-mid-`change_pin` test passes; passphrase < 8 chars rejected at every frontend; `SECURITY.md` exists and matches the code.
@@ -205,7 +206,7 @@ Severity: **C**ritical / **H**igh / **M**edium / **L**ow. Each finding is labele
 
 ### What NOT to fix (explicit)
 - **The three thin bridge layers** (CLI/JNI/Tauri command shims) — they duplicate marshalling, not logic; unifying them buys nothing. (Making the CLI depend on `comrade_ui` is worthwhile only as part of M2 wiring work, not as its own project.)
-- **Sled → redb migration** — queue behind M1; the durability tests make a later swap safe, and prototype data is disposable. Document the sled risk in `SECURITY.md` instead (D1/N2).
+- ~~Sled → redb migration~~ — **done 2026-07-12** (see decision log); no longer deferred.
 - **UPI feature hardening beyond f64 → paise** — product direction is unclear (see Open Questions); don't invest until it is.
 - **Gendered `PairRole` naming, Hindi nomenclature** — product/brand decisions, not engineering defects; flagged in Open Questions only.
 - **Triple nostr clients (P5), AES helper triplication (Q7), `comrade_state` history growth** — real but cheap debt; batch them into M3 or into adjacent M2 work, don't schedule standalone.
@@ -231,7 +232,7 @@ Effort: **S** < 2h · **M** ≈ half-day · **L** 1–2 days · **XL** needs bre
 | ID | Task | Files | Acceptance criteria | Effort | Risk | Deps |
 |---|---|---|---|---|---|---|
 | M1-1 | Migrate DMs to NIP-44 (send + decrypt both, NIP-04 decrypt-only legacy) | `crates/comrade_core/src/vault.rs`, `error.rs`, tests | New DMs use NIP-44; old NIP-04 DMs still decrypt; round-trip + fixed-vector tests; README table updated | L | medium | — |
-| M1-2 | Make `change_pin` atomic | `crates/comrade_storage/src/lib.rs` | Re-key into staging trees + single meta swap (or versioned dual-read); M0-5 test now passes; documented recovery semantics | M | medium | M0-5 |
+| M1-2 | ~~Make `change_pin` atomic~~ **— done 2026-07-12** | `crates/comrade_storage/src/lib.rs` | Landed as a side effect of the redb migration: the whole rekey runs in one redb write transaction, so an interrupted rekey never commits. The regression test no longer needs `#[ignore]`. | M | medium | M0-5 |
 | M1-3 | README truth pass (status column, wired vs experimental) + remove false Off-Grid toast | `README.md`, `desktop/ui/main.js` | Every table row states its wiring status; comrade_ui claim corrected; the "relays paused" toast is gone or true | S | none | — |
 | M1-4 | Passphrase policy + terminology | `desktop/ui/main.js`, `src/main.rs`, `comrade_ui/src/lib.rs` | Min-length (≥8) enforced at unlock creation everywhere; "PIN" renamed passphrase in user-facing text; CLI stops echoing passphrase (rpassword) | M | low | — |
 | M1-5 | Scope the Sabha feed + cap client memory | `crates/comrade_core/src/sabha.rs`, `comrade_ui/src/runtime.rs`, `desktop/ui/main.js` | Subscription takes authors/limit (default: own + follows, `limit(200)`); `state.chitthis` ring-capped; Vault inbox capped; desktop survives live relay soak | M | medium | — |
@@ -250,7 +251,7 @@ Effort: **S** < 2h · **M** ≈ half-day · **L** 1–2 days · **XL** needs bre
 | M2-3 | Persist + backfill Vault inbox; persist incoming chitthis | `vault.rs`, `runtime.rs` (use existing repositories) | DMs and received chitthis survive restart; subscription backfills since last-seen timestamp | M | medium | M1-1 |
 | M2-4 | Engine lifecycle owner in `ComradeRuntime` | `runtime.rs`, `comrade_state` | OffGridTravel transition disconnects Nostr engines (and starts Saathi only if product says so — OQ2); state doc updated; `netstat`-visible | L | medium | M1-9, OQ2 |
 | M2-5 | Money as integer paise | `vault.rs`, `sakha.rs`, DTOs, `main.js` | `amount_paise: u64` end-to-end; URI formatting from integers; tests updated | M | low | — |
-| M2-6 | `spawn_blocking` for KDF/sled + narrow lock scopes | `comrade_ui/src/lib.rs`, `runtime.rs`, `commands.rs` | Unlock no longer stalls the runtime; no guard held across KDF or relay awaits | M | low | — |
+| M2-6 | `spawn_blocking` for KDF/store-open + narrow lock scopes | `comrade_ui/src/lib.rs`, `runtime.rs`, `commands.rs` | Unlock no longer stalls the runtime; no guard held across KDF or relay awaits | M | low | — |
 | M2-7 | Thread the live feed | `runtime.rs`, `sabha.rs` | `ChitthiDto::from_event` populates `reply_to` via the existing NIP-10 resolver; tree builder gets an iterative implementation or depth cap | S | low | M1-5 |
 
 ### M3 — Quality & polish

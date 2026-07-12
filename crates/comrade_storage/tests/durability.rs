@@ -2,9 +2,10 @@
 //!
 //! These exercise the *public* `comrade_storage` API only (as the app would),
 //! simulating client reboots by dropping the `EncryptedStore` (which releases
-//! the sled lock) and reopening it at the same path with the same passphrase.
-//! Every assertion checks that data survives uncorrupted and that failures come
-//! back as `Result::Err` — never a panic that would take down the core thread.
+//! the underlying redb file handle) and reopening it at the same path with the
+//! same passphrase. Every assertion checks that data survives uncorrupted and
+//! that failures come back as `Result::Err` — never a panic that would take
+//! down the core thread.
 
 use comrade_storage::{
     Chitthi, EncryptedStore, LedgerState, StorageError, StoredIdentity, StoredMessage,
@@ -16,7 +17,7 @@ fn with_store(dir: &TempDir, pin: &str, f: impl FnOnce(&EncryptedStore)) {
     let store = EncryptedStore::open(dir.path(), pin).expect("open store");
     f(&store);
     store.flush().expect("flush");
-    // store dropped here -> sled lock released, key zeroized.
+    // store dropped here -> redb file handle released, key zeroized.
 }
 
 #[test]

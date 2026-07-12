@@ -25,7 +25,7 @@ entirely in Rust, with a shared view-model layer driving an Android
 | **Relay gossip** | NIP-65 | Dynamic relay discovery + outbox-model routing | 🧪 Experimental — routing library + CLI demo only |
 | **Media** | NIP-94 / NIP-96 | Encrypted file staging + pluggable decentralized upload | ⚠️ Send + download-and-decrypt over Blossom (`media-http` feature) — desktop **and Android** (attach button); rich in-thread rendering of received media is Android follow-up; not on CLI |
 | **Calls** | WebRTC + signaling over the Vault DM channel (NIP-100 direction) | 1:1 **voice & video** — SDP/ICE ride encrypted DMs; public STUN by default, configurable TURN; call log | ⚠️ Signaling engine + call log tested; desktop wired (webview WebRTC); Android native (`org.webrtc`) is a documented follow-up — see [`AUDIT.md` §8.1](AUDIT.md). Connection not guaranteed on CGNAT without TURN |
-| **Storage** | sled + Argon2id + AES-256-GCM | Encrypted-at-rest persistence (identity, ChitthiCache, VaultCache, LedgerState) unlocked by a passphrase | ✅ Wired (identity + own posts; incoming-message persistence planned) |
+| **Storage** | redb + Argon2id + AES-256-GCM | Encrypted-at-rest persistence (identity, ChitthiCache, VaultCache, LedgerState) unlocked by a passphrase | ✅ Wired (identity + own posts; incoming-message persistence planned) |
 | **Voice** | Vosk (offline) + Android TTS | "Hey Comrade" wake word, tap-to-talk, and assist-app role — all on-device, no cloud | ⚠️ Recognition/dispatch work; `post`/`read timeline` need a vault-unlock screen the Android UI doesn't have yet |
 
 > **Status honesty.** 🧪 rows are working, unit-tested library code that no
@@ -87,7 +87,7 @@ Base ──────── Sabha (public feed) + Vault (E2E DMs)
 crates/
   comrade_state/   State machine (no I/O dependencies)
   comrade_core/    Protocol engines: crypto, sabha, vault, saathi, sakha, relay, media
-  comrade_storage/ Encrypted-at-rest persistence (sled + Argon2id + AES-256-GCM)
+  comrade_storage/ Encrypted-at-rest persistence (redb + Argon2id + AES-256-GCM)
   comrade_ui/      Framework-agnostic view-model / service layer (UiService + DTOs)
   comrade_jni/     JNI bridge — compiled to libcomrade_jni.so for Android
 src/main.rs        Interactive CLI harness (development / testing)

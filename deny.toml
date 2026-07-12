@@ -8,8 +8,12 @@ all-features = true
 version = 2
 yanked = "deny"
 # Each ignore must carry a reason and an exit condition. Decision context:
-# the project accepts current-framework maturity risk (sled, libp2p) rather
-# than migrating — see AUDIT.md §4 "What NOT to fix".
+# the project accepts current-framework maturity risk (libp2p) rather than
+# migrating — see AUDIT.md §4 "What NOT to fix". `sled`'s live-store role was
+# retired in favor of `redb` (AUDIT.md decision log, 2026-07-12); `sled` stays
+# only as a one-time legacy-migration reader in `comrade_storage::migrate`, so
+# its transitive-dep advisories are still ignored below until that reader is
+# removed in a future release (once existing users have all migrated).
 ignore = [
     # hickory-proto 0.25.x DNS vulns; fixed only in 0.26, which libp2p 0.56
     # does not yet accept. The affected code is reachable only via the Saathi
@@ -18,7 +22,8 @@ ignore = [
     "RUSTSEC-2026-0118",
     "RUSTSEC-2026-0119",
     # Unmaintained transitive deps of accepted frameworks (sled / libp2p /
-    # proc-macro ecosystem). Exit: upstream framework releases drop them.
+    # proc-macro ecosystem). Exit: upstream framework releases drop them, or
+    # the sled migration reader itself is removed.
     "RUSTSEC-2025-0057", # fxhash (via sled)
     "RUSTSEC-2024-0384", # instant (via sled's parking_lot)
     "RUSTSEC-2024-0436", # paste (proc-macro, compile-time only)

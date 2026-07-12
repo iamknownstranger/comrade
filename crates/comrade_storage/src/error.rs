@@ -33,3 +33,33 @@ impl From<sled::Error> for StorageError {
         StorageError::Db(e.to_string())
     }
 }
+
+impl From<redb::DatabaseError> for StorageError {
+    fn from(e: redb::DatabaseError) -> Self {
+        StorageError::Db(e.to_string())
+    }
+}
+
+impl From<redb::TransactionError> for StorageError {
+    fn from(e: redb::TransactionError) -> Self {
+        StorageError::Db(e.to_string())
+    }
+}
+
+impl From<redb::TableError> for StorageError {
+    fn from(e: redb::TableError) -> Self {
+        StorageError::Db(e.to_string())
+    }
+}
+
+impl From<redb::CommitError> for StorageError {
+    fn from(e: redb::CommitError) -> Self {
+        StorageError::Db(e.to_string())
+    }
+}
+
+impl From<redb::StorageError> for StorageError {
+    fn from(e: redb::StorageError) -> Self {
+        StorageError::Db(e.to_string())
+    }
+}
