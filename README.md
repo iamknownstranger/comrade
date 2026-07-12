@@ -17,14 +17,14 @@ entirely in Rust, with a shared view-model layer driving an Android
 | Engine | Protocol | Feature | Status |
 |--------|----------|---------|--------|
 | **Sabha** | Nostr Kind-1 + NIP-10 | Public microblogging — the **Chitthi Feed**, with nested `ChitthiThread` reply trees | ✅ Wired (desktop + Android: broadcast + live feed; reply threading in live feed pending) |
-| **Vault** | Nostr Kind-4 + NIP-04 | End-to-end encrypted direct messages; replies (NIP-10 `e` tag), delivered/read receipts, `/pay` UPI intent detection | ✅ Send + receive wired (desktop + Android), offline chat history persisted; NIP-44 migration planned |
+| **Vault** | NIP-44 + NIP-17/NIP-59 (gift-wrapped); legacy NIP-04 read-only | End-to-end encrypted direct messages; replies (NIP-10 `e` tag), delivered/read receipts, `/pay` UPI intent detection | ✅ Send + receive wired (desktop + Android), offline chat history persisted. New DMs are NIP-44-encrypted and gift-wrapped (no sender/content metadata leaks to relays); a peer's older NIP-04 DMs still decrypt |
 | **Message requests** | Conversation gate + Kind-4 profile share | A stranger's DM lands in a *requests* bucket, not your chat list; **your @handle is shared only when you accept**; accept / block; blocked keys are dropped | ✅ Engine + bridges tested; UI wired (desktop + Android) |
 | **Profiles** | Nostr Kind-0 + NIP-50 | @username display handles: published with retry **and republished on every launch**, searched on dedicated NIP-50 relays; peers' handles cached locally so chats are titled by name; per-contact aliases | ✅ Wired (Android onboarding + settings + chat UI; desktop backend commands) |
 | **Saathi** | libp2p mDNS + Gossipsub | Off-grid local mesh — works without internet | 🧪 Experimental — engine + tests only, not started by any frontend |
 | **Sakha/Sakhi** | Yrs CRDT + AES-256-GCM | Cryptographically isolated shared ledger for couples | 🧪 Engine built; pairing handshake not yet reachable from any UI |
 | **Relay gossip** | NIP-65 | Dynamic relay discovery + outbox-model routing | 🧪 Experimental — routing library + CLI demo only |
 | **Media** | NIP-94 / NIP-96 | Encrypted file staging + pluggable decentralized upload | ⚠️ Send + download-and-decrypt over Blossom (`media-http` feature) — desktop **and Android** (attach button); rich in-thread rendering of received media is Android follow-up; not on CLI |
-| **Calls** | WebRTC + signaling over the Vault DM channel (NIP-100 direction) | 1:1 **voice & video** — SDP/ICE ride encrypted DMs; public STUN by default, configurable TURN; call log | ⚠️ Signaling engine + call log tested; desktop wired (webview WebRTC); Android native (`org.webrtc`) is a documented follow-up — see [`AUDIT.md` §8.1](AUDIT.md). Connection not guaranteed on CGNAT without TURN |
+| **Calls** | WebRTC + signaling over the Vault DM channel (NIP-100 direction) | 1:1 **voice & video** — SDP/ICE ride encrypted DMs; STUN-only first attempt, automatic fallback to a configurable TURN relay if STUN can't connect (e.g. strict CGNAT); call log | ⚠️ Signaling engine + call log tested, incl. the STUN→TURN fallback strategy (`IceStrategy`); desktop wired (webview WebRTC); Android native (`org.webrtc`) is a documented follow-up — see [`AUDIT.md` §8.1](AUDIT.md). Frontends still need to call the fallback on ICE failure (currently only `place_call`'s initial offer is wired to start STUN-only) |
 | **Storage** | redb + Argon2id + AES-256-GCM | Encrypted-at-rest persistence (identity, ChitthiCache, VaultCache, LedgerState) unlocked by a passphrase | ✅ Wired (identity + own posts; incoming-message persistence planned) |
 | **Voice** | Vosk (offline) + Android TTS | "Hey Comrade" wake word, tap-to-talk, and assist-app role — all on-device, no cloud | ⚠️ Recognition/dispatch work; `post`/`read timeline` need a vault-unlock screen the Android UI doesn't have yet |
 
@@ -35,7 +35,7 @@ entirely in Rust, with a shared view-model layer driving an Android
 > **Nomenclature.** A public post is a **Chitthi** (Hindi for *letter*) throughout
 > the application layer — `ChitthiNode`/`ChitthiThread`, `broadcast_chitthi`,
 > `subscribe_chitthi_feed`, the `chitthi_cache`. Nostr protocol constants
-> (`Kind::TextNote`, NIP-04) are kept intact at the wire level.
+> (`Kind::TextNote`, NIP-44) are kept intact at the wire level.
 
 ## Identity & usernames
 

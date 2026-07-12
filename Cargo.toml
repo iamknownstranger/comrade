@@ -15,7 +15,7 @@ resolver = "2"
 
 [workspace.dependencies]
 tokio          = { version = "1",     features = ["full"] }
-nostr-sdk      = { version = "0.44", features = ["nip04"] }
+nostr-sdk      = { version = "0.44", features = ["nip04", "nip44", "nip59"] }
 libp2p         = { version = "0.56",  features = ["tokio", "tcp", "noise", "yamux", "mdns", "gossipsub", "macros"] }
 yrs            = "0.21"
 serde          = { version = "1",     features = ["derive"] }
