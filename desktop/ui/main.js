@@ -148,11 +148,23 @@
     workspace: null,
     chitthis: [],
     seenChitthi: new Set(),
-    dms: new Map(), // peer pubkey -> [{ content?, media?, created_at, outgoing, upi }]
+    // peer pubkey -> [{ id?, content?, media?, created_at, outgoing, upi, status?, reply_to? }]
+    dms: new Map(),
     activeContact: null,
     coupleRole: "sakha",
     partnerNpub: null,
+    // Milestone 6: comms
+    requests: [], // pending stranger DMs: [{ peer, last_message, last_at }]
+    peerNames: new Map(), // peer pubkey -> published display handle
+    replyTo: null, // { id, content, outgoing } while composing a reply
+    call: null, // active call session (see newCallState)
   };
+
+  // Prefer a peer's published handle over the raw npub when we have one.
+  function displayName(peer) {
+    const n = state.peerNames.get(peer);
+    return n ? n : shortNpub(peer);
+  }
 
   // ── Media helpers ─────────────────────────────────────────────────────────
   function fileToBase64(file) {
@@ -265,6 +277,7 @@
       applyWorkspace(ws);
       await loadTimeline();
       await loadConversations();
+      await loadRequests();
     } catch {
       /* error already toasted */
     } finally {
@@ -389,10 +402,12 @@
     const key = p.sender || "unknown";
     const list = state.dms.get(key) || [];
     list.push({
+      id: p.id,
       content: p.content || "",
       created_at: p.created_at,
       outgoing: false,
       upi: p.upi_intents || [],
+      reply_to: p.reply_to || null,
     });
     state.dms.set(key, list);
     renderContacts();
@@ -416,7 +431,7 @@
             class: "contact" + (k === state.activeContact ? " is-active" : ""),
             onClick: () => selectContact(k),
           },
-          el("span", { class: "contact-name", text: shortNpub(k) }),
+          el("span", { class: "contact-name", text: displayName(k) }),
           el("span", {
             class: "contact-last",
             text: last
@@ -449,11 +464,14 @@
 
   function selectContact(key) {
     state.activeContact = key;
+    clearReply();
     $("#dm-input").disabled = false;
     $("#dm-attach").disabled = false;
     $("#dm-send").disabled = false;
     renderContacts();
     renderConversation();
+    // Opening a conversation clears its unread state and sends read receipts.
+    safeInvoke("mark_conversation_read", { peer: key }, { silent: true }).catch(() => {});
     // Pull the full persisted thread; keep live media bubbles (not part of the
     // stored text history) merged in.
     safeInvoke("messages_with", { peer: key }, { silent: true })
@@ -462,10 +480,13 @@
         const media = (state.dms.get(key) || []).filter((m) => m.media);
         const merged = msgs
           .map((m) => ({
+            id: m.id,
             content: m.content,
             created_at: m.created_at,
             outgoing: !!m.outgoing,
             upi: [],
+            status: m.status || null,
+            reply_to: m.reply_to || null,
           }))
           .concat(media)
           .sort((a, b) => a.created_at - b.created_at);
@@ -485,22 +506,33 @@
       return;
     }
     const btn = $("#dm-send");
+    const replyTo = state.replyTo;
     setBusy(btn, true);
     try {
-      const msg = await safeInvoke("send_dm", {
-        target: state.activeContact,
-        content,
-      });
+      const msg = replyTo
+        ? await safeInvoke("send_dm_reply", {
+            target: state.activeContact,
+            content,
+            replyTo: replyTo.id,
+          })
+        : await safeInvoke("send_dm", {
+            target: state.activeContact,
+            content,
+          });
       input.value = "";
       const preview = $("#dm-upi-preview");
       preview.hidden = true;
       preview.innerHTML = "";
+      clearReply();
       const list = state.dms.get(state.activeContact) || [];
       list.push({
+        id: msg.id,
         content: msg.content,
         created_at: msg.created_at,
         outgoing: true,
         upi: [],
+        status: msg.status || "sent",
+        reply_to: msg.reply_to || (replyTo ? replyTo.id : null),
       });
       state.dms.set(state.activeContact, list);
       renderContacts();
@@ -521,7 +553,28 @@
       head.append(el("span", { class: "muted", text: "Select a conversation" }));
       return;
     }
-    head.textContent = shortNpub(state.activeContact);
+    const peer = state.activeContact;
+    head.append(
+      el("span", { class: "chat-peer mono", text: displayName(peer) }),
+      el(
+        "div",
+        { class: "chat-actions" },
+        el("button", {
+          class: "icon-btn",
+          title: "Voice call",
+          "aria-label": "Start voice call",
+          text: "📞",
+          onClick: () => startCall(peer, "audio"),
+        }),
+        el("button", {
+          class: "icon-btn",
+          title: "Video call",
+          "aria-label": "Start video call",
+          text: "🎥",
+          onClick: () => startCall(peer, "video"),
+        }),
+      ),
+    );
     const msgs = state.dms.get(state.activeContact) || [];
     for (const m of msgs) {
       log.append(m.media ? mediaBubble(m) : textBubble(m));
@@ -539,12 +592,740 @@
   }
 
   function textBubble(m) {
+    const wrap = el("div", { class: "bubble " + (m.outgoing ? "out" : "in") });
+    if (m.reply_to) wrap.append(quotePreview(m.reply_to));
+    wrap.append(el("span", { class: "bubble-text", text: m.content }));
+    wrap.append(
+      el(
+        "div",
+        { class: "bubble-meta" },
+        el("span", { class: "bubble-time", text: relTime(m.created_at) }),
+        m.outgoing && m.status ? statusTick(m.status) : null,
+      ),
+    );
+    // A reply is only addressable if we know the target message's event id.
+    if (m.id) wrap.append(replyButton(m));
+    return wrap;
+  }
+
+  // ── Milestone 6: replies, receipts, requests, calls ───────────────────────
+
+  /** A quoted preview of the replied-to message, looked up in the open thread. */
+  function quotePreview(replyToId) {
+    const msgs = state.dms.get(state.activeContact) || [];
+    const q = msgs.find((x) => x.id && x.id === replyToId);
+    const text = q
+      ? q.content || (q.media ? `📎 ${q.media.caption || "media"}` : "message")
+      : "Original message";
     return el(
       "div",
-      { class: "bubble " + (m.outgoing ? "out" : "in") },
-      el("span", { text: m.content }),
-      el("span", { class: "bubble-time", text: relTime(m.created_at) }),
+      { class: "bubble-quote" },
+      el("span", { class: "bubble-quote-text", text: text }),
     );
+  }
+
+  /** Delivery-status ticks for an outgoing bubble. */
+  function statusTick(status) {
+    const glyph = status === "sent" ? "✓" : "✓✓";
+    return el("span", {
+      class: "bubble-status" + (status === "read" ? " read" : ""),
+      title: status,
+      text: glyph,
+    });
+  }
+
+  function replyButton(m) {
+    return el("button", {
+      class: "bubble-reply",
+      title: "Reply",
+      "aria-label": "Reply to this message",
+      text: "↩",
+      onClick: (e) => {
+        e.stopPropagation();
+        setReply(m);
+      },
+    });
+  }
+
+  function setReply(m) {
+    if (!m || !m.id) return;
+    const content = m.content || (m.media ? `📎 ${m.media.caption || "media"}` : "message");
+    state.replyTo = { id: m.id, content, outgoing: !!m.outgoing };
+    $("#dm-reply-text").textContent = content;
+    $("#dm-reply-chip").hidden = false;
+    const input = $("#dm-input");
+    if (!input.disabled) input.focus();
+  }
+
+  function clearReply() {
+    state.replyTo = null;
+    const chip = $("#dm-reply-chip");
+    if (chip) chip.hidden = true;
+  }
+
+  // ── Delivered / read receipts ──────────────────────────────────────────────
+  const STATUS_RANK = { sent: 1, delivered: 2, read: 3 };
+
+  function onMessageStatus(p) {
+    const list = state.dms.get(p.peer);
+    if (!list) return;
+    const ids = new Set(p.message_ids || []);
+    const next = p.status;
+    let changed = false;
+    for (const m of list) {
+      if (!m.outgoing || !m.id || !ids.has(m.id)) continue;
+      // Never regress a status (a late "delivered" must not undo "read").
+      if ((STATUS_RANK[next] || 0) >= (STATUS_RANK[m.status] || 0)) {
+        m.status = next;
+        changed = true;
+      }
+    }
+    if (changed && state.activeContact === p.peer) renderConversation();
+  }
+
+  function onPeerProfileUpdated(p) {
+    if (!p.peer) return;
+    if (p.name) state.peerNames.set(p.peer, p.name);
+    else state.peerNames.delete(p.peer);
+    renderContacts();
+    renderRequests();
+    if (state.activeContact === p.peer) renderConversation();
+  }
+
+  // ── Message requests (stranger DMs awaiting accept/block) ──────────────────
+  async function loadRequests() {
+    let reqs;
+    try {
+      reqs = await safeInvoke("message_requests", undefined, { silent: true });
+    } catch {
+      return; // older backend without the command
+    }
+    state.requests = Array.isArray(reqs) ? reqs : [];
+    renderRequests();
+  }
+
+  function renderRequests() {
+    const section = $("#requests-section");
+    if (!section) return;
+    const list = $("#requests-list");
+    const count = $("#requests-count");
+    list.innerHTML = "";
+    const reqs = state.requests || [];
+    section.hidden = reqs.length === 0;
+    count.textContent = reqs.length ? String(reqs.length) : "";
+    for (const r of reqs) {
+      list.append(
+        el(
+          "li",
+          { class: "request" },
+          el(
+            "div",
+            { class: "request-info" },
+            el("span", { class: "request-name mono", text: displayName(r.peer) }),
+            el("span", { class: "request-last", text: r.last_message || "" }),
+          ),
+          el(
+            "div",
+            { class: "request-actions" },
+            el("button", {
+              class: "btn btn-primary btn-sm",
+              text: "Accept",
+              onClick: () => acceptRequest(r.peer),
+            }),
+            el("button", {
+              class: "btn btn-ghost btn-sm",
+              text: "Block",
+              onClick: () => blockRequest(r.peer),
+            }),
+          ),
+        ),
+      );
+    }
+  }
+
+  async function acceptRequest(peer) {
+    try {
+      await safeInvoke("accept_request", { peer });
+    } catch {
+      return; // toasted
+    }
+    state.requests = (state.requests || []).filter((r) => r.peer !== peer);
+    renderRequests();
+    showToast(`Request from ${shortNpub(peer)} accepted`, "success");
+    loadRequests().catch(() => {});
+    loadConversations().catch(() => {});
+  }
+
+  async function blockRequest(peer) {
+    try {
+      await safeInvoke("block_conversation", { peer });
+    } catch {
+      return; // toasted
+    }
+    state.requests = (state.requests || []).filter((r) => r.peer !== peer);
+    renderRequests();
+    showToast(`${shortNpub(peer)} blocked`, "info");
+    loadRequests().catch(() => {});
+    loadConversations().catch(() => {});
+  }
+
+  function onIncomingMessageRequest(p) {
+    const rec = { peer: p.peer, last_message: p.last_message, last_at: p.last_at };
+    const i = (state.requests || []).findIndex((r) => r.peer === p.peer);
+    if (i >= 0) state.requests[i] = rec;
+    else state.requests.unshift(rec);
+    renderRequests();
+    showToast(`New message request from ${shortNpub(p.peer)}`, "info");
+  }
+
+  // ── TURN relay (call settings) ─────────────────────────────────────────────
+  function openTurnModal() {
+    $("#modal-turn").hidden = false;
+    $("#turn-url").focus();
+  }
+  function closeTurnModal() {
+    $("#modal-turn").hidden = true;
+  }
+  async function handleSaveTurn() {
+    const url = $("#turn-url").value.trim();
+    const username = $("#turn-username").value.trim();
+    const credential = $("#turn-credential").value.trim();
+    const btn = $("#turn-save");
+    setBusy(btn, true);
+    try {
+      await safeInvoke("set_turn_server", { url, username, credential });
+      showToast(url ? "TURN relay saved" : "TURN relay cleared", "success");
+      closeTurnModal();
+    } catch {
+      /* toasted */
+    } finally {
+      setBusy(btn, false);
+    }
+  }
+
+  // ── WebRTC 1:1 voice / video calls ─────────────────────────────────────────
+  //
+  // Signaling rides the E2E DM channel: we hand a CallSignal JSON string to
+  // `send_call_signal`, and receive the peer's signals as `incoming_call_signal`
+  // events. WebRTC itself (getUserMedia + RTCPeerConnection) runs in the webview.
+  // One call at a time; `state.call` holds the whole session.
+
+  function callSupported() {
+    return !!(
+      navigator.mediaDevices &&
+      navigator.mediaDevices.getUserMedia &&
+      window.RTCPeerConnection
+    );
+  }
+
+  function newCallState(base) {
+    return Object.assign(
+      {
+        callId: null,
+        peer: null,
+        media: "audio",
+        incoming: false,
+        phase: "calling", // calling | ringing | connecting | connected
+        pc: null,
+        localStream: null,
+        remoteStream: null,
+        offerSdp: null, // buffered offer (callee) until Accept
+        pendingIce: [], // remote candidates buffered until remoteDescription set
+        remoteSet: false,
+        connected: false,
+        startedAt: null, // connect time (unix secs) that drives the timer
+        initAt: nowSecs(), // call-initiation time; the log's started_at fallback
+        timerId: null,
+        muted: false,
+        ended: false,
+      },
+      base,
+    );
+  }
+
+  // Map ice-server DTOs -> RTCIceServer, dropping null auth fields.
+  function normalizeIce(list) {
+    return (list || [])
+      .map((s) => {
+        const o = { urls: s.urls };
+        if (s.username != null) o.username = s.username;
+        if (s.credential != null) o.credential = s.credential;
+        return o;
+      })
+      .filter((o) => o.urls && o.urls.length);
+  }
+
+  async function sendSignal(sig) {
+    const c = state.call;
+    if (!c) return;
+    try {
+      await safeInvoke(
+        "send_call_signal",
+        {
+          peer: c.peer,
+          callId: c.callId,
+          media: c.media,
+          signalJson: JSON.stringify(sig),
+        },
+        { silent: true },
+      );
+    } catch {
+      /* ICE loss is tolerable; a dropped offer/answer fails the call cleanly */
+    }
+  }
+
+  // Shared peer-connection setup for both the caller and the accepting callee.
+  async function setupPeer(iceServers) {
+    const c = state.call;
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: true,
+        video: c.media === "video",
+      });
+    } catch (e) {
+      showToast(`Microphone/camera unavailable — ${errText(e)}`, "error");
+      await finishCall({
+        sendHangup: true,
+        reason: c.incoming ? "declined" : "failed",
+        outcome: "failed",
+      });
+      return false;
+    }
+    let pc;
+    try {
+      pc = new RTCPeerConnection({ iceServers: normalizeIce(iceServers) });
+    } catch (e) {
+      showToast(`Could not start WebRTC — ${errText(e)}`, "error");
+      stream.getTracks().forEach((t) => t.stop());
+      await finishCall({ sendHangup: true, reason: "failed", outcome: "failed" });
+      return false;
+    }
+    c.localStream = stream;
+    c.pc = pc;
+    c.remoteStream = new MediaStream();
+    for (const track of stream.getTracks()) pc.addTrack(track, stream);
+
+    pc.onicecandidate = (ev) => {
+      if (!ev.candidate) return; // null == end-of-candidates
+      sendSignal({
+        kind: "ice",
+        candidate: ev.candidate.candidate,
+        sdp_mid: ev.candidate.sdpMid == null ? undefined : ev.candidate.sdpMid,
+        sdp_m_line_index:
+          ev.candidate.sdpMLineIndex == null ? undefined : ev.candidate.sdpMLineIndex,
+      });
+    };
+    pc.ontrack = (ev) => {
+      if (ev.streams && ev.streams[0]) c.remoteStream = ev.streams[0];
+      else c.remoteStream.addTrack(ev.track);
+      attachRemoteMedia();
+    };
+    pc.onconnectionstatechange = () => {
+      const st = pc.connectionState;
+      if (st === "connected") onCallConnected();
+      else if (st === "failed")
+        finishCall({ sendHangup: true, reason: "failed", outcome: "failed" });
+      // "disconnected" can be transient (ICE restart); don't tear down on it.
+    };
+
+    attachLocalMedia();
+    attachRemoteMedia();
+    return true;
+  }
+
+  // Caller: place the call, negotiate locally, and send the offer.
+  async function startCall(peer, media) {
+    if (!peer) {
+      showToast("Select a conversation first", "warn");
+      return;
+    }
+    if (state.call) {
+      showToast("You're already in a call", "warn");
+      return;
+    }
+    if (!callSupported()) {
+      showToast("Calling isn't available in this environment", "error");
+      return;
+    }
+    let session;
+    try {
+      session = await safeInvoke("place_call", { peer, media });
+    } catch {
+      return; // toasted
+    }
+    state.call = newCallState({
+      callId: session.call_id,
+      peer: session.peer || peer,
+      media: session.media || media,
+      incoming: false,
+      phase: "calling",
+    });
+    showCallOverlay();
+    setCallStatusText("Calling…");
+    const ok = await setupPeer(session.ice_servers || []);
+    if (!ok) return; // setupPeer handled cleanup
+    try {
+      const offer = await state.call.pc.createOffer();
+      await state.call.pc.setLocalDescription(offer);
+      await sendSignal({ kind: "offer", sdp: offer.sdp });
+    } catch (e) {
+      showToast(`Could not start the call — ${errText(e)}`, "error");
+      await finishCall({ sendHangup: true, reason: "failed", outcome: "failed" });
+    }
+  }
+
+  // Callee: an offer arrived. Ring (Accept/Decline), or auto-reject if busy.
+  async function handleIncomingOffer(p, sig) {
+    if (state.call) {
+      // Busy: politely reject the new caller and log the missed attempt.
+      try {
+        await safeInvoke(
+          "send_call_signal",
+          {
+            peer: p.peer,
+            callId: p.call_id,
+            media: p.media,
+            signalJson: JSON.stringify({ kind: "busy" }),
+          },
+          { silent: true },
+        );
+      } catch {
+        /* best-effort */
+      }
+      logCall(p.peer, p.call_id, p.media, true, "busy", nowSecs(), 0);
+      return;
+    }
+    if (!callSupported()) {
+      try {
+        await safeInvoke(
+          "hangup_call",
+          { peer: p.peer, callId: p.call_id, media: p.media, reason: "failed" },
+          { silent: true },
+        );
+      } catch {
+        /* best-effort */
+      }
+      return;
+    }
+    state.call = newCallState({
+      callId: p.call_id,
+      peer: p.peer,
+      media: p.media,
+      incoming: true,
+      phase: "ringing",
+      offerSdp: sig.sdp,
+    });
+    sendSignal({ kind: "ringing" }); // best-effort, not awaited
+    showRingingOverlay();
+    showToast(
+      `Incoming ${p.media === "video" ? "video" : "voice"} call from ${shortNpub(p.peer)}`,
+      "info",
+    );
+  }
+
+  async function acceptIncoming() {
+    const c = state.call;
+    if (!c || !c.incoming || c.pc) return; // only valid from the ringing phase
+    hideRingingOverlay();
+    c.phase = "connecting";
+    showCallOverlay();
+    setCallStatusText("Connecting…");
+    let ice = [];
+    try {
+      ice = (await safeInvoke("call_ice_servers", undefined, { silent: true })) || [];
+    } catch {
+      /* fall back to host-only candidates */
+    }
+    const ok = await setupPeer(ice);
+    if (!ok) return;
+    try {
+      await c.pc.setRemoteDescription({ type: "offer", sdp: c.offerSdp });
+      c.remoteSet = true;
+      await flushPendingIce();
+      const answer = await c.pc.createAnswer();
+      await c.pc.setLocalDescription(answer);
+      await sendSignal({ kind: "answer", sdp: answer.sdp });
+    } catch (e) {
+      showToast(`Could not answer the call — ${errText(e)}`, "error");
+      await finishCall({ sendHangup: true, reason: "failed", outcome: "failed" });
+    }
+  }
+
+  function declineIncoming() {
+    if (!state.call) return;
+    finishCall({ sendHangup: true, reason: "declined", outcome: "declined" });
+  }
+
+  function hangupByUser() {
+    const c = state.call;
+    if (!c) return;
+    const wasConnected = c.connected;
+    finishCall({
+      sendHangup: true,
+      reason: wasConnected ? "normal" : c.incoming ? "declined" : "cancelled",
+      outcome: wasConnected ? "connected" : c.incoming ? "declined" : "cancelled",
+    });
+  }
+
+  // Route a non-offer signal (answer/ice/ringing/busy/hangup) to the live call.
+  function onCallSignal(p) {
+    const sig = p.signal || {};
+    const kind = sig.kind;
+    if (kind === "offer") {
+      handleIncomingOffer(p, sig);
+      return;
+    }
+    const c = state.call;
+    if (!c || c.callId !== p.call_id) return; // stray, or for a call we've ended
+    if (kind === "answer") {
+      applyRemoteAnswer(sig.sdp);
+    } else if (kind === "ice") {
+      addRemoteIce(sig);
+    } else if (kind === "ringing") {
+      if (!c.connected) setCallStatusText("Ringing…");
+    } else if (kind === "busy") {
+      showToast(`${displayName(c.peer)} is busy`, "warn");
+      finishCall({ sendHangup: false, reason: "busy", outcome: "busy" });
+    } else if (kind === "hangup") {
+      const reason = sig.reason || "normal";
+      const outcome = remoteHangupOutcome(c, reason);
+      showToast(
+        outcome === "declined" ? `${displayName(c.peer)} declined the call` : "Call ended",
+        "info",
+      );
+      finishCall({ sendHangup: false, reason, outcome });
+    }
+  }
+
+  async function applyRemoteAnswer(sdp) {
+    const c = state.call;
+    if (!c || !c.pc) return;
+    try {
+      await c.pc.setRemoteDescription({ type: "answer", sdp });
+      c.remoteSet = true;
+      await flushPendingIce();
+      if (!c.connected) setCallStatusText("Connecting…");
+    } catch (e) {
+      await finishCall({ sendHangup: true, reason: "failed", outcome: "failed" });
+    }
+  }
+
+  async function addRemoteIce(sig) {
+    const c = state.call;
+    if (!c) return;
+    const cand = {
+      candidate: sig.candidate,
+      sdpMid: sig.sdp_mid == null ? null : sig.sdp_mid,
+      sdpMLineIndex: sig.sdp_m_line_index == null ? null : sig.sdp_m_line_index,
+    };
+    // Buffer until the remote description exists (also covers the ring phase).
+    if (!c.pc || !c.remoteSet) {
+      c.pendingIce.push(cand);
+      return;
+    }
+    try {
+      await c.pc.addIceCandidate(cand);
+    } catch {
+      /* a rejected candidate shouldn't kill the call */
+    }
+  }
+
+  async function flushPendingIce() {
+    const c = state.call;
+    if (!c || !c.pc) return;
+    const queued = c.pendingIce.splice(0);
+    for (const cand of queued) {
+      try {
+        await c.pc.addIceCandidate(cand);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  function remoteHangupOutcome(c, reason) {
+    if (c.connected) return "connected";
+    if (c.incoming) return "missed"; // caller cancelled before we answered
+    if (reason === "declined") return "declined";
+    if (reason === "busy") return "busy";
+    if (reason === "missed") return "missed";
+    return "cancelled";
+  }
+
+  function onCallConnected() {
+    const c = state.call;
+    if (!c || c.connected) return;
+    c.connected = true;
+    c.phase = "connected";
+    c.startedAt = nowSecs();
+    startDurationTimer();
+  }
+
+  // Best-effort call-log write (never surfaces its own error).
+  function logCall(peer, callId, media, incoming, outcome, startedAt, durationSecs) {
+    safeInvoke(
+      "log_call",
+      { peer, callId, media, incoming, outcome, startedAt, durationSecs },
+      { silent: true },
+    ).catch(() => {});
+  }
+
+  // The single call terminator: optionally signal hangup, log, stop media, hide.
+  async function finishCall({ sendHangup, reason, outcome }) {
+    const c = state.call;
+    if (!c || c.ended) return;
+    c.ended = true;
+    stopDurationTimer();
+    const duration = c.startedAt ? Math.max(0, nowSecs() - c.startedAt) : 0;
+    if (sendHangup) {
+      try {
+        await safeInvoke(
+          "hangup_call",
+          { peer: c.peer, callId: c.callId, media: c.media, reason },
+          { silent: true },
+        );
+      } catch {
+        /* best-effort */
+      }
+    }
+    logCall(
+      c.peer,
+      c.callId,
+      c.media,
+      c.incoming,
+      outcome,
+      c.startedAt || c.initAt || nowSecs(),
+      duration,
+    );
+    teardownMedia(c);
+    hideCallOverlay();
+    hideRingingOverlay();
+    state.call = null;
+  }
+
+  function teardownMedia(c) {
+    try {
+      if (c.pc) {
+        c.pc.onicecandidate = null;
+        c.pc.ontrack = null;
+        c.pc.onconnectionstatechange = null;
+        c.pc.close();
+      }
+    } catch {
+      /* ignore */
+    }
+    try {
+      if (c.localStream) c.localStream.getTracks().forEach((t) => t.stop());
+    } catch {
+      /* ignore */
+    }
+    try {
+      $("#call-remote-video").srcObject = null;
+      $("#call-local-video").srcObject = null;
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function toggleMute() {
+    const c = state.call;
+    if (!c || !c.localStream) return;
+    c.muted = !c.muted;
+    for (const t of c.localStream.getAudioTracks()) t.enabled = !c.muted;
+    const btn = $("#call-mute");
+    btn.classList.toggle("is-muted", c.muted);
+    btn.textContent = c.muted ? "🔇" : "🎙";
+    btn.title = c.muted ? "Unmute microphone" : "Mute microphone";
+  }
+
+  // ── Call overlay / media-element plumbing ──────────────────────────────────
+  function showCallOverlay() {
+    const c = state.call;
+    if (!c) return;
+    $("#call-peer").textContent = displayName(c.peer);
+    $("#call-media-label").textContent = c.media === "video" ? "Video call" : "Voice call";
+    $("#call-timer").hidden = true;
+    attachLocalMedia();
+    attachRemoteMedia();
+    $("#call-active").hidden = false;
+  }
+
+  function hideCallOverlay() {
+    $("#call-active").hidden = true;
+    const mb = $("#call-mute");
+    mb.classList.remove("is-muted");
+    mb.textContent = "🎙";
+    mb.title = "Mute microphone";
+  }
+
+  function showRingingOverlay() {
+    const c = state.call;
+    if (!c) return;
+    $("#ring-peer").textContent = displayName(c.peer);
+    $("#ring-media").textContent =
+      c.media === "video" ? "Incoming video call" : "Incoming voice call";
+    $("#call-ring").hidden = false;
+  }
+
+  function hideRingingOverlay() {
+    $("#call-ring").hidden = true;
+  }
+
+  function attachLocalMedia() {
+    const c = state.call;
+    if (!c) return;
+    const lv = $("#call-local-video");
+    if (c.media === "video" && c.localStream) {
+      lv.srcObject = c.localStream;
+      lv.hidden = false;
+    } else {
+      lv.srcObject = null;
+      lv.hidden = true;
+    }
+  }
+
+  function attachRemoteMedia() {
+    const c = state.call;
+    if (!c) return;
+    // One <video> carries remote audio+video; on a voice call it just plays
+    // audio while the avatar covers the empty frame.
+    if (c.remoteStream) $("#call-remote-video").srcObject = c.remoteStream;
+    $("#call-avatar").hidden = c.media === "video";
+  }
+
+  function setCallStatusText(text) {
+    const node = $("#call-status");
+    if (text == null) {
+      node.hidden = true;
+      return;
+    }
+    node.hidden = false;
+    node.textContent = text;
+  }
+
+  function startDurationTimer() {
+    stopDurationTimer();
+    const timerEl = $("#call-timer");
+    timerEl.hidden = false;
+    setCallStatusText(null);
+    const tick = () => {
+      const c = state.call;
+      if (!c || !c.startedAt) return;
+      const s = Math.max(0, nowSecs() - c.startedAt);
+      const mm = String(Math.floor(s / 60)).padStart(2, "0");
+      const ss = String(s % 60).padStart(2, "0");
+      timerEl.textContent = `${mm}:${ss}`;
+    };
+    tick();
+    if (state.call) state.call.timerId = setInterval(tick, 1000);
+  }
+
+  function stopDurationTimer() {
+    if (state.call && state.call.timerId) {
+      clearInterval(state.call.timerId);
+      state.call.timerId = null;
+    }
   }
 
   // A media bubble: renders inline if we already hold an object URL (our own
@@ -802,6 +1583,14 @@
           onIncomingDm(p);
         } else if (p.type === "incoming_media") {
           onIncomingMedia(p);
+        } else if (p.type === "incoming_call_signal") {
+          onCallSignal(p);
+        } else if (p.type === "incoming_message_request") {
+          onIncomingMessageRequest(p);
+        } else if (p.type === "message_status") {
+          onMessageStatus(p);
+        } else if (p.type === "peer_profile_updated") {
+          onPeerProfileUpdated(p);
         }
       });
     } catch (e) {
@@ -864,11 +1653,28 @@
     $("#couple-exit").addEventListener("click", exitCouple);
     $("#sync-ledger-btn").addEventListener("click", handleSyncLedger);
 
+    // Reply chip + message requests + call settings (Milestone 6)
+    $("#dm-reply-cancel").addEventListener("click", clearReply);
+    $("#call-settings-btn").addEventListener("click", openTurnModal);
+    $("#turn-cancel").addEventListener("click", closeTurnModal);
+    $("#turn-save").addEventListener("click", handleSaveTurn);
+
+    // Call overlays (ringing + in-call controls)
+    $("#ring-accept").addEventListener("click", acceptIncoming);
+    $("#ring-decline").addEventListener("click", declineIncoming);
+    $("#call-mute").addEventListener("click", toggleMute);
+    $("#call-hangup").addEventListener("click", hangupByUser);
+
     $("#modal-partner").addEventListener("click", (e) => {
       if (e.target === $("#modal-partner")) closePartnerModal();
     });
+    $("#modal-turn").addEventListener("click", (e) => {
+      if (e.target === $("#modal-turn")) closeTurnModal();
+    });
     document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape" && !$("#modal-partner").hidden) closePartnerModal();
+      if (e.key !== "Escape") return;
+      if (!$("#modal-partner").hidden) closePartnerModal();
+      else if (!$("#modal-turn").hidden) closeTurnModal();
     });
 
     wireEvents();
@@ -892,6 +1698,18 @@
     let ws = wsOf("Base");
     const delay = (ms) => new Promise((r) => setTimeout(r, ms));
     const re = /\/pay\s+(\d+(?:\.\d{1,2})?)\s+to\s+([a-zA-Z0-9.\-_]+@[a-zA-Z0-9]+)/gi;
+    const ICE_DEMO = [
+      { urls: ["stun:stun.l.google.com:19302"], username: null, credential: null },
+    ];
+    // A demo message request so the Requests UI is visible in browser preview;
+    // accept/block splice it so the interaction feels real without a backend.
+    let mockRequests = [
+      {
+        peer: "npub1stranger00000000000000000000000000000000000000000",
+        last_message: "Hey, saw your Chitthi — mind if we chat? (mock)",
+        last_at: nowSecs() - 300,
+      },
+    ];
 
     const invoke = async (cmd, args = {}) => {
       await delay(120);
@@ -957,6 +1775,53 @@
             base64:
               "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
           };
+        // ── Milestone 6: replies / receipts / requests / calls ──────────────
+        case "send_dm_reply":
+          return {
+            id: "mockdm_" + Date.now(),
+            peer: args.target,
+            content: args.content,
+            created_at: nowSecs(),
+            outgoing: true,
+            status: "sent",
+            reply_to: args.replyTo || null,
+          };
+        case "mark_conversation_read":
+          return null;
+        case "message_requests":
+          return mockRequests.slice();
+        case "accept_request":
+          mockRequests = mockRequests.filter((r) => r.peer !== args.peer);
+          return null;
+        case "block_conversation":
+          mockRequests = mockRequests.filter((r) => r.peer !== args.peer);
+          return null;
+        case "call_ice_servers":
+          return ICE_DEMO.slice();
+        case "set_turn_server":
+          return null;
+        case "place_call":
+          return {
+            call_id: "mockcall_" + Date.now(),
+            peer: args.peer,
+            media: args.media,
+            ice_servers: ICE_DEMO.slice(),
+          };
+        case "send_call_signal":
+        case "hangup_call":
+          return null;
+        case "log_call":
+          return {
+            id: "mockrec_" + Date.now(),
+            peer: args.peer,
+            media: args.media,
+            incoming: !!args.incoming,
+            outcome: args.outcome,
+            started_at: args.startedAt || nowSecs(),
+            duration_secs: args.durationSecs || 0,
+          };
+        case "call_history":
+          return [];
         default:
           throw `mock backend: unknown command '${cmd}'`;
       }
