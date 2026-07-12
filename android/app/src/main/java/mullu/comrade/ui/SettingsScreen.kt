@@ -131,10 +131,13 @@ fun SettingsScreen(
                     color = MaterialTheme.colorScheme.primary,
                 )
                 Text(
-                    "Off-grid mesh chat (works without internet) and a private " +
-                        "shared space for couples are built and tested at the engine " +
-                        "level, but not usable from the app yet. They'll appear here " +
-                        "when they actually work — no fake switches.",
+                    "Off-grid mesh connectivity is real: switch by voice " +
+                        "(\"hey comrade, go off grid\") and the status bar shows " +
+                        "nearby devices live. Actually chatting over the mesh, and " +
+                        "the private shared space for couples, are still built and " +
+                        "tested only at the engine level, not usable from the app " +
+                        "yet. They'll appear here when they actually work — no " +
+                        "fake switches.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )

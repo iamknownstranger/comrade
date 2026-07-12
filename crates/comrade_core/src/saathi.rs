@@ -12,7 +12,7 @@
  */
 
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     hash::{DefaultHasher, Hash, Hasher},
     sync::Arc,
     time::Duration,
@@ -26,7 +26,7 @@ use libp2p::{
     PeerId, Swarm,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
 use tracing::{debug, info, warn};
 
 use crate::error::SaathiError;
@@ -75,6 +75,10 @@ struct SaathiShared {
     peer_id: PeerId,
     outbox_cache: VecDeque<MeshMessage>,
     received: Vec<MeshMessage>,
+    /// Peers currently reachable via mDNS (inserted on `Discovered`, removed on
+    /// `Expired`). A set, not a running counter, so a peer mDNS reports more
+    /// than once (it advertises once per address) never inflates the count.
+    connected_peers: HashSet<PeerId>,
 }
 
 pub struct SaathiEngine {
@@ -84,6 +88,10 @@ pub struct SaathiEngine {
     msg_rx: Arc<Mutex<mpsc::Receiver<MeshMessage>>>,
     shared: Arc<Mutex<SaathiShared>>,
     local_id: String,
+    local_peer_id: PeerId,
+    /// Live count of currently-reachable mDNS peers — the local-mesh
+    /// discovery signal a connectivity indicator subscribes to.
+    peer_count_rx: watch::Receiver<usize>,
 }
 
 enum SaathiCmd {
@@ -161,7 +169,10 @@ impl SaathiEngine {
             peer_id: local_peer_id,
             outbox_cache: VecDeque::new(),
             received: Vec::new(),
+            connected_peers: HashSet::new(),
         }));
+
+        let (peer_count_tx, peer_count_rx) = watch::channel(0usize);
 
         let shared_clone = shared.clone();
         let _label_clone = sender_label.clone();
@@ -212,8 +223,11 @@ impl SaathiEngine {
                                          .gossipsub
                                          .add_explicit_peer(&peer_id);
 
-                                    // Drain the outbox cache now that we have a peer
                                     let mut guard = shared_clone.lock().await;
+                                    guard.connected_peers.insert(peer_id);
+                                    let count = guard.connected_peers.len();
+
+                                    // Drain the outbox cache now that we have a peer
                                     while let Some(cached_msg) = guard.outbox_cache.pop_front() {
                                         let bytes = match serde_json::to_vec(&cached_msg) {
                                             Ok(b)  => b,
@@ -229,6 +243,8 @@ impl SaathiEngine {
                                             debug!("Saathi: cached message drained to network");
                                         }
                                     }
+                                    drop(guard);
+                                    let _ = peer_count_tx.send(count);
                                 }
                             }
 
@@ -240,6 +256,12 @@ impl SaathiEngine {
                                     swarm.behaviour_mut()
                                          .gossipsub
                                          .remove_explicit_peer(&peer_id);
+
+                                    let mut guard = shared_clone.lock().await;
+                                    guard.connected_peers.remove(&peer_id);
+                                    let count = guard.connected_peers.len();
+                                    drop(guard);
+                                    let _ = peer_count_tx.send(count);
                                 }
                             }
 
@@ -283,6 +305,8 @@ impl SaathiEngine {
             msg_rx: Arc::new(Mutex::new(msg_rx)),
             shared,
             local_id: sender_label,
+            local_peer_id,
+            peer_count_rx,
         })
     }
 
@@ -318,5 +342,77 @@ impl SaathiEngine {
 
     pub fn local_peer_label(&self) -> &str {
         &self.local_id
+    }
+
+    /// This node's libp2p identity, as seen by mesh peers.
+    pub fn local_peer_id(&self) -> PeerId {
+        self.local_peer_id
+    }
+
+    /// Current count of mDNS-reachable peers — a cheap, non-blocking snapshot.
+    /// Use [`Self::peer_count_stream`] to react to changes instead of polling.
+    pub fn peer_count(&self) -> usize {
+        *self.peer_count_rx.borrow()
+    }
+
+    /// Subscribe to the live count of mDNS-reachable peers. The returned
+    /// receiver immediately yields the current count, then the new value each
+    /// time a peer joins or leaves — the local-mesh discovery stream a
+    /// connectivity indicator watches.
+    pub fn peer_count_stream(&self) -> watch::Receiver<usize> {
+        self.peer_count_rx.clone()
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn peer_count_starts_at_zero() {
+        let engine = SaathiEngine::new("test-peer")
+            .await
+            .expect("engine should initialise");
+        assert_eq!(engine.peer_count(), 0);
+        assert_eq!(*engine.peer_count_stream().borrow(), 0);
+        engine.shutdown().await;
+    }
+
+    /// Two engines started in-process must discover each other over real mDNS
+    /// multicast, proving the `Discovered`/`Expired` swarm-event handlers
+    /// actually drive `peer_count` end to end (not just the plumbing).
+    #[tokio::test]
+    async fn two_engines_discover_each_other_via_mdns() {
+        let a = SaathiEngine::new("test-peer-a")
+            .await
+            .expect("engine a should initialise");
+        let b = SaathiEngine::new("test-peer-b")
+            .await
+            .expect("engine b should initialise");
+
+        async fn wait_until_connected(mut rx: watch::Receiver<usize>) {
+            while *rx.borrow() < 1 {
+                rx.changed()
+                    .await
+                    .expect("swarm driver task should stay alive");
+            }
+        }
+
+        tokio::time::timeout(Duration::from_secs(20), async {
+            tokio::join!(
+                wait_until_connected(a.peer_count_stream()),
+                wait_until_connected(b.peer_count_stream()),
+            )
+        })
+        .await
+        .expect("engines should discover each other via mDNS within 20s");
+
+        assert_eq!(a.peer_count(), 1);
+        assert_eq!(b.peer_count(), 1);
+
+        a.shutdown().await;
+        b.shutdown().await;
     }
 }
