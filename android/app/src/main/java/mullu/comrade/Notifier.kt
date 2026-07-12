@@ -1,5 +1,6 @@
 package mullu.comrade
 
+import android.annotation.SuppressLint
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -72,6 +73,7 @@ object Notifier {
     }
 
     /** A new encrypted DM from an accepted conversation. */
+    @SuppressLint("MissingPermission") // guarded by canPost() / areNotificationsEnabled()
     fun notifyMessage(context: Context, peer: String, title: String, preview: String) {
         if (!canPost(context)) return
         val n = NotificationCompat.Builder(context, CHANNEL_MESSAGES)
@@ -88,6 +90,7 @@ object Notifier {
     }
 
     /** A stranger's DM landed in the message-requests bucket. */
+    @SuppressLint("MissingPermission") // guarded by canPost() / areNotificationsEnabled()
     fun notifyRequest(context: Context, peer: String, preview: String) {
         if (!canPost(context)) return
         val n = NotificationCompat.Builder(context, CHANNEL_REQUESTS)
@@ -101,6 +104,7 @@ object Notifier {
     }
 
     /** An incoming call is ringing. */
+    @SuppressLint("MissingPermission") // guarded by canPost() / areNotificationsEnabled()
     fun notifyIncomingCall(context: Context, peer: String, title: String, video: Boolean) {
         if (!canPost(context)) return
         val kind = if (video) "video" else "voice"

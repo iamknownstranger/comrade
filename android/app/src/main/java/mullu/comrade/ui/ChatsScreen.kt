@@ -106,6 +106,29 @@ fun PeerAvatar(
 
 // ── Chat list ────────────────────────────────────────────────────────────────
 
+/** Tappable banner atop the chat list linking to the message-requests inbox. */
+@Composable
+private fun RequestsBanner(count: Int, onClick: () -> Unit) {
+    if (count <= 0) return
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onClick() }
+            .background(MaterialTheme.colorScheme.secondaryContainer)
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Text("✉", style = MaterialTheme.typography.titleMedium)
+        Text(
+            "Message requests ($count)",
+            style = MaterialTheme.typography.titleSmall,
+            modifier = Modifier.weight(1f),
+        )
+        Text("›", style = MaterialTheme.typography.titleMedium)
+    }
+}
+
 @Composable
 fun ChatsScreen(
     chatTick: Int,
@@ -125,29 +148,7 @@ fun ChatsScreen(
     }
     LaunchedEffect(chatTick, requestTick) {
         requestCount = withContext(Dispatchers.IO) {
-            runCatching { ComradeCore.messageRequests().size }.getOrDefault(0)
-        }
-    }
-
-    @Composable
-    fun RequestsBanner() {
-        if (requestCount <= 0) return
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .clickable { onOpenRequests() }
-                .background(MaterialTheme.colorScheme.secondaryContainer)
-                .padding(horizontal = 16.dp, vertical = 12.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            Text("✉", style = MaterialTheme.typography.titleMedium)
-            Text(
-                "Message requests ($requestCount)",
-                style = MaterialTheme.typography.titleSmall,
-                modifier = Modifier.weight(1f),
-            )
-            Text("›", style = MaterialTheme.typography.titleMedium)
+            runCatching { ComradeCore.messageRequestsTyped().size }.getOrDefault(0)
         }
     }
 
@@ -159,11 +160,11 @@ fun ChatsScreen(
         list.isEmpty() -> Column(
             modifier = modifier.fillMaxSize(),
         ) {
-            RequestsBanner()
+            RequestsBanner(requestCount, onOpenRequests)
             EmptyChats(onNewChat)
         }
         else -> LazyColumn(modifier = modifier.fillMaxSize()) {
-            item { RequestsBanner() }
+            item { RequestsBanner(requestCount, onOpenRequests) }
             items(list, key = { it.peer }) { convo ->
                 val title = peerTitle(convo.peer, convo.alias, convo.peerName)
                 Row(
@@ -699,7 +700,7 @@ fun RequestsScreen(
 
     LaunchedEffect(chatTick, reloadTick) {
         requests = withContext(Dispatchers.IO) {
-            runCatching { ComradeCore.messageRequests() }.getOrDefault(emptyList())
+            runCatching { ComradeCore.messageRequestsTyped() }.getOrDefault(emptyList())
         }
     }
 

@@ -453,7 +453,7 @@ object ComradeCore {
         JSONObject(sendDmReply(target, content, replyTo ?: "")).failOnError("Send").toMessage()
 
     /** Pending message requests, newest first. */
-    fun messageRequests(): List<MessageRequestInfo> {
+    fun messageRequestsTyped(): List<MessageRequestInfo> {
         val parsed = JSONTokener(messageRequests()).nextValue()
         if (parsed is JSONObject) parsed.failOnError("Requests")
         val arr = parsed as JSONArray
