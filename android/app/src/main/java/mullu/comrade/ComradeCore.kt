@@ -72,9 +72,17 @@ object ComradeCore {
 
     /**
      * Toggle the active workspace, enforcing the transition state machine.
+     * Entering "OffGridTravel" really starts the Saathi mDNS mesh engine.
      * @return the new workspace JSON, or a typed `{"error":"…"}`.
      */
     external fun toggleWorkspace(target: String): String
+
+    /**
+     * Snapshot of the off-grid mesh's live status: whether it's running, and
+     * how many peers are currently reachable via mDNS. Has no error case.
+     * @return JSON `{"active":bool,"peer_count":n}`.
+     */
+    external fun meshStatus(): String
 
     /**
      * Non-blocking drain of the next bridge event (incoming Chitthi / DM).
@@ -242,6 +250,15 @@ object ComradeCore {
             val obj = arr.getJSONObject(i)
             WorkspaceInfo(key = obj.getString("key"), label = obj.getString("label"))
         }
+    }
+
+    /** Live status of the off-grid Saathi mesh (mDNS discovery + Gossipsub). */
+    data class MeshStatus(val active: Boolean, val peerCount: Int)
+
+    /** Snapshot of the mesh's current status. Never throws. */
+    fun meshStatusTyped(): MeshStatus {
+        val o = JSONObject(meshStatus())
+        return MeshStatus(active = o.optBoolean("active"), peerCount = o.optInt("peer_count"))
     }
 
     /**

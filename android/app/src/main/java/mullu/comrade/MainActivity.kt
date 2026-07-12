@@ -10,6 +10,7 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -18,6 +19,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Create
@@ -41,6 +43,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
@@ -189,6 +192,9 @@ private sealed interface PumpEvent {
 
     /** Media / receipt / profile update — just reload the chat lists. */
     data object HistoryChanged : PumpEvent
+
+    /** The off-grid mesh's live connectivity changed. */
+    data class MeshStatusChanged(val status: ComradeCore.MeshStatus) : PumpEvent
 }
 
 /** Bound on the in-memory public feed (the relay stream is unbounded). */
@@ -240,6 +246,15 @@ private fun MainShell(
         }
         for (item in cached.sortedByDescending { it.createdAt }) addToFeed(item, front = false)
 
+        // Seed the mesh indicator with a real snapshot before the first
+        // mesh_status_changed event arrives (e.g. a fresh process that was
+        // already off-grid — an activity recreation, not a cold identity).
+        val initialMesh = withContext(Dispatchers.IO) {
+            runCatching { ComradeCore.meshStatusTyped() }
+                .getOrDefault(ComradeCore.MeshStatus(active = false, peerCount = 0))
+        }
+        MeshStatusMonitor.update(initialMesh)
+
         // Fetch the published @handles of people we already talk to, so chats
         // are titled by name instead of key. Launched on its own coroutine —
         // never awaited by the pump, so a slow relay can't stall event
@@ -289,6 +304,7 @@ private fun MainShell(
                         Notifier.notifyRequest(context, event.peer, event.preview)
                     }
                     PumpEvent.HistoryChanged -> historyChanged = true
+                    is PumpEvent.MeshStatusChanged -> MeshStatusMonitor.update(event.status)
                 }
             }
             if (historyChanged) {
@@ -306,140 +322,144 @@ private fun MainShell(
         chatNav = ChatNav.List
     }
 
-    Scaffold(
-        topBar = {
-            when {
-                tab == MainTab.Chats && openChat != null -> TopAppBar(
-                    navigationIcon = {
-                        IconButton(onClick = { chatNav = ChatNav.List }) {
-                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
-                        }
-                    },
-                    title = {
-                        val title = peerTitle(openChat.peer, openChat.alias, openChat.username)
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(10.dp),
-                        ) {
-                            PeerAvatar(title, seed = openChat.peer, size = 36.dp)
-                            Column {
-                                Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                Text(
-                                    shortNpub(openChat.peer),
-                                    style = MaterialTheme.typography.labelSmall,
-                                    fontFamily = FontFamily.Monospace,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
+    Column(modifier = Modifier.fillMaxSize()) {
+        MeshStatusBanner()
+        Scaffold(
+            modifier = Modifier.weight(1f),
+            topBar = {
+                when {
+                    tab == MainTab.Chats && openChat != null -> TopAppBar(
+                        navigationIcon = {
+                            IconButton(onClick = { chatNav = ChatNav.List }) {
+                                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                             }
+                        },
+                        title = {
+                            val title = peerTitle(openChat.peer, openChat.alias, openChat.username)
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            ) {
+                                PeerAvatar(title, seed = openChat.peer, size = 36.dp)
+                                Column {
+                                    Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    Text(
+                                        shortNpub(openChat.peer),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontFamily = FontFamily.Monospace,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                            }
+                        },
+                        actions = {
+                            IconButton(
+                                onClick = { editingAlias = true },
+                                modifier = Modifier.testTag("edit-alias"),
+                            ) {
+                                Icon(Icons.Filled.Edit, contentDescription = "Set alias")
+                            }
+                        },
+                    )
+                    tab == MainTab.Chats && chatNav == ChatNav.NewChat -> TopAppBar(
+                        navigationIcon = {
+                            IconButton(onClick = { chatNav = ChatNav.List }) {
+                                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                            }
+                        },
+                        title = { Text("New chat") },
+                    )
+                    tab == MainTab.Chats && chatNav == ChatNav.Requests -> TopAppBar(
+                        navigationIcon = {
+                            IconButton(onClick = { chatNav = ChatNav.List }) {
+                                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                            }
+                        },
+                        title = { Text("Message requests") },
+                    )
+                    else -> CenterAlignedTopAppBar(
+                        title = {
+                            Text(
+                                when (tab) {
+                                    MainTab.Chats -> "Comrade"
+                                    MainTab.Journal -> "Journal"
+                                    MainTab.Feed -> "Feed"
+                                    MainTab.Settings -> "Settings"
+                                },
+                            )
+                        },
+                    )
+                }
+            },
+            bottomBar = {
+                // The conversation view owns the whole screen, Telegram-style.
+                if (openChat == null || tab != MainTab.Chats) {
+                    NavigationBar {
+                        MainTab.entries.forEach { t ->
+                            NavigationBarItem(
+                                selected = tab == t,
+                                onClick = { tab = t },
+                                icon = { Icon(t.icon, contentDescription = null) },
+                                label = { Text(t.label) },
+                            )
                         }
-                    },
-                    actions = {
-                        IconButton(
-                            onClick = { editingAlias = true },
-                            modifier = Modifier.testTag("edit-alias"),
-                        ) {
-                            Icon(Icons.Filled.Edit, contentDescription = "Set alias")
-                        }
-                    },
-                )
-                tab == MainTab.Chats && chatNav == ChatNav.NewChat -> TopAppBar(
-                    navigationIcon = {
-                        IconButton(onClick = { chatNav = ChatNav.List }) {
-                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
-                        }
-                    },
-                    title = { Text("New chat") },
-                )
-                tab == MainTab.Chats && chatNav == ChatNav.Requests -> TopAppBar(
-                    navigationIcon = {
-                        IconButton(onClick = { chatNav = ChatNav.List }) {
-                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
-                        }
-                    },
-                    title = { Text("Message requests") },
-                )
-                else -> CenterAlignedTopAppBar(
-                    title = {
-                        Text(
-                            when (tab) {
-                                MainTab.Chats -> "Comrade"
-                                MainTab.Journal -> "Journal"
-                                MainTab.Feed -> "Feed"
-                                MainTab.Settings -> "Settings"
-                            },
-                        )
-                    },
-                )
-            }
-        },
-        bottomBar = {
-            // The conversation view owns the whole screen, Telegram-style.
-            if (openChat == null || tab != MainTab.Chats) {
-                NavigationBar {
-                    MainTab.entries.forEach { t ->
-                        NavigationBarItem(
-                            selected = tab == t,
-                            onClick = { tab = t },
-                            icon = { Icon(t.icon, contentDescription = null) },
-                            label = { Text(t.label) },
-                        )
                     }
                 }
-            }
-        },
-        floatingActionButton = {
-            if (tab == MainTab.Chats && chatNav == ChatNav.List) {
-                FloatingActionButton(onClick = { chatNav = ChatNav.NewChat }) {
-                    Icon(Icons.Filled.Create, contentDescription = "New chat")
+            },
+            floatingActionButton = {
+                if (tab == MainTab.Chats && chatNav == ChatNav.List) {
+                    FloatingActionButton(onClick = { chatNav = ChatNav.NewChat }) {
+                        Icon(Icons.Filled.Create, contentDescription = "New chat")
+                    }
                 }
+            },
+        ) { padding ->
+            val content = Modifier
+                .fillMaxSize()
+                .padding(padding)
+            when (tab) {
+                MainTab.Chats -> when (val nav = chatNav) {
+                    ChatNav.List -> ChatsScreen(
+                        chatTick = chatTick,
+                        requestTick = requestTick,
+                        onOpen = { peer, alias, username ->
+                            chatNav = ChatNav.Open(peer, alias, username)
+                        },
+                        onNewChat = { chatNav = ChatNav.NewChat },
+                        onOpenRequests = { chatNav = ChatNav.Requests },
+                        modifier = content,
+                    )
+                    ChatNav.NewChat -> NewChatScreen(
+                        onOpen = { peer, alias, username ->
+                            chatNav = ChatNav.Open(peer, alias, username)
+                        },
+                        modifier = content,
+                    )
+                    ChatNav.Requests -> RequestsScreen(
+                        chatTick = requestTick,
+                        onOpen = { peer, alias, username ->
+                            chatNav = ChatNav.Open(peer, alias, username)
+                        },
+                        modifier = content,
+                    )
+                    is ChatNav.Open -> ConversationScreen(
+                        peer = nav.peer,
+                        chatTick = chatTick,
+                        modifier = content,
+                    )
+                }
+                MainTab.Journal -> JournalScreen(modifier = content)
+                MainTab.Feed -> FeedScreen(
+                    feedItems = feedItems,
+                    onPosted = { addToFeed(it, front = true) },
+                    modifier = content,
+                )
+                MainTab.Settings -> SettingsScreen(
+                    profile = profile,
+                    onProfileChange = onProfileChange,
+                    modifier = content,
+                )
             }
-        },
-    ) { padding ->
-        val content = Modifier
-            .fillMaxSize()
-            .padding(padding)
-        when (tab) {
-            MainTab.Chats -> when (val nav = chatNav) {
-                ChatNav.List -> ChatsScreen(
-                    chatTick = chatTick,
-                    requestTick = requestTick,
-                    onOpen = { peer, alias, username ->
-                        chatNav = ChatNav.Open(peer, alias, username)
-                    },
-                    onNewChat = { chatNav = ChatNav.NewChat },
-                    onOpenRequests = { chatNav = ChatNav.Requests },
-                    modifier = content,
-                )
-                ChatNav.NewChat -> NewChatScreen(
-                    onOpen = { peer, alias, username ->
-                        chatNav = ChatNav.Open(peer, alias, username)
-                    },
-                    modifier = content,
-                )
-                ChatNav.Requests -> RequestsScreen(
-                    chatTick = requestTick,
-                    onOpen = { peer, alias, username ->
-                        chatNav = ChatNav.Open(peer, alias, username)
-                    },
-                    modifier = content,
-                )
-                is ChatNav.Open -> ConversationScreen(
-                    peer = nav.peer,
-                    chatTick = chatTick,
-                    modifier = content,
-                )
-            }
-            MainTab.Journal -> JournalScreen(modifier = content)
-            MainTab.Feed -> FeedScreen(
-                feedItems = feedItems,
-                onPosted = { addToFeed(it, front = true) },
-                modifier = content,
-            )
-            MainTab.Settings -> SettingsScreen(
-                profile = profile,
-                onProfileChange = onProfileChange,
-                modifier = content,
-            )
         }
     }
 
@@ -458,6 +478,61 @@ private fun MainShell(
                 chatTick++ // the chat list titles change too
             },
         )
+    }
+}
+
+/**
+ * Persistent off-grid mesh connectivity indicator, shown directly under the
+ * top bar on every screen while the Saathi mDNS mesh is running. This is the
+ * one signal that still works with zero cellular or relay reachability, so it
+ * stays visible rather than a one-off toast — exactly what to check when
+ * navigating somewhere with no signal at all.
+ */
+@Composable
+private fun MeshStatusBanner() {
+    val status by MeshStatusMonitor.status.collectAsState()
+    if (!status.active) return
+
+    val connected = status.peerCount > 0
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        color = if (connected) {
+            MaterialTheme.colorScheme.primaryContainer
+        } else {
+            MaterialTheme.colorScheme.surfaceVariant
+        },
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
+        ) {
+            Box(
+                Modifier
+                    .size(8.dp)
+                    .background(
+                        color = if (connected) {
+                            MaterialTheme.colorScheme.primary
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        },
+                        shape = CircleShape,
+                    ),
+            )
+            Text(
+                if (connected) {
+                    "Local mesh · ${status.peerCount} nearby"
+                } else {
+                    "Local mesh · searching for nearby devices…"
+                },
+                style = MaterialTheme.typography.labelMedium,
+                color = if (connected) {
+                    MaterialTheme.colorScheme.onPrimaryContainer
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                },
+            )
+        }
     }
 }
 
@@ -579,6 +654,12 @@ private fun drainEvents(max: Int = 200): List<PumpEvent> {
                 // titles). Call signals are handled by the desktop/native call
                 // layer, not this messaging pump.
                 "message_status", "peer_profile_updated" -> out += PumpEvent.HistoryChanged
+                "mesh_status_changed" -> out += PumpEvent.MeshStatusChanged(
+                    ComradeCore.MeshStatus(
+                        active = obj.optBoolean("active"),
+                        peerCount = obj.optInt("peer_count"),
+                    ),
+                )
             }
         }
     }

@@ -438,6 +438,7 @@ pub async fn toggle_app_workspace(
         .write()
         .await
         .toggle_workspace(&target)
+        .await
         .map_err(|e| e.to_string())
 }
 
@@ -459,12 +460,17 @@ pub async fn switch_workspace(
     state: tauri::State<'_, Runtime>,
     key: String,
 ) -> Result<WorkspaceDto, String> {
-    state.write().await.toggle_workspace(&key).map_err(|e| e.to_string())
+    state
+        .write()
+        .await
+        .toggle_workspace(&key)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn back(state: tauri::State<'_, Runtime>) -> Result<WorkspaceDto, String> {
-    Ok(state.write().await.back())
+    Ok(state.write().await.back().await)
 }
 
 #[tauri::command]

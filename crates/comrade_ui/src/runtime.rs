@@ -37,6 +37,7 @@ use comrade_core::media::{
     build_file_metadata_event, encrypt_media, fetch_and_decrypt_media, FileMetadata,
     MAX_MEDIA_BYTES,
 };
+use comrade_core::saathi::SaathiEngine;
 use comrade_core::sabha::{display_name_of, ChitthiCallback, SabhaEngine, DEFAULT_RELAYS};
 use comrade_core::sakha::SakhaEngine;
 use comrade_core::vault::{VaultCallback, VaultEngine, VaultMessage};
@@ -407,6 +408,17 @@ pub struct MessageDto {
     pub reply_to: Option<String>,
 }
 
+/// Live connectivity status of the off-grid Saathi mesh (mDNS discovery +
+/// Gossipsub), for a persistent UI indicator — the one signal that still works
+/// with zero cellular or relay reachability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeshStatusDto {
+    /// Whether the mesh engine is running at all (the workspace is `OffGridTravel`).
+    pub active: bool,
+    /// Peers currently reachable over the local network via mDNS.
+    pub peer_count: usize,
+}
+
 /// A push event emitted by the background Tokio loops and forwarded across the
 /// webview boundary (`window.emit`) or polled over JNI. Internally tagged so the
 /// frontend can `switch (evt.type)`.
@@ -436,6 +448,9 @@ pub enum BridgeEvent {
     /// A peer shared (or updated) their display handle — e.g. by accepting our
     /// message request. The chat list should re-title their conversation.
     PeerProfileUpdated { peer: String, name: Option<String> },
+    /// The off-grid mesh's connectivity changed: it started/stopped, or a peer
+    /// joined/left via mDNS. Drives the persistent local-mesh status indicator.
+    MeshStatusChanged(MeshStatusDto),
 }
 
 // ── Runtime ───────────────────────────────────────────────────────────────────
@@ -448,6 +463,11 @@ pub struct ComradeRuntime {
     sabha: Option<Arc<SabhaEngine>>,
     vault: Option<Arc<VaultEngine>>,
     sakha: Option<Arc<SakhaEngine>>,
+    /// The off-grid mesh engine — running iff the active workspace is
+    /// `OffGridTravel` (see [`Self::sync_saathi_lifecycle`]). Unlike the Nostr
+    /// engines above, it is started and stopped on the fly rather than built
+    /// once at unlock, since mDNS/Gossipsub only make sense while off-grid.
+    saathi: Option<Arc<SaathiEngine>>,
     events: broadcast::Sender<BridgeEvent>,
     /// Guards [`spawn_event_loops`] against re-spawning the feed/DM tasks if it
     /// is called more than once. [`spawn_event_loops`]: ComradeRuntime::spawn_event_loops
@@ -472,6 +492,7 @@ impl ComradeRuntime {
             sabha: None,
             vault: None,
             sakha: None,
+            saathi: None,
             events,
             loops_spawned: false,
             publish_task: None,
@@ -1657,13 +1678,114 @@ impl ComradeRuntime {
     /// Switch the active workspace, enforcing the [`comrade_state`] transition
     /// rules. An invalid or un-paired transition returns a typed [`UiError`]
     /// (surfaced to the frontend as a rejected promise / JSON error).
-    pub fn toggle_workspace(&mut self, target: &str) -> Result<WorkspaceDto, UiError> {
-        self.ui.switch_workspace(target)
+    ///
+    /// On success, also brings the Saathi mesh engine's lifecycle in line with
+    /// the new workspace (see [`Self::sync_saathi_lifecycle`]) — entering
+    /// `OffGridTravel` really starts mDNS discovery, it doesn't just flip a label.
+    pub async fn toggle_workspace(&mut self, target: &str) -> Result<WorkspaceDto, UiError> {
+        let dto = self.ui.switch_workspace(target)?;
+        self.sync_saathi_lifecycle().await;
+        Ok(dto)
     }
 
-    /// Step back to the previous workspace.
-    pub fn back(&mut self) -> WorkspaceDto {
-        self.ui.back()
+    /// Step back to the previous workspace, syncing the Saathi mesh lifecycle
+    /// exactly as [`Self::toggle_workspace`] does.
+    pub async fn back(&mut self) -> WorkspaceDto {
+        let dto = self.ui.back();
+        self.sync_saathi_lifecycle().await;
+        dto
+    }
+
+    /// Snapshot of the off-grid mesh's live status — for seeding a UI's
+    /// connectivity indicator before any [`BridgeEvent::MeshStatusChanged`]
+    /// has arrived (e.g. right after a cold start or an activity recreation).
+    pub fn mesh_status(&self) -> MeshStatusDto {
+        match &self.saathi {
+            Some(engine) => MeshStatusDto {
+                active: true,
+                peer_count: engine.peer_count(),
+            },
+            None => MeshStatusDto {
+                active: false,
+                peer_count: 0,
+            },
+        }
+    }
+
+    /// Ensure the Saathi engine is running iff the current workspace is
+    /// `OffGridTravel`. Centralised here (rather than duplicated in
+    /// `toggle_workspace`/`back`) so every path that can change the workspace —
+    /// a voice command, a future UI toggle, stepping back — drives the same
+    /// real engine the persistent mesh-status indicator reads from.
+    async fn sync_saathi_lifecycle(&mut self) {
+        let should_run = self.ui.current_workspace().mesh_active;
+        match (should_run, self.saathi.is_some()) {
+            (true, false) => self.start_saathi().await,
+            (false, true) => self.stop_saathi().await,
+            _ => {}
+        }
+    }
+
+    /// Start the Saathi mesh engine and spawn the task that forwards its live
+    /// peer-count stream onto the shared event bus. Best-effort: if the swarm
+    /// fails to initialise (e.g. no usable socket), the workspace switch still
+    /// succeeds — the indicator just reports `active: false` rather than
+    /// hanging in a perpetual "connecting" state.
+    async fn start_saathi(&mut self) {
+        let label = self
+            .ui
+            .username()
+            .or_else(|| self.ui.current_identity().map(|i| i.npub))
+            .unwrap_or_else(|| "comrade-mesh-peer".to_string());
+        match SaathiEngine::new(label).await {
+            Ok(engine) => {
+                let engine = Arc::new(engine);
+                self.spawn_mesh_status_forwarder(engine.clone());
+                self.saathi = Some(engine);
+            }
+            Err(e) => {
+                warn!("Saathi: failed to start mesh engine: {e}");
+                let _ = self
+                    .events
+                    .send(BridgeEvent::MeshStatusChanged(MeshStatusDto {
+                        active: false,
+                        peer_count: 0,
+                    }));
+            }
+        }
+    }
+
+    /// Shut down the Saathi mesh engine and tell the UI it is gone.
+    async fn stop_saathi(&mut self) {
+        if let Some(engine) = self.saathi.take() {
+            engine.shutdown().await;
+        }
+        let _ = self
+            .events
+            .send(BridgeEvent::MeshStatusChanged(MeshStatusDto {
+                active: false,
+                peer_count: 0,
+            }));
+    }
+
+    /// Forward the engine's peer-count stream onto the bridge event bus as
+    /// [`BridgeEvent::MeshStatusChanged`] — once immediately (the starting
+    /// snapshot) and again every time a peer joins or leaves.
+    fn spawn_mesh_status_forwarder(&self, engine: Arc<SaathiEngine>) {
+        let mut peer_count_rx = engine.peer_count_stream();
+        let tx = self.events.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(BridgeEvent::MeshStatusChanged(MeshStatusDto {
+                active: true,
+                peer_count: *peer_count_rx.borrow(),
+            }));
+            while peer_count_rx.changed().await.is_ok() {
+                let _ = tx.send(BridgeEvent::MeshStatusChanged(MeshStatusDto {
+                    active: true,
+                    peer_count: *peer_count_rx.borrow(),
+                }));
+            }
+        });
     }
 
     // ── Milestone 1: Sakha/Sakhi CRDT ledger sync ────────────────────────────
@@ -2210,26 +2332,69 @@ mod tests {
             require_send(rt.download_and_decrypt_media("x"));
             require_send(wrt.set_username("neo"));
             require_send(urt.unlock_vault("/tmp/x", "p"));
+            require_send(wrt.toggle_workspace("Base"));
+            require_send(urt.back());
         }
         let _ = probe;
     }
 
-    #[test]
-    fn toggle_workspace_enforces_state_machine() {
+    #[tokio::test]
+    async fn toggle_workspace_enforces_state_machine() {
         let mut rt = ComradeRuntime::new();
-        let dto = rt.toggle_workspace("OffGridTravel").unwrap();
+        let dto = rt.toggle_workspace("OffGridTravel").await.unwrap();
         assert_eq!(dto.key, "OffGridTravel");
         assert!(dto.mesh_active);
         // OffGridTravel -> CoupleSandbox is blocked by the transition graph.
         assert!(matches!(
-            rt.toggle_workspace("CoupleSandboxSakha"),
+            rt.toggle_workspace("CoupleSandboxSakha").await,
             Err(UiError::Transition(_))
         ));
         // Unknown keys are a distinct typed error.
         assert!(matches!(
-            rt.toggle_workspace("Nope"),
+            rt.toggle_workspace("Nope").await,
             Err(UiError::UnknownWorkspace(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn toggle_workspace_starts_and_stops_the_mesh_engine() {
+        let mut rt = ComradeRuntime::new();
+        assert_eq!(
+            rt.mesh_status(),
+            MeshStatusDto {
+                active: false,
+                peer_count: 0
+            }
+        );
+
+        rt.toggle_workspace("OffGridTravel").await.unwrap();
+        assert_eq!(
+            rt.mesh_status(),
+            MeshStatusDto {
+                active: true,
+                peer_count: 0
+            }
+        );
+
+        rt.toggle_workspace("Base").await.unwrap();
+        assert_eq!(
+            rt.mesh_status(),
+            MeshStatusDto {
+                active: false,
+                peer_count: 0
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn back_also_stops_the_mesh_engine() {
+        let mut rt = ComradeRuntime::new();
+        rt.toggle_workspace("OffGridTravel").await.unwrap();
+        assert!(rt.mesh_status().active);
+
+        let dto = rt.back().await;
+        assert_eq!(dto.key, "Base");
+        assert!(!rt.mesh_status().active);
     }
 
     #[test]

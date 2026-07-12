@@ -299,10 +299,33 @@ pub extern "C" fn Java_mullu_comrade_ComradeCore_toggleWorkspace<'local>(
     };
 
     let out = guard_json(move || {
+        let rt = runtime().ok_or_else(|| "failed to initialise async runtime".to_string())?;
         let state = state();
-        let mut guard = state.blocking_write();
-        let ws = guard.toggle_workspace(&target).map_err(|e| e.to_string())?;
-        serde_json::to_value(ws).map_err(|e| e.to_string())
+        rt.block_on(async move {
+            let mut guard = state.write().await;
+            let ws = guard
+                .toggle_workspace(&target)
+                .await
+                .map_err(|e| e.to_string())?;
+            serde_json::to_value(ws).map_err(|e| e.to_string())
+        })
+    });
+    to_jstring(&mut env, &out)
+}
+
+/// Snapshot of the off-grid mesh's live status: whether it is running, and how
+/// many peers are currently reachable via mDNS. Returns
+/// `{"active":bool,"peer_count":n}` — never `{"error":…}`, since there is no
+/// failure mode (the mesh being off is a valid, common state).
+#[no_mangle]
+pub extern "C" fn Java_mullu_comrade_ComradeCore_meshStatus<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jstring {
+    let out = guard_json(move || {
+        let state = state();
+        let guard = state.blocking_read();
+        serde_json::to_value(guard.mesh_status()).map_err(|e| e.to_string())
     });
     to_jstring(&mut env, &out)
 }
