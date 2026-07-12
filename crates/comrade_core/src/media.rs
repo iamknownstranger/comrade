@@ -382,9 +382,56 @@ pub use nip96::Nip96Uploader;
 
 // ── Blossom upload + fetch-and-decrypt (feature-gated) ───────────────────────────
 
-/// Default Blossom server used by [`upload_encrypted_blob`]. Blossom servers are
-/// content-addressed (blob URL = `<server>/<sha256>`) and accept raw `PUT`s.
-pub const DEFAULT_BLOSSOM_SERVER: &str = "https://cdn.hackers.town";
+/// Public Blossom servers, tried in order by the UI runtime's signed uploader
+/// (see `comrade_ui`'s `upload_blob`) through [`upload_to_first_available`].
+///
+/// Media survives any single host being down: the first server that accepts the
+/// (already end-to-end-encrypted) blob wins. A Blossom host only ever sees
+/// opaque ciphertext and a per-upload ephemeral key — never the chat identity —
+/// but it does see the uploader's IP, so this is a deliberate list of hosts to
+/// spread that trust across rather than one point of failure. Prepend a
+/// self-hosted server to keep blobs on infrastructure you control.
+///
+/// Blossom servers are content-addressed (blob URL = `<server>/<sha256>`) and
+/// accept raw `PUT`s.
+pub const DEFAULT_BLOSSOM_SERVERS: &[&str] = &[
+    "https://blossom.primal.net",
+    "https://cdn.satellite.earth",
+    "https://blossom.band",
+    "https://cdn.hackers.town",
+];
+
+/// The primary (first) entry of [`DEFAULT_BLOSSOM_SERVERS`], for the anonymous
+/// single-server helper [`upload_encrypted_blob`].
+pub const DEFAULT_BLOSSOM_SERVER: &str = DEFAULT_BLOSSOM_SERVERS[0];
+
+/// Run `attempt` against each server in `servers`, in order, returning the first
+/// `Ok(url)`.
+///
+/// This is the resilience layer over a fleet of interchangeable Blossom hosts:
+/// on an error the next server is tried, and only when every server fails does
+/// the last error surface (an empty list yields a clear "no servers configured"
+/// error rather than a silent success). `attempt` is handed each server by
+/// value so its returned future can own the per-attempt work (the blob clone,
+/// a fresh auth key) without borrowing across the `await`.
+pub async fn upload_to_first_available<F, Fut>(
+    servers: &[&str],
+    mut attempt: F,
+) -> Result<String, MediaError>
+where
+    F: FnMut(&str) -> Fut,
+    Fut: core::future::Future<Output = Result<String, MediaError>>,
+{
+    let mut last_err: Option<MediaError> = None;
+    for &server in servers {
+        match attempt(server).await {
+            Ok(url) => return Ok(url),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err
+        .unwrap_or_else(|| MediaError::UploadFailed("no Blossom servers configured".into())))
+}
 
 /// Hard cap on a decrypted media payload (10 MB). Mirrors the frontend limit;
 /// enforced in the core so *every* caller (desktop, JNI/Android) is protected,
@@ -741,6 +788,51 @@ mod tests {
             .unwrap();
         assert!(receipt.url.starts_with("https://blob.example/"));
         assert_eq!(uploader.fetch(&receipt.url).await, Some(b"opaque".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn upload_fallback_uses_first_server_that_succeeds() {
+        // The first two hosts are "down"; the third accepts the blob.
+        let servers = ["https://a.test", "https://b.test", "https://c.test"];
+        let url = upload_to_first_available(&servers, |server| {
+            let server = server.to_string();
+            async move {
+                if server.contains("c.test") {
+                    Ok(format!("{server}/blobhash"))
+                } else {
+                    Err(MediaError::Http(format!("unreachable: {server}")))
+                }
+            }
+        })
+        .await
+        .expect("must fall back to the reachable server");
+        assert_eq!(url, "https://c.test/blobhash");
+    }
+
+    #[tokio::test]
+    async fn upload_fallback_surfaces_last_error_when_all_fail() {
+        let servers = ["https://a.test", "https://b.test"];
+        let err = upload_to_first_available(&servers, |server| {
+            let server = server.to_string();
+            async move { Err::<String, _>(MediaError::Http(format!("down: {server}"))) }
+        })
+        .await
+        .unwrap_err();
+        // The most recently tried server's error is the one surfaced.
+        assert!(
+            matches!(err, MediaError::Http(ref msg) if msg.contains("b.test")),
+            "expected the last server's error, got {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_fallback_errors_clearly_with_no_servers() {
+        let err = upload_to_first_available(&[], |_server| async move {
+            Ok::<String, MediaError>("unreachable".into())
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(err, MediaError::UploadFailed(_)));
     }
 
     #[tokio::test]

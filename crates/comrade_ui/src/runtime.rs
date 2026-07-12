@@ -1757,13 +1757,27 @@ impl ComradeRuntime {
     /// time T from IP Z" — a metadata leak at odds with the privacy model.
     #[cfg(feature = "media-http")]
     async fn upload_blob(&self, blob: Vec<u8>, mime: &str) -> Result<String, UiError> {
-        use comrade_core::media::{BlossomUploader, MediaUploader, DEFAULT_BLOSSOM_SERVER};
-        let uploader = BlossomUploader::new(DEFAULT_BLOSSOM_SERVER, nostr_sdk::Keys::generate());
-        let receipt = uploader
-            .upload(&blob, mime)
-            .await
-            .map_err(|e| UiError::Engine(e.to_string()))?;
-        Ok(receipt.url)
+        use comrade_core::media::{
+            upload_to_first_available, BlossomUploader, MediaUploader, DEFAULT_BLOSSOM_SERVERS,
+        };
+        // Try each configured Blossom host in turn so a single server being
+        // down (or unreachable from this network) doesn't fail the send — the
+        // symptom that made every attachment error out on one hardcoded host.
+        // Each attempt re-signs with a fresh ephemeral key (identity-unlinkable)
+        // and re-uploads the same ciphertext.
+        upload_to_first_available(DEFAULT_BLOSSOM_SERVERS, |server| {
+            let server = server.to_string();
+            let blob = blob.clone();
+            let mime = mime.to_string();
+            async move {
+                BlossomUploader::new(server, nostr_sdk::Keys::generate())
+                    .upload(&blob, &mime)
+                    .await
+                    .map(|receipt| receipt.url)
+            }
+        })
+        .await
+        .map_err(|e| UiError::Engine(format!("all media servers failed: {e}")))
     }
 
     #[cfg(not(feature = "media-http"))]
