@@ -247,7 +247,7 @@ async fn demo_ledger(state: &Arc<RwLock<AppState>>) {
     let partner_keys = guard.partner_profile.as_ref().unwrap().keys.clone();
     drop(guard);
 
-    let mut engine = match SakhaEngine::new(&our_keys, vec![]).await {
+    let engine = match SakhaEngine::new(&our_keys, vec![]).await {
         Ok(e) => e,
         Err(e) => {
             println!("  Sakha engine init failed: {e}");

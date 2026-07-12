@@ -10,7 +10,7 @@
  *  • On receipt the peer decrypts and applies the Yrs update (CRDT merge)
  */
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as SyncRwLock};
 
 use aes_gcm::{
     aead::{Aead, KeyInit},
@@ -33,6 +33,24 @@ use crate::{
 // ── Custom Nostr event kind ──────────────────────────────────────────────────
 
 const LEDGER_SYNC_KIND: u16 = 30078;
+
+/// Invoked with the fully-merged ledger text after a partner's CRDT update is
+/// received and applied — lets a caller (the UI bridge) push the fresh state
+/// to the frontend and persist a snapshot without polling.
+pub type SakhaSyncCallback = Box<dyn Fn(String) + Send + Sync>;
+
+/// Read a small `Copy` value out of a [`SyncRwLock`], recovering from
+/// poisoning rather than panicking (the guarded value is a plain in-memory
+/// key/pubkey — a poisoned lock still holds a perfectly usable last value).
+fn read_locked<T: Copy>(lock: &SyncRwLock<Option<T>>) -> Option<T> {
+    *lock.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Overwrite a [`SyncRwLock`]'s value, recovering from poisoning (see
+/// [`read_locked`]).
+fn write_locked<T>(lock: &SyncRwLock<Option<T>>, value: T) {
+    *lock.write().unwrap_or_else(|e| e.into_inner()) = Some(value);
+}
 
 // ── AES-256-GCM helpers ──────────────────────────────────────────────────────
 
@@ -104,8 +122,8 @@ impl LedgerEntry {
 
 pub struct SakhaEngine {
     our_keys: Keys,
-    partner_pk: Option<PublicKey>,
-    symmetric_key: Option<[u8; 32]>,
+    partner_pk: SyncRwLock<Option<PublicKey>>,
+    symmetric_key: SyncRwLock<Option<[u8; 32]>>,
     pub doc: Arc<RwLock<Doc>>,
     client: Client,
 }
@@ -121,8 +139,8 @@ impl SakhaEngine {
         }
         Ok(Self {
             our_keys: our_keys.clone(),
-            partner_pk: None,
-            symmetric_key: None,
+            partner_pk: SyncRwLock::new(None),
+            symmetric_key: SyncRwLock::new(None),
             doc: Arc::new(RwLock::new(Doc::new())),
             client,
         })
@@ -133,14 +151,29 @@ impl SakhaEngine {
         info!("Sakha engine connected");
     }
 
-    pub fn pair_with(&mut self, partner_pk: PublicKey) -> Result<(), SakhaError> {
+    /// Perform the DH pairing handshake with a partner's public key, deriving
+    /// the shared AES-256 key the ledger sync channel encrypts under.
+    ///
+    /// Takes `&self` (not `&mut self`) so pairing can be called through an
+    /// `Arc<SakhaEngine>` shared handle — the usual way this engine is held
+    /// once wrapped for the async bridge (see `comrade_ui::ComradeRuntime`).
+    /// Idempotent: re-pairing with the same partner recomputes the identical
+    /// key (DH is deterministic); re-pairing with a *different* partner
+    /// simply replaces both fields together, so the two are never out of sync.
+    pub fn pair_with(&self, partner_pk: PublicKey) -> Result<(), SakhaError> {
         let shared_secret = compute_dh_shared_secret(self.our_keys.secret_key(), &partner_pk)
             .map_err(|e| SakhaError::EncryptionError(e.to_string()))?;
 
-        self.symmetric_key = Some(derive_symmetric_key(&shared_secret, "sakha-hisab-kitab-v1"));
-        self.partner_pk = Some(partner_pk);
+        let key = derive_symmetric_key(&shared_secret, "sakha-hisab-kitab-v1");
+        write_locked(&self.symmetric_key, key);
+        write_locked(&self.partner_pk, partner_pk);
         info!("Sakha pairing handshake complete");
         Ok(())
+    }
+
+    /// The paired partner's public key, if a handshake has completed.
+    pub fn partner_pubkey(&self) -> Option<PublicKey> {
+        read_locked(&self.partner_pk)
     }
 
     pub async fn add_entry(&self, entry: LedgerEntry) -> Result<(), SakhaError> {
@@ -170,7 +203,7 @@ impl SakhaEngine {
     /// Encode current Yrs state diff, encrypt with AES-GCM, and publish as
     /// a base64-encoded Kind-30078 Nostr event. Relays see only opaque bytes.
     pub async fn publish_sync(&self) -> Result<EventId, SakhaError> {
-        let key = self.symmetric_key.ok_or(SakhaError::NoSharedSecret)?;
+        let key = read_locked(&self.symmetric_key).ok_or(SakhaError::NoSharedSecret)?;
 
         let update_bytes = {
             let doc = self.doc.read().await;
@@ -196,9 +229,12 @@ impl SakhaEngine {
     }
 
     /// Subscribe to incoming sync events from the partner and CRDT-merge them.
-    pub async fn subscribe_sync(&self) -> Result<(), SakhaError> {
-        let partner_pk = self.partner_pk.ok_or(SakhaError::NoSharedSecret)?;
-        let key = self.symmetric_key.ok_or(SakhaError::NoSharedSecret)?;
+    /// `on_update` fires with the fully merged ledger text after every
+    /// successfully-applied remote update, so a caller can push live state to
+    /// a frontend and persist a fresh snapshot without polling.
+    pub async fn subscribe_sync(&self, on_update: SakhaSyncCallback) -> Result<(), SakhaError> {
+        let partner_pk = read_locked(&self.partner_pk).ok_or(SakhaError::NoSharedSecret)?;
+        let key = read_locked(&self.symmetric_key).ok_or(SakhaError::NoSharedSecret)?;
 
         let filter = Filter::new()
             .kind(Kind::Custom(LEDGER_SYNC_KIND))
@@ -213,13 +249,21 @@ impl SakhaEngine {
         info!("Sakha sync subscription active");
 
         let doc = self.doc.clone();
+        let on_update = Arc::new(on_update);
 
         self.client
             .handle_notifications(move |notification| {
                 let doc = doc.clone();
+                let on_update = on_update.clone();
                 async move {
                     if let RelayPoolNotification::Event { event, .. } = notification {
-                        if event.kind != Kind::Custom(LEDGER_SYNC_KIND) {
+                        // A defense-in-depth check: only the paired partner's
+                        // key can produce ciphertext that decrypts below, but
+                        // rejecting a mismatched author up front avoids even
+                        // trying (AUDIT S9).
+                        if event.kind != Kind::Custom(LEDGER_SYNC_KIND)
+                            || event.pubkey != partner_pk
+                        {
                             return Ok::<bool, Box<dyn std::error::Error>>(false);
                         }
 
@@ -239,6 +283,12 @@ impl SakhaEngine {
                             }
                         };
 
+                        // `yrs::Update` is not `Send` (it can carry nested
+                        // sub-documents whose observer callbacks aren't
+                        // Send/Sync), so it must never be held across an
+                        // `.await` — decode it only after the write lock is
+                        // acquired, immediately before `apply_update` uses it.
+                        let doc_guard = doc.write().await;
                         let update = match Update::decode_v1(&plaintext) {
                             Ok(u) => u,
                             Err(e) => {
@@ -246,13 +296,16 @@ impl SakhaEngine {
                                 return Ok::<bool, Box<dyn std::error::Error>>(false);
                             }
                         };
-
-                        let doc_guard = doc.write().await;
+                        let text = doc_guard.get_or_insert_text("hisab_kitab");
                         let mut txn = doc_guard.transact_mut();
-                        if let Err(e) = txn.apply_update(update) {
-                            warn!(event_id = %event.id, "Sakha: Yrs apply failed: {e}");
-                        } else {
-                            debug!(event_id = %event.id, "Sakha: CRDT sync applied");
+                        match txn.apply_update(update) {
+                            Err(e) => warn!(event_id = %event.id, "Sakha: Yrs apply failed: {e}"),
+                            Ok(()) => {
+                                let content = text.get_string(&txn);
+                                drop(txn);
+                                debug!(event_id = %event.id, "Sakha: CRDT sync applied");
+                                on_update(content);
+                            }
                         }
                     }
                     Ok::<bool, Box<dyn std::error::Error>>(false)
@@ -267,7 +320,36 @@ impl SakhaEngine {
     }
 
     pub fn is_paired(&self) -> bool {
-        self.symmetric_key.is_some()
+        read_locked(&self.symmetric_key).is_some()
+    }
+
+    /// Encode the full current CRDT state as a Yrs binary update — a complete
+    /// snapshot (diffed against an empty state vector), not an incremental
+    /// change — suitable for persisting to disk and restoring on next launch
+    /// via [`Self::load_snapshot`].
+    pub async fn snapshot_bytes(&self) -> Vec<u8> {
+        let doc = self.doc.read().await;
+        let txn = doc.transact();
+        txn.encode_diff_v1(&StateVector::default())
+    }
+
+    /// Merge a previously-saved snapshot (or any Yrs update) into the current
+    /// document. CRDT merges are commutative and idempotent, so this is safe
+    /// to call with a snapshot that overlaps what's already in memory (e.g.
+    /// applying a restored snapshot before any new entries have been added).
+    pub async fn load_snapshot(&self, bytes: &[u8]) -> Result<(), SakhaError> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        // As in `subscribe_sync`: decode only after the write lock is held —
+        // `yrs::Update` is not `Send` and must never span an `.await`.
+        let doc = self.doc.write().await;
+        let update =
+            Update::decode_v1(bytes).map_err(|e| SakhaError::SyncDecodeFailed(e.to_string()))?;
+        let mut txn = doc.transact_mut();
+        txn.apply_update(update)
+            .map_err(|e| SakhaError::CrdtError(e.to_string()))?;
+        Ok(())
     }
 }
 
@@ -313,6 +395,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unpaired_engine_reports_no_partner() {
+        let keys = Keys::generate();
+        let engine = SakhaEngine::new(&keys, vec![]).await.unwrap();
+        assert!(!engine.is_paired());
+        assert_eq!(engine.partner_pubkey(), None);
+        assert!(matches!(
+            engine.publish_sync().await,
+            Err(SakhaError::NoSharedSecret)
+        ));
+    }
+
+    #[tokio::test]
+    async fn pair_with_works_through_a_shared_arc_handle() {
+        // Regression guard for AUDIT A3: pairing must be reachable once the
+        // engine is wrapped the way `comrade_ui::ComradeRuntime` holds it —
+        // behind an `Arc`, with no way to get a `&mut` to the inner engine.
+        let alice = KeyProfile::generate().unwrap();
+        let bob = KeyProfile::generate().unwrap();
+        let engine: Arc<SakhaEngine> =
+            Arc::new(SakhaEngine::new(&alice.keys, vec![]).await.unwrap());
+        engine.pair_with(bob.public_key()).unwrap();
+        assert!(engine.is_paired());
+    }
+
+    #[tokio::test]
+    async fn snapshot_roundtrips_ledger_entries() {
+        let keys = Keys::generate();
+        let engine = SakhaEngine::new(&keys, vec![]).await.unwrap();
+        engine
+            .add_entry(LedgerEntry::new("Rent", 12000.0, "Sakha"))
+            .await
+            .unwrap();
+        let snapshot = engine.snapshot_bytes().await;
+        assert!(!snapshot.is_empty());
+
+        // A fresh engine (simulating a relaunch) restores the ledger from the
+        // persisted snapshot alone, with no partner traffic involved.
+        let restored = SakhaEngine::new(&keys, vec![]).await.unwrap();
+        assert!(restored.read_ledger().await.is_empty());
+        restored.load_snapshot(&snapshot).await.unwrap();
+        let ledger = restored.read_ledger().await;
+        assert!(
+            ledger.contains("Rent"),
+            "restored ledger must contain the entry: {ledger}"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_snapshot_is_a_noop_on_empty_bytes() {
+        let keys = Keys::generate();
+        let engine = SakhaEngine::new(&keys, vec![]).await.unwrap();
+        engine.load_snapshot(&[]).await.unwrap();
+        assert!(engine.read_ledger().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn load_snapshot_rejects_garbage_bytes() {
+        let keys = Keys::generate();
+        let engine = SakhaEngine::new(&keys, vec![]).await.unwrap();
+        assert!(matches!(
+            engine.load_snapshot(b"not a yrs update").await,
+            Err(SakhaError::SyncDecodeFailed(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn ledger_append_and_read() {
         let keys = Keys::generate();
         let engine = SakhaEngine::new(&keys, vec![]).await.unwrap();
@@ -330,8 +478,10 @@ mod tests {
         let alice = KeyProfile::generate().unwrap();
         let bob = KeyProfile::generate().unwrap();
 
-        let mut engine_alice = SakhaEngine::new(&alice.keys, vec![]).await.unwrap();
+        let engine_alice = SakhaEngine::new(&alice.keys, vec![]).await.unwrap();
         engine_alice.pair_with(bob.public_key()).unwrap();
+        assert!(engine_alice.is_paired());
+        assert_eq!(engine_alice.partner_pubkey(), Some(bob.public_key()));
 
         engine_alice
             .add_entry(LedgerEntry::new("Groceries", 300.0, "Sakhi"))
@@ -339,18 +489,14 @@ mod tests {
             .unwrap();
 
         // Encode and encrypt the state diff
-        let key = engine_alice.symmetric_key.unwrap();
-        let update_bytes = {
-            let doc = engine_alice.doc.read().await;
-            let txn = doc.transact();
-            txn.encode_diff_v1(&StateVector::default())
-        };
+        let key = read_locked(&engine_alice.symmetric_key).unwrap();
+        let update_bytes = engine_alice.snapshot_bytes().await;
         let ciphertext = aes_encrypt(&key, &update_bytes).unwrap();
 
         // Bob decrypts and applies
-        let mut engine_bob = SakhaEngine::new(&bob.keys, vec![]).await.unwrap();
+        let engine_bob = SakhaEngine::new(&bob.keys, vec![]).await.unwrap();
         engine_bob.pair_with(alice.public_key()).unwrap();
-        let bob_key = engine_bob.symmetric_key.unwrap();
+        let bob_key = read_locked(&engine_bob.symmetric_key).unwrap();
 
         let plaintext = aes_decrypt(&bob_key, &ciphertext).unwrap();
         let update = Update::decode_v1(&plaintext).unwrap();

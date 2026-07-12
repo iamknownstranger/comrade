@@ -648,7 +648,7 @@ private fun drainEvents(max: Int = 200): List<PumpEvent> {
                 )
                 "incoming_media" -> out += PumpEvent.IncomingDm(
                     peer = obj.optString("sender"),
-                    preview = "📎 Attachment",
+                    preview = obj.optString("caption").ifBlank { "Attachment" }.let { "📎 $it" },
                 )
                 // Receipt + profile updates only need a chat-list reload (ticks,
                 // titles). Call signals are handled by the desktop/native call

@@ -149,6 +149,13 @@ object ComradeCore {
     /** Offline message history with [peer], oldest first, as a JSON array. */
     external fun messagesWith(peer: String): String
 
+    /**
+     * Full encrypted-media history with [peer], oldest first, as a JSON array
+     * — the media counterpart of [messagesWith], for rendering past
+     * attachments inline after a restart, not just ones received live.
+     */
+    external fun mediaWith(peer: String): String
+
     // ── Replies, message requests & receipts ─────────────────────────────────
 
     /** Send a reply DM ([replyTo] = replied event id hex, or "" for none). */
@@ -348,7 +355,7 @@ object ComradeCore {
         val durationSecs: Long,
     )
 
-    /** An encrypted-media message (send result or incoming reference). */
+    /** An encrypted-media message (send result, incoming reference, or history entry). */
     data class MediaMessageInfo(
         val eventId: String,
         val url: String,
@@ -357,6 +364,8 @@ object ComradeCore {
         val sender: String,
         val createdAt: Long,
         val size: Long,
+        /** Whether *this device* sent it — mirrors [MessageInfo.outgoing]. */
+        val outgoing: Boolean,
     )
 
     /** Decrypted media bytes (base64) plus MIME type. */
@@ -507,7 +516,20 @@ object ComradeCore {
         sender = getString("sender"),
         createdAt = getLong("created_at"),
         size = getLong("size"),
+        outgoing = optBoolean("outgoing"),
     )
+
+    /**
+     * Full encrypted-media history with [peer], oldest first (named `media`,
+     * not `mediaWith`, to avoid clashing with the native declaration of the
+     * same parameter shape — matching the [messagesWith]/[messages] pattern).
+     */
+    fun media(peer: String): List<MediaMessageInfo> {
+        val parsed = JSONTokener(mediaWith(peer)).nextValue()
+        if (parsed is JSONObject) parsed.failOnError("Media history")
+        val arr = parsed as JSONArray
+        return (0 until arr.length()).map { i -> arr.getJSONObject(i).toMediaMessage() }
+    }
 
     /** Encrypt + send media, returning the stored reference or throwing. */
     fun sendMediaBytesTyped(

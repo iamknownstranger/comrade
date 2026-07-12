@@ -17,7 +17,7 @@ use std::sync::Arc;
 use comrade_ui::{
     CallRecordDto, CallSessionDto, ChitthiDto, ComradeRuntime, ContactDto, ConversationDto,
     FoundProfileDto, IceServerDto, IdentityDto, JournalEntryDto, MediaBytesDto, MediaMessageDto,
-    MessageDto, MessageRequestDto, ProfileDto, UpiIntentDto, WorkspaceDto,
+    MessageDto, MessageRequestDto, ProfileDto, SakhaStatusDto, UpiIntentDto, WorkspaceDto,
 };
 use tokio::sync::RwLock;
 
@@ -103,6 +103,60 @@ pub async fn sync_ledger(state: tauri::State<'_, Runtime>) -> Result<String, Str
     state.read().await.sync_ledger().await.map_err(|e| e.to_string())
 }
 
+// ── Sakha/Sakhi pairing handshake + shared ledger ────────────────────────────
+
+/// Perform the DH pairing handshake with `partner_pubkey` (npub or hex) as
+/// `role` ("sakha"/"sakhi"), persist it, and start the background sync loop.
+/// Returns the resulting pairing status.
+#[tauri::command]
+pub async fn pair_sakha(
+    state: tauri::State<'_, Runtime>,
+    partner_pubkey: String,
+    role: String,
+) -> Result<SakhaStatusDto, String> {
+    state
+        .write()
+        .await
+        .pair_sakha(&partner_pubkey, &role)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// This device's Sakha/Sakhi pairing state — lets the frontend offer
+/// "continue as paired partner" without asking for the partner's key again.
+#[tauri::command]
+pub async fn sakha_status(state: tauri::State<'_, Runtime>) -> Result<SakhaStatusDto, String> {
+    state.read().await.sakha_status().map_err(|e| e.to_string())
+}
+
+/// Append an entry to the shared Sakha/Sakhi ledger. Returns the merged
+/// ledger text. Requires a completed pairing (see [`pair_sakha`]).
+#[tauri::command]
+pub async fn sakha_add_entry(
+    state: tauri::State<'_, Runtime>,
+    description: String,
+    amount_inr: f64,
+    paid_by: String,
+) -> Result<String, String> {
+    state
+        .read()
+        .await
+        .sakha_add_entry(&description, amount_inr, &paid_by)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// The current Sakha/Sakhi ledger text (local CRDT state, no network round trip).
+#[tauri::command]
+pub async fn sakha_read_ledger(state: tauri::State<'_, Runtime>) -> Result<String, String> {
+    state
+        .read()
+        .await
+        .sakha_read_ledger()
+        .await
+        .map_err(|e| e.to_string())
+}
+
 // ── Direct messages, profile & contacts (Telegram-like flow) ──────────────────
 
 /// Send an E2E-encrypted DM to `target` (npub or hex pubkey). The message is
@@ -136,6 +190,17 @@ pub async fn messages_with(
     peer: String,
 ) -> Result<Vec<MessageDto>, String> {
     state.read().await.messages_with(&peer).map_err(|e| e.to_string())
+}
+
+/// Full encrypted-media history with `peer`, oldest first — the media
+/// counterpart of [`messages_with`], for rendering past attachments inline
+/// after a restart.
+#[tauri::command]
+pub async fn media_with(
+    state: tauri::State<'_, Runtime>,
+    peer: String,
+) -> Result<Vec<MediaMessageDto>, String> {
+    state.read().await.media_with(&peer).map_err(|e| e.to_string())
 }
 
 /// Send a DM as a reply to a prior message (`reply_to` = replied event id hex).

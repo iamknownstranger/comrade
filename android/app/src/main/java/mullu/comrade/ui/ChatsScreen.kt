@@ -407,6 +407,19 @@ private fun statusGlyph(status: String?): String = when (status) {
     else -> "✓"
 }
 
+/** A conversation is a time-ordered merge of text messages and media attachments. */
+private sealed interface ChatItem {
+    val createdAt: Long
+
+    data class TextItem(val msg: ComradeCore.MessageInfo) : ChatItem {
+        override val createdAt get() = msg.createdAt
+    }
+
+    data class MediaItem(val info: ComradeCore.MediaMessageInfo) : ChatItem {
+        override val createdAt get() = info.createdAt
+    }
+}
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun ConversationScreen(
@@ -415,6 +428,7 @@ fun ConversationScreen(
     modifier: Modifier = Modifier,
 ) {
     var messages by remember { mutableStateOf<List<ComradeCore.MessageInfo>>(emptyList()) }
+    var mediaItems by remember { mutableStateOf<List<ComradeCore.MediaMessageInfo>>(emptyList()) }
     var draft by remember { mutableStateOf("") }
     var sending by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
@@ -426,12 +440,25 @@ fun ConversationScreen(
 
     // Quick lookup so a bubble carrying reply_to can show a quoted preview.
     val byId = remember(messages) { messages.associateBy { it.id } }
+    // Text and media interleaved in one time-ordered thread, like a real chat.
+    // Named `chatItems`, not `items`, to avoid shadowing the LazyListScope
+    // `items(...)` DSL function called with it below.
+    val chatItems = remember(messages, mediaItems) {
+        (messages.map(ChatItem::TextItem) + mediaItems.map(ChatItem::MediaItem))
+            .sortedBy { it.createdAt }
+    }
 
     LaunchedEffect(peer, chatTick) {
-        messages = withContext(Dispatchers.IO) {
-            runCatching { ComradeCore.messages(peer) }.getOrDefault(emptyList())
+        val (msgs, media) = withContext(Dispatchers.IO) {
+            val msgs = runCatching { ComradeCore.messages(peer) }.getOrDefault(emptyList())
+            val media = runCatching { ComradeCore.media(peer) }.getOrDefault(emptyList())
+            msgs to media
         }
-        if (messages.isNotEmpty()) listState.scrollToItem(messages.size - 1)
+        messages = msgs
+        mediaItems = media
+        if (msgs.isNotEmpty() || media.isNotEmpty()) {
+            listState.scrollToItem(msgs.size + media.size - 1)
+        }
     }
 
     // Opening the thread marks it read (sends a read receipt) and clears any
@@ -457,7 +484,7 @@ fun ConversationScreen(
                 replyingTo = null
                 sending = false
                 messages = messages + sent
-                scope.launch { listState.scrollToItem(messages.size - 1) }
+                scope.launch { listState.scrollToItem(messages.size + mediaItems.size - 1) }
             }.onFailure {
                 sending = false
                 error = it.message ?: "Could not send."
@@ -486,17 +513,9 @@ fun ConversationScreen(
                 }
             }.onSuccess {
                 attaching = false
-                // Media isn't part of the text history; show a local marker line.
-                messages = messages + ComradeCore.MessageInfo(
-                    id = "media:${it.eventId}",
-                    peer = peer,
-                    content = "📎 ${it.mimeType}",
-                    createdAt = it.createdAt,
-                    outgoing = true,
-                    status = "sent",
-                    replyTo = null,
-                )
-                scope.launch { listState.scrollToItem(messages.size - 1) }
+                // Render the real attachment inline — not a synthetic text line.
+                mediaItems = mediaItems + it
+                scope.launch { listState.scrollToItem(messages.size + mediaItems.size - 1) }
             }.onFailure {
                 attaching = false
                 error = it.message ?: "Could not send the attachment."
@@ -513,7 +532,7 @@ fun ConversationScreen(
             contentPadding = PaddingValues(12.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            if (messages.isEmpty()) {
+            if (chatItems.isEmpty()) {
                 item {
                     Text(
                         "Messages are end-to-end encrypted with your keys. Say hi!",
@@ -524,59 +543,78 @@ fun ConversationScreen(
                     )
                 }
             }
-            items(messages, key = { it.id }) { msg ->
-                val quoted = msg.replyTo?.let { byId[it] }
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .combinedClickable(
-                            onClick = {},
-                            onLongClick = { replyingTo = msg },
-                        ),
-                    horizontalArrangement = if (msg.outgoing) Arrangement.End else Arrangement.Start,
-                ) {
-                    Surface(
-                        shape = RoundedCornerShape(
-                            topStart = 18.dp,
-                            topEnd = 18.dp,
-                            bottomStart = if (msg.outgoing) 18.dp else 6.dp,
-                            bottomEnd = if (msg.outgoing) 6.dp else 18.dp,
-                        ),
-                        color = if (msg.outgoing) {
-                            MaterialTheme.colorScheme.primaryContainer
-                        } else {
-                            MaterialTheme.colorScheme.surfaceVariant
-                        },
-                        tonalElevation = 1.dp,
-                        modifier = Modifier.widthIn(max = 300.dp),
+            items(
+                chatItems,
+                key = { item ->
+                    when (item) {
+                        is ChatItem.TextItem -> item.msg.id
+                        is ChatItem.MediaItem -> "media:${item.info.eventId}"
+                    }
+                },
+            ) { item ->
+                when (item) {
+                    is ChatItem.MediaItem -> Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = if (item.info.outgoing) Arrangement.End else Arrangement.Start,
                     ) {
-                        Column(Modifier.padding(horizontal = 14.dp, vertical = 9.dp)) {
-                            if (quoted != null) {
-                                QuotedPreview(quoted.content)
-                            }
-                            Text(msg.content, style = MaterialTheme.typography.bodyLarge)
-                            Row(
-                                modifier = Modifier
-                                    .align(Alignment.End)
-                                    .padding(top = 2.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        MediaAttachmentBubble(item.info)
+                    }
+                    is ChatItem.TextItem -> {
+                        val msg = item.msg
+                        val quoted = msg.replyTo?.let { byId[it] }
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .combinedClickable(
+                                    onClick = {},
+                                    onLongClick = { replyingTo = msg },
+                                ),
+                            horizontalArrangement = if (msg.outgoing) Arrangement.End else Arrangement.Start,
+                        ) {
+                            Surface(
+                                shape = RoundedCornerShape(
+                                    topStart = 18.dp,
+                                    topEnd = 18.dp,
+                                    bottomStart = if (msg.outgoing) 18.dp else 6.dp,
+                                    bottomEnd = if (msg.outgoing) 6.dp else 18.dp,
+                                ),
+                                color = if (msg.outgoing) {
+                                    MaterialTheme.colorScheme.primaryContainer
+                                } else {
+                                    MaterialTheme.colorScheme.surfaceVariant
+                                },
+                                tonalElevation = 1.dp,
+                                modifier = Modifier.widthIn(max = 300.dp),
                             ) {
-                                Text(
-                                    relativeTime(msg.createdAt),
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.outline,
-                                )
-                                if (msg.outgoing) {
-                                    Text(
-                                        statusGlyph(msg.status),
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = if (msg.status == "read") {
-                                            MaterialTheme.colorScheme.primary
-                                        } else {
-                                            MaterialTheme.colorScheme.outline
-                                        },
-                                    )
+                                Column(Modifier.padding(horizontal = 14.dp, vertical = 9.dp)) {
+                                    if (quoted != null) {
+                                        QuotedPreview(quoted.content)
+                                    }
+                                    Text(msg.content, style = MaterialTheme.typography.bodyLarge)
+                                    Row(
+                                        modifier = Modifier
+                                            .align(Alignment.End)
+                                            .padding(top = 2.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                    ) {
+                                        Text(
+                                            relativeTime(msg.createdAt),
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.outline,
+                                        )
+                                        if (msg.outgoing) {
+                                            Text(
+                                                statusGlyph(msg.status),
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = if (msg.status == "read") {
+                                                    MaterialTheme.colorScheme.primary
+                                                } else {
+                                                    MaterialTheme.colorScheme.outline
+                                                },
+                                            )
+                                        }
+                                    }
                                 }
                             }
                         }

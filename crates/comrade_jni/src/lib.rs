@@ -578,6 +578,30 @@ pub extern "C" fn Java_mullu_comrade_ComradeCore_messagesWith<'local>(
     to_jstring(&mut env, &out)
 }
 
+/// Full encrypted-media history with `peer`, oldest first, as a JSON array —
+/// the media counterpart of [`Java_mullu_comrade_ComradeCore_messagesWith`],
+/// for rendering past attachments inline after a restart.
+#[no_mangle]
+pub extern "C" fn Java_mullu_comrade_ComradeCore_mediaWith<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    peer: JString<'local>,
+) -> jstring {
+    let Some(peer) = jni_string(&mut env, &peer) else {
+        return to_jstring(
+            &mut env,
+            &json!({"error":"invalid peer argument"}).to_string(),
+        );
+    };
+    let out = guard_json(move || {
+        let state = state();
+        let guard = state.blocking_read();
+        let media = guard.media_with(&peer).map_err(|e| e.to_string())?;
+        serde_json::to_value(media).map_err(|e| e.to_string())
+    });
+    to_jstring(&mut env, &out)
+}
+
 // ── Journal (strictly local, never networked) ─────────────────────────────────
 
 /// Save a journal entry (`mood` may be empty for none). Returns the stored

@@ -39,7 +39,7 @@ use comrade_core::media::{
 };
 use comrade_core::saathi::SaathiEngine;
 use comrade_core::sabha::{display_name_of, ChitthiCallback, SabhaEngine, DEFAULT_RELAYS};
-use comrade_core::sakha::SakhaEngine;
+use comrade_core::sakha::{LedgerEntry, SakhaEngine, SakhaSyncCallback};
 use comrade_core::vault::{VaultCallback, VaultEngine, VaultMessage};
 use nostr_sdk::{EventId, Metadata, PublicKey, ToBech32};
 use serde::{Deserialize, Serialize};
@@ -76,6 +76,11 @@ const PUBLISH_ATTEMPTS: u32 = 5;
 const SETTINGS_TREE: &str = "app_settings";
 /// Settings key holding the optional [`TurnConfig`] for WebRTC calls.
 const TURN_CONFIG_KEY: &str = "turn_server";
+/// Encrypted-store tree holding the Sakha/Sakhi pairing record (there is only
+/// ever one partner per device, but a tree keeps the storage shape uniform
+/// with the rest of the repository layer).
+const SAKHA_TREE: &str = "sakha_pairing";
+const SAKHA_PAIRING_KEY: &str = "partner";
 
 /// Conversation gate states (persisted in `ConversationMeta.state`).
 const STATE_PENDING: &str = "pending";
@@ -230,6 +235,29 @@ pub struct MessageRequestDto {
     pub last_at: u64,
 }
 
+/// This device's Sakha/Sakhi pairing state — lets the frontend show "pair
+/// with your partner" or, for a returning paired couple, "continue as
+/// {role}" without asking for the partner's key again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SakhaStatusDto {
+    pub paired: bool,
+    pub partner_npub: Option<String>,
+    /// `"sakha"` or `"sakhi"` — which role this device paired as, if known.
+    pub role: Option<String>,
+}
+
+/// A persisted Sakha/Sakhi pairing, so a returning couple survives a
+/// relaunch without re-exchanging keys. Never holds the derived symmetric
+/// key — that is re-derived from the partner's pubkey plus our own secret
+/// key every time [`SakhaEngine::pair_with`] runs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SakhaPairingRecord {
+    /// Partner's public key, hex-encoded.
+    partner_pubkey_hex: String,
+    /// `"sakha"` or `"sakhi"`.
+    role: String,
+}
+
 /// A NIP-94 encrypted-media reference as the frontend sees it (no key material).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaMessageDto {
@@ -243,6 +271,10 @@ pub struct MediaMessageDto {
     pub created_at: u64,
     /// Size of the encrypted blob in bytes.
     pub size: u64,
+    /// Whether *this device* sent it (mirrors `MessageDto::outgoing`) — needed
+    /// to tell the two apart once media from both directions is merged into
+    /// one history by [`ComradeRuntime::media_with`].
+    pub outgoing: bool,
 }
 
 /// Decrypted media handed back to the frontend. Bytes are base64-encoded so the
@@ -257,6 +289,12 @@ pub struct MediaBytesDto {
 /// Holds everything needed to *re-derive* the key — but never the key itself.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MediaRef {
+    /// NIP-94 event id (hex) — duplicates the store key this row lives under,
+    /// so a full-tree scan ([`ComradeRuntime::media_with`]) can rebuild a
+    /// complete [`MediaMessageDto`] without a second round trip per row.
+    /// Defaulted so refs written before this field are still readable.
+    #[serde(default)]
+    event_id: String,
     url: String,
     /// Hex pubkey of the other party (recipient if outgoing, sender if incoming).
     peer_pubkey: String,
@@ -451,6 +489,9 @@ pub enum BridgeEvent {
     /// The off-grid mesh's connectivity changed: it started/stopped, or a peer
     /// joined/left via mDNS. Drives the persistent local-mesh status indicator.
     MeshStatusChanged(MeshStatusDto),
+    /// The Sakha/Sakhi shared ledger changed — a partner's entry merged in
+    /// over the sync channel. Carries the fresh, fully-merged ledger text.
+    LedgerUpdated { ledger: String },
 }
 
 // ── Runtime ───────────────────────────────────────────────────────────────────
@@ -472,6 +513,9 @@ pub struct ComradeRuntime {
     /// Guards [`spawn_event_loops`] against re-spawning the feed/DM tasks if it
     /// is called more than once. [`spawn_event_loops`]: ComradeRuntime::spawn_event_loops
     loops_spawned: bool,
+    /// Guards [`spawn_sakha_sync_loop`] the same way `loops_spawned` guards
+    /// the feed/DM loops. [`spawn_sakha_sync_loop`]: ComradeRuntime::spawn_sakha_sync_loop
+    sakha_sync_spawned: bool,
     /// The one live profile-publish retry task. Replaced (old one aborted)
     /// whenever the handle changes, so a stale retry loop can never republish
     /// an old name over a new one.
@@ -495,6 +539,7 @@ impl ComradeRuntime {
             saathi: None,
             events,
             loops_spawned: false,
+            sakha_sync_spawned: false,
             publish_task: None,
         }
     }
@@ -592,6 +637,7 @@ impl ComradeRuntime {
                 .await
                 .map_err(|e| UiError::Engine(e.to_string()))?,
         ));
+        self.restore_sakha_pairing().await;
 
         // Startup observability: the unlock is the gate every frontend waits
         // on, so record how long its two phases actually took.
@@ -665,6 +711,13 @@ impl ComradeRuntime {
                     warn!("vault inbox loop ended: {e}");
                 }
             });
+        }
+
+        // A pairing restored from a previous launch (see `restore_sakha_pairing`,
+        // called from `unlock_vault`) should start syncing immediately too —
+        // a fresh pairing via `pair_sakha` starts it itself.
+        if self.sakha.as_ref().is_some_and(|s| s.is_paired()) {
+            self.spawn_sakha_sync_loop();
         }
     }
 
@@ -1568,6 +1621,7 @@ impl ComradeRuntime {
 
         // Persist a local ref so download_and_decrypt_media(event_id) resolves.
         let reff = MediaRef {
+            event_id: event_id.clone(),
             url: url.clone(),
             peer_pubkey: peer.to_hex(),
             mime_type: mime_type.to_string(),
@@ -1614,6 +1668,7 @@ impl ComradeRuntime {
             sender,
             created_at,
             size,
+            outgoing: true,
         })
     }
 
@@ -1646,6 +1701,45 @@ impl ComradeRuntime {
             mime_type: reff.mime_type,
             base64: B64.encode(&bytes),
         })
+    }
+
+    /// Full encrypted-media history with `peer` (npub or hex), oldest first —
+    /// the media counterpart of [`Self::messages_with`]. Lets a frontend
+    /// render past attachments inline after a restart, not just ones that
+    /// arrived live this session (references are persisted the moment they're
+    /// sent or received — see [`Self::upload_and_send_media`] and
+    /// `dispatch_incoming_dm`).
+    pub fn media_with(&self, peer: &str) -> Result<Vec<MediaMessageDto>, UiError> {
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        let peer_hex = parse_pubkey(peer)?.to_hex();
+        let own_npub = self
+            .ui
+            .current_identity()
+            .map(|i| i.npub)
+            .unwrap_or_default();
+
+        let mut items: Vec<MediaMessageDto> = store
+            .values::<MediaRef>(MEDIA_REFS_TREE)
+            .map_err(|e| UiError::Storage(e.to_string()))?
+            .into_iter()
+            .filter(|r| r.peer_pubkey == peer_hex)
+            .map(|r| MediaMessageDto {
+                event_id: r.event_id,
+                url: r.url,
+                mime_type: r.mime_type,
+                caption: r.caption,
+                sender: if r.outgoing {
+                    own_npub.clone()
+                } else {
+                    to_npub(&r.peer_pubkey)
+                },
+                created_at: r.created_at,
+                size: r.size,
+                outgoing: r.outgoing,
+            })
+            .collect();
+        items.sort_by_key(|m| m.created_at);
+        Ok(items)
     }
 
     /// Upload an encrypted blob to Blossom, signed with a BUD-01 auth event.
@@ -1788,7 +1882,161 @@ impl ComradeRuntime {
         });
     }
 
-    // ── Milestone 1: Sakha/Sakhi CRDT ledger sync ────────────────────────────
+    // ── Sakha/Sakhi CRDT ledger: pairing + entries + sync ────────────────────
+
+    /// Restore a previously-completed pairing (and its ledger snapshot) from
+    /// the encrypted store, so a returning paired couple doesn't have to
+    /// re-exchange keys every launch. Called once from [`Self::unlock_vault`],
+    /// right after the Sakha engine is constructed. Best-effort: a missing or
+    /// unreadable record just leaves the engine unpaired, exactly as if this
+    /// were the first launch.
+    async fn restore_sakha_pairing(&mut self) {
+        let Some(store) = self.ui.store_ref() else {
+            return;
+        };
+        let record: Option<SakhaPairingRecord> =
+            store.get(SAKHA_TREE, SAKHA_PAIRING_KEY).ok().flatten();
+        if let (Some(record), Some(sakha)) = (record, self.sakha.clone()) {
+            match PublicKey::parse(&record.partner_pubkey_hex) {
+                Ok(partner_pk) => {
+                    if let Err(e) = sakha.pair_with(partner_pk) {
+                        warn!("failed to restore Sakha pairing: {e}");
+                    }
+                }
+                Err(e) => warn!("stored Sakha partner key is invalid: {e}"),
+            }
+        }
+        // The ledger snapshot restores independently of pairing succeeding —
+        // the CRDT text itself doesn't need a partner key to read locally.
+        if let Ok(Some(state)) = store.load_ledger_state() {
+            if let Some(sakha) = self.sakha.clone() {
+                if let Err(e) = sakha.load_snapshot(&state.snapshot).await {
+                    warn!("failed to restore Sakha ledger snapshot: {e}");
+                }
+            }
+        }
+    }
+
+    /// Start the background loop that merges the partner's incoming ledger
+    /// updates: each successful merge pushes [`BridgeEvent::LedgerUpdated`]
+    /// and persists a fresh snapshot. Idempotent and safe to call whether
+    /// triggered by a fresh [`Self::pair_sakha`] or a pairing restored at
+    /// unlock — spawned at most once per runtime.
+    fn spawn_sakha_sync_loop(&mut self) {
+        if self.sakha_sync_spawned {
+            return;
+        }
+        let Some(sakha) = self.sakha.clone() else {
+            return;
+        };
+        self.sakha_sync_spawned = true;
+        let tx = self.events.clone();
+        let store = self.ui.store_arc();
+        let sakha_for_snapshot = sakha.clone();
+        tokio::spawn(async move {
+            sakha.connect().await;
+            let cb: SakhaSyncCallback = Box::new(move |ledger| {
+                let _ = tx.send(BridgeEvent::LedgerUpdated { ledger });
+                let Some(store) = store.clone() else { return };
+                let sakha = sakha_for_snapshot.clone();
+                tokio::spawn(async move { persist_ledger_snapshot(&store, &sakha).await });
+            });
+            if let Err(e) = sakha.subscribe_sync(cb).await {
+                warn!("sakha sync loop ended: {e}");
+            }
+        });
+    }
+
+    /// Perform the Sakha/Sakhi pairing handshake with `partner_pubkey` (npub
+    /// or hex) as `role` (`"sakha"`/`"sakhi"`): derives the shared ledger key,
+    /// persists the pairing so it survives a restart, and starts the
+    /// background sync loop that merges the partner's future ledger updates
+    /// live. Returns the resulting pairing status.
+    pub async fn pair_sakha(
+        &mut self,
+        partner_pubkey: &str,
+        role: &str,
+    ) -> Result<SakhaStatusDto, UiError> {
+        let sakha = self.sakha.clone().ok_or(UiError::VaultLocked)?;
+        let peer = parse_pubkey(partner_pubkey)?;
+        sakha
+            .pair_with(peer)
+            .map_err(|e| UiError::Engine(e.to_string()))?;
+
+        let role = normalize_pair_role(role);
+        if let Some(store) = self.ui.store_ref() {
+            let record = SakhaPairingRecord {
+                partner_pubkey_hex: peer.to_hex(),
+                role,
+            };
+            store
+                .put(SAKHA_TREE, SAKHA_PAIRING_KEY, &record)
+                .and_then(|()| store.flush())
+                .map_err(|e| UiError::Storage(e.to_string()))?;
+        }
+
+        self.spawn_sakha_sync_loop();
+        self.sakha_status()
+    }
+
+    /// This device's Sakha/Sakhi pairing state.
+    pub fn sakha_status(&self) -> Result<SakhaStatusDto, UiError> {
+        let sakha = self.sakha.clone().ok_or(UiError::VaultLocked)?;
+        let partner_npub = sakha
+            .partner_pubkey()
+            .map(|pk| pk.to_bech32().unwrap_or_else(|_| pk.to_hex()));
+        let role = self
+            .ui
+            .store_ref()
+            .and_then(|s| {
+                s.get::<SakhaPairingRecord>(SAKHA_TREE, SAKHA_PAIRING_KEY)
+                    .ok()
+                    .flatten()
+            })
+            .map(|r| r.role);
+        Ok(SakhaStatusDto {
+            paired: sakha.is_paired(),
+            partner_npub,
+            role,
+        })
+    }
+
+    /// Append an entry to the shared Sakha/Sakhi CRDT ledger, persist a fresh
+    /// local snapshot, and return the merged ledger text. Requires a
+    /// completed pairing — use [`Self::pair_sakha`] first.
+    pub async fn sakha_add_entry(
+        &self,
+        description: &str,
+        amount_inr: f64,
+        paid_by: &str,
+    ) -> Result<String, UiError> {
+        if description.trim().is_empty() {
+            return Err(UiError::Engine("description is empty".into()));
+        }
+        let sakha = self.sakha.clone().ok_or(UiError::VaultLocked)?;
+        if !sakha.is_paired() {
+            return Err(UiError::Engine(
+                "not paired with a partner yet — open the Partner Portal first".into(),
+            ));
+        }
+        let entry = LedgerEntry::new(description, amount_inr, paid_by);
+        sakha
+            .add_entry(entry)
+            .await
+            .map_err(|e| UiError::Engine(e.to_string()))?;
+        let ledger = sakha.read_ledger().await;
+        if let Some(store) = self.ui.store_arc() {
+            persist_ledger_snapshot(&store, &sakha).await;
+        }
+        Ok(ledger)
+    }
+
+    /// The current Sakha/Sakhi ledger text (local CRDT state — no network
+    /// round trip). Empty until entries exist or a snapshot/sync restores some.
+    pub async fn sakha_read_ledger(&self) -> Result<String, UiError> {
+        let sakha = self.sakha.clone().ok_or(UiError::VaultLocked)?;
+        Ok(sakha.read_ledger().await)
+    }
 
     /// Publish the current Sakha/Sakhi shared CRDT ledger state to the partner.
     /// Returns the sync event id (hex). Without a completed pairing handshake the
@@ -1835,6 +2083,33 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or_default()
+}
+
+/// Normalise a pairing-role string to exactly `"sakha"` or `"sakhi"` —
+/// anything else (including case variants) falls back to `"sakha"`, mirroring
+/// the lenient `from_str_lenient` pattern already used for `CallMediaKind`/
+/// `HangupReason` elsewhere in this bridge.
+fn normalize_pair_role(role: &str) -> String {
+    if role.eq_ignore_ascii_case("sakhi") {
+        "sakhi".to_string()
+    } else {
+        "sakha".to_string()
+    }
+}
+
+/// Snapshot the Sakha CRDT doc and persist it, so the ledger survives a
+/// restart without needing a fresh sync from the partner. Best-effort: a
+/// write failure is logged, not propagated — losing a snapshot write is far
+/// less bad than failing the ledger update that triggered it.
+async fn persist_ledger_snapshot(store: &comrade_storage::EncryptedStore, sakha: &SakhaEngine) {
+    let bytes = sakha.snapshot_bytes().await;
+    let state = comrade_storage::LedgerState {
+        snapshot: bytes,
+        updated_at: now_secs(),
+    };
+    if let Err(e) = store.save_ledger_state(&state).and_then(|()| store.flush()) {
+        warn!("failed to persist Sakha ledger snapshot: {e}");
+    }
 }
 
 /// Store key for a journal entry: a zero-padded timestamp prefix (so ids sort
@@ -2060,6 +2335,7 @@ fn dispatch_incoming_dm(
     if let Some(env) = parse_media_envelope(&msg.content) {
         if let Some(store) = store {
             let reff = MediaRef {
+                event_id: env.event_id.clone(),
                 url: env.url.clone(),
                 peer_pubkey: msg.sender_pubkey.clone(),
                 mime_type: env.mime.clone(),
@@ -2085,6 +2361,7 @@ fn dispatch_incoming_dm(
                 sender: to_npub(&msg.sender_pubkey),
                 created_at: msg.created_at,
                 size: env.size,
+                outgoing: false,
             }));
             send_delivered_receipt(vault, &msg.sender_pubkey, &msg.event_id);
         } else {
@@ -2330,7 +2607,10 @@ mod tests {
             require_send(rt.sync_ledger());
             require_send(rt.upload_and_send_media("x", vec![], "image/png", ""));
             require_send(rt.download_and_decrypt_media("x"));
+            require_send(rt.sakha_add_entry("desc", 1.0, "sakha"));
+            require_send(rt.sakha_read_ledger());
             require_send(wrt.set_username("neo"));
+            require_send(wrt.pair_sakha("npub1x", "sakha"));
             require_send(urt.unlock_vault("/tmp/x", "p"));
             require_send(wrt.toggle_workspace("Base"));
             require_send(urt.back());
@@ -2460,6 +2740,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sakha_status_and_ledger_reject_gracefully_before_pairing() {
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+        rt.unlock_vault(dir.path(), "pin").await.unwrap();
+
+        let status = rt.sakha_status().unwrap();
+        assert!(!status.paired);
+        assert_eq!(status.partner_npub, None);
+
+        assert!(matches!(
+            rt.sakha_add_entry("Coffee", 150.0, "Sakha").await,
+            Err(UiError::Engine(_))
+        ));
+        // Reading the (empty) local ledger doesn't require pairing.
+        assert_eq!(rt.sakha_read_ledger().await.unwrap(), "");
+    }
+
+    #[tokio::test]
+    async fn pair_sakha_rejects_an_invalid_partner_key() {
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+        rt.unlock_vault(dir.path(), "pin").await.unwrap();
+        assert!(rt.pair_sakha("not-a-valid-key", "sakha").await.is_err());
+        assert!(!rt.sakha_status().unwrap().paired);
+    }
+
+    #[tokio::test]
+    async fn pair_sakha_add_entry_and_status_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+        rt.unlock_vault(dir.path(), "pin").await.unwrap();
+
+        let partner = comrade_core::crypto::KeyProfile::generate().unwrap();
+        let status = rt.pair_sakha(&partner.npub, "Sakhi").await.unwrap();
+        assert!(status.paired);
+        assert_eq!(status.partner_npub.as_deref(), Some(partner.npub.as_str()));
+        assert_eq!(status.role.as_deref(), Some("sakhi"));
+
+        let ledger = rt
+            .sakha_add_entry("Groceries", 300.0, "Sakhi")
+            .await
+            .unwrap();
+        assert!(ledger.contains("Groceries"), "entry must appear: {ledger}");
+        assert_eq!(rt.sakha_read_ledger().await.unwrap(), ledger);
+    }
+
+    #[test]
+    fn sakha_pairing_and_ledger_survive_a_relaunch() {
+        // Regression guard for AUDIT A3/A8: pairing state and the local
+        // ledger must not evaporate on restart just because the in-memory
+        // Yrs doc and the paired-partner key live nowhere but RAM otherwise.
+        //
+        // This uses two independent Tokio runtimes (rather than one shared
+        // `#[tokio::test]` runtime) to actually simulate a process restart:
+        // `pair_sakha` spawns a detached background sync task that holds its
+        // own `Arc` clone of the encrypted store, so within a single runtime
+        // that task outlives the `{ }` scope below and keeps the redb file
+        // open — dropping the whole `Runtime` (unlike a scope exit) forcibly
+        // tears down every task it owns, exactly as a real process exit
+        // would, and only then is the file lock actually released.
+        let dir = TempDir::new().unwrap();
+        let partner = comrade_core::crypto::KeyProfile::generate().unwrap();
+
+        {
+            let rt_tokio = tokio::runtime::Runtime::new().unwrap();
+            rt_tokio.block_on(async {
+                let mut rt = ComradeRuntime::new();
+                rt.unlock_vault(dir.path(), "pin").await.unwrap();
+                rt.pair_sakha(&partner.npub, "sakha").await.unwrap();
+                rt.sakha_add_entry("Rent", 12000.0, "Sakha").await.unwrap();
+            });
+        }
+
+        let rt_tokio2 = tokio::runtime::Runtime::new().unwrap();
+        rt_tokio2.block_on(async {
+            let mut rt2 = ComradeRuntime::new();
+            rt2.unlock_vault(dir.path(), "pin").await.unwrap();
+            let status = rt2.sakha_status().unwrap();
+            assert!(status.paired, "pairing must survive a relaunch");
+            assert_eq!(status.partner_npub.as_deref(), Some(partner.npub.as_str()));
+            let ledger = rt2.sakha_read_ledger().await.unwrap();
+            assert!(
+                ledger.contains("Rent"),
+                "ledger snapshot must survive a relaunch: {ledger}"
+            );
+        });
+    }
+
+    #[tokio::test]
     async fn fetch_timeline_reads_from_encrypted_cache() {
         let dir = TempDir::new().unwrap();
         let mut rt = ComradeRuntime::new();
@@ -2556,6 +2925,7 @@ mod tests {
             sender: "npub1x".into(),
             created_at: 1,
             size: 42,
+            outgoing: false,
         });
         let json = serde_json::to_string(&ev).unwrap();
         assert!(json.contains("\"type\":\"incoming_media\""));
@@ -3015,6 +3385,7 @@ mod tests {
         let id = rt.unlock_vault(dir.path(), "pin").await.unwrap();
         let peer_hex = nostr_sdk::PublicKey::parse(&id.npub).unwrap().to_hex();
         let reff = MediaRef {
+            event_id: "evt1".into(),
             url: "https://blob.example/abc".into(),
             peer_pubkey: peer_hex,
             mime_type: "image/png".into(),
@@ -3036,6 +3407,64 @@ mod tests {
         #[cfg(not(feature = "media-http"))]
         assert!(matches!(out, Err(UiError::Engine(_))));
         let _ = out;
+    }
+
+    #[tokio::test]
+    async fn media_with_lists_history_oldest_first_with_correct_direction() {
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+        let id = rt.unlock_vault(dir.path(), "pin").await.unwrap();
+        let (peer_hex, peer_npub) = stranger();
+
+        let incoming = MediaRef {
+            event_id: "evt_in".into(),
+            url: "https://blob.example/in".into(),
+            peer_pubkey: peer_hex.clone(),
+            mime_type: "image/png".into(),
+            caption: "from them".into(),
+            size: 3,
+            sha256_hex: String::new(),
+            outgoing: false,
+            created_at: 10,
+        };
+        let outgoing = MediaRef {
+            event_id: "evt_out".into(),
+            url: "https://blob.example/out".into(),
+            peer_pubkey: peer_hex,
+            mime_type: "audio/ogg".into(),
+            caption: "from me".into(),
+            size: 5,
+            sha256_hex: String::new(),
+            outgoing: true,
+            created_at: 20,
+        };
+        let store = rt.ui.store_ref().unwrap();
+        store.put(MEDIA_REFS_TREE, "evt_in", &incoming).unwrap();
+        store.put(MEDIA_REFS_TREE, "evt_out", &outgoing).unwrap();
+
+        let history = rt.media_with(&peer_npub).unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].event_id, "evt_in");
+        assert!(!history[0].outgoing);
+        assert_eq!(history[0].sender, peer_npub);
+        assert_eq!(history[1].event_id, "evt_out");
+        assert!(history[1].outgoing);
+        assert_eq!(history[1].sender, id.npub);
+    }
+
+    #[tokio::test]
+    async fn media_with_rejects_when_locked_and_is_empty_for_a_stranger() {
+        let rt = ComradeRuntime::new();
+        let (_, peer_npub) = stranger();
+        assert!(matches!(
+            rt.media_with(&peer_npub),
+            Err(UiError::VaultLocked)
+        ));
+
+        let dir = TempDir::new().unwrap();
+        let mut rt2 = ComradeRuntime::new();
+        rt2.unlock_vault(dir.path(), "pin").await.unwrap();
+        assert!(rt2.media_with(&peer_npub).unwrap().is_empty());
     }
 
     // ── Message requests, receipts, and calls ────────────────────────────────

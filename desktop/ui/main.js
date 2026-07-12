@@ -236,9 +236,11 @@
 
     if (ws.couple_sandbox) {
       $("#couple-role").textContent = ws.key.endsWith("Sakhi") ? "Sakhi" : "Sakha";
-      $("#couple-attach").disabled = !state.partnerNpub;
-      renderCoupleMedia();
       setScreen("couple");
+      // Pull the authoritative pairing state (partner key, ledger form
+      // enablement, ledger content) — fire-and-forget so entering the
+      // screen never blocks on it.
+      refreshSakhaStatus().catch(() => {});
     } else {
       setScreen("app");
     }
@@ -472,28 +474,42 @@
     renderConversation();
     // Opening a conversation clears its unread state and sends read receipts.
     safeInvoke("mark_conversation_read", { peer: key }, { silent: true }).catch(() => {});
-    // Pull the full persisted thread; keep live media bubbles (not part of the
-    // stored text history) merged in.
-    safeInvoke("messages_with", { peer: key }, { silent: true })
-      .then((msgs) => {
-        if (!Array.isArray(msgs) || !msgs.length || state.activeContact !== key) return;
-        const media = (state.dms.get(key) || []).filter((m) => m.media);
-        const merged = msgs
-          .map((m) => ({
-            id: m.id,
-            content: m.content,
-            created_at: m.created_at,
-            outgoing: !!m.outgoing,
-            upi: [],
-            status: m.status || null,
-            reply_to: m.reply_to || null,
-          }))
-          .concat(media)
-          .sort((a, b) => a.created_at - b.created_at);
-        state.dms.set(key, merged);
-        renderConversation();
-      })
-      .catch(() => {});
+    // Pull the full persisted thread — text history plus persisted media
+    // history — and merge in any live media bubbles from this session ahead
+    // of their persisted duplicate (a live one may already hold a decrypted
+    // objectUrl, which a freshly-fetched persisted row never does).
+    Promise.all([
+      safeInvoke("messages_with", { peer: key }, { silent: true }).catch(() => []),
+      safeInvoke("media_with", { peer: key }, { silent: true }).catch(() => []),
+    ]).then(([msgs, mediaHistory]) => {
+      if (state.activeContact !== key) return;
+      const texts = Array.isArray(msgs) ? msgs : [];
+      const liveMedia = (state.dms.get(key) || []).filter((m) => m.media);
+      const seenEventIds = new Set(liveMedia.map((m) => m.media.eventId));
+      const persistedMedia = (Array.isArray(mediaHistory) ? mediaHistory : [])
+        .filter((m) => !seenEventIds.has(m.event_id))
+        .map((m) => ({
+          created_at: m.created_at,
+          outgoing: !!m.outgoing,
+          media: { eventId: m.event_id, mime: m.mime_type, caption: m.caption },
+        }));
+      if (!texts.length && !liveMedia.length && !persistedMedia.length) return;
+      const merged = texts
+        .map((m) => ({
+          id: m.id,
+          content: m.content,
+          created_at: m.created_at,
+          outgoing: !!m.outgoing,
+          upi: [],
+          status: m.status || null,
+          reply_to: m.reply_to || null,
+        }))
+        .concat(liveMedia)
+        .concat(persistedMedia)
+        .sort((a, b) => a.created_at - b.created_at);
+      state.dms.set(key, merged);
+      renderConversation();
+    });
   }
 
   /** Send the composed DM to the active contact (real end-to-end send). */
@@ -1503,40 +1519,89 @@
     }
   }
 
-  // ── Milestone 4: Partner Portal (Couple Sandbox) ──────────────────────────
-  function openPartnerModal() {
+  // ── Milestone 4: Partner Portal — real Sakha/Sakhi pairing handshake ──────
+  //
+  // Pairing is a genuine Diffie-Hellman key exchange (`pair_sakha`, backed by
+  // `SakhaEngine::pair_with`) between two Nostr public keys — not a client-side
+  // token check. A completed pairing is persisted on the backend and survives
+  // a relaunch, so a returning couple gets a "Continue" shortcut instead of
+  // being asked to paste each other's keys again every session.
+
+  /** Opening the portal decides which face to show: the pairing form (first
+   * time, or pairing with someone new) or the "already paired" shortcut. */
+  async function openPartnerModal() {
     $("#modal-partner").hidden = false;
-    $("#pair-payload").focus();
+    let status = null;
+    try {
+      status = await safeInvoke("sakha_status", undefined, { silent: true });
+    } catch {
+      /* vault locked or an older backend without the command — show the form */
+    }
+    if (status && status.paired) {
+      showPairExisting(status);
+    } else {
+      showPairForm();
+    }
   }
+
   function closePartnerModal() {
     $("#modal-partner").hidden = true;
   }
 
+  function showPairExisting(status) {
+    $("#pair-existing-npub").textContent = shortNpub(status.partner_npub || "");
+    $("#pair-existing-role").textContent = status.role === "sakhi" ? "Sakhi" : "Sakha";
+    $("#pair-existing").hidden = false;
+    $("#pair-form").hidden = true;
+  }
+
+  function showPairForm() {
+    $("#pair-existing").hidden = true;
+    $("#pair-form").hidden = false;
+    $("#pair-payload").focus();
+  }
+
+  /** Re-enter the sandbox as an already-paired partner — no new handshake. */
+  async function handlePairContinue() {
+    const btn = $("#pair-continue");
+    setBusy(btn, true);
+    try {
+      const status = await safeInvoke("sakha_status", undefined, { silent: true });
+      const role = status.role === "sakhi" ? "sakhi" : "sakha";
+      const target = role === "sakhi" ? "CoupleSandboxSakhi" : "CoupleSandboxSakha";
+      const ws = await safeInvoke("toggle_app_workspace", { target });
+      state.coupleRole = role;
+      closePartnerModal();
+      applyWorkspace(ws);
+    } catch {
+      /* toasted */
+    } finally {
+      setBusy(btn, false);
+    }
+  }
+
+  /** Perform the real pairing handshake, then enter the sandbox. */
   async function handlePair() {
     const payload = $("#pair-payload").value.trim();
     const role = (document.querySelector("input[name=pair-role]:checked") || {}).value || "sakha";
-    // Client-side validation of the cryptographic pairing payload.
-    if (payload.length < 8) {
-      showToast("Enter a valid pairing payload", "warn");
-      return;
-    }
-    if (!/^npub1[0-9a-z]+$/i.test(payload) && !payload.includes(":")) {
-      showToast("That doesn't look like a valid pairing token", "warn");
+    if (!/^npub1[0-9a-z]+$/i.test(payload)) {
+      showToast("Enter your partner's npub public key", "warn");
       return;
     }
     const btn = $("#pair-submit");
     setBusy(btn, true);
     try {
+      await safeInvoke("pair_sakha", { partnerPubkey: payload, role });
       const target = role === "sakhi" ? "CoupleSandboxSakhi" : "CoupleSandboxSakha";
       const ws = await safeInvoke("toggle_app_workspace", { target });
       state.coupleRole = role;
-      // Capture the partner's npub for couple media when the payload is one.
-      state.partnerNpub = /^npub1[0-9a-z]+$/i.test(payload) ? payload : null;
+      $("#pair-payload").value = "";
       closePartnerModal();
       applyWorkspace(ws);
-      showToast("Partner portal unlocked", "success");
+      showToast("Paired — your shared ledger is ready", "success");
     } catch {
-      /* e.g. blocked because Travel mode is active — toasted already */
+      /* e.g. an invalid key, or blocked because Travel mode is active —
+         toasted already */
     } finally {
       setBusy(btn, false);
     }
@@ -1551,17 +1616,83 @@
     }
   }
 
+  // ── Hisab-Kitab shared ledger: pairing status, entries, live sync ────────
+
+  function setLedgerFormEnabled(enabled) {
+    for (const id of ["ledger-desc", "ledger-amount", "ledger-paid-by", "ledger-add-btn"]) {
+      $(`#${id}`).disabled = !enabled;
+    }
+  }
+
+  function renderLedgerText(text) {
+    $("#ledger-status").textContent =
+      text && text.trim() ? text : "No entries yet — add the first one below.";
+  }
+
+  /** Pull the authoritative pairing state and refresh everything it drives:
+   * the partner key (couple media), the entry form's enabled state, and the
+   * ledger content itself. Called whenever the Couple Sandbox screen opens. */
+  async function refreshSakhaStatus() {
+    let status;
+    try {
+      status = await safeInvoke("sakha_status", undefined, { silent: true });
+    } catch {
+      return; // older backend without the command, or vault locked
+    }
+    state.partnerNpub = status.partner_npub || null;
+    $("#couple-attach").disabled = !state.partnerNpub;
+    setLedgerFormEnabled(!!status.paired);
+    renderCoupleMedia();
+    if (status.paired) await loadLedger();
+    else $("#ledger-status").textContent = "Not yet paired.";
+  }
+
+  async function loadLedger() {
+    try {
+      renderLedgerText(await safeInvoke("sakha_read_ledger", undefined, { silent: true }));
+    } catch {
+      /* leave whatever was already shown */
+    }
+  }
+
+  async function handleAddLedgerEntry(e) {
+    e.preventDefault();
+    const description = $("#ledger-desc").value.trim();
+    const paidBy = $("#ledger-paid-by").value.trim();
+    const amountInr = parseFloat($("#ledger-amount").value);
+    if (!description || !paidBy || !Number.isFinite(amountInr) || amountInr < 0) {
+      showToast("Fill in what it was for, the amount, and who paid", "warn");
+      return;
+    }
+    const btn = $("#ledger-add-btn");
+    setBusy(btn, true);
+    try {
+      renderLedgerText(await safeInvoke("sakha_add_entry", { description, amountInr, paidBy }));
+      $("#ledger-desc").value = "";
+      $("#ledger-amount").value = "";
+      $("#ledger-paid-by").value = "";
+      $("#ledger-desc").focus();
+    } catch {
+      /* toasted */
+    } finally {
+      setBusy(btn, false);
+    }
+  }
+
+  /** The partner pushed a ledger update over the sync channel — refresh live. */
+  function onLedgerUpdated(p) {
+    renderLedgerText(p.ledger || "");
+    showToast("Your partner updated the shared ledger", "info");
+  }
+
   async function handleSyncLedger() {
     const btn = $("#sync-ledger-btn");
-    const status = $("#ledger-status");
     setBusy(btn, true);
-    status.textContent = "Syncing the shared ledger…";
     try {
-      const id = await safeInvoke("sync_ledger");
-      status.textContent = `Synced ✓  ·  event ${String(id).slice(0, 16)}…`;
-      showToast("Hisab-Kitab ledger synced", "success");
-    } catch (e) {
-      status.textContent = `Sync unavailable — ${errText(e)}`;
+      await safeInvoke("sync_ledger");
+      showToast("Hisab-Kitab ledger synced to your partner", "success");
+    } catch {
+      /* toasted */
     } finally {
       setBusy(btn, false);
     }
@@ -1596,6 +1727,8 @@
           onMessageStatus(p);
         } else if (p.type === "peer_profile_updated") {
           onPeerProfileUpdated(p);
+        } else if (p.type === "ledger_updated") {
+          onLedgerUpdated(p);
         }
       });
     } catch (e) {
@@ -1655,8 +1788,11 @@
     $("#partner-btn").addEventListener("click", openPartnerModal);
     $("#partner-cancel").addEventListener("click", closePartnerModal);
     $("#pair-submit").addEventListener("click", handlePair);
+    $("#pair-continue").addEventListener("click", handlePairContinue);
+    $("#pair-again").addEventListener("click", showPairForm);
     $("#couple-exit").addEventListener("click", exitCouple);
     $("#sync-ledger-btn").addEventListener("click", handleSyncLedger);
+    $("#ledger-entry-form").addEventListener("submit", handleAddLedgerEntry);
 
     // Reply chip + message requests + call settings (Milestone 6)
     $("#dm-reply-cancel").addEventListener("click", clearReply);
@@ -1712,9 +1848,16 @@
       {
         peer: "npub1stranger00000000000000000000000000000000000000000",
         last_message: "Hey, saw your Chitthi — mind if we chat? (mock)",
-        last_at: nowSecs() - 300,
+        // mockBackend() runs at module-init time (`const backend = hasTauri ?
+        // … : mockBackend()` above), before the `nowSecs` const further down
+        // this same scope is initialized — calling it here would be a
+        // temporal-dead-zone ReferenceError, so compute the timestamp inline.
+        last_at: Math.floor(Date.now() / 1000) - 300,
       },
     ];
+    // Local Sakha/Sakhi pairing + ledger state, so the pairing modal and the
+    // Couple Sandbox behave believably in browser preview.
+    let mockSakha = { paired: false, partnerNpub: null, role: null, ledger: "" };
 
     const invoke = async (cmd, args = {}) => {
       await delay(120);
@@ -1749,6 +1892,7 @@
           };
         case "conversations":
         case "messages_with":
+        case "media_with":
         case "list_contacts":
           return [];
         case "current_profile":
@@ -1761,8 +1905,26 @@
             out.push({ amount_inr: parseFloat(m[1]), vpa: m[2], uri: `upi://pay?pa=${m[2]}&am=${m[1]}` });
           return out;
         }
+        case "pair_sakha":
+          mockSakha.paired = true;
+          mockSakha.partnerNpub = args.partnerPubkey;
+          mockSakha.role = args.role === "sakhi" ? "sakhi" : "sakha";
+          return { paired: true, partner_npub: mockSakha.partnerNpub, role: mockSakha.role };
+        case "sakha_status":
+          return mockSakha.paired
+            ? { paired: true, partner_npub: mockSakha.partnerNpub, role: mockSakha.role }
+            : { paired: false, partner_npub: null, role: null };
+        case "sakha_add_entry": {
+          if (!mockSakha.paired) throw "not paired with a partner yet";
+          const line = `[mock] ${args.description} | ₹${Number(args.amountInr).toFixed(2)} | paid by ${args.paidBy}`;
+          mockSakha.ledger = mockSakha.ledger ? `${mockSakha.ledger}\n${line}` : line;
+          return mockSakha.ledger;
+        }
+        case "sakha_read_ledger":
+          return mockSakha.ledger;
         case "sync_ledger":
-          throw "no shared secret available — pairing handshake incomplete";
+          if (!mockSakha.paired) throw "no shared secret available — pairing handshake incomplete";
+          return "mockledgersync_" + Date.now();
         case "send_media_bytes":
           return {
             event_id: "mockmedia_" + Date.now(),
