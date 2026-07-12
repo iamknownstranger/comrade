@@ -78,8 +78,10 @@ import mullu.comrade.ui.PeerAvatar
 import mullu.comrade.ui.RequestsScreen
 import mullu.comrade.ui.SettingsScreen
 import mullu.comrade.ui.peerTitle
+import mullu.comrade.ui.purgeDecryptedMedia
 import mullu.comrade.ui.shortNpub
 import mullu.comrade.ui.theme.ComradeTheme
+import uniffi.comrade_core.CallSignal
 import uniffi.comrade_ui.BridgeEvent
 
 class MainActivity : ComponentActivity() {
@@ -101,6 +103,19 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    /**
+     * Backgrounding is our "session over" signal: drop every decrypted media
+     * plaintext the app cached this session (received voice notes, images,
+     * videos) from `cacheDir/media`. Anything the user reopens is transparently
+     * re-decrypted, so this leaves nothing recoverable at rest yet costs the
+     * user nothing (AUDIT S-4). The same call is the natural hook for an
+     * explicit vault-lock action once one exists.
+     */
+    override fun onStop() {
+        super.onStop()
+        purgeDecryptedMedia(this)
     }
 }
 
@@ -189,6 +204,9 @@ private sealed interface PumpEvent {
 
     /** A stranger's gated DM — refresh requests + notify. */
     data class Request(val peer: String, val preview: String) : PumpEvent
+
+    /** A ringing incoming call (a fresh WebRTC offer) — notify. */
+    data class IncomingCall(val peer: String, val video: Boolean) : PumpEvent
 
     /** Media / receipt / profile update — just reload the chat lists. */
     data object HistoryChanged : PumpEvent
@@ -303,6 +321,12 @@ private fun MainShell(
                         requestTick++
                         Notifier.notifyRequest(context, event.peer, event.preview)
                     }
+                    is PumpEvent.IncomingCall -> Notifier.notifyIncomingCall(
+                        context,
+                        event.peer,
+                        shortNpub(event.peer),
+                        event.video,
+                    )
                     PumpEvent.HistoryChanged -> historyChanged = true
                     is PumpEvent.MeshStatusChanged -> MeshStatusMonitor.update(event.status)
                 }
@@ -649,10 +673,21 @@ private fun drainEvents(max: Int = 200): List<PumpEvent> {
                 preview = "📎 " + event.v1.caption.ifBlank { "Attachment" },
             )
             // Receipt + profile updates only need a chat-list reload (ticks,
-            // titles). Call signals are handled by the desktop/native call
-            // layer, not this messaging pump.
+            // titles).
             is BridgeEvent.MessageStatus, is BridgeEvent.PeerProfileUpdated -> out += PumpEvent.HistoryChanged
-            is BridgeEvent.IncomingCallSignal -> Unit
+            // A fresh WebRTC offer is a ringing incoming call — surface it. The
+            // follow-up signals of an in-progress call (answer/ICE/hangup) are
+            // fed straight into the active PeerConnection by the call layer, not
+            // turned into notifications here.
+            is BridgeEvent.IncomingCallSignal -> {
+                val dto = event.v1
+                if (dto.signal is CallSignal.Offer) {
+                    out += PumpEvent.IncomingCall(
+                        peer = dto.peer,
+                        video = dto.media == "video",
+                    )
+                }
+            }
             is BridgeEvent.MeshStatusChanged -> out += PumpEvent.MeshStatusChanged(
                 ComradeCore.MeshStatus(active = event.v1.active, peerCount = event.v1.peerCount.toInt()),
             )

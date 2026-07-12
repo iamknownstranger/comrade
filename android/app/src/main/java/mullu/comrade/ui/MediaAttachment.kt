@@ -109,20 +109,42 @@ private object MediaCache {
 
     suspend fun resolveFile(context: Context, info: ComradeCore.MediaMessageInfo): File =
         withContext(Dispatchers.IO) {
-            fileMemo[info.eventId]?.let { if (it.exists()) return@withContext it }
+            synchronized(fileMemo) { fileMemo[info.eventId] }
+                ?.let { if (it.exists()) return@withContext it }
             val dir = File(context.cacheDir, "media").apply { mkdirs() }
             val file = File(dir, "${info.eventId}.${extensionFor(info.mimeType)}")
             if (!file.exists()) {
                 val bytes = ComradeCore.downloadMediaTyped(info.eventId)
                 file.writeBytes(Base64.decode(bytes.base64, Base64.NO_WRAP))
             }
-            fileMemo[info.eventId] = file
+            synchronized(fileMemo) { fileMemo[info.eventId] = file }
             file
         }
 
     fun uriFor(context: Context, file: File) =
         FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+
+    /**
+     * Drop every decrypted plaintext this cache is holding: the in-memory image
+     * LRU and each file written under `cacheDir/media`. Anything still needed is
+     * transparently re-decrypted on next view, so this is safe to call any time
+     * the app should not be sitting on plaintext (backgrounded / vault locked).
+     */
+    fun clear(context: Context) {
+        synchronized(bitmapCache) { bitmapCache.clear() }
+        synchronized(fileMemo) { fileMemo.clear() }
+        val dir = File(context.cacheDir, "media")
+        dir.listFiles()?.forEach { it.delete() }
+    }
 }
+
+/**
+ * Wipe all decrypted media the app has cached to `cacheDir/media` (and the
+ * in-memory bitmap LRU). Called when the app is backgrounded or the vault is
+ * locked so plaintext attachments — including received voice notes — never
+ * outlive a foreground session on disk (AUDIT S-4).
+ */
+internal fun purgeDecryptedMedia(context: Context) = MediaCache.clear(context)
 
 /**
  * A chat bubble for one NIP-94/96 attachment — renders images, audio, and
