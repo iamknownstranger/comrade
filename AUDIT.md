@@ -396,11 +396,25 @@ user has)? Owner call required before any companion code.
 > `ComradeRuntime::call_ice_servers_for` let a call start on free, blind-to-the-
 > call public STUN (`place_call`'s initial offer already does), then explicitly
 > ask for the TURN-inclusive list once a frontend's `RTCPeerConnection` reports
-> ICE never reaches `connected` (the CGNAT case) — engine-level and unit-tested,
-> but no frontend calls the fallback (or restarts ICE) yet; that's the remaining
-> wiring, alongside **Android `org.webrtc`** native media. Both bridges (JNI +
-> Tauri) carry the existing calls. **Desktop** drives real WebRTC in the
-> webview. OQ10 (below) is still open.
+> ICE never reaches `connected` (the CGNAT case) — engine-level and unit-tested.
+> Both bridges (JNI + Tauri) carry the existing calls. **Desktop** drives real
+> WebRTC in the webview. **2026-07-12 (Android):** the Android frontend now
+> drives real `org.webrtc` media too — `mullu.comrade.call.CallManager` builds
+> the `PeerConnectionFactory`/`PeerConnection`, captures mic+camera, and runs the
+> same offer/answer/ICE handshake the desktop does, forwarding every payload
+> through `ComradeCore` (so the NIP-59 DM routing is reused unchanged); the
+> `MainActivity` event pump feeds `IncomingCallSignal` back in (it was previously
+> dropped) and raises an incoming-call notification, and `CallScreen.kt` renders
+> the ringing/connecting/active/ended states with `SurfaceViewRenderer` video and
+> earpiece/speaker routing. The STUN→TURN fallback (caller widens to
+> `call_ice_servers_for("stun_and_turn")` and ICE-restarts on a failed
+> connection) is wired on Android; desktop still does not restart ICE.
+> Dependency note: the historical `org.webrtc:google-webrtc` prebuilt is gone
+> from public Maven (JCenter-only, shut down 2021), so Android depends on the
+> Maven-Central-published `io.github.webrtc-sdk:android`, which keeps the same
+> `org.webrtc.*` package. Honest scope: calls work while the app process is alive
+> (foreground / held by an activity); always-on background delivery needs a
+> connection service or push (AUDIT §7). OQ10 (below) is still open.
 
 Session-style calling for the loved-one pillar. Design sketch, honest about
 size (this is a **multi-PR epic**, comparable to everything built so far):

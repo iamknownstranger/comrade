@@ -13,6 +13,16 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- Voice/video calls (WebRTC): camera capture for video calls and in-call
+         audio routing (earpiece ⇄ speakerphone). RECORD_AUDIO above already
+         covers the microphone. The camera is declared optional so the app still
+         installs on camera-less devices — voice calls don't need it. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-feature
+        android:name="android.hardware.camera"
+        android:required="false" />
+
     <!-- allowBackup=false: the encrypted vault must not leave the device via
          adb/cloud backup — an exported copy is an offline brute-force target. -->
     <application

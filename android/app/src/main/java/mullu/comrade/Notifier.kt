@@ -130,6 +130,11 @@ object Notifier {
         mgr.cancel("call:$peer".hashCode())
     }
 
+    /** Clear only the incoming-call notification for `peer` (call answered/ended). */
+    fun clearCall(context: Context, peer: String) {
+        NotificationManagerCompat.from(context).cancel("call:$peer".hashCode())
+    }
+
     /** Whether POST_NOTIFICATIONS is granted (always true below Android 13). */
     fun hasPermission(context: Context): Boolean =
         Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||

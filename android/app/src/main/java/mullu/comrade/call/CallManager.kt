@@ -1,0 +1,771 @@
+package mullu.comrade.call
+
+import android.content.Context
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
+import android.util.Log
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import mullu.comrade.ComradeCore
+import org.webrtc.AudioSource
+import org.webrtc.AudioTrack
+import org.webrtc.Camera2Enumerator
+import org.webrtc.CameraVideoCapturer
+import org.webrtc.DefaultVideoDecoderFactory
+import org.webrtc.DefaultVideoEncoderFactory
+import org.webrtc.EglBase
+import org.webrtc.IceCandidate
+import org.webrtc.MediaConstraints
+import org.webrtc.MediaStream
+import org.webrtc.PeerConnection
+import org.webrtc.PeerConnectionFactory
+import org.webrtc.RtpReceiver
+import org.webrtc.SdpObserver
+import org.webrtc.SessionDescription
+import org.webrtc.SurfaceTextureHelper
+import org.webrtc.VideoCapturer
+import org.webrtc.VideoSource
+import org.webrtc.VideoTrack
+import uniffi.comrade_core.CallMediaKind
+import uniffi.comrade_core.CallSignal
+import uniffi.comrade_core.HangupReason
+import uniffi.comrade_core.IceStrategy
+import uniffi.comrade_ui.CallSignalDto
+
+/**
+ * The Android side of a WebRTC voice/video call.
+ *
+ * The Rust core ([`comrade_core::call`]) owns the *wire protocol*: it mints the
+ * call id, wraps each [CallSignal] in a NIP-59 DM envelope, and routes it over
+ * the encrypted Vault channel — all of which we reach through [ComradeCore]. The
+ * *media* — mic/camera capture and the `PeerConnection` — has no home in Rust
+ * and lives here, in `org.webrtc`.
+ *
+ * This object is the bridge between the two: it drives an `org.webrtc`
+ * [PeerConnection] through the exact signaling handshake the desktop webview
+ * uses (see `desktop/ui/main.js`), forwarding every locally-generated SDP/ICE
+ * payload to the core via [ComradeCore.sendCallSignalTyped] and feeding every
+ * remote payload (delivered as [CallSignalDto] by the event pump) back into the
+ * peer connection.
+ *
+ * ## State machine (mirrors the desktop)
+ * ```
+ * caller:  Idle → Ringing(out) → Connecting → Active → Ended → Idle
+ * callee:  Idle → Ringing(in)  → Connecting → Active → Ended → Idle
+ * ```
+ * There is no explicit "accept" signal — the callee's `Answer` *is* the accept;
+ * `Ringing` is purely informational. Exactly one call exists at a time; a second
+ * incoming offer is auto-rejected with [CallSignal.Busy].
+ *
+ * ## Threading
+ * `org.webrtc` invokes its [PeerConnection.Observer]/[SdpObserver] callbacks on
+ * internal signaling threads. Observable state is held in [StateFlow]s (safe to
+ * publish from any thread); the blocking FFI sends run on [io]. Mutating call
+ * transitions are `@Synchronized` on this object so the pump thread, the WebRTC
+ * threads, and the UI thread can't interleave a teardown with a fresh signal.
+ */
+object CallManager {
+
+    private const val TAG = "CallManager"
+    private const val STREAM_ID = "comrade-call"
+    private const val LOCAL_AUDIO_ID = "comrade-audio"
+    private const val LOCAL_VIDEO_ID = "comrade-video"
+
+    /** How long the [CallUiState.Ended] card lingers before returning to [CallUiState.Idle]. */
+    private const val ENDED_LINGER_MS = 1_600L
+
+    private val io = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    // ── Observable state for the Compose layer ───────────────────────────────
+    private val _state = MutableStateFlow<CallUiState>(CallUiState.Idle)
+    val state: StateFlow<CallUiState> = _state.asStateFlow()
+
+    private val _localVideo = MutableStateFlow<VideoTrack?>(null)
+    /** The local camera track (video calls only), for the self-preview renderer. */
+    val localVideo: StateFlow<VideoTrack?> = _localVideo.asStateFlow()
+
+    private val _remoteVideo = MutableStateFlow<VideoTrack?>(null)
+    /** The remote camera track, published once the peer's video arrives. */
+    val remoteVideo: StateFlow<VideoTrack?> = _remoteVideo.asStateFlow()
+
+    private val _muted = MutableStateFlow(false)
+    val muted: StateFlow<Boolean> = _muted.asStateFlow()
+
+    private val _speakerphone = MutableStateFlow(false)
+    val speakerphone: StateFlow<Boolean> = _speakerphone.asStateFlow()
+
+    // ── WebRTC singletons (lazily built on the first call, never at startup) ──
+    private var appContext: Context? = null
+    private var eglBase: EglBase? = null
+    private var factory: PeerConnectionFactory? = null
+
+    /** The shared EGL context renderers must init against (null until a call runs). */
+    val eglBaseContext: EglBase.Context? get() = eglBase?.eglBaseContext
+
+    private var session: Session? = null
+
+    /** Everything mutable about the one in-flight call. */
+    private class Session(
+        val callId: String,
+        val peer: String,
+        val peerLabel: String,
+        val media: CallMediaKind,
+        val incoming: Boolean,
+    ) {
+        var pc: PeerConnection? = null
+        var audioSource: AudioSource? = null
+        var audioTrack: AudioTrack? = null
+        var videoSource: VideoSource? = null
+        var videoTrack: VideoTrack? = null
+        var capturer: VideoCapturer? = null
+        var surfaceHelper: SurfaceTextureHelper? = null
+
+        /** Remote description applied — gates ICE (WebRTC rejects early candidates). */
+        var remoteSet = false
+        val pendingIce = ArrayList<IceCandidate>()
+
+        /** Callee only: the offer SDP, buffered from ring until Accept. */
+        var offerSdp: String? = null
+
+        val startedAtMs = System.currentTimeMillis()
+        var connectedAtMs = 0L
+        val isVideo get() = media == CallMediaKind.VIDEO
+
+        /** Set once we've widened to STUN+TURN, so the fallback fires at most once. */
+        var triedTurn = false
+
+        /** Idempotency guard so a hangup + a remote hangup don't double-teardown. */
+        var ended = false
+    }
+
+    // ── Public API: outgoing ─────────────────────────────────────────────────
+
+    /**
+     * Place a call to [peer]. Runs the STUN-only first attempt the core's design
+     * intends: [ComradeCore.placeCallTyped] returns the minted call id and a
+     * STUN-only ICE list, we build the peer connection, and send the `Offer`.
+     *
+     * Permissions (mic, + camera for video) must already be granted — the UI
+     * gates on that before calling in.
+     */
+    @Synchronized
+    fun startOutgoingCall(context: Context, peer: String, peerLabel: String, media: CallMediaKind) {
+        if (session != null) {
+            Log.w(TAG, "startOutgoingCall ignored: a call is already in progress")
+            return
+        }
+        ensureFactory(context)
+        // Optimistic ringing state so the UI opens immediately; the placeCall +
+        // offer happen on IO because placeCall touches the store and the signal
+        // send is a blocking DM round-trip.
+        _state.value = CallUiState.Ringing(peer, peerLabel, media == CallMediaKind.VIDEO, incoming = false)
+        io.launch {
+            val placed = runCatching { ComradeCore.placeCallTyped(peer, media) }
+                .getOrElse {
+                    Log.e(TAG, "placeCall failed", it)
+                    endWith(HangupReason.FAILED, "failed", sendHangup = false)
+                    return@launch
+                }
+            synchronized(this@CallManager) {
+                if (session != null) return@launch // raced with a teardown
+                val s = Session(placed.callId, placed.peer, peerLabel, media, incoming = false)
+                session = s
+                val ice = placed.iceServers.map { it.toWebRtc() }
+                if (!setupPeer(s, ice)) return@launch
+                // Caller creates the offer, sets it local, then signals it.
+                s.pc?.createOffer(
+                    createSdpObserver(s) { offer ->
+                        setLocalThen(s, offer) { sendSignal(s, CallSignal.Offer(offer.description)) }
+                    },
+                    mediaConstraints(s.isVideo),
+                )
+            }
+        }
+    }
+
+    // ── Public API: incoming (driven by the event pump) ──────────────────────
+
+    /**
+     * Route one incoming [CallSignalDto] (delivered by the MainActivity event
+     * pump from [uniffi.comrade_ui.BridgeEvent.IncomingCallSignal]). Returns
+     * `true` if this signal is a fresh incoming offer that should raise a
+     * ringing notification, so the caller can fire [mullu.comrade.Notifier].
+     */
+    @Synchronized
+    fun onIncomingSignal(dto: CallSignalDto): Boolean {
+        val s = session
+        return when (val signal = dto.signal) {
+            is CallSignal.Offer -> handleRemoteOffer(dto, signal.sdp)
+            is CallSignal.Answer -> {
+                if (s != null && s.callId == dto.callId) applyRemoteAnswer(s, signal.sdp)
+                false
+            }
+            is CallSignal.Ice -> {
+                if (s != null && s.callId == dto.callId) addRemoteIce(s, signal)
+                false
+            }
+            CallSignal.Ringing -> {
+                // Caller side: the callee's device is ringing (pre-answer).
+                if (s != null && s.callId == dto.callId && _state.value is CallUiState.Ringing) {
+                    _state.value = CallUiState.Ringing(s.peer, s.peerLabel, s.isVideo, incoming = false)
+                }
+                false
+            }
+            CallSignal.Busy -> {
+                if (s != null && s.callId == dto.callId) endWith(HangupReason.BUSY, "busy", sendHangup = false)
+                false
+            }
+            is CallSignal.Hangup -> {
+                if (s != null && s.callId == dto.callId) {
+                    val connected = s.connectedAtMs > 0
+                    endWith(signal.reason, outcomeForRemoteHangup(signal.reason, connected), sendHangup = false)
+                }
+                false
+            }
+        }
+    }
+
+    /** Accept the ringing incoming call: build the peer connection and answer. */
+    @Synchronized
+    fun accept(context: Context) {
+        val s = session ?: return
+        if (s.incoming.not() || _state.value !is CallUiState.Ringing) return
+        val offer = s.offerSdp ?: run {
+            endWith(HangupReason.FAILED, "failed", sendHangup = true)
+            return
+        }
+        ensureFactory(context)
+        _state.value = CallUiState.Connecting(s.peer, s.peerLabel, s.isVideo, incoming = true)
+        io.launch {
+            synchronized(this@CallManager) {
+                if (session !== s || s.ended) return@launch
+                // The callee starts STUN-only too; the fallback (below) widens to
+                // TURN if the direct/STUN path never connects.
+                val ice = runCatching { ComradeCore.callIceServersForTyped(IceStrategy.STUN_ONLY) }
+                    .getOrDefault(emptyList())
+                    .map { it.toWebRtc() }
+                if (!setupPeer(s, ice)) return@launch
+                setRemoteThen(s, SessionDescription(SessionDescription.Type.OFFER, offer)) {
+                    s.pc?.createAnswer(
+                        createSdpObserver(s) { answer ->
+                            setLocalThen(s, answer) { sendSignal(s, CallSignal.Answer(answer.description)) }
+                        },
+                        mediaConstraints(s.isVideo),
+                    )
+                }
+            }
+        }
+    }
+
+    /** Reject the ringing incoming call (callee declines before answering). */
+    @Synchronized
+    fun reject() {
+        if (session == null) return
+        endWith(HangupReason.DECLINED, "declined", sendHangup = true)
+    }
+
+    /** Hang up / cancel the current call from the local UI. */
+    @Synchronized
+    fun hangup() {
+        val s = session ?: return
+        val connected = s.connectedAtMs > 0
+        val reason = when {
+            connected -> HangupReason.NORMAL
+            s.incoming -> HangupReason.DECLINED
+            else -> HangupReason.CANCELLED
+        }
+        val outcome = when {
+            connected -> "connected"
+            s.incoming -> "declined"
+            else -> "cancelled"
+        }
+        endWith(reason, outcome, sendHangup = true)
+    }
+
+    // ── Toggles ──────────────────────────────────────────────────────────────
+
+    /** Flip local mic enablement (no renegotiation — just [AudioTrack.setEnabled]). */
+    @Synchronized
+    fun toggleMute() {
+        val s = session ?: return
+        val next = !_muted.value
+        s.audioTrack?.setEnabled(!next)
+        _muted.value = next
+    }
+
+    /** Flip earpiece ⇄ speakerphone. */
+    @Synchronized
+    fun toggleSpeaker() = setSpeakerphone(!_speakerphone.value)
+
+    /** Route in-call audio to the speakerphone ([on]) or the earpiece. */
+    @Synchronized
+    @Suppress("DEPRECATION") // isSpeakerphoneOn: setCommunicationDevice (API 31+) not on minSdk 26
+    fun setSpeakerphone(on: Boolean) {
+        val am = appContext?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+        am.isSpeakerphoneOn = on
+        _speakerphone.value = on
+    }
+
+    /** Flip between the front and back cameras (video calls only). */
+    @Synchronized
+    fun switchCamera() {
+        (session?.capturer as? CameraVideoCapturer)?.switchCamera(null)
+    }
+
+    // ── Peer connection setup ─────────────────────────────────────────────────
+
+    /** Build the [PeerConnection] and local tracks. Returns false (and tears down) on failure. */
+    private fun setupPeer(s: Session, iceServers: List<PeerConnection.IceServer>): Boolean {
+        val fac = factory ?: return false
+        val config = PeerConnection.RTCConfiguration(iceServers).apply {
+            sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
+            continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
+            bundlePolicy = PeerConnection.BundlePolicy.MAXBUNDLE
+            rtcpMuxPolicy = PeerConnection.RtcpMuxPolicy.REQUIRE
+        }
+        val pc = fac.createPeerConnection(config, peerObserver(s)) ?: run {
+            Log.e(TAG, "createPeerConnection returned null")
+            endWith(HangupReason.FAILED, "failed", sendHangup = false)
+            return false
+        }
+        s.pc = pc
+
+        // Local microphone — always.
+        val audioSource = fac.createAudioSource(MediaConstraints())
+        val audioTrack = fac.createAudioTrack(LOCAL_AUDIO_ID, audioSource).apply { setEnabled(!_muted.value) }
+        s.audioSource = audioSource
+        s.audioTrack = audioTrack
+        pc.addTrack(audioTrack, listOf(STREAM_ID))
+
+        // Local camera — video calls only.
+        if (s.isVideo) {
+            val capturer = createCameraCapturer()
+            if (capturer != null) {
+                val ctx = appContext!!
+                val helper = SurfaceTextureHelper.create("CaptureThread", eglBase!!.eglBaseContext)
+                val videoSource = fac.createVideoSource(false)
+                capturer.initialize(helper, ctx, videoSource.capturerObserver)
+                capturer.startCapture(1280, 720, 30)
+                val videoTrack = fac.createVideoTrack(LOCAL_VIDEO_ID, videoSource).apply { setEnabled(true) }
+                s.capturer = capturer
+                s.surfaceHelper = helper
+                s.videoSource = videoSource
+                s.videoTrack = videoTrack
+                pc.addTrack(videoTrack, listOf(STREAM_ID))
+                _localVideo.value = videoTrack
+            } else {
+                Log.w(TAG, "no camera available; continuing audio-only")
+            }
+        }
+
+        beginAudioRouting(s.isVideo)
+        return true
+    }
+
+    private fun createCameraCapturer(): VideoCapturer? {
+        val ctx = appContext ?: return null
+        if (!Camera2Enumerator.isSupported(ctx)) return null
+        val enumerator = Camera2Enumerator(ctx)
+        val names = enumerator.deviceNames
+        // Prefer the front camera for a call; fall back to any camera.
+        names.firstOrNull { enumerator.isFrontFacing(it) }?.let { return enumerator.createCapturer(it, null) }
+        names.firstOrNull()?.let { return enumerator.createCapturer(it, null) }
+        return null
+    }
+
+    // ── Remote signal application ─────────────────────────────────────────────
+
+    /** A fresh offer: ring (or renegotiate an existing call, or reject as busy). */
+    private fun handleRemoteOffer(dto: CallSignalDto, sdp: String): Boolean {
+        val existing = session
+        if (existing != null) {
+            // A re-offer for the current call (e.g. the caller's TURN ICE-restart)
+            // is a renegotiation, not a new call — answer it on the existing pc.
+            if (existing.callId == dto.callId && existing.pc != null) {
+                setRemoteThen(existing, SessionDescription(SessionDescription.Type.OFFER, sdp)) {
+                    existing.pc?.createAnswer(
+                        createSdpObserver(existing) { answer ->
+                            setLocalThen(existing, answer) {
+                                sendSignal(existing, CallSignal.Answer(answer.description))
+                            }
+                        },
+                        mediaConstraints(existing.isVideo),
+                    )
+                }
+                return false
+            }
+            // Otherwise we're already busy on another call — auto-reject.
+            val busyMedia = mediaKindOf(dto.media)
+            io.launch {
+                runCatching {
+                    ComradeCore.sendCallSignalTyped(dto.peer, dto.callId, busyMedia, CallSignal.Busy)
+                    ComradeCore.logCallTyped(
+                        dto.peer, dto.callId, busyMedia,
+                        incoming = true, outcome = "busy", startedAt = 0, durationSecs = 0,
+                    )
+                }.onFailure { Log.w(TAG, "busy-reject failed", it) }
+            }
+            return false
+        }
+
+        val media = mediaKindOf(dto.media)
+        val s = Session(dto.callId, dto.peer, mullu.comrade.ui.shortNpub(dto.peer), media, incoming = true)
+        s.offerSdp = sdp
+        session = s
+        _state.value = CallUiState.Ringing(s.peer, s.peerLabel, s.isVideo, incoming = true)
+        // Best-effort "ringing on my device" ack; failure is non-fatal.
+        sendSignal(s, CallSignal.Ringing)
+        return true
+    }
+
+    private fun applyRemoteAnswer(s: Session, sdp: String) {
+        setRemoteThen(s, SessionDescription(SessionDescription.Type.ANSWER, sdp)) {
+            if (_state.value is CallUiState.Ringing) {
+                _state.value = CallUiState.Connecting(s.peer, s.peerLabel, s.isVideo, incoming = false)
+            }
+        }
+    }
+
+    private fun addRemoteIce(s: Session, ice: CallSignal.Ice) {
+        val candidate = IceCandidate(ice.sdpMid, ice.sdpMLineIndex?.toInt() ?: 0, ice.candidate)
+        val pc = s.pc
+        if (pc != null && s.remoteSet) pc.addIceCandidate(candidate) else s.pendingIce.add(candidate)
+    }
+
+    private fun flushPendingIce(s: Session) {
+        val pc = s.pc ?: return
+        s.pendingIce.forEach { pc.addIceCandidate(it) }
+        s.pendingIce.clear()
+    }
+
+    // ── STUN → TURN fallback (caller side) ────────────────────────────────────
+
+    /**
+     * The direct/STUN path failed to connect. If we haven't already, widen to
+     * STUN+TURN ([IceStrategy.STUN_AND_TURN]) and restart ICE with a fresh
+     * offer — the CGNAT case the core keeps a TURN relay for. Only the caller
+     * drives this; the callee answers the re-offer as a renegotiation. With no
+     * TURN configured the widened list equals the STUN-only one, so we skip
+     * straight to an honest "failed".
+     */
+    private fun tryTurnFallbackOrFail(s: Session) {
+        if (s.ended) return
+        if (s.incoming || s.triedTurn) {
+            endWith(HangupReason.FAILED, "failed", sendHangup = true)
+            return
+        }
+        s.triedTurn = true
+        io.launch {
+            val stunOnly = runCatching { ComradeCore.callIceServersForTyped(IceStrategy.STUN_ONLY) }.getOrDefault(emptyList())
+            val widened = runCatching { ComradeCore.callIceServersForTyped(IceStrategy.STUN_AND_TURN) }.getOrDefault(emptyList())
+            synchronized(this@CallManager) {
+                if (session !== s || s.ended) return@launch
+                val pc = s.pc
+                if (pc == null || widened.size <= stunOnly.size) {
+                    // No relay to fall back to — end honestly.
+                    endWith(HangupReason.FAILED, "failed", sendHangup = true)
+                    return@launch
+                }
+                val config = PeerConnection.RTCConfiguration(widened.map { it.toWebRtc() }).apply {
+                    sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
+                    continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
+                    bundlePolicy = PeerConnection.BundlePolicy.MAXBUNDLE
+                    rtcpMuxPolicy = PeerConnection.RtcpMuxPolicy.REQUIRE
+                }
+                pc.setConfiguration(config)
+                s.remoteSet = false
+                pc.createOffer(
+                    createSdpObserver(s) { offer ->
+                        setLocalThen(s, offer) { sendSignal(s, CallSignal.Offer(offer.description)) }
+                    },
+                    mediaConstraints(s.isVideo).apply {
+                        mandatory.add(MediaConstraints.KeyValuePair("IceRestart", "true"))
+                    },
+                )
+            }
+        }
+    }
+
+    // ── Connection lifecycle ──────────────────────────────────────────────────
+
+    private fun onConnected(s: Session) {
+        if (s.connectedAtMs == 0L) s.connectedAtMs = System.currentTimeMillis()
+        _state.value = CallUiState.Active(s.peer, s.peerLabel, s.isVideo, s.incoming, s.connectedAtMs)
+    }
+
+    /**
+     * Terminate the call: optionally signal a hangup, log the outcome, release
+     * all media/hardware, and surface the [CallUiState.Ended] card before
+     * returning to [CallUiState.Idle]. Idempotent — the first caller wins.
+     * `@Synchronized` (the object monitor is reentrant) so it is safe both from
+     * the already-locked transitions and from the bare `placeCall` failure path.
+     */
+    @Synchronized
+    private fun endWith(reason: HangupReason, outcome: String, sendHangup: Boolean) {
+        val s = session ?: run {
+            if (_state.value !is CallUiState.Idle) _state.value = CallUiState.Idle
+            return
+        }
+        if (s.ended) return
+        s.ended = true
+
+        if (sendHangup) {
+            io.launch {
+                runCatching { ComradeCore.hangupCallTyped(s.peer, s.callId, s.media, reason) }
+                    .onFailure { Log.w(TAG, "hangup signal failed", it) }
+            }
+        }
+        // Log the call to the store-backed history (exercises logCallTyped; the
+        // record is what callHistoryTyped later reads back).
+        io.launch {
+            val duration = if (s.connectedAtMs > 0) (System.currentTimeMillis() - s.connectedAtMs) / 1000 else 0L
+            runCatching {
+                ComradeCore.logCallTyped(
+                    peer = s.peer,
+                    callId = s.callId,
+                    media = s.media,
+                    incoming = s.incoming,
+                    outcome = outcome,
+                    startedAt = s.startedAtMs / 1000,
+                    durationSecs = duration,
+                )
+            }.onFailure { Log.w(TAG, "logCall failed", it) }
+        }
+
+        teardownMedia(s)
+        session = null
+        _state.value = CallUiState.Ended(s.peerLabel, outcome, s.isVideo)
+        io.launch {
+            delay(ENDED_LINGER_MS)
+            synchronized(this@CallManager) {
+                if (session == null && _state.value is CallUiState.Ended) _state.value = CallUiState.Idle
+            }
+        }
+    }
+
+    /**
+     * Release every camera/microphone/PeerConnection handle. This is the
+     * teardown Phase 4 requires: stopping the capturer + disposing the sources
+     * frees the physical camera and mic, `pc.dispose()` closes the transport,
+     * and audio routing is restored to normal.
+     */
+    private fun teardownMedia(s: Session) {
+        _localVideo.value = null
+        _remoteVideo.value = null
+
+        runCatching { s.capturer?.stopCapture() }.onFailure { Log.w(TAG, "stopCapture", it) }
+        runCatching { s.capturer?.dispose() }
+        runCatching { s.videoTrack?.dispose() }
+        runCatching { s.videoSource?.dispose() }
+        runCatching { s.surfaceHelper?.dispose() }
+        runCatching { s.audioTrack?.dispose() }
+        runCatching { s.audioSource?.dispose() }
+        runCatching { s.pc?.dispose() }
+
+        s.pc = null
+        s.capturer = null
+        s.videoTrack = null
+        s.videoSource = null
+        s.surfaceHelper = null
+        s.audioTrack = null
+        s.audioSource = null
+
+        endAudioRouting()
+        _muted.value = false
+        _speakerphone.value = false
+    }
+
+    // ── Audio routing ─────────────────────────────────────────────────────────
+
+    private var audioFocus: AudioFocusRequest? = null
+    private var priorAudioMode = AudioManager.MODE_NORMAL
+
+    /** Enter communication audio mode; default speaker on for video, earpiece for voice. */
+    private fun beginAudioRouting(video: Boolean) {
+        val am = appContext?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+        priorAudioMode = am.mode
+        val focus = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build(),
+            )
+            .build()
+        audioFocus = focus
+        am.requestAudioFocus(focus)
+        am.mode = AudioManager.MODE_IN_COMMUNICATION
+        setSpeakerphone(video)
+    }
+
+    /** Restore normal audio mode and drop focus once the call is over. */
+    @Suppress("DEPRECATION") // isSpeakerphoneOn: see setSpeakerphone
+    private fun endAudioRouting() {
+        val am = appContext?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+        am.isSpeakerphoneOn = false
+        am.mode = priorAudioMode
+        audioFocus?.let { am.abandonAudioFocusRequest(it) }
+        audioFocus = null
+    }
+
+    // ── WebRTC bootstrap (idempotent) ─────────────────────────────────────────
+
+    private fun ensureFactory(context: Context) {
+        if (factory != null) return
+        val app = context.applicationContext
+        appContext = app
+        PeerConnectionFactory.initialize(
+            PeerConnectionFactory.InitializationOptions.builder(app)
+                .createInitializationOptions(),
+        )
+        val egl = EglBase.create()
+        eglBase = egl
+        factory = PeerConnectionFactory.builder()
+            .setVideoEncoderFactory(DefaultVideoEncoderFactory(egl.eglBaseContext, true, true))
+            .setVideoDecoderFactory(DefaultVideoDecoderFactory(egl.eglBaseContext))
+            .createPeerConnectionFactory()
+    }
+
+    // ── Helpers ────────────────────────────────────────────────────────────────
+
+    private fun sendSignal(s: Session, signal: CallSignal) {
+        io.launch {
+            runCatching { ComradeCore.sendCallSignalTyped(s.peer, s.callId, s.media, signal) }
+                .onFailure { Log.w(TAG, "sendCallSignal(${signal.kind()}) failed", it) }
+        }
+    }
+
+    private fun mediaConstraints(video: Boolean) = MediaConstraints().apply {
+        mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveAudio", "true"))
+        mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveVideo", if (video) "true" else "false"))
+    }
+
+    /** An [SdpObserver] whose only interesting callback is create-success. */
+    private fun createSdpObserver(s: Session, onCreated: (SessionDescription) -> Unit) = object : SdpObserver {
+        override fun onCreateSuccess(desc: SessionDescription) = onCreated(desc)
+        override fun onSetSuccess() {}
+        override fun onCreateFailure(error: String?) {
+            Log.e(TAG, "createOffer/Answer failed: $error")
+            synchronized(this@CallManager) {
+                if (session === s) endWith(HangupReason.FAILED, "failed", sendHangup = true)
+            }
+        }
+        override fun onSetFailure(error: String?) {}
+    }
+
+    private fun setLocalThen(s: Session, desc: SessionDescription, onDone: () -> Unit) {
+        s.pc?.setLocalDescription(
+            object : SdpObserver {
+                override fun onCreateSuccess(p0: SessionDescription?) {}
+                override fun onSetSuccess() = onDone()
+                override fun onCreateFailure(p0: String?) {}
+                override fun onSetFailure(error: String?) {
+                    Log.e(TAG, "setLocalDescription failed: $error")
+                }
+            },
+            desc,
+        )
+    }
+
+    private fun setRemoteThen(s: Session, desc: SessionDescription, onDone: () -> Unit) {
+        s.pc?.setRemoteDescription(
+            object : SdpObserver {
+                override fun onCreateSuccess(p0: SessionDescription?) {}
+                override fun onSetSuccess() {
+                    synchronized(this@CallManager) {
+                        if (session !== s) return
+                        s.remoteSet = true
+                        flushPendingIce(s)
+                        onDone()
+                    }
+                }
+                override fun onCreateFailure(p0: String?) {}
+                override fun onSetFailure(error: String?) {
+                    Log.e(TAG, "setRemoteDescription failed: $error")
+                    synchronized(this@CallManager) {
+                        if (session === s) endWith(HangupReason.FAILED, "failed", sendHangup = true)
+                    }
+                }
+            },
+            desc,
+        )
+    }
+
+    private fun outcomeForRemoteHangup(reason: HangupReason, connected: Boolean): String = when (reason) {
+        HangupReason.DECLINED -> "declined"
+        HangupReason.BUSY -> "busy"
+        HangupReason.MISSED -> "missed"
+        HangupReason.FAILED -> "failed"
+        else -> if (connected) "connected" else "missed"
+    }
+
+    private fun CallSignal.kind(): String = when (this) {
+        is CallSignal.Offer -> "offer"
+        is CallSignal.Answer -> "answer"
+        is CallSignal.Ice -> "ice"
+        CallSignal.Ringing -> "ringing"
+        CallSignal.Busy -> "busy"
+        is CallSignal.Hangup -> "hangup"
+    }
+
+    private fun ComradeCore.IceServerInfo.toWebRtc(): PeerConnection.IceServer =
+        PeerConnection.IceServer.builder(urls)
+            .apply {
+                username?.let { setUsername(it) }
+                credential?.let { setPassword(it) }
+            }
+            .createIceServer()
+
+    private fun mediaKindOf(media: String): CallMediaKind =
+        if (media.equals("video", ignoreCase = true)) CallMediaKind.VIDEO else CallMediaKind.AUDIO
+
+    // ── PeerConnection.Observer ────────────────────────────────────────────────
+
+    private fun peerObserver(s: Session): PeerConnection.Observer = object : PeerConnection.Observer {
+        override fun onIceCandidate(candidate: IceCandidate) {
+            sendSignal(
+                s,
+                CallSignal.Ice(
+                    candidate = candidate.sdp,
+                    sdpMid = candidate.sdpMid,
+                    sdpMLineIndex = candidate.sdpMLineIndex.toUShort(),
+                ),
+            )
+        }
+
+        override fun onAddTrack(receiver: RtpReceiver, mediaStreams: Array<out MediaStream>) {
+            (receiver.track() as? VideoTrack)?.let { track ->
+                track.setEnabled(true)
+                _remoteVideo.value = track
+            }
+        }
+
+        override fun onConnectionChange(newState: PeerConnection.PeerConnectionState) {
+            when (newState) {
+                PeerConnection.PeerConnectionState.CONNECTED ->
+                    synchronized(this@CallManager) { if (session === s) onConnected(s) }
+                PeerConnection.PeerConnectionState.FAILED ->
+                    synchronized(this@CallManager) { if (session === s) tryTurnFallbackOrFail(s) }
+                else -> Unit // DISCONNECTED can be transient (ICE restart) — don't tear down.
+            }
+        }
+
+        // Unused observer surface — required by the interface.
+        override fun onSignalingChange(newState: PeerConnection.SignalingState) {}
+        override fun onIceConnectionChange(newState: PeerConnection.IceConnectionState) {}
+        override fun onIceConnectionReceivingChange(receiving: Boolean) {}
+        override fun onIceGatheringChange(newState: PeerConnection.IceGatheringState) {}
+        override fun onIceCandidatesRemoved(candidates: Array<out IceCandidate>) {}
+        override fun onAddStream(stream: MediaStream) {}
+        override fun onRemoveStream(stream: MediaStream) {}
+        override fun onDataChannel(channel: org.webrtc.DataChannel) {}
+        override fun onRenegotiationNeeded() {}
+    }
+}
