@@ -1279,6 +1279,7 @@
     if (c.media === "video" && c.localStream) {
       lv.srcObject = c.localStream;
       lv.hidden = false;
+      lv.play().catch(() => {}); // autoplay attr isn't always honored in a webview
     } else {
       lv.srcObject = null;
       lv.hidden = true;
@@ -1290,7 +1291,11 @@
     if (!c) return;
     // One <video> carries remote audio+video; on a voice call it just plays
     // audio while the avatar covers the empty frame.
-    if (c.remoteStream) $("#call-remote-video").srcObject = c.remoteStream;
+    if (c.remoteStream) {
+      const rv = $("#call-remote-video");
+      rv.srcObject = c.remoteStream;
+      rv.play().catch(() => {}); // best-effort; user gesture (the call) already occurred
+    }
     $("#call-avatar").hidden = c.media === "video";
   }
 
