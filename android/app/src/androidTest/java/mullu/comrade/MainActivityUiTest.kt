@@ -1,5 +1,6 @@
 package mullu.comrade
 
+import android.Manifest
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
@@ -12,8 +13,10 @@ import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTextInput
 import androidx.test.espresso.Espresso
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.rule.GrantPermissionRule
 import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.RuleChain
 import org.junit.runner.RunWith
 
 /**
@@ -30,8 +33,18 @@ import org.junit.runner.RunWith
 @RunWith(AndroidJUnit4::class)
 class MainActivityUiTest {
 
+    private val composeRule = createAndroidComposeRule<MainActivity>()
+
+    // Grant POST_NOTIFICATIONS *before* the activity launches: the shell's
+    // first-run notification prompt would otherwise pop a system dialog over
+    // the app, pausing MainActivity — and a paused activity exposes no
+    // queryable Compose hierarchy, which fails the semantics assertions below.
+    // The outer rule runs first, so the permission is already granted when
+    // MainShell mounts and the app never prompts.
     @get:Rule
-    val composeRule = createAndroidComposeRule<MainActivity>()
+    val rules: RuleChain = RuleChain
+        .outerRule(GrantPermissionRule.grant(Manifest.permission.POST_NOTIFICATIONS))
+        .around(composeRule)
 
     private fun hasText(text: String) =
         composeRule.onAllNodesWithText(text).fetchSemanticsNodes().isNotEmpty()
