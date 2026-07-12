@@ -83,6 +83,67 @@ val BookIcon: ImageVector = materialIcon(name = "Filled.Book") {
     }
 }
 
+/** Material "call" (filled) — placing/accepting a call (red-tinted = end/decline). */
+val CallIcon: ImageVector = materialIcon(name = "Filled.Call") {
+    materialPath {
+        moveTo(6.62f, 10.79f)
+        curveToRelative(1.44f, 2.83f, 3.76f, 5.14f, 6.59f, 6.59f)
+        lineToRelative(2.2f, -2.2f)
+        curveToRelative(0.27f, -0.27f, 0.67f, -0.36f, 1.02f, -0.24f)
+        curveToRelative(1.12f, 0.37f, 2.33f, 0.57f, 3.57f, 0.57f)
+        curveToRelative(0.55f, 0.0f, 1.0f, 0.45f, 1.0f, 1.0f)
+        verticalLineTo(20.0f)
+        curveToRelative(0.0f, 0.55f, -0.45f, 1.0f, -1.0f, 1.0f)
+        curveToRelative(-9.39f, 0.0f, -17.0f, -7.61f, -17.0f, -17.0f)
+        curveToRelative(0.0f, -0.55f, 0.45f, -1.0f, 1.0f, -1.0f)
+        horizontalLineToRelative(3.5f)
+        curveToRelative(0.55f, 0.0f, 1.0f, 0.45f, 1.0f, 1.0f)
+        curveToRelative(0.0f, 1.25f, 0.2f, 2.45f, 0.57f, 3.57f)
+        curveToRelative(0.11f, 0.35f, 0.03f, 0.74f, -0.25f, 1.02f)
+        lineToRelative(-2.2f, 2.2f)
+        close()
+    }
+}
+
+/** Material "videocam" (filled) — the camera toggle in a video call. */
+val CameraIcon: ImageVector = materialIcon(name = "Filled.Videocam") {
+    materialPath {
+        moveTo(17.0f, 10.5f)
+        verticalLineTo(7.0f)
+        curveToRelative(0.0f, -0.55f, -0.45f, -1.0f, -1.0f, -1.0f)
+        horizontalLineTo(4.0f)
+        curveToRelative(-0.55f, 0.0f, -1.0f, 0.45f, -1.0f, 1.0f)
+        verticalLineToRelative(10.0f)
+        curveToRelative(0.0f, 0.55f, 0.45f, 1.0f, 1.0f, 1.0f)
+        horizontalLineToRelative(12.0f)
+        curveToRelative(0.55f, 0.0f, 1.0f, -0.45f, 1.0f, -1.0f)
+        verticalLineTo(13.5f)
+        lineToRelative(4.0f, 4.0f)
+        verticalLineToRelative(-11.0f)
+        lineToRelative(-4.0f, 4.0f)
+        close()
+    }
+}
+
+/** A simple "speaker" (filled) — the speakerphone toggle. */
+val SpeakerIcon: ImageVector = materialIcon(name = "Filled.VolumeUp") {
+    materialPath {
+        moveTo(3.0f, 9.0f)
+        verticalLineToRelative(6.0f)
+        horizontalLineToRelative(4.0f)
+        lineToRelative(5.0f, 5.0f)
+        verticalLineTo(4.0f)
+        lineToRelative(-5.0f, 5.0f)
+        horizontalLineTo(3.0f)
+        close()
+        moveTo(16.5f, 12.0f)
+        curveToRelative(0.0f, -1.77f, -1.02f, -3.29f, -2.5f, -4.03f)
+        verticalLineToRelative(8.05f)
+        curveToRelative(1.48f, -0.73f, 2.5f, -2.25f, 2.5f, -4.02f)
+        close()
+    }
+}
+
 /** Material "mic" (filled) — the voice assistant. */
 val MicIcon: ImageVector = materialIcon(name = "Filled.Mic") {
     materialPath {

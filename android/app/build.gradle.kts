@@ -153,6 +153,14 @@ dependencies {
     // Offline "Hey Comrade" wake word + speech recognition (Apache-2.0, no cloud)
     implementation("com.alphacephei:vosk-android:0.3.47")
 
+    // WebRTC for voice/video calls (CallManager/CallScreen). The historical
+    // `org.webrtc:google-webrtc` artifact only ever lived on JCenter, which shut
+    // down in 2021, so it no longer resolves from google()/mavenCentral(). This
+    // is the maintained community build of the *same* library — identical
+    // `org.webrtc.*` package and API (BSD-3, published to Maven Central) — which
+    // is what the CallManager compiles against.
+    implementation("io.github.webrtc-sdk:android:125.6422.06")
+
     // Runtime support for the uniffi-generated bindings (see the codegen setup
     // above): JNA is how the generated Kotlin calls into libcomrade_jni.so,
     // and kotlinx-coroutines-core backs its `suspend fun`s. Coroutines was
