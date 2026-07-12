@@ -329,6 +329,49 @@ voice notes (most-missed daily feature), (4) disappearing messages,
 (8) calls last. Each lands as its own PR with tests; nothing gets a README
 checkmark before it's wired end-to-end (Theme 1 discipline).
 
+> **Note (2026-07-12, owner direction):** the wellbeing north star in §8 now
+> governs priority. Communication features from this table matter in so far
+> as they serve the "stay connected to a loved one" pillar (E2E DMs, voice
+> notes, media, disappearing messages) — full messenger parity (groups,
+> communities, calls) is deprioritised, not deleted.
+
+---
+
+## 8. Product north star — a (mental) wellbeing companion
+
+_Added 2026-07-12 from owner direction: "the primary use case of Comrade is
+to be your (mental) wellbeing companion — journal, help brainstorming,
+therapy; write down any thoughts in chitthi/voice recording anonymously;
+stay connected to your loved one who might be of help, who's with you
+always."_
+
+This is a re-framing, not a rebuild: the architecture already carries most
+of the load. Mapping each pillar to what exists:
+
+| Pillar | What exists today | What's missing (the actual work) |
+|---|---|---|
+| **Journal** | Encrypted-at-rest store (Argon2id + AES-256-GCM) seals anything we write; Vosk speech-to-text runs fully on-device; the voice pipeline (`OneShotRecognizer`, wake word) is wired | A `journal` tree + typed repository (entry = text, optional mood, timestamp), a Journal tab (write / dictate / browse by day), and a "dictate → entry" voice command. **Smallest real feature; all pieces exist. Build first.** |
+| **Anonymous thoughts (chitthi / voice)** | Public Chitthi broadcast works; voice dictation works | True anonymity needs **per-post ephemeral keys**: sign each anonymous Chitthi with a throwaway keypair (never the identity key), no reuse across posts, so posts can't be linked to you *or to each other*. Also: strip `created_at` precision, publish via a relay subset. Without this, "anonymous" would be a false promise — the current broadcast is pseudonymous under your permanent key. |
+| **Stay connected to a loved one** | This is exactly what Sakha/Sakhi was built for: a cryptographically isolated couple space (Yrs CRDT + AES-256-GCM) with engine-level tests — plus E2E DMs already shipping. The named-chats/alias work (this PR) makes the loved-one thread feel human | The pairing handshake is engine-complete but unreachable from any UI (A1 in §3.2). Wire pairing + a warm, dedicated "your person" surface: pinned thread, shared journal/ledger, maybe a lightweight "thinking of you" signal. |
+| **Brainstorming / reflective companion ("therapy")** | Voice in (Vosk) and voice out (TTS) exist; the command dispatcher gives a slot to hang a conversational agent on | The companion itself. **Two honesty gates before building:** (1) an LLM companion is *not therapy* and must never present as one — reflective prompts, journaling nudges, brainstorming, plus crisis-referral hand-offs (e.g. helpline numbers) when distress cues appear; (2) privacy-first means the model should run **on-device** (small quantised model) or not at all — routing raw mental-health disclosures to a cloud API contradicts the product's core promise. Model choice and scope need an owner decision (OQ9). |
+
+**Sequencing recommendation (supersedes §7 order):**
+1. **Journal** — encrypted entries + voice dictation (foundations complete).
+2. **Anonymous Chitthi** — ephemeral-key posting (small, but the privacy
+   claim must be engineered, not asserted).
+3. **Loved-one space** — surface Sakha/Sakhi pairing in the UI; DM quality
+   items from §7 (voice notes, media on Android, disappearing messages)
+   slot in here.
+4. **Reflective companion** — design doc + on-device model decision first
+   (OQ9), then a deliberately narrow v1 (journaling prompts over your own
+   recent entries, opt-in).
+
+**New open question (OQ9):** which model/runtime for the companion —
+on-device (llama.cpp-class quantised model: private, heavy on low-end
+phones) vs. none (template-based reflective prompts only) vs. cloud
+(fastest, but breaks the privacy promise for the most sensitive data a
+user has)? Owner call required before any companion code.
+
 ---
 
 ## Appendix — Review coverage

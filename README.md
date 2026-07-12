@@ -1,7 +1,16 @@
 # Comrade
 
-A privacy-first, cross-platform social client built entirely in Rust, with a shared
-view-model layer driving an Android (Kotlin/Compose), desktop (Tauri), or CLI frontend.
+A privacy-first companion for your (mental) wellbeing — journal your
+thoughts (typed or spoken, on-device), share what you choose anonymously,
+and stay end-to-end-encrypted-close to the people who hold you up. Built
+entirely in Rust, with a shared view-model layer driving an Android
+(Kotlin/Compose), desktop (Tauri), or CLI frontend.
+
+> **Vision status.** The wellbeing pillars (journal, anonymous thoughts,
+> loved-one space, reflective companion) are the product's north star — the
+> gap map and build order live in [`AUDIT.md` §8](AUDIT.md). What is shipped
+> and working today is the table below; no pillar gets a checkmark before
+> it's wired end-to-end.
 
 ## What it does
 
