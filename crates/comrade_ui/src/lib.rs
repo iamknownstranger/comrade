@@ -23,6 +23,13 @@ use comrade_storage::{EncryptedStore, StoredIdentity};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+// This crate's own `UniFfiTag` — lets `UiError` and every DTO in `runtime`
+// derive `uniffi::Record`/`uniffi::Enum`/`uniffi::Error` directly, so
+// `comrade_jni`'s FFI object can use them with no hand-written mirror types.
+// See the note on `comrade_core::setup_scaffolding!` for why each crate that
+// contributes FFI types needs its own call.
+uniffi::setup_scaffolding!("comrade_ui");
+
 pub mod runtime;
 
 pub use runtime::{
@@ -34,7 +41,7 @@ pub use runtime::{
 
 // ── Errors ──────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, uniffi::Error)]
 pub enum UiError {
     #[error("unknown workspace key: {0}")]
     UnknownWorkspace(String),
@@ -64,7 +71,7 @@ pub enum UiError {
 // ── DTOs (serializable across any IPC/FFI boundary) ──────────────────────────────
 
 /// A workspace entry for the UI, including whether it is currently active.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, uniffi::Record)]
 pub struct WorkspaceDto {
     pub key: String,
     pub label: String,
@@ -88,14 +95,14 @@ impl WorkspaceDto {
 }
 
 /// The local identity as the UI sees it. Never exposes the secret key.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, uniffi::Record)]
 pub struct IdentityDto {
     pub npub: String,
     pub has_secret: bool,
 }
 
 /// A detected UPI payment intent for display/confirmation in the UI.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, uniffi::Record)]
 pub struct UpiIntentDto {
     pub amount_inr: f64,
     pub vpa: String,

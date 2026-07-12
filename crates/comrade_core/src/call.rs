@@ -34,7 +34,7 @@ pub const CALL_ENVELOPE_MARKER: u8 = 1;
 /// Whether a call negotiates audio only or audio + video. The signaling and
 /// state machine are identical for both; this only tells the frontend whether
 /// to capture a camera track.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum)]
 #[serde(rename_all = "lowercase")]
 pub enum CallMediaKind {
     /// Voice call — microphone only.
@@ -64,7 +64,7 @@ impl CallMediaKind {
 
 /// Why a call ended — carried on [`CallSignal::Hangup`] so the other side and
 /// the call log can distinguish "declined" from "missed" from "network failed".
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum)]
 #[serde(rename_all = "snake_case")]
 pub enum HangupReason {
     /// Either party hung up a connected call normally.
@@ -112,7 +112,7 @@ impl HangupReason {
 
 /// One step of the WebRTC negotiation, or a call-control message. Internally
 /// tagged (`{"kind":"offer","sdp":"…"}`) so a frontend can `switch` on `kind`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CallSignal {
     /// Caller → callee: the WebRTC session description offer.
@@ -264,7 +264,7 @@ pub fn default_ice_servers() -> Vec<IceServer> {
 /// or server-reflexive candidate pair actually connects) calls
 /// [`ice_servers_for`] with [`Self::StunAndTurn`] and restarts ICE with that
 /// widened server list — see `comrade_ui::ComradeRuntime::call_ice_servers_for`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum)]
 #[serde(rename_all = "snake_case")]
 pub enum IceStrategy {
     /// Every call's first attempt: public STUN only.

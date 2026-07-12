@@ -54,7 +54,7 @@ The Rust workspace shows genuinely strong engineering discipline for a prototype
 | `crates/comrade_state/` | I/O-free progressive-disclosure state machine (Base / OffGridTravel / CoupleSandbox) |
 | `crates/comrade_storage/` | Encrypted-at-rest KV store + typed repositories; the best-tested crate |
 | `crates/comrade_ui/` | Framework-agnostic view-model (`UiService`) + async bridge orchestrator (`ComradeRuntime`) |
-| `crates/comrade_jni/` | Android JNI exports (panic-guarded, JSON-string protocol) |
+| `crates/comrade_jni/` | Android FFI boundary — uniffi-generated Kotlin bindings (typed, panic-guarded by uniffi's own scaffolding; no hand-rolled JSON, as of 2026-07-12) |
 | `src/main.rs` | 720-line interactive CLI harness; mostly demo commands |
 | `desktop/` | Tauri 2 shell (excluded from workspace) + vanilla JS SPA (`desktop/ui/`) |
 | `android/` | Compose app: workspace list, keygen, "Hey Comrade" voice assistant |
@@ -99,7 +99,16 @@ Severity: **C**ritical / **H**igh / **M**edium / **L**ow. Each finding is labele
 | A6 | L | **[fact] JNI event delivery is poll-based and lossy-by-design.** A single process-global broadcast receiver is created lazily at first `pollEvent` (`comrade_jni/src/lib.rs:69-72`); events emitted before that are silently dropped, and lag drops surface as `{"lagged":n}`. Currently moot (no Kotlin caller — A2), but the contract should be documented or replaced with a callback when Android wiring lands. |
 | A7 | L | **[fact] `comrade_core` declares an unused dependency on `comrade_state`** (`crates/comrade_core/Cargo.toml:7`; zero use sites in `comrade_core/src/`) — muddies the otherwise-clean layering story. |
 
-**Healthy:** crate dependency direction is clean (storage has no core/nostr deps to avoid cycles — `repository.rs:6-7`; state is I/O-free by doc and by fact); DTO/event contracts are serde-typed and round-trip tested (`runtime.rs:489-510`); the JNI boundary is panic-guarded (`guard_json`, `lib.rs:77-86`) so no unwinding crosses `extern "C"`; the Android voice layer is cleanly abstracted behind the `ComradeBackend` interface so dispatcher logic is JVM-unit-testable without the native library (`CommandDispatcher.kt:9-28`).
+**Healthy:** crate dependency direction is clean (storage has no core/nostr deps to avoid cycles — `repository.rs:6-7`; state is I/O-free by doc and by fact); DTO/event contracts are serde-typed and round-trip tested (`runtime.rs:489-510`); the JNI boundary is panic-guarded — as of the uniffi-rs migration (2026-07-12), this is uniffi's own generated `catch_unwind` scaffolding rather than the hand-rolled `guard_json` this line used to cite, so no unwinding crosses `extern "C"` either way; the Android voice layer is cleanly abstracted behind the `ComradeBackend` interface so dispatcher logic is JVM-unit-testable without the native library (`CommandDispatcher.kt:9-28`).
+
+> **2026-07-12 note:** `comrade_jni/src/lib.rs` was rewritten wholesale for the
+> uniffi-rs migration (hand-written `extern "C"` exports + `guard_json` + JSON
+> marshaling → generated scaffolding + typed `Comrade` object). Several
+> findings above (S5, A5, A6, Q8, O4, P2, M3-4, M3-8) cite specific old line
+> numbers or mechanisms (`guard_json`, hand-rolled JSON, `format!`) in that
+> file; their line citations are now stale and their substance has not been
+> re-verified against the new code. Re-auditing them is a separate follow-up,
+> not part of the FFI migration itself.
 
 ### 3.3 Performance & Concurrency
 

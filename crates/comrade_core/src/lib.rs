@@ -13,6 +13,13 @@
  *   media   — NIP-94/96 encrypted media staging + pluggable uploaders
  */
 
+// Gives this crate its own `UniFfiTag`, so the plain-data types the engines
+// expose (`UpiPaymentIntent`, `CallSignal`, …) can derive `uniffi::Record` /
+// `uniffi::Enum` directly — no parallel FFI-only mirror type to keep in sync
+// as the data model grows. `comrade_jni` is the only crate that turns this
+// (plus `comrade_ui`'s own namespace) into an actual cdylib.
+uniffi::setup_scaffolding!("comrade_core");
+
 pub mod call;
 pub mod crypto;
 pub mod dm;

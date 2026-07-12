@@ -115,6 +115,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Rust stable
+        # Gradle's Kotlin compile tasks depend on generateUniffiBindings
+        # (android/app/build.gradle.kts), which builds comrade_jni for the
+        # host and runs comrade_uniffi_bindgen — needed even for JVM-only
+        # unit tests, since they compile against the same `main` sources.
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo (host, uniffi bindgen)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-host-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-host-
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:

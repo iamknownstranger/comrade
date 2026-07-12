@@ -1,0 +1,26 @@
+[package]
+name    = "comrade_uniffi_bindgen"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone `uniffi-bindgen` CLI for this workspace's FFI crates. Kept in its
+# own crate — rather than as a `[[bin]]` inside comrade_jni — so the `cli`
+# feature's dependency graph (clap, askama templates, uniffi_bindgen's own
+# codegen machinery) never becomes part of comrade_jni's build, and can never
+# leak into the shipped Android `libcomrade_jni.so` (see its release-profile
+# comments in the workspace root Cargo.toml on why that .so stays lean).
+#
+# Usage (see android/app/build.gradle.kts for the Gradle-driven version):
+#   cargo run -p comrade_uniffi_bindgen -- generate \
+#     --library target/debug/libcomrade_jni.so \
+#     --language kotlin --out-dir <out-dir>
+# "Library mode": reads the compiled cdylib's own embedded uniffi metadata,
+# so there is no .udl file to keep in sync as comrade_jni's interface grows.
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/main.rs"
+
+[dependencies]
+uniffi = { workspace = true, features = ["cli"] }

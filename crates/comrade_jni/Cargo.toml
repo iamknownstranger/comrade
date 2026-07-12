@@ -5,19 +5,23 @@ edition = "2021"
 publish = false
 
 [lib]
-# cdylib = shared library (.so) loaded at runtime by the Android JVM via System.loadLibrary
+# cdylib = shared library (.so) loaded at runtime by the Android JVM — via
+# uniffi's generated JNA bindings, not a hand-written `System.loadLibrary` +
+# `external fun` pairing (see `uniffi::setup_scaffolding!` in lib.rs).
 crate-type = ["cdylib"]
 
 [dependencies]
 comrade_core  = { path = "../comrade_core" }
 comrade_state = { path = "../comrade_state" }
 comrade_ui    = { path = "../comrade_ui" }
-jni           = { workspace = true }
+uniffi        = { workspace = true }
+# `CallSignal`'s wire form on the Vault DM channel is still a JSON string
+# (comrade_ui::ComradeRuntime::send_call_signal takes `signal_json: &str`);
+# this crate accepts the typed enum from Kotlin and encodes it once here.
 serde_json    = { workspace = true }
-# Decoding base64 media bytes handed down from the Kotlin file picker.
-base64        = { workspace = true }
-# A multi-thread Tokio runtime, owned by a process-global, keeps the async core
-# alive across JNI call boundaries (JNI invocations are synchronous from Java).
+# A multi-thread Tokio runtime is no longer owned here: `async_runtime =
+# "tokio"` (see lib.rs) hands each async export to `async-compat`, which
+# lazily drives it on a runtime of its own the first time it's polled.
 tokio         = { workspace = true }
 
 [features]

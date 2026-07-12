@@ -1,6 +1,60 @@
+import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+}
+
+// ── uniffi-generated Kotlin bindings ──────────────────────────────────────────
+//
+// crates/comrade_jni has no hand-written JNI glue any more (no `external fun`
+// declarations to keep in sync, no `System.loadLibrary` call) — its whole
+// Kotlin-facing surface is generated straight from the compiled cdylib's own
+// embedded uniffi metadata ("library mode": no .udl file to drift out of sync
+// as the Vault/Sabha/Identity data model grows).
+//
+// The generated bindings are identical across build variant and target ABI
+// (the metadata they're read from is architecture-independent), so this
+// builds comrade_jni once for the *host* — deliberately not the `cargo ndk`
+// cross-compiled build that produces the arm64-v8a/x86_64 jniLibs/*.so CI
+// bundles into the APK (see android-apk.yml) — purely to extract that
+// metadata, and generates into one shared directory added to `main`.
+val uniffiOutDir = layout.buildDirectory.dir("generated/source/uniffi/kotlin")
+val cargoWorkspaceRoot = rootProject.projectDir.resolve("..")
+val hostCdylibName = when {
+    org.gradle.internal.os.OperatingSystem.current().isMacOsX -> "libcomrade_jni.dylib"
+    org.gradle.internal.os.OperatingSystem.current().isWindows -> "comrade_jni.dll"
+    else -> "libcomrade_jni.so"
+}
+val hostCdylibPath = cargoWorkspaceRoot.resolve("target/debug/$hostCdylibName")
+
+val cargoBuildHostCdylib = tasks.register<Exec>("cargoBuildHostCdylib") {
+    description = "Builds comrade_jni for the host — only to read its uniffi interface metadata"
+    workingDir = cargoWorkspaceRoot
+    commandLine("cargo", "build", "-p", "comrade_jni")
+    outputs.file(hostCdylibPath)
+    outputs.upToDateWhen { hostCdylibPath.exists() }
+}
+
+val generateUniffiBindings = tasks.register<Exec>("generateUniffiBindings") {
+    description = "Generates Kotlin bindings from comrade_jni's uniffi interface"
+    dependsOn(cargoBuildHostCdylib)
+    workingDir = cargoWorkspaceRoot
+    val outDir = uniffiOutDir.get().asFile
+    doFirst { outDir.deleteRecursively() }
+    commandLine(
+        "cargo", "run", "-p", "comrade_uniffi_bindgen", "--",
+        "generate",
+        "--library", hostCdylibPath.absolutePath,
+        "--language", "kotlin",
+        "--out-dir", outDir.absolutePath,
+    )
+    inputs.file(hostCdylibPath)
+    outputs.dir(uniffiOutDir)
+}
+
+tasks.withType<KotlinCompile>().configureEach {
+    dependsOn(generateUniffiBindings)
 }
 
 android {
@@ -73,6 +127,12 @@ android {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
     }
+
+    sourceSets {
+        getByName("main") {
+            kotlin.srcDir(uniffiOutDir)
+        }
+    }
 }
 
 dependencies {
@@ -92,6 +152,15 @@ dependencies {
 
     // Offline "Hey Comrade" wake word + speech recognition (Apache-2.0, no cloud)
     implementation("com.alphacephei:vosk-android:0.3.47")
+
+    // Runtime support for the uniffi-generated bindings (see the codegen setup
+    // above): JNA is how the generated Kotlin calls into libcomrade_jni.so,
+    // and kotlinx-coroutines-core backs its `suspend fun`s. Coroutines was
+    // already present transitively via Compose; declared explicitly now that
+    // this crate's own code imports it directly (ComradeCore's event-listener
+    // registration).
+    implementation("net.java.dev.jna:jna:5.17.0@aar")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.1")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
 
