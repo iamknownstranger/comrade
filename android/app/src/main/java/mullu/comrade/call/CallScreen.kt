@@ -17,10 +17,12 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -160,6 +162,7 @@ private fun InCallContent(
     val remoteVideo by CallManager.remoteVideo.collectAsState()
     val localVideo by CallManager.localVideo.collectAsState()
     val connectionQuality by CallManager.connectionQuality.collectAsState()
+    val sasEmojis by CallManager.sasEmojis.collectAsState()
 
     // Audio calls: let the proximity sensor blank the screen when held to the ear.
     ProximityScreenControl(active = !video && status == null)
@@ -171,6 +174,9 @@ private fun InCallContent(
     // indicator doesn't add visual noise to the common case.
     val showWeakConnection = status == null &&
         (connectionQuality == CallQuality.MEDIUM || connectionQuality == CallQuality.POOR)
+    // Same Active-only gating as showWeakConnection; a missing fingerprint on
+    // either side is a valid "can't verify" and shown as simply nothing.
+    val sas = sasEmojis?.takeIf { status == null && it.isNotEmpty() }
 
     Box(Modifier.fillMaxSize()) {
         if (video) {
@@ -203,12 +209,20 @@ private fun InCallContent(
                     Spacer(Modifier.height(4.dp))
                     ConnectionQualityBadge(connectionQuality)
                 }
+                if (sas != null) {
+                    Spacer(Modifier.height(4.dp))
+                    SasRow(emojis = sas)
+                }
             }
         } else {
             PeerHeader(peer, peerLabel, label, Modifier.align(Alignment.Center)) {
                 if (showWeakConnection) {
                     Spacer(Modifier.height(6.dp))
                     ConnectionQualityBadge(connectionQuality)
+                }
+                if (sas != null) {
+                    Spacer(Modifier.height(6.dp))
+                    SasRow(emojis = sas)
                 }
             }
         }
@@ -329,6 +343,42 @@ private fun ConnectionQualityBadge(quality: CallQuality) {
         )
         Spacer(Modifier.width(6.dp))
         Text(stringOf(R.string.call_weak_connection), color = Color.White, fontSize = 13.sp)
+    }
+}
+
+/**
+ * The 4-emoji short authentication string ("Verify: 🐶 🦊 …"), shown only
+ * while [CallManager.sasEmojis] has a non-empty value for the current
+ * (Active) call. This is a real security signal, not decoration: it is
+ * derived from both sides' DTLS-SRTP certificate fingerprints, so the same 4
+ * emoji appearing on both phones is what rules out a man-in-the-middle on
+ * the call's media path — tapping the row explains that rather than leaving
+ * it unexplained.
+ */
+@Composable
+private fun SasRow(emojis: List<String>, modifier: Modifier = Modifier) {
+    var showInfo by remember { mutableStateOf(false) }
+    Row(
+        modifier = modifier
+            .clip(RoundedCornerShape(14.dp))
+            .background(ControlIdle)
+            .clickable(onClickLabel = stringOf(R.string.call_sas_explain_title)) { showInfo = true }
+            .padding(horizontal = 14.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(stringOf(R.string.call_sas_label), color = Color(0xFFB0BEC5), fontSize = 13.sp)
+        Spacer(Modifier.width(8.dp))
+        Text(emojis.joinToString(" "), fontSize = 20.sp)
+    }
+    if (showInfo) {
+        AlertDialog(
+            onDismissRequest = { showInfo = false },
+            confirmButton = {
+                TextButton(onClick = { showInfo = false }) { Text(stringOf(R.string.call_sas_dismiss)) }
+            },
+            title = { Text(stringOf(R.string.call_sas_explain_title)) },
+            text = { Text(stringOf(R.string.call_sas_explain_body)) },
+        )
     }
 }
 

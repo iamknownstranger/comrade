@@ -379,6 +379,15 @@ object ComradeCore {
     fun callIceServersForTyped(strategy: IceStrategy): List<IceServerInfo> =
         ffi.callIceServersFor(strategy).map { it.toInfo() }
 
+    /**
+     * The 4-emoji short authentication string (SAS) both call participants
+     * should read aloud and compare to catch a man-in-the-middle — derived
+     * from the two sides' already-negotiated SDP fingerprints. `null`/empty
+     * when either side's SDP had no fingerprint to derive one from; that is
+     * a valid "can't verify" outcome, not an error, so this never throws.
+     */
+    fun callSasTyped(localSdp: String, remoteSdp: String): List<String>? = ffi.callSas(localSdp, remoteSdp)
+
     fun setTurnServerTyped(url: String, username: String, credential: String) {
         rethrowing("TURN config") { ffi.setTurnServer(url, username, credential) }
     }

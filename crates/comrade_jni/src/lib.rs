@@ -379,6 +379,14 @@ impl Comrade {
             .call_ice_servers_for(strategy.as_str())
     }
 
+    /// The 4-emoji short authentication string (SAS) for the in-progress call
+    /// whose local/remote SDPs are `local_sdp`/`remote_sdp` — see
+    /// `comrade_ui::ComradeRuntime::call_sas`. `None` when either side's SDP
+    /// carries no `a=fingerprint:` line to derive a code from.
+    pub fn call_sas(&self, local_sdp: String, remote_sdp: String) -> Option<Vec<String>> {
+        self.inner.blocking_read().call_sas(&local_sdp, &remote_sdp)
+    }
+
     pub fn set_turn_server(
         &self,
         url: String,
@@ -564,6 +572,19 @@ mod tests {
         let c = Comrade::new();
         assert!(matches!(c.conversations(), Err(UiError::VaultLocked)));
         assert!(matches!(c.profile(), Err(UiError::NoIdentity)));
+    }
+
+    #[test]
+    fn call_sas_needs_no_unlock_and_is_order_independent() {
+        // Pure computation over the two SDP strings already in hand — unlike
+        // the store-backed calls above, this must work before the vault is
+        // ever unlocked.
+        let c = Comrade::new();
+        let sdp_a = "v=0\r\na=fingerprint:sha-256 AA:BB\r\n".to_string();
+        let sdp_b = "v=0\r\na=fingerprint:sha-256 CC:DD\r\n".to_string();
+        let sas = c.call_sas(sdp_a.clone(), sdp_b.clone());
+        assert_eq!(sas.as_ref().map(Vec::len), Some(4));
+        assert_eq!(sas, c.call_sas(sdp_b, sdp_a));
     }
 
     // `#[tokio::test]` for the async tier — these run under

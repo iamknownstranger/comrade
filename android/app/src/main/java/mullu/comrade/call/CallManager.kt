@@ -159,6 +159,18 @@ object CallManager {
     /** Which [AudioRoute]s are selectable right now — grows/shrinks as headsets connect. */
     val availableRoutes: StateFlow<List<AudioRoute>> = _availableRoutes.asStateFlow()
 
+    private val _sasEmojis = MutableStateFlow<List<String>?>(null)
+
+    /**
+     * The 4-emoji short authentication string for the current call, once
+     * connected and both sides' SDPs are known — for the two participants to
+     * read aloud and compare, catching a man-in-the-middle that re-terminated
+     * the DTLS-SRTP media path. `null` before that point, or if it could not
+     * be derived at all (a missing fingerprint on either side): an honest
+     * "can't verify", never a fabricated code. See [onConnected].
+     */
+    val sasEmojis: StateFlow<List<String>?> = _sasEmojis.asStateFlow()
+
     // ── WebRTC singletons (lazily built on the first call, never at startup) ──
     private var appContext: Context? = null
     private var eglBase: EglBase? = null
@@ -191,6 +203,24 @@ object CallManager {
 
         /** Callee only: the offer SDP, buffered from ring until Accept. */
         var offerSdp: String? = null
+
+        /**
+         * This side's negotiated local SDP — the offer for the caller, the
+         * answer for the callee — captured once `setLocalDescription`
+         * succeeds (see [setLocalThen]). Feeds SAS derivation in
+         * [onConnected] once [remoteSdp] is known too. Overwritten, not
+         * appended, on a renegotiation (ICE-restart TURN fallback, or an
+         * answered re-offer), so it never goes stale.
+         */
+        var localSdp: String? = null
+
+        /**
+         * The peer's negotiated remote SDP — the answer for the caller, the
+         * offer for the callee — captured once `setRemoteDescription`
+         * succeeds (see [setRemoteThen]). Same overwrite-on-renegotiation
+         * behavior as [localSdp].
+         */
+        var remoteSdp: String? = null
 
         val startedAtMs = System.currentTimeMillis()
         var connectedAtMs = 0L
@@ -648,6 +678,7 @@ object CallManager {
         s.timeoutJob?.cancel() // connected — no timeout applies any more
         _state.value = CallUiState.Active(s.peer, s.peerLabel, s.isVideo, s.incoming, s.connectedAtMs)
         startStatsPolling(s)
+        maybeDeriveSas(s)
     }
 
     /**
@@ -716,6 +747,31 @@ object CallManager {
             rttMs <= RTT_GOOD_MS && (jitterMs == null || jitterMs <= JITTER_GOOD_MS) -> CallQuality.GOOD
             rttMs <= RTT_MEDIUM_MS -> CallQuality.MEDIUM
             else -> CallQuality.POOR
+        }
+    }
+
+    /**
+     * Kick off short-authentication-string derivation once both this side's
+     * and the peer's SDP are known. Runs the (blocking, native) FFI call on
+     * [io] rather than inline — this fires from inside a `synchronized`
+     * block ([onConnected] is called from [peerObserver]'s
+     * `onConnectionChange`, itself synchronized) — and publishes the result
+     * back under a fresh `synchronized` block, matching [sendSignal]'s
+     * fire-and-forget shape. A missing fingerprint on either side yields
+     * `null` from [mullu.comrade.ComradeCore.callSasTyped] — a valid "can't
+     * verify" outcome, published as-is rather than hidden as an error.
+     */
+    private fun maybeDeriveSas(s: Session) {
+        val local = s.localSdp
+        val remote = s.remoteSdp
+        if (local == null || remote == null) return
+        io.launch {
+            val sas = runCatching { ComradeCore.callSasTyped(local, remote) }
+                .onFailure { Log.w(TAG, "callSas failed", it) }
+                .getOrNull()
+            synchronized(this@CallManager) {
+                if (session === s && !s.ended) _sasEmojis.value = sas
+            }
         }
     }
 
@@ -805,6 +861,7 @@ object CallManager {
         _connectionQuality.value = CallQuality.UNKNOWN
         _audioRoute.value = AudioRoute.EARPIECE
         _availableRoutes.value = listOf(AudioRoute.EARPIECE, AudioRoute.SPEAKER)
+        _sasEmojis.value = null
     }
 
     // ── Audio routing ─────────────────────────────────────────────────────────
@@ -998,7 +1055,16 @@ object CallManager {
         s.pc?.setLocalDescription(
             object : SdpObserver {
                 override fun onCreateSuccess(p0: SessionDescription?) {}
-                override fun onSetSuccess() = onDone()
+                override fun onSetSuccess() {
+                    synchronized(this@CallManager) {
+                        if (session !== s) return
+                        // The offer for the caller, the answer for the callee — and
+                        // whichever of the two on a renegotiation, overwriting the
+                        // prior value so it can never go stale (see [Session.localSdp]).
+                        s.localSdp = desc.description
+                        onDone()
+                    }
+                }
                 override fun onCreateFailure(p0: String?) {}
                 override fun onSetFailure(error: String?) {
                     Log.e(TAG, "setLocalDescription failed: $error")
@@ -1016,6 +1082,10 @@ object CallManager {
                     synchronized(this@CallManager) {
                         if (session !== s) return
                         s.remoteSet = true
+                        // The answer for the caller, the offer for the callee — and
+                        // whichever of the two on a renegotiation, overwriting the
+                        // prior value so it can never go stale (see [Session.remoteSdp]).
+                        s.remoteSdp = desc.description
                         flushPendingIce(s)
                         onDone()
                     }

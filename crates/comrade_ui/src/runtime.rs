@@ -31,8 +31,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use comrade_core::call::{
-    ice_servers_for, new_call_id, parse_call_envelope, CallEnvelope, CallMediaKind, CallSignal,
-    HangupReason, IceServer, IceStrategy,
+    derive_sas, ice_servers_for, new_call_id, parse_call_envelope, CallEnvelope, CallMediaKind,
+    CallSignal, HangupReason, IceServer, IceStrategy,
 };
 use comrade_core::crypto::derive_media_key;
 use comrade_core::dm::{parse_profile_share, parse_receipt, ProfileShare, Receipt, ReceiptKind};
@@ -1164,6 +1164,20 @@ impl ComradeRuntime {
             .into_iter()
             .map(IceServerDto::from)
             .collect()
+    }
+
+    /// The 4-emoji short authentication string (SAS) for the in-progress call
+    /// whose local and remote SDPs are `local_sdp`/`remote_sdp` — for the two
+    /// participants to read aloud and compare, catching a man-in-the-middle
+    /// that re-terminated the DTLS-SRTP media path. `None` when either side's
+    /// SDP has no `a=fingerprint:` line to derive a code from — an honest
+    /// "can't verify" rather than a fabricated one; the frontend should treat
+    /// that the same as a user who never checked, not as a failure.
+    ///
+    /// Pure computation over the two SDP strings already in hand (no store,
+    /// no network) — see [`comrade_core::call::derive_sas`] for the crypto.
+    pub fn call_sas(&self, local_sdp: &str, remote_sdp: &str) -> Option<Vec<String>> {
+        derive_sas(local_sdp, remote_sdp)
     }
 
     /// Configure (or, with a blank `url`, clear) the TURN relay used for calls
@@ -3606,6 +3620,28 @@ mod tests {
 
         // Garbage input defaults to the private stun_only behavior.
         assert_eq!(rt.call_ice_servers_for("nonsense").len(), stun_only.len());
+    }
+
+    #[test]
+    fn call_sas_delegates_to_comrade_core_and_needs_no_vault() {
+        // Pure computation over the two SDP strings already in hand — unlike
+        // the ICE-server methods above, it touches no store, so a bare
+        // `ComradeRuntime::new()` (never unlocked) must work.
+        let rt = ComradeRuntime::new();
+        let sdp_a = "v=0\r\na=fingerprint:sha-256 AA:BB:CC:DD\r\n";
+        let sdp_b = "v=0\r\na=fingerprint:sha-256 11:22:33:44\r\n";
+
+        let sas = rt
+            .call_sas(sdp_a, sdp_b)
+            .expect("both sides have a fingerprint");
+        assert_eq!(sas.len(), 4);
+        // Same property `derive_sas` itself guarantees — checked again here so
+        // a future refactor that swaps the delegation's argument order (the
+        // one mistake that would silently break verification) fails a test.
+        assert_eq!(rt.call_sas(sdp_a, sdp_b), rt.call_sas(sdp_b, sdp_a));
+
+        let no_fingerprint = "v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\n";
+        assert_eq!(rt.call_sas(sdp_a, no_fingerprint), None);
     }
 
     #[tokio::test]
