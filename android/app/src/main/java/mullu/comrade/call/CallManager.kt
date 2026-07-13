@@ -761,7 +761,7 @@ object CallManager {
 
         teardownMedia(s)
         session = null
-        _state.value = CallUiState.Ended(s.peerLabel, outcome, s.isVideo)
+        _state.value = CallUiState.Ended(s.peer, s.peerLabel, s.isVideo, s.incoming, outcome)
         io.launch {
             delay(ENDED_LINGER_MS)
             synchronized(this@CallManager) {

@@ -56,6 +56,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -67,6 +68,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import mullu.comrade.ui.ArticleIcon
 import mullu.comrade.ui.BookIcon
+import mullu.comrade.ui.CallHistoryScreen
 import mullu.comrade.ui.ChatBubbleIcon
 import mullu.comrade.ui.ChatsScreen
 import mullu.comrade.ui.ConversationScreen
@@ -208,6 +210,7 @@ private sealed interface ChatNav {
     data object List : ChatNav
     data object NewChat : ChatNav
     data object Requests : ChatNav
+    data object CallHistory : ChatNav
     data class Open(
         val peer: String,
         /** User-chosen alias for the peer, when one exists. */
@@ -326,7 +329,18 @@ private fun MainShell(
                 Notifier.clearCall(context, st.peer)
                 Ringer.stop()
             }
-            is CallUiState.Ended, CallUiState.Idle -> {
+            is CallUiState.Ended -> {
+                // Missed from *this* device's perspective only when this device
+                // was the callee and the ring timed out unanswered — the
+                // caller's own unanswered outgoing call is not "missed" here.
+                if (st.outcome == "missed" && st.incoming) {
+                    Notifier.notifyMissedCall(context, st.peer, st.peerLabel)
+                }
+                lastCallPeer?.let { Notifier.clearCall(context, it) }
+                Ringer.stop()
+                activity?.setShowOverLockScreen(false)
+            }
+            CallUiState.Idle -> {
                 lastCallPeer?.let { Notifier.clearCall(context, it) }
                 Ringer.stop()
                 activity?.setShowOverLockScreen(false)
@@ -515,6 +529,14 @@ private fun MainShell(
                         },
                         title = { Text("Message requests") },
                     )
+                    tab == MainTab.Chats && chatNav == ChatNav.CallHistory -> TopAppBar(
+                        navigationIcon = {
+                            IconButton(onClick = { chatNav = ChatNav.List }) {
+                                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                            }
+                        },
+                        title = { Text(stringResource(R.string.call_history_title)) },
+                    )
                     else -> CenterAlignedTopAppBar(
                         title = {
                             Text(
@@ -565,6 +587,7 @@ private fun MainShell(
                         },
                         onNewChat = { chatNav = ChatNav.NewChat },
                         onOpenRequests = { chatNav = ChatNav.Requests },
+                        onOpenCallHistory = { chatNav = ChatNav.CallHistory },
                         modifier = content,
                     )
                     ChatNav.NewChat -> NewChatScreen(
@@ -577,6 +600,17 @@ private fun MainShell(
                         chatTick = requestTick,
                         onOpen = { peer, alias, username ->
                             chatNav = ChatNav.Open(peer, alias, username)
+                        },
+                        modifier = content,
+                    )
+                    ChatNav.CallHistory -> CallHistoryScreen(
+                        onCallBack = { peer, peerLabel, video ->
+                            withCallPermissions(video) {
+                                CallManager.startOutgoingCall(
+                                    context, peer, peerLabel,
+                                    if (video) CallMediaKind.VIDEO else CallMediaKind.AUDIO,
+                                )
+                            }
                         },
                         modifier = content,
                     )

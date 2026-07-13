@@ -48,4 +48,15 @@
     <string name="call_route_wired">Wired headset</string>
     <string name="call_weak_connection">Weak connection</string>
     <string name="call_permission_needed">Microphone (and camera for video) permission is required to call.</string>
+
+    <!-- Call history -->
+    <string name="call_history_title">Call history</string>
+    <string name="call_history_empty">No calls yet</string>
+    <string name="call_direction_incoming">Incoming</string>
+    <string name="call_direction_outgoing">Outgoing</string>
+    <string name="call_outcome_missed">Missed</string>
+    <string name="call_outcome_declined">Declined</string>
+    <string name="call_outcome_busy">Busy</string>
+    <string name="call_outcome_cancelled">Cancelled</string>
+    <string name="call_outcome_failed">Failed</string>
 </resources>

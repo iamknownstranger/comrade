@@ -40,10 +40,16 @@ sealed interface CallUiState {
         val connectedAtMs: Long,
     ) : CallUiState
 
-    /** Terminal card shown briefly before returning to [Idle]. */
+    /**
+     * Terminal card shown briefly before returning to [Idle]. [peer]/[incoming]
+     * ride alongside [peerLabel] so call-history/missed-call logic can key off
+     * them once the call's underlying session is already gone.
+     */
     data class Ended(
+        val peer: String,
         val peerLabel: String,
-        val outcome: String,
         val video: Boolean,
+        val incoming: Boolean,
+        val outcome: String,
     ) : CallUiState
 }

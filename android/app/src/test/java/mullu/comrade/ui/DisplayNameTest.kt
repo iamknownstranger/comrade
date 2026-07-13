@@ -39,6 +39,17 @@ class DisplayNameTest {
     }
 
     @Test
+    fun formatCallDurationRendersMinutesAndSeconds() {
+        assertEquals("0:00", formatCallDuration(0))
+        assertEquals("0:09", formatCallDuration(9))
+        assertEquals("1:00", formatCallDuration(60))
+        assertEquals("1:05", formatCallDuration(65))
+        assertEquals("61:00", formatCallDuration(3660))
+        // Defensive: a negative duration (shouldn't happen) doesn't render negative.
+        assertEquals("0:00", formatCallDuration(-5))
+    }
+
+    @Test
     fun dayLabelsGroupJournalEntriesHumanly() {
         val utc = java.time.ZoneId.of("UTC")
         val now = 1_752_303_600L // 2025-07-12T07:00:00Z

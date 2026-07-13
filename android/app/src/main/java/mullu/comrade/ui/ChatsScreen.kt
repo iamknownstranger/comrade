@@ -54,6 +54,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -67,6 +68,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import mullu.comrade.ComradeCore
 import mullu.comrade.Notifier
+import mullu.comrade.R
 import mullu.comrade.media.VoiceRecorder
 
 /**
@@ -135,6 +137,31 @@ private fun RequestsBanner(count: Int, onClick: () -> Unit) {
     }
 }
 
+/** Tappable row linking to the call history / missed-calls screen. */
+@Composable
+private fun CallHistoryEntry(onClick: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onClick() }
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Icon(
+            CallIcon,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            stringResource(R.string.call_history_title),
+            style = MaterialTheme.typography.titleSmall,
+            modifier = Modifier.weight(1f),
+        )
+        Text("›", style = MaterialTheme.typography.titleMedium)
+    }
+}
+
 @Composable
 fun ChatsScreen(
     chatTick: Int,
@@ -142,6 +169,7 @@ fun ChatsScreen(
     onOpen: (peer: String, alias: String?, username: String?) -> Unit,
     onNewChat: () -> Unit,
     onOpenRequests: () -> Unit,
+    onOpenCallHistory: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var conversations by remember { mutableStateOf<List<ComradeCore.ConversationInfo>?>(null) }
@@ -167,10 +195,12 @@ fun ChatsScreen(
             modifier = modifier.fillMaxSize(),
         ) {
             RequestsBanner(requestCount, onOpenRequests)
+            CallHistoryEntry(onOpenCallHistory)
             EmptyChats(onNewChat)
         }
         else -> LazyColumn(modifier = modifier.fillMaxSize()) {
             item { RequestsBanner(requestCount, onOpenRequests) }
+            item { CallHistoryEntry(onOpenCallHistory) }
             items(list, key = { it.peer }) { convo ->
                 val title = peerTitle(convo.peer, convo.alias, convo.peerName)
                 Row(
