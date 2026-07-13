@@ -9,6 +9,7 @@ import android.content.Intent
 import android.os.Build
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
+import androidx.core.app.Person
 import androidx.core.content.ContextCompat
 import mullu.comrade.ui.shortNpub
 
@@ -103,21 +104,42 @@ object Notifier {
         NotificationManagerCompat.from(context).notify("req:$peer".hashCode(), n)
     }
 
-    /** An incoming call is ringing. */
+    /**
+     * An incoming call is ringing. Uses [NotificationCompat.CallStyle] so the
+     * notification renders as a real incoming call — Decline and Answer actions,
+     * full-screen on the lock screen — with AndroidX's compat rendering on
+     * older platforms. Decline broadcasts to [CallActionReceiver] (no runtime
+     * permission needed); Answer just opens the app, where the ringing screen
+     * gates Accept on the mic/camera permission a receiver couldn't request.
+     */
     @SuppressLint("MissingPermission") // guarded by canPost() / areNotificationsEnabled()
     fun notifyIncomingCall(context: Context, peer: String, title: String, video: Boolean) {
         if (!canPost(context)) return
         val kind = if (video) "video" else "voice"
+        val openApp = openAppIntent(context)
+        val declineIntent = PendingIntent.getBroadcast(
+            context,
+            peer.hashCode(),
+            Intent(context, CallActionReceiver::class.java)
+                .setAction(CallActionReceiver.ACTION_DECLINE)
+                .putExtra(CallActionReceiver.EXTRA_PEER, peer),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val caller = Person.Builder().setName(title.ifBlank { shortNpub(peer) }).build()
+        val style = NotificationCompat.CallStyle.forIncomingCall(caller, declineIntent, openApp)
         val n = NotificationCompat.Builder(context, CHANNEL_CALLS)
             .setSmallIcon(android.R.drawable.sym_action_call)
             .setContentTitle("Incoming $kind call")
             .setContentText(title.ifBlank { shortNpub(peer) })
-            .setAutoCancel(true)
-            .setOngoing(false)
+            .setStyle(style)
+            .addPerson(caller)
+            // A ringing call isn't swipe-dismissable — Decline/Answer are the
+            // intended exits, matching how the OS's own dialer behaves.
+            .setOngoing(true)
             .setCategory(NotificationCompat.CATEGORY_CALL)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .setFullScreenIntent(openAppIntent(context), true)
-            .setContentIntent(openAppIntent(context))
+            .setFullScreenIntent(openApp, true)
+            .setContentIntent(openApp)
             .build()
         NotificationManagerCompat.from(context).notify("call:$peer".hashCode(), n)
     }
