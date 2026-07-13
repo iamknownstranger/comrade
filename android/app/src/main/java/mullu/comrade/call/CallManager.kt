@@ -2,8 +2,11 @@ package mullu.comrade.call
 
 import android.content.Context
 import android.media.AudioAttributes
+import android.media.AudioDeviceCallback
+import android.media.AudioDeviceInfo
 import android.media.AudioFocusRequest
 import android.media.AudioManager
+import android.os.Build
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -115,8 +118,13 @@ object CallManager {
     private val _muted = MutableStateFlow(false)
     val muted: StateFlow<Boolean> = _muted.asStateFlow()
 
-    private val _speakerphone = MutableStateFlow(false)
-    val speakerphone: StateFlow<Boolean> = _speakerphone.asStateFlow()
+    private val _audioRoute = MutableStateFlow(AudioRoute.EARPIECE)
+    /** Where in-call audio is currently playing. */
+    val audioRoute: StateFlow<AudioRoute> = _audioRoute.asStateFlow()
+
+    private val _availableRoutes = MutableStateFlow(listOf(AudioRoute.EARPIECE, AudioRoute.SPEAKER))
+    /** Which [AudioRoute]s are selectable right now — grows/shrinks as headsets connect. */
+    val availableRoutes: StateFlow<List<AudioRoute>> = _availableRoutes.asStateFlow()
 
     // ── WebRTC singletons (lazily built on the first call, never at startup) ──
     private var appContext: Context? = null
@@ -333,17 +341,58 @@ object CallManager {
         _muted.value = next
     }
 
-    /** Flip earpiece ⇄ speakerphone. */
+    /** Cycle to the next available [AudioRoute] (earpiece → speaker → Bluetooth/wired → …). */
     @Synchronized
-    fun toggleSpeaker() = setSpeakerphone(!_speakerphone.value)
+    fun cycleAudioRoute() {
+        val avail = _availableRoutes.value
+        if (avail.isEmpty()) return
+        val idx = avail.indexOf(_audioRoute.value).coerceAtLeast(0)
+        setAudioRoute(avail[(idx + 1) % avail.size])
+    }
 
-    /** Route in-call audio to the speakerphone ([on]) or the earpiece. */
+    /** Explicitly route in-call audio to [route], if it's currently in [availableRoutes]. */
     @Synchronized
-    @Suppress("DEPRECATION") // isSpeakerphoneOn: setCommunicationDevice (API 31+) not on minSdk 26
-    fun setSpeakerphone(on: Boolean) {
+    fun setAudioRoute(route: AudioRoute) {
+        if (route !in _availableRoutes.value) return
         val am = appContext?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
-        am.isSpeakerphoneOn = on
-        _speakerphone.value = on
+        applyAudioRoute(am, route)
+        _audioRoute.value = route
+    }
+
+    /**
+     * Apply [route] to the platform. API 31+ has a purpose-built API for
+     * exactly this (`setCommunicationDevice`); below that, routing is the
+     * older speakerphone flag plus manual Bluetooth SCO start/stop.
+     */
+    private fun applyAudioRoute(am: AudioManager, route: AudioRoute) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val wantedType = when (route) {
+                AudioRoute.EARPIECE -> AudioDeviceInfo.TYPE_BUILTIN_EARPIECE
+                AudioRoute.SPEAKER -> AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+                AudioRoute.BLUETOOTH -> AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                AudioRoute.WIRED -> AudioDeviceInfo.TYPE_WIRED_HEADSET
+            }
+            val device = am.availableCommunicationDevices.firstOrNull {
+                it.type == wantedType ||
+                    (route == AudioRoute.WIRED && it.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES)
+            }
+            if (device != null) am.setCommunicationDevice(device) else am.clearCommunicationDevice()
+        } else {
+            applyAudioRouteLegacy(am, route)
+        }
+    }
+
+    @Suppress("DEPRECATION") // isSpeakerphoneOn/isBluetoothScoOn/*BluetoothSco: the API 31+ path above covers modern devices
+    private fun applyAudioRouteLegacy(am: AudioManager, route: AudioRoute) {
+        if (route == AudioRoute.BLUETOOTH) {
+            am.isSpeakerphoneOn = false
+            if (!am.isBluetoothScoOn) am.startBluetoothSco()
+            am.isBluetoothScoOn = true
+        } else {
+            if (am.isBluetoothScoOn) am.stopBluetoothSco()
+            am.isBluetoothScoOn = false
+            am.isSpeakerphoneOn = route == AudioRoute.SPEAKER
+        }
     }
 
     /** Flip between the front and back cameras (video calls only). */
@@ -618,15 +667,21 @@ object CallManager {
 
         endAudioRouting()
         _muted.value = false
-        _speakerphone.value = false
+        _audioRoute.value = AudioRoute.EARPIECE
+        _availableRoutes.value = listOf(AudioRoute.EARPIECE, AudioRoute.SPEAKER)
     }
 
     // ── Audio routing ─────────────────────────────────────────────────────────
 
     private var audioFocus: AudioFocusRequest? = null
     private var priorAudioMode = AudioManager.MODE_NORMAL
+    private var audioDeviceCallback: AudioDeviceCallback? = null
 
-    /** Enter communication audio mode; default speaker on for video, earpiece for voice. */
+    /**
+     * Enter communication audio mode, start watching for Bluetooth/wired
+     * headsets connecting or disconnecting, and pick the first route: a
+     * present headset wins, otherwise speaker for video / earpiece for voice.
+     */
     private fun beginAudioRouting(video: Boolean) {
         val am = appContext?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
         priorAudioMode = am.mode
@@ -641,14 +696,81 @@ object CallManager {
         audioFocus = focus
         am.requestAudioFocus(focus)
         am.mode = AudioManager.MODE_IN_COMMUNICATION
-        setSpeakerphone(video)
+
+        val callback = object : AudioDeviceCallback() {
+            override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) = refreshAndMaybeSwitchRoute(am)
+            override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) = refreshAndMaybeSwitchRoute(am)
+        }
+        audioDeviceCallback = callback
+        am.registerAudioDeviceCallback(callback, null)
+
+        refreshAvailableRoutes(am)
+        val avail = _availableRoutes.value
+        val initial = when {
+            AudioRoute.BLUETOOTH in avail -> AudioRoute.BLUETOOTH
+            AudioRoute.WIRED in avail -> AudioRoute.WIRED
+            video -> AudioRoute.SPEAKER
+            else -> AudioRoute.EARPIECE
+        }
+        setAudioRoute(initial)
     }
 
-    /** Restore normal audio mode and drop focus once the call is over. */
-    @Suppress("DEPRECATION") // isSpeakerphoneOn: see setSpeakerphone
+    /** Re-scan connected devices; switch route if a headset just appeared/vanished. */
+    @Synchronized
+    private fun refreshAndMaybeSwitchRoute(am: AudioManager) {
+        if (session == null) return
+        val hadBluetooth = AudioRoute.BLUETOOTH in _availableRoutes.value
+        val hadWired = AudioRoute.WIRED in _availableRoutes.value
+        refreshAvailableRoutes(am)
+        val avail = _availableRoutes.value
+
+        if (_audioRoute.value !in avail) {
+            // The route we were on just disconnected — fall back sensibly.
+            val fallback = when {
+                AudioRoute.BLUETOOTH in avail -> AudioRoute.BLUETOOTH
+                AudioRoute.WIRED in avail -> AudioRoute.WIRED
+                else -> AudioRoute.EARPIECE
+            }
+            setAudioRoute(fallback)
+        } else if (AudioRoute.BLUETOOTH in avail && !hadBluetooth) {
+            setAudioRoute(AudioRoute.BLUETOOTH) // a headset just connected — prefer it
+        } else if (AudioRoute.WIRED in avail && !hadWired && AudioRoute.BLUETOOTH !in avail) {
+            setAudioRoute(AudioRoute.WIRED)
+        }
+    }
+
+    /** Rebuild [availableRoutes] from the platform's current output devices. */
+    private fun refreshAvailableRoutes(am: AudioManager) {
+        val routes = linkedSetOf(AudioRoute.EARPIECE, AudioRoute.SPEAKER)
+        val types = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            am.availableCommunicationDevices.map { it.type }
+        } else {
+            legacyOutputDeviceTypes(am)
+        }
+        for (type in types) {
+            when (type) {
+                AudioDeviceInfo.TYPE_BLUETOOTH_SCO, AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> routes.add(AudioRoute.BLUETOOTH)
+                AudioDeviceInfo.TYPE_WIRED_HEADSET, AudioDeviceInfo.TYPE_WIRED_HEADPHONES -> routes.add(AudioRoute.WIRED)
+            }
+        }
+        _availableRoutes.value = routes.toList()
+    }
+
+    /** `getDevices` is the pre-31 way to enumerate output devices (not deprecated — [Build.VERSION_CODES.S]'s
+     * `availableCommunicationDevices` above is simply more specific, not a replacement for this general API). */
+    private fun legacyOutputDeviceTypes(am: AudioManager): List<Int> =
+        am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).map { it.type }
+
+    /** Restore normal audio mode, stop watching devices, and drop focus once the call is over. */
     private fun endAudioRouting() {
         val am = appContext?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
-        am.isSpeakerphoneOn = false
+        audioDeviceCallback?.let { am.unregisterAudioDeviceCallback(it) }
+        audioDeviceCallback = null
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            am.clearCommunicationDevice()
+        } else {
+            applyAudioRouteLegacy(am, AudioRoute.EARPIECE)
+        }
         am.mode = priorAudioMode
         audioFocus?.let { am.abandonAudioFocusRequest(it) }
         audioFocus = null

@@ -17,6 +17,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -151,7 +153,8 @@ private fun InCallContent(
     connectedAtMs: Long = 0L,
 ) {
     val muted by CallManager.muted.collectAsState()
-    val speaker by CallManager.speakerphone.collectAsState()
+    val audioRoute by CallManager.audioRoute.collectAsState()
+    val availableRoutes by CallManager.availableRoutes.collectAsState()
     val remoteVideo by CallManager.remoteVideo.collectAsState()
     val localVideo by CallManager.localVideo.collectAsState()
 
@@ -209,13 +212,7 @@ private fun InCallContent(
                 tint = if (muted) CallBackground else Color.White,
                 size = 56.dp,
             ) { CallManager.toggleMute() }
-            CallActionButton(
-                icon = SpeakerIcon,
-                desc = stringOf(R.string.call_speaker),
-                bg = if (speaker) ControlActive else ControlIdle,
-                tint = if (speaker) CallBackground else Color.White,
-                size = 56.dp,
-            ) { CallManager.toggleSpeaker() }
+            AudioRouteButton(audioRoute, availableRoutes)
             if (video) {
                 CallActionButton(
                     icon = VideocamIcon,
@@ -299,6 +296,46 @@ private fun CallActionButton(
     ) {
         Icon(icon, contentDescription = desc, tint = tint, modifier = Modifier.size(size * 0.44f))
     }
+}
+
+/**
+ * The audio-output control: a button showing the current [AudioRoute] that
+ * opens a menu of every currently-present route ([availableRoutes] — earpiece
+ * and speaker are always listed; Bluetooth/wired only while connected).
+ * Tapping an entry calls [CallManager.setAudioRoute] directly.
+ */
+@Composable
+private fun AudioRouteButton(current: AudioRoute, availableRoutes: List<AudioRoute>) {
+    var expanded by remember { mutableStateOf(false) }
+    val active = current != AudioRoute.EARPIECE
+    Box {
+        CallActionButton(
+            icon = SpeakerIcon,
+            desc = stringOf(R.string.call_speaker) + ": " + audioRouteLabel(current),
+            bg = if (active) ControlActive else ControlIdle,
+            tint = if (active) CallBackground else Color.White,
+            size = 56.dp,
+        ) { expanded = true }
+        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            availableRoutes.forEach { route ->
+                DropdownMenuItem(
+                    text = { Text(audioRouteLabel(route)) },
+                    onClick = {
+                        CallManager.setAudioRoute(route)
+                        expanded = false
+                    },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun audioRouteLabel(route: AudioRoute): String = when (route) {
+    AudioRoute.EARPIECE -> stringOf(R.string.call_route_earpiece)
+    AudioRoute.SPEAKER -> stringOf(R.string.call_route_speaker)
+    AudioRoute.BLUETOOTH -> stringOf(R.string.call_route_bluetooth)
+    AudioRoute.WIRED -> stringOf(R.string.call_route_wired)
 }
 
 /**

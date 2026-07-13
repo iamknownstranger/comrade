@@ -14,9 +14,12 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <!-- Voice/video calls (WebRTC): camera capture for video calls and in-call
-         audio routing (earpiece ⇄ speakerphone). RECORD_AUDIO above already
-         covers the microphone. The camera is declared optional so the app still
-         installs on camera-less devices — voice calls don't need it. -->
+         audio routing (earpiece/speaker/Bluetooth/wired headset — see
+         CallManager's AudioRoute). RECORD_AUDIO above already covers the
+         microphone. The camera is declared optional so the app still installs
+         on camera-less devices — voice calls don't need it. Bluetooth headset
+         routing uses only AudioManager APIs (device enumeration + legacy SCO),
+         never android.bluetooth.*, so no BLUETOOTH_CONNECT permission is needed. -->
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <!-- Ringing/vibrating for an incoming call (Ringer.kt). Normal permission —
