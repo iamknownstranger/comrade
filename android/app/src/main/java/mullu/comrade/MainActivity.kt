@@ -86,6 +86,7 @@ import mullu.comrade.ui.theme.ComradeTheme
 import mullu.comrade.call.CallManager
 import mullu.comrade.call.CallScreen
 import mullu.comrade.call.CallUiState
+import mullu.comrade.call.Ringer
 import uniffi.comrade_core.CallMediaKind
 import uniffi.comrade_ui.BridgeEvent
 import uniffi.comrade_ui.CallSignalDto
@@ -127,6 +128,21 @@ class MainActivity : ComponentActivity() {
 
 /** Where the encrypted vault lives on this device. */
 internal fun vaultPath(context: Context): File = File(context.filesDir, "comrade-vault")
+
+/**
+ * Show (or stop showing) the whole activity over the lock screen and wake the
+ * display — an incoming call rings and is answerable without first unlocking
+ * the device, exactly like the platform dialer. `FLAG_SHOW_WHEN_LOCKED`/
+ * `FLAG_TURN_SCREEN_ON` are deprecated in favour of `Activity.setShowWhenLocked`/
+ * `setTurnScreenOn` (API 27+), but minSdk is 26 and the flags still work
+ * correctly on every version this app supports, so a single code path is used
+ * instead of an API-level branch.
+ */
+@Suppress("DEPRECATION")
+private fun Activity.setShowOverLockScreen(show: Boolean) {
+    val flags = WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+    if (show) window.addFlags(flags) else window.clearFlags(flags)
+}
 
 /** Startup phases: resolve what's on disk, then either the door or the app. */
 private sealed interface AppPhase {
@@ -234,6 +250,7 @@ private fun MainShell(
     onProfileChange: (ComradeCore.Profile) -> Unit,
 ) {
     val context = LocalContext.current
+    val activity = context as? Activity
     var tab by rememberSaveable { mutableStateOf(MainTab.Chats) }
     var chatNav by remember { mutableStateOf<ChatNav>(ChatNav.List) }
     // Bumped whenever the DM history changed; list + open thread reload on it.
@@ -284,13 +301,36 @@ private fun MainShell(
     // Once the ring is answered/over, drop the incoming-call notification (leaving
     // message notifications untouched). The peer is only known off the ringing/
     // in-call states, so remember the last one to clear on the terminal states.
+    // The same transitions also drive the ringtone/vibration (Ringer) and the
+    // lock-screen bypass, so an incoming call rings and lights up the screen
+    // even while the device is locked, exactly like a real phone call.
     var lastCallPeer by remember { mutableStateOf<String?>(null) }
     LaunchedEffect(callState) {
         when (val st = callState) {
-            is CallUiState.Ringing -> lastCallPeer = st.peer
-            is CallUiState.Connecting -> { lastCallPeer = st.peer; Notifier.clearCall(context, st.peer) }
-            is CallUiState.Active -> { lastCallPeer = st.peer; Notifier.clearCall(context, st.peer) }
-            is CallUiState.Ended, CallUiState.Idle -> lastCallPeer?.let { Notifier.clearCall(context, it) }
+            is CallUiState.Ringing -> {
+                lastCallPeer = st.peer
+                if (st.incoming) {
+                    Ringer.start(context)
+                    activity?.setShowOverLockScreen(true)
+                } else {
+                    Ringer.stop()
+                }
+            }
+            is CallUiState.Connecting -> {
+                lastCallPeer = st.peer
+                Notifier.clearCall(context, st.peer)
+                Ringer.stop()
+            }
+            is CallUiState.Active -> {
+                lastCallPeer = st.peer
+                Notifier.clearCall(context, st.peer)
+                Ringer.stop()
+            }
+            is CallUiState.Ended, CallUiState.Idle -> {
+                lastCallPeer?.let { Notifier.clearCall(context, it) }
+                Ringer.stop()
+                activity?.setShowOverLockScreen(false)
+            }
         }
     }
 

@@ -19,6 +19,9 @@
          installs on camera-less devices — voice calls don't need it. -->
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <!-- Ringing/vibrating for an incoming call (Ringer.kt). Normal permission —
+         no runtime prompt. -->
+    <uses-permission android:name="android.permission.VIBRATE" />
     <uses-feature
         android:name="android.hardware.camera"
         android:required="false" />
@@ -43,6 +46,13 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Handles the Decline action on the incoming-call notification
+             (Notifier.notifyIncomingCall's CallStyle). Not exported: only this
+             app's own PendingIntent ever invokes it. -->
+        <receiver
+            android:name=".CallActionReceiver"
+            android:exported="false" />
 
         <!-- Always-listening "Hey Comrade" wake-word foreground service -->
         <service
