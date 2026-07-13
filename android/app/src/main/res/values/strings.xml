@@ -39,5 +39,6 @@
     <string name="call_unmute">Unmute</string>
     <string name="call_speaker">Speaker</string>
     <string name="call_switch_camera">Switch camera</string>
+    <string name="call_swap_video">Swap video</string>
     <string name="call_permission_needed">Microphone (and camera for video) permission is required to call.</string>
 </resources>
