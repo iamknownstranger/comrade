@@ -162,16 +162,24 @@ private fun InCallContent(
 
     Box(Modifier.fillMaxSize()) {
         if (video) {
-            VideoRenderer(remoteVideo, mirror = false, modifier = Modifier.fillMaxSize())
-            // Self-preview, picture-in-picture, top-end.
+            // Tap the picture-in-picture tile to swap it with the full-screen
+            // view (Telegram-style). `swapped` only changes which track renders
+            // where — the underlying tracks/renderers are unaffected.
+            var swapped by remember { mutableStateOf(false) }
+            val mainTrack = if (swapped) localVideo else remoteVideo
+            val pipTrack = if (swapped) remoteVideo else localVideo
+            // The local track is the front camera preview, so it mirrors
+            // wherever it renders; the remote track never mirrors.
+            VideoRenderer(mainTrack, mirror = swapped, modifier = Modifier.fillMaxSize())
             VideoRenderer(
-                track = localVideo,
-                mirror = true,
+                track = pipTrack,
+                mirror = !swapped,
                 modifier = Modifier
                     .align(Alignment.TopEnd)
                     .padding(16.dp)
                     .size(width = 108.dp, height = 152.dp)
-                    .clip(RoundedCornerShape(12.dp)),
+                    .clip(RoundedCornerShape(12.dp))
+                    .clickable(onClickLabel = stringOf(R.string.call_swap_video)) { swapped = !swapped },
             )
             Text(
                 text = label,
