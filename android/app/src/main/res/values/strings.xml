@@ -39,6 +39,8 @@
     <string name="call_unmute">Unmute</string>
     <string name="call_speaker">Speaker</string>
     <string name="call_switch_camera">Switch camera</string>
+    <string name="call_camera_off">Turn camera off</string>
+    <string name="call_camera_on">Turn camera on</string>
     <string name="call_swap_video">Swap video</string>
     <string name="call_route_earpiece">Earpiece</string>
     <string name="call_route_speaker">Speaker</string>

@@ -153,6 +153,7 @@ private fun InCallContent(
     connectedAtMs: Long = 0L,
 ) {
     val muted by CallManager.muted.collectAsState()
+    val cameraOn by CallManager.cameraOn.collectAsState()
     val audioRoute by CallManager.audioRoute.collectAsState()
     val availableRoutes by CallManager.availableRoutes.collectAsState()
     val remoteVideo by CallManager.remoteVideo.collectAsState()
@@ -216,10 +217,20 @@ private fun InCallContent(
             if (video) {
                 CallActionButton(
                     icon = VideocamIcon,
-                    desc = stringOf(R.string.call_switch_camera),
-                    bg = ControlIdle,
+                    desc = stringOf(if (cameraOn) R.string.call_camera_off else R.string.call_camera_on),
+                    bg = if (!cameraOn) ControlActive else ControlIdle,
+                    tint = if (!cameraOn) CallBackground else Color.White,
                     size = 56.dp,
-                ) { CallManager.switchCamera() }
+                ) { CallManager.toggleCamera() }
+                // Nothing to flip while the camera itself is off.
+                if (cameraOn) {
+                    CallActionButton(
+                        icon = VideocamIcon,
+                        desc = stringOf(R.string.call_switch_camera),
+                        bg = ControlIdle,
+                        size = 56.dp,
+                    ) { CallManager.switchCamera() }
+                }
             }
             CallActionButton(CallEndIcon, stringOf(R.string.call_hang_up), HangupRed, size = 64.dp) {
                 CallManager.hangup()
