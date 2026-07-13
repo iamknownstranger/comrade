@@ -13,6 +13,12 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- CallService: keeps an in-progress call's process alive while the app
+         is backgrounded. Required alongside the matching foregroundServiceType
+         on Android 14+ (see CallService/the <service> entry below); video
+         calls additionally use the camera type. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+
     <!-- Voice/video calls (WebRTC): camera capture for video calls and in-call
          audio routing (earpiece/speaker/Bluetooth/wired headset — see
          CallManager's AudioRoute). RECORD_AUDIO above already covers the
@@ -50,12 +56,22 @@
             </intent-filter>
         </activity>
 
-        <!-- Handles the Decline action on the incoming-call notification
-             (Notifier.notifyIncomingCall's CallStyle). Not exported: only this
-             app's own PendingIntent ever invokes it. -->
+        <!-- Handles the Decline/Hang Up actions on the call notifications'
+             CallStyle (Notifier.notifyIncomingCall, CallService). Not
+             exported: only this app's own PendingIntents ever invoke it. -->
         <receiver
             android:name=".CallActionReceiver"
             android:exported="false" />
+
+        <!-- Keeps the process alive with an ongoing-call notification for the
+             duration of a call's live media — see CallService's doc comment.
+             foregroundServiceType declares the maximum this service may use;
+             each startForeground() call passes the subset it actually needs
+             (microphone alone for voice, +camera for video). -->
+        <service
+            android:name=".call.CallService"
+            android:exported="false"
+            android:foregroundServiceType="camera|microphone" />
 
         <!-- Always-listening "Hey Comrade" wake-word foreground service -->
         <service

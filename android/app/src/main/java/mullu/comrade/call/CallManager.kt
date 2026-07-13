@@ -448,6 +448,9 @@ object CallManager {
         }
 
         beginAudioRouting(s.isVideo)
+        // Keep the process alive & visible for the rest of the call even if
+        // the app is backgrounded — see CallService's doc comment.
+        appContext?.let { CallService.start(it, s.peer, s.peerLabel, s.isVideo) }
         return true
     }
 
@@ -666,6 +669,7 @@ object CallManager {
         s.audioSource = null
 
         endAudioRouting()
+        appContext?.let { CallService.stop(it) }
         _muted.value = false
         _audioRoute.value = AudioRoute.EARPIECE
         _availableRoutes.value = listOf(AudioRoute.EARPIECE, AudioRoute.SPEAKER)
