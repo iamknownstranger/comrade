@@ -81,6 +81,9 @@ object CallManager {
     private const val STREAM_ID = "comrade-call"
     private const val LOCAL_AUDIO_ID = "comrade-audio"
     private const val LOCAL_VIDEO_ID = "comrade-video"
+    private const val CAMERA_WIDTH = 1280
+    private const val CAMERA_HEIGHT = 720
+    private const val CAMERA_FPS = 30
 
     /** How long the [CallUiState.Ended] card lingers before returning to [CallUiState.Idle]. */
     private const val ENDED_LINGER_MS = 1_600L
@@ -117,6 +120,10 @@ object CallManager {
 
     private val _muted = MutableStateFlow(false)
     val muted: StateFlow<Boolean> = _muted.asStateFlow()
+
+    private val _cameraOn = MutableStateFlow(true)
+    /** Whether the local camera is currently capturing (video calls only). */
+    val cameraOn: StateFlow<Boolean> = _cameraOn.asStateFlow()
 
     private val _audioRoute = MutableStateFlow(AudioRoute.EARPIECE)
     /** Where in-call audio is currently playing. */
@@ -341,6 +348,29 @@ object CallManager {
         _muted.value = next
     }
 
+    /**
+     * Turn the local camera off/on mid-call (video calls only) — no
+     * renegotiation, matching [toggleMute]. Turning off both disables the
+     * track (so the peer, and the local self-preview, stop receiving frames)
+     * and stops the capturer (releasing the physical camera, not just muting
+     * it); turning back on resumes both. A no-op for audio calls.
+     */
+    @Synchronized
+    fun toggleCamera() {
+        val s = session ?: return
+        if (!s.isVideo) return
+        val next = !_cameraOn.value
+        if (next) {
+            runCatching { s.capturer?.startCapture(CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS) }
+                .onFailure { Log.w(TAG, "startCapture failed", it) }
+            s.videoTrack?.setEnabled(true)
+        } else {
+            s.videoTrack?.setEnabled(false)
+            runCatching { s.capturer?.stopCapture() }.onFailure { Log.w(TAG, "stopCapture failed", it) }
+        }
+        _cameraOn.value = next
+    }
+
     /** Cycle to the next available [AudioRoute] (earpiece → speaker → Bluetooth/wired → …). */
     @Synchronized
     fun cycleAudioRoute() {
@@ -434,7 +464,7 @@ object CallManager {
                 val helper = SurfaceTextureHelper.create("CaptureThread", eglBase!!.eglBaseContext)
                 val videoSource = fac.createVideoSource(false)
                 capturer.initialize(helper, ctx, videoSource.capturerObserver)
-                capturer.startCapture(1280, 720, 30)
+                capturer.startCapture(CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS)
                 val videoTrack = fac.createVideoTrack(LOCAL_VIDEO_ID, videoSource).apply { setEnabled(true) }
                 s.capturer = capturer
                 s.surfaceHelper = helper
@@ -671,6 +701,7 @@ object CallManager {
         endAudioRouting()
         appContext?.let { CallService.stop(it) }
         _muted.value = false
+        _cameraOn.value = true
         _audioRoute.value = AudioRoute.EARPIECE
         _availableRoutes.value = listOf(AudioRoute.EARPIECE, AudioRoute.SPEAKER)
     }
