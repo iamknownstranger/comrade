@@ -31,6 +31,15 @@
     <!-- Ringing/vibrating for an incoming call (Ringer.kt). Normal permission —
          no runtime prompt. -->
     <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- Required for Notifier.notifyIncomingCall's CallStyle notification: on
+         the callee side there is no foreground service yet while merely
+         ringing (CallService only starts once the call is accepted/placed),
+         so the fullScreenIntent it already sets is the only one of
+         CallStyle's three allowed conditions available at ring time. Without
+         this declared, the platform silently treats fullScreenIntent as
+         absent too, and NotificationManagerCompat.notify throws
+         IllegalArgumentException instead of posting. -->
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
     <uses-feature
         android:name="android.hardware.camera"
         android:required="false" />
