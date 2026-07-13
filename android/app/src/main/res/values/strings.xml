@@ -26,6 +26,11 @@
     <string name="call_incoming_video">Incoming video call</string>
     <string name="call_connecting">Connecting…</string>
     <string name="call_ended">Call ended</string>
+    <string name="call_no_answer">No answer</string>
+    <string name="call_couldnt_connect">Couldn\'t connect</string>
+    <string name="call_declined_ended">Call declined</string>
+    <string name="call_busy_ended">Busy</string>
+    <string name="call_cancelled_ended">Call cancelled</string>
     <string name="call_accept">Accept</string>
     <string name="call_decline">Decline</string>
     <string name="call_hang_up">Hang up</string>
