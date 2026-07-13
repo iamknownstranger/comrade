@@ -114,6 +114,7 @@ private fun RingingContent(s: CallUiState.Ringing, onAccept: () -> Unit) {
     val status = when {
         s.incoming && s.video -> stringOf(R.string.call_incoming_video)
         s.incoming -> stringOf(R.string.call_incoming_voice)
+        s.remoteRinging -> stringOf(R.string.call_ringing)
         else -> stringOf(R.string.call_calling)
     }
     Column(Modifier.fillMaxSize()) {
@@ -226,6 +227,14 @@ private fun InCallContent(
 
 @Composable
 private fun EndedContent(s: CallUiState.Ended) {
+    val labelRes = when (s.outcome) {
+        "missed" -> R.string.call_no_answer
+        "failed" -> R.string.call_couldnt_connect
+        "declined" -> R.string.call_declined_ended
+        "busy" -> R.string.call_busy_ended
+        "cancelled" -> R.string.call_cancelled_ended
+        else -> R.string.call_ended
+    }
     Column(
         modifier = Modifier.fillMaxSize(),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -233,7 +242,7 @@ private fun EndedContent(s: CallUiState.Ended) {
     ) {
         Text(s.peerLabel, color = Color.White, fontSize = 22.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
         Spacer(Modifier.height(8.dp))
-        Text(stringOf(R.string.call_ended), color = Color(0xFFB0BEC5), fontSize = 15.sp)
+        Text(stringOf(labelRes), color = Color(0xFFB0BEC5), fontSize = 15.sp)
     }
 }
 

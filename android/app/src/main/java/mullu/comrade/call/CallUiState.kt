@@ -19,6 +19,8 @@ sealed interface CallUiState {
         val peerLabel: String,
         val video: Boolean,
         val incoming: Boolean,
+        /** Caller side: the callee's device has acked the ring ("Ringing…" vs "Calling…"). */
+        val remoteRinging: Boolean = false,
     ) : CallUiState
 
     /** Negotiating: offer/answer exchanged, waiting for the media path. */

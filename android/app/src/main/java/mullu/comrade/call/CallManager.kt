@@ -7,6 +7,7 @@ import android.media.AudioManager
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -81,6 +82,22 @@ object CallManager {
     /** How long the [CallUiState.Ended] card lingers before returning to [CallUiState.Idle]. */
     private const val ENDED_LINGER_MS = 1_600L
 
+    /**
+     * Ring timeout: how long we wait for the callee to answer (caller side) or
+     * for the user to accept an incoming call (callee side) before giving up with
+     * "No answer". Without this a call whose offer is never answered — an offline
+     * peer, an un-accepted conversation, or a dropped signaling DM — hangs on
+     * "Calling…" forever.
+     */
+    private const val RING_TIMEOUT_MS = 45_000L
+
+    /**
+     * Connect timeout: once the answer is exchanged, how long we give ICE to
+     * actually reach `CONNECTED` (through the STUN→TURN fallback) before failing
+     * with "Couldn't connect".
+     */
+    private const val CONNECT_TIMEOUT_MS = 30_000L
+
     private val io = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     // ── Observable state for the Compose layer ───────────────────────────────
@@ -143,6 +160,12 @@ object CallManager {
 
         /** Idempotency guard so a hangup + a remote hangup don't double-teardown. */
         var ended = false
+
+        /** The pending ring/connect timeout, cancelled on connect or teardown. */
+        var timeoutJob: Job? = null
+
+        /** Caller side: the callee's device has acked with a `Ringing` signal. */
+        var remoteRinging = false
     }
 
     // ── Public API: outgoing ─────────────────────────────────────────────────
@@ -179,13 +202,17 @@ object CallManager {
                 session = s
                 val ice = placed.iceServers.map { it.toWebRtc() }
                 if (!setupPeer(s, ice)) return@launch
-                // Caller creates the offer, sets it local, then signals it.
+                // Caller creates the offer, sets it local, then signals it. A
+                // failed offer send ends the call (see sendSignalOrFail) instead
+                // of hanging on "Calling…".
                 s.pc?.createOffer(
                     createSdpObserver(s) { offer ->
-                        setLocalThen(s, offer) { sendSignal(s, CallSignal.Offer(offer.description)) }
+                        setLocalThen(s, offer) { sendSignalOrFail(s, CallSignal.Offer(offer.description)) }
                     },
                     mediaConstraints(s.isVideo),
                 )
+                // Give up with "No answer" if the callee never picks up.
+                armTimeout(s, RING_TIMEOUT_MS, HangupReason.MISSED, "missed")
             }
         }
     }
@@ -212,9 +239,13 @@ object CallManager {
                 false
             }
             CallSignal.Ringing -> {
-                // Caller side: the callee's device is ringing (pre-answer).
+                // Caller side: the callee's device is ringing (pre-answer) — show
+                // "Ringing…" instead of "Calling…".
                 if (s != null && s.callId == dto.callId && _state.value is CallUiState.Ringing) {
-                    _state.value = CallUiState.Ringing(s.peer, s.peerLabel, s.isVideo, incoming = false)
+                    s.remoteRinging = true
+                    _state.value = CallUiState.Ringing(
+                        s.peer, s.peerLabel, s.isVideo, incoming = false, remoteRinging = true,
+                    )
                 }
                 false
             }
@@ -255,11 +286,13 @@ object CallManager {
                 setRemoteThen(s, SessionDescription(SessionDescription.Type.OFFER, offer)) {
                     s.pc?.createAnswer(
                         createSdpObserver(s) { answer ->
-                            setLocalThen(s, answer) { sendSignal(s, CallSignal.Answer(answer.description)) }
+                            setLocalThen(s, answer) { sendSignalOrFail(s, CallSignal.Answer(answer.description)) }
                         },
                         mediaConstraints(s.isVideo),
                     )
                 }
+                // Answered — now fail with "Couldn't connect" if ICE never completes.
+                armTimeout(s, CONNECT_TIMEOUT_MS, HangupReason.FAILED, "failed")
             }
         }
     }
@@ -422,6 +455,8 @@ object CallManager {
         _state.value = CallUiState.Ringing(s.peer, s.peerLabel, s.isVideo, incoming = true)
         // Best-effort "ringing on my device" ack; failure is non-fatal.
         sendSignal(s, CallSignal.Ringing)
+        // Auto-miss the call if the user never accepts.
+        armTimeout(s, RING_TIMEOUT_MS, HangupReason.MISSED, "missed")
         return true
     }
 
@@ -430,6 +465,8 @@ object CallManager {
             if (_state.value is CallUiState.Ringing) {
                 _state.value = CallUiState.Connecting(s.peer, s.peerLabel, s.isVideo, incoming = false)
             }
+            // Answer in hand — switch from the ring timeout to the connect timeout.
+            armTimeout(s, CONNECT_TIMEOUT_MS, HangupReason.FAILED, "failed")
         }
     }
 
@@ -497,6 +534,7 @@ object CallManager {
 
     private fun onConnected(s: Session) {
         if (s.connectedAtMs == 0L) s.connectedAtMs = System.currentTimeMillis()
+        s.timeoutJob?.cancel() // connected — no timeout applies any more
         _state.value = CallUiState.Active(s.peer, s.peerLabel, s.isVideo, s.incoming, s.connectedAtMs)
     }
 
@@ -515,6 +553,7 @@ object CallManager {
         }
         if (s.ended) return
         s.ended = true
+        s.timeoutJob?.cancel()
 
         if (sendHangup) {
             io.launch {
@@ -639,6 +678,43 @@ object CallManager {
         io.launch {
             runCatching { ComradeCore.sendCallSignalTyped(s.peer, s.callId, s.media, signal) }
                 .onFailure { Log.w(TAG, "sendCallSignal(${signal.kind()}) failed", it) }
+        }
+    }
+
+    /**
+     * Send a signal whose delivery is essential to the call (the offer/answer).
+     * Unlike [sendSignal], a failure here ends the call with "Couldn't connect"
+     * rather than leaving the UI waiting forever for a reply that can't come —
+     * e.g. no relay connection, or a locked vault.
+     */
+    private fun sendSignalOrFail(s: Session, signal: CallSignal) {
+        io.launch {
+            val ok = runCatching { ComradeCore.sendCallSignalTyped(s.peer, s.callId, s.media, signal) }
+                .onFailure { Log.w(TAG, "sendCallSignal(${signal.kind()}) failed", it) }
+                .isSuccess
+            if (!ok) {
+                synchronized(this@CallManager) {
+                    if (session === s && !s.ended) endWith(HangupReason.FAILED, "failed", sendHangup = false)
+                }
+            }
+        }
+    }
+
+    /**
+     * Arm (replacing any previous) a one-shot timeout for the current call: after
+     * [ms], if this session is still current and has not connected, end it with
+     * [reason]/[outcome]. Cancelled on connect and on teardown. This is what keeps
+     * an unanswered or never-connecting call from hanging on "Calling…".
+     */
+    private fun armTimeout(s: Session, ms: Long, reason: HangupReason, outcome: String) {
+        s.timeoutJob?.cancel()
+        s.timeoutJob = io.launch {
+            delay(ms)
+            synchronized(this@CallManager) {
+                if (session === s && !s.ended && s.connectedAtMs == 0L) {
+                    endWith(reason, outcome, sendHangup = true)
+                }
+            }
         }
     }
 
