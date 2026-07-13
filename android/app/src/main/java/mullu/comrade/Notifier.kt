@@ -144,6 +144,27 @@ object Notifier {
         NotificationManagerCompat.from(context).notify("call:$peer".hashCode(), n)
     }
 
+    /**
+     * The callee side missed an incoming call — the ring timed out unanswered
+     * before the user accepted or declined. Posted on the messages channel
+     * (a "you missed something" notice, not an active-call alert) under a
+     * `missed:`-prefixed id so it can't collide with, or be silently cleared
+     * by, [clearCall]/[clearForPeer]'s `call:$peer` id.
+     */
+    @SuppressLint("MissingPermission") // guarded by canPost() / areNotificationsEnabled()
+    fun notifyMissedCall(context: Context, peer: String, peerLabel: String) {
+        if (!canPost(context)) return
+        val n = NotificationCompat.Builder(context, CHANNEL_MESSAGES)
+            .setSmallIcon(android.R.drawable.sym_action_call)
+            .setContentTitle("Missed call")
+            .setContentText(peerLabel)
+            .setAutoCancel(true)
+            .setCategory(NotificationCompat.CATEGORY_CALL)
+            .setContentIntent(openAppIntent(context))
+            .build()
+        NotificationManagerCompat.from(context).notify("missed:$peer".hashCode(), n)
+    }
+
     /** Clear any notification we posted for `peer` (e.g. on opening the chat). */
     fun clearForPeer(context: Context, peer: String) {
         val mgr = NotificationManagerCompat.from(context)

@@ -25,6 +25,7 @@
 
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// Envelope marker for a call-signaling payload riding inside a DM body. A DM
 /// whose decrypted body is JSON with `comrade_call == 1` is a call signal, not
@@ -310,6 +311,91 @@ pub fn ice_servers_for(strategy: IceStrategy, turn: Option<&IceServer>) -> Vec<I
     servers
 }
 
+// ── Short authentication string (SAS) for call verification ─────────────────
+//
+// A SAS lets both participants of a call *verbally* confirm they hold the
+// same DTLS-SRTP session — i.e. that no man-in-the-middle re-terminated the
+// media path with its own certificate. This module only derives the human-
+// readable code from the two sides' already-negotiated SDPs; nothing here
+// touches key material, and a failure to verify never blocks or degrades the
+// call itself (it is an out-of-band, optional check, exactly like Signal's
+// "safety numbers").
+
+/// Extract the DTLS-SRTP certificate fingerprint from one line of an SDP body
+/// (`a=fingerprint:<algorithm> <hex-with-colons>`), if present.
+pub fn extract_fingerprint(sdp: &str) -> Option<String> {
+    const PREFIX: &str = "a=fingerprint:";
+    sdp.lines().find_map(|line| {
+        let trimmed = line.trim();
+        trimmed
+            .strip_prefix(PREFIX)
+            .map(|rest| rest.trim().to_string())
+    })
+}
+
+/// Emoji alphabet the short authentication string is drawn from.
+///
+/// All 32 entries are common animal emoji chosen deliberately: each is a
+/// single Unicode scalar value with default emoji presentation (no
+/// variation selector needed), none has a skin-tone or gender modifier, none
+/// is a flag or a multi-glyph ZWJ sequence, and every entry renders
+/// identically across current Android/iOS/desktop fonts. That combination
+/// matters here specifically because two people are reading the same 4
+/// symbols off two different screens and comparing them out loud — a glyph
+/// that could silently render as a different sequence of codepoints on one
+/// platform (as some ZWJ/skin-tone emoji do) would defeat the whole point.
+/// `emoji_alphabet_entries_are_single_codepoint_and_unique` (below) checks
+/// this assumption rather than just asserting it.
+const EMOJI_ALPHABET: &[&str] = &[
+    "🐶", "🐱", "🐭", "🐹", "🐰", "🦊", "🐻", "🐼", "🐨", "🐯", "🦁", "🐮", "🐷", "🐸", "🐵", "🐔",
+    "🐧", "🐦", "🐤", "🦆", "🦉", "🐴", "🐗", "🐺", "🐢", "🐍", "🐙", "🦋", "🐝", "🐞", "🐬", "🐳",
+];
+
+/// Derive a 4-emoji short authentication string from both sides' SDP
+/// fingerprints, for the two call participants to verbally compare and catch
+/// a man-in-the-middle. `None` if either SDP lacks a fingerprint — an honest
+/// "can't verify" rather than a fabricated code.
+///
+/// Symmetric by construction: `derive_sas(a, b) == derive_sas(b, a)` always —
+/// this is the property that makes the same 4 emoji show up on both phones
+/// regardless of which side is "local" and which is "remote". Achieved by
+/// sorting the two fingerprints before hashing, so caller/callee order never
+/// affects the result.
+pub fn derive_sas(local_sdp: &str, remote_sdp: &str) -> Option<Vec<String>> {
+    let mut fingerprints = [
+        extract_fingerprint(local_sdp)?,
+        extract_fingerprint(remote_sdp)?,
+    ];
+    // Sorting the pair — not the two SDPs, just the two extracted fingerprint
+    // strings — is what makes the result order-independent: whichever side
+    // calls this, the same two strings get hashed in the same order.
+    fingerprints.sort();
+
+    // Hash each fingerprint as a length-prefixed byte string rather than
+    // joining the pair with a plain separator. A fingerprint is conventionally
+    // `<algorithm-name> <hex-with-colons>` (e.g. "sha-256 AB:CD:…"), so a
+    // separator such as `|` that can't appear in that alphabet would in
+    // practice be safe too — but length-prefixing removes the need to trust
+    // that invariant at all: `("a", "bc")` and `("ab", "c")` hash to different
+    // digests even though a naive `a|bc` vs `ab|c` concatenation would not
+    // (if either half ever contained the separator byte). `u64` length prefix
+    // in big-endian bytes; the exact encoding only needs to be fixed and
+    // unambiguous, not compact.
+    let mut hasher = Sha256::new();
+    for fp in &fingerprints {
+        hasher.update((fp.len() as u64).to_be_bytes());
+        hasher.update(fp.as_bytes());
+    }
+    let digest = hasher.finalize();
+
+    Some(
+        digest[..4]
+            .iter()
+            .map(|b| EMOJI_ALPHABET[*b as usize % EMOJI_ALPHABET.len()].to_string())
+            .collect(),
+    )
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -516,5 +602,121 @@ mod tests {
             IceStrategy::from_str_lenient("garbage"),
             IceStrategy::StunOnly
         );
+    }
+
+    /// A minimal, plausible SDP fragment carrying `fingerprint` as its DTLS
+    /// certificate fingerprint line, plus a handful of other `a=` lines that
+    /// real SDP always has around it (so tests exercise line-scanning, not a
+    /// document containing nothing but the one line we care about).
+    fn fake_sdp(fingerprint: &str) -> String {
+        format!(
+            "v=0\r\n\
+             o=- 4028539873384368828 2 IN IP4 127.0.0.1\r\n\
+             s=-\r\n\
+             t=0 0\r\n\
+             a=group:BUNDLE 0\r\n\
+             m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+             c=IN IP4 0.0.0.0\r\n\
+             a=ice-ufrag:abcd\r\n\
+             a=ice-pwd:efghijklmnopqrstuvwxyz012345\r\n\
+             a=fingerprint:{fingerprint}\r\n\
+             a=setup:actpass\r\n\
+             a=mid:0\r\n"
+        )
+    }
+
+    #[test]
+    fn extract_fingerprint_parses_realistic_multiline_sdp() {
+        let sdp = fake_sdp(
+            "sha-256 AB:CD:EF:12:34:56:78:90:AB:CD:EF:12:34:56:78:90:AB:CD:EF:12:34:56:78:90:AB:CD:EF:12:34:56:78:90",
+        );
+        assert_eq!(
+            extract_fingerprint(&sdp),
+            Some(
+                "sha-256 AB:CD:EF:12:34:56:78:90:AB:CD:EF:12:34:56:78:90:AB:CD:EF:12:34:56:78:90:AB:CD:EF:12:34:56:78:90"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn extract_fingerprint_is_none_without_a_fingerprint_line() {
+        let sdp = "v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\na=setup:actpass\r\na=mid:0\r\n";
+        assert!(extract_fingerprint(sdp).is_none());
+    }
+
+    #[test]
+    fn extract_fingerprint_trims_surrounding_whitespace() {
+        // Leading whitespace on the line itself, and trailing whitespace after
+        // the value — neither should end up in the returned fingerprint.
+        let sdp = "v=0\r\n   a=fingerprint:sha-256 AA:BB   \r\ns=-\r\n";
+        assert_eq!(extract_fingerprint(sdp), Some("sha-256 AA:BB".to_string()));
+    }
+
+    #[test]
+    fn derive_sas_is_symmetric() {
+        let sdp_a = fake_sdp("sha-256 AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99");
+        let sdp_b = fake_sdp("sha-256 11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00");
+
+        let sas_ab = derive_sas(&sdp_a, &sdp_b);
+        let sas_ba = derive_sas(&sdp_b, &sdp_a);
+        assert_eq!(
+            sas_ab, sas_ba,
+            "the same 4 emoji must show up regardless of which side is local/remote"
+        );
+
+        let sas = sas_ab.expect("both sides have a fingerprint");
+        assert_eq!(sas.len(), 4);
+    }
+
+    #[test]
+    fn derive_sas_differs_for_different_fingerprint_pairs() {
+        let sdp_a = fake_sdp("sha-256 AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA");
+        let sdp_b = fake_sdp("sha-256 BB:BB:BB:BB:BB:BB:BB:BB:BB:BB:BB:BB:BB:BB:BB:BB");
+        let sdp_c = fake_sdp("sha-256 CC:CC:CC:CC:CC:CC:CC:CC:CC:CC:CC:CC:CC:CC:CC:CC");
+        let sdp_d = fake_sdp("sha-256 DD:DD:DD:DD:DD:DD:DD:DD:DD:DD:DD:DD:DD:DD:DD:DD");
+
+        let sas_1 = derive_sas(&sdp_a, &sdp_b).expect("a/b have fingerprints");
+        let sas_2 = derive_sas(&sdp_c, &sdp_d).expect("c/d have fingerprints");
+        assert_ne!(
+            sas_1, sas_2,
+            "two clearly different fingerprint pairs should not collide to the same code"
+        );
+    }
+
+    #[test]
+    fn derive_sas_is_deterministic() {
+        let sdp_a = fake_sdp("sha-256 AA:BB:CC:DD");
+        let sdp_b = fake_sdp("sha-256 EE:FF:00:11");
+        assert_eq!(derive_sas(&sdp_a, &sdp_b), derive_sas(&sdp_a, &sdp_b));
+    }
+
+    #[test]
+    fn derive_sas_is_none_when_either_side_lacks_a_fingerprint() {
+        let with_fp = fake_sdp("sha-256 AA:BB:CC:DD");
+        let without_fp =
+            "v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\na=setup:actpass\r\n".to_string();
+
+        assert!(derive_sas(&with_fp, &without_fp).is_none());
+        assert!(derive_sas(&without_fp, &with_fp).is_none());
+        assert!(derive_sas(&without_fp, &without_fp).is_none());
+    }
+
+    #[test]
+    fn emoji_alphabet_entries_are_single_codepoint_and_unique() {
+        // Verifies the assumption the doc comment on `EMOJI_ALPHABET` makes,
+        // rather than just asserting it: every entry must be exactly one
+        // Unicode scalar value (no ZWJ sequence, no variation selector) and
+        // no two entries may be the same glyph.
+        assert!(EMOJI_ALPHABET.len() >= 32);
+        let mut seen = std::collections::HashSet::new();
+        for emoji in EMOJI_ALPHABET {
+            assert_eq!(
+                emoji.chars().count(),
+                1,
+                "{emoji:?} must be exactly one Unicode scalar value"
+            );
+            assert!(seen.insert(*emoji), "{emoji:?} appears more than once");
+        }
     }
 }

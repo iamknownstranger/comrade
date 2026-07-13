@@ -44,6 +44,12 @@ fun relativeTime(epochSecs: Long): String {
     }
 }
 
+/** `mm:ss` duration for a connected call (e.g. a call-history row). */
+fun formatCallDuration(totalSecs: Long): String {
+    val secs = totalSecs.coerceAtLeast(0)
+    return "%d:%02d".format(secs / 60, secs % 60)
+}
+
 /**
  * Human day header for journal grouping: "Today", "Yesterday", else
  * "12 Jul 2026". [zone] is injectable so the rule is unit-testable.

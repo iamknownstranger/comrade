@@ -30,6 +30,7 @@ import org.webrtc.MediaConstraints
 import org.webrtc.MediaStream
 import org.webrtc.PeerConnection
 import org.webrtc.PeerConnectionFactory
+import org.webrtc.RTCStatsReport
 import org.webrtc.RtpReceiver
 import org.webrtc.SdpObserver
 import org.webrtc.SessionDescription
@@ -104,6 +105,27 @@ object CallManager {
      */
     private const val CONNECT_TIMEOUT_MS = 30_000L
 
+    /**
+     * How often [startStatsPolling] samples [PeerConnection.getStats] for the
+     * connection-quality indicator. Frequent enough that the indicator feels
+     * live, cheap enough that the extra wakeups don't matter.
+     */
+    private const val STATS_POLL_MS = 2_000L
+
+    /**
+     * Round-trip-time thresholds behind [classifyQuality] — a deliberately
+     * simple heuristic, not a real quality model: at/under [RTT_GOOD_MS] (with
+     * jitter also low) reads as [CallQuality.GOOD]; up to [RTT_MEDIUM_MS] is
+     * [CallQuality.MEDIUM]; anything worse — or stats we can't read — is
+     * [CallQuality.POOR]/[CallQuality.UNKNOWN]. Good enough to flag an
+     * obviously-bad call, not meant to be precise.
+     */
+    private const val RTT_GOOD_MS = 150.0
+    private const val RTT_MEDIUM_MS = 400.0
+
+    /** Above this, jitter alone knocks an otherwise-GOOD RTT reading down to MEDIUM. */
+    private const val JITTER_GOOD_MS = 30.0
+
     private val io = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     // ── Observable state for the Compose layer ───────────────────────────────
@@ -125,6 +147,10 @@ object CallManager {
     /** Whether the local camera is currently capturing (video calls only). */
     val cameraOn: StateFlow<Boolean> = _cameraOn.asStateFlow()
 
+    private val _connectionQuality = MutableStateFlow(CallQuality.UNKNOWN)
+    /** A live, heuristic read on the current call's media quality — see [CallQuality]. */
+    val connectionQuality: StateFlow<CallQuality> = _connectionQuality.asStateFlow()
+
     private val _audioRoute = MutableStateFlow(AudioRoute.EARPIECE)
     /** Where in-call audio is currently playing. */
     val audioRoute: StateFlow<AudioRoute> = _audioRoute.asStateFlow()
@@ -132,6 +158,18 @@ object CallManager {
     private val _availableRoutes = MutableStateFlow(listOf(AudioRoute.EARPIECE, AudioRoute.SPEAKER))
     /** Which [AudioRoute]s are selectable right now — grows/shrinks as headsets connect. */
     val availableRoutes: StateFlow<List<AudioRoute>> = _availableRoutes.asStateFlow()
+
+    private val _sasEmojis = MutableStateFlow<List<String>?>(null)
+
+    /**
+     * The 4-emoji short authentication string for the current call, once
+     * connected and both sides' SDPs are known — for the two participants to
+     * read aloud and compare, catching a man-in-the-middle that re-terminated
+     * the DTLS-SRTP media path. `null` before that point, or if it could not
+     * be derived at all (a missing fingerprint on either side): an honest
+     * "can't verify", never a fabricated code. See [onConnected].
+     */
+    val sasEmojis: StateFlow<List<String>?> = _sasEmojis.asStateFlow()
 
     // ── WebRTC singletons (lazily built on the first call, never at startup) ──
     private var appContext: Context? = null
@@ -166,6 +204,24 @@ object CallManager {
         /** Callee only: the offer SDP, buffered from ring until Accept. */
         var offerSdp: String? = null
 
+        /**
+         * This side's negotiated local SDP — the offer for the caller, the
+         * answer for the callee — captured once `setLocalDescription`
+         * succeeds (see [setLocalThen]). Feeds SAS derivation in
+         * [onConnected] once [remoteSdp] is known too. Overwritten, not
+         * appended, on a renegotiation (ICE-restart TURN fallback, or an
+         * answered re-offer), so it never goes stale.
+         */
+        var localSdp: String? = null
+
+        /**
+         * The peer's negotiated remote SDP — the answer for the caller, the
+         * offer for the callee — captured once `setRemoteDescription`
+         * succeeds (see [setRemoteThen]). Same overwrite-on-renegotiation
+         * behavior as [localSdp].
+         */
+        var remoteSdp: String? = null
+
         val startedAtMs = System.currentTimeMillis()
         var connectedAtMs = 0L
         val isVideo get() = media == CallMediaKind.VIDEO
@@ -178,6 +234,9 @@ object CallManager {
 
         /** The pending ring/connect timeout, cancelled on connect or teardown. */
         var timeoutJob: Job? = null
+
+        /** The connection-quality stats-polling loop, started on connect and cancelled on teardown. */
+        var statsJob: Job? = null
 
         /** Caller side: the callee's device has acked with a `Ringing` signal. */
         var remoteRinging = false
@@ -618,6 +677,102 @@ object CallManager {
         if (s.connectedAtMs == 0L) s.connectedAtMs = System.currentTimeMillis()
         s.timeoutJob?.cancel() // connected — no timeout applies any more
         _state.value = CallUiState.Active(s.peer, s.peerLabel, s.isVideo, s.incoming, s.connectedAtMs)
+        startStatsPolling(s)
+        maybeDeriveSas(s)
+    }
+
+    /**
+     * Poll [PeerConnection.getStats] every [STATS_POLL_MS] while this call
+     * stays connected, updating [_connectionQuality] via [classifyQuality].
+     * `getStats`'s callback fires on an internal WebRTC thread, so — like
+     * every other WebRTC-callback path in this file — the read of [session]
+     * and the write to [_connectionQuality] are synchronized and re-check
+     * that [s] is still the live, un-ended session before touching anything.
+     */
+    private fun startStatsPolling(s: Session) {
+        s.statsJob?.cancel()
+        s.statsJob = io.launch {
+            while (true) {
+                delay(STATS_POLL_MS)
+                val pc = synchronized(this@CallManager) { if (session === s && !s.ended) s.pc else null } ?: break
+                pc.getStats { report ->
+                    val quality = classifyQuality(report)
+                    synchronized(this@CallManager) {
+                        if (session === s && !s.ended) _connectionQuality.value = quality
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * A deliberately simple heuristic — not a real quality model. Reads
+     * `roundTripTime`/`jitter` off the RTCP-derived `"remote-inbound-rtp"`
+     * stats (present once the peer's receiver reports start arriving),
+     * falling back to the ICE `"candidate-pair"`'s STUN-derived
+     * `currentRoundTripTime` if no RTP-stream stats are in yet (e.g. right
+     * after connecting). `RTCStats.getMembers()` is a loosely-typed
+     * `Map<String, Object>`, so every field is read as a nullable [Number]
+     * rather than hard-cast — a missing or renamed field degrades this one
+     * poll to [CallQuality.UNKNOWN] instead of crashing.
+     */
+    private fun classifyQuality(report: RTCStatsReport): CallQuality {
+        var remoteRttSeconds: Double? = null
+        var jitterSeconds: Double? = null
+        var pairRttSeconds: Double? = null
+
+        for (stat in report.statsMap.values) {
+            val members = stat.members
+            when (stat.type) {
+                "remote-inbound-rtp" -> {
+                    (members["roundTripTime"] as? Number)?.toDouble()?.let { rtt ->
+                        remoteRttSeconds = maxOf(remoteRttSeconds ?: rtt, rtt)
+                    }
+                    (members["jitter"] as? Number)?.toDouble()?.let { jitter ->
+                        jitterSeconds = maxOf(jitterSeconds ?: jitter, jitter)
+                    }
+                }
+                "candidate-pair" -> {
+                    if (members["state"] == "succeeded") {
+                        (members["currentRoundTripTime"] as? Number)?.toDouble()?.let { pairRttSeconds = it }
+                    }
+                }
+            }
+        }
+
+        val rttSeconds = remoteRttSeconds ?: pairRttSeconds ?: return CallQuality.UNKNOWN
+        val rttMs = rttSeconds * 1000.0
+        val jitterMs = jitterSeconds?.times(1000.0)
+        return when {
+            rttMs <= RTT_GOOD_MS && (jitterMs == null || jitterMs <= JITTER_GOOD_MS) -> CallQuality.GOOD
+            rttMs <= RTT_MEDIUM_MS -> CallQuality.MEDIUM
+            else -> CallQuality.POOR
+        }
+    }
+
+    /**
+     * Kick off short-authentication-string derivation once both this side's
+     * and the peer's SDP are known. Runs the (blocking, native) FFI call on
+     * [io] rather than inline — this fires from inside a `synchronized`
+     * block ([onConnected] is called from [peerObserver]'s
+     * `onConnectionChange`, itself synchronized) — and publishes the result
+     * back under a fresh `synchronized` block, matching [sendSignal]'s
+     * fire-and-forget shape. A missing fingerprint on either side yields
+     * `null` from [mullu.comrade.ComradeCore.callSasTyped] — a valid "can't
+     * verify" outcome, published as-is rather than hidden as an error.
+     */
+    private fun maybeDeriveSas(s: Session) {
+        val local = s.localSdp
+        val remote = s.remoteSdp
+        if (local == null || remote == null) return
+        io.launch {
+            val sas = runCatching { ComradeCore.callSasTyped(local, remote) }
+                .onFailure { Log.w(TAG, "callSas failed", it) }
+                .getOrNull()
+            synchronized(this@CallManager) {
+                if (session === s && !s.ended) _sasEmojis.value = sas
+            }
+        }
     }
 
     /**
@@ -662,7 +817,7 @@ object CallManager {
 
         teardownMedia(s)
         session = null
-        _state.value = CallUiState.Ended(s.peerLabel, outcome, s.isVideo)
+        _state.value = CallUiState.Ended(s.peer, s.peerLabel, s.isVideo, s.incoming, outcome)
         io.launch {
             delay(ENDED_LINGER_MS)
             synchronized(this@CallManager) {
@@ -678,6 +833,7 @@ object CallManager {
      * and audio routing is restored to normal.
      */
     private fun teardownMedia(s: Session) {
+        s.statsJob?.cancel()
         _localVideo.value = null
         _remoteVideo.value = null
 
@@ -702,8 +858,10 @@ object CallManager {
         appContext?.let { CallService.stop(it) }
         _muted.value = false
         _cameraOn.value = true
+        _connectionQuality.value = CallQuality.UNKNOWN
         _audioRoute.value = AudioRoute.EARPIECE
         _availableRoutes.value = listOf(AudioRoute.EARPIECE, AudioRoute.SPEAKER)
+        _sasEmojis.value = null
     }
 
     // ── Audio routing ─────────────────────────────────────────────────────────
@@ -897,7 +1055,16 @@ object CallManager {
         s.pc?.setLocalDescription(
             object : SdpObserver {
                 override fun onCreateSuccess(p0: SessionDescription?) {}
-                override fun onSetSuccess() = onDone()
+                override fun onSetSuccess() {
+                    synchronized(this@CallManager) {
+                        if (session !== s) return
+                        // The offer for the caller, the answer for the callee — and
+                        // whichever of the two on a renegotiation, overwriting the
+                        // prior value so it can never go stale (see [Session.localSdp]).
+                        s.localSdp = desc.description
+                        onDone()
+                    }
+                }
                 override fun onCreateFailure(p0: String?) {}
                 override fun onSetFailure(error: String?) {
                     Log.e(TAG, "setLocalDescription failed: $error")
@@ -915,6 +1082,10 @@ object CallManager {
                     synchronized(this@CallManager) {
                         if (session !== s) return
                         s.remoteSet = true
+                        // The answer for the caller, the offer for the callee — and
+                        // whichever of the two on a renegotiation, overwriting the
+                        // prior value so it can never go stale (see [Session.remoteSdp]).
+                        s.remoteSdp = desc.description
                         flushPendingIce(s)
                         onDone()
                     }

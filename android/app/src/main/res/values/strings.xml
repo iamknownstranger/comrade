@@ -46,5 +46,21 @@
     <string name="call_route_speaker">Speaker</string>
     <string name="call_route_bluetooth">Bluetooth</string>
     <string name="call_route_wired">Wired headset</string>
+    <string name="call_weak_connection">Weak connection</string>
     <string name="call_permission_needed">Microphone (and camera for video) permission is required to call.</string>
+    <string name="call_sas_label">Verify:</string>
+    <string name="call_sas_explain_title">Call verification code</string>
+    <string name="call_sas_explain_body">These 4 symbols are derived from both phones\' connection security codes. Read them aloud — if the other person sees the same 4, your call is not being intercepted. If they see something different, hang up.</string>
+    <string name="call_sas_dismiss">Got it</string>
+
+    <!-- Call history -->
+    <string name="call_history_title">Call history</string>
+    <string name="call_history_empty">No calls yet</string>
+    <string name="call_direction_incoming">Incoming</string>
+    <string name="call_direction_outgoing">Outgoing</string>
+    <string name="call_outcome_missed">Missed</string>
+    <string name="call_outcome_declined">Declined</string>
+    <string name="call_outcome_busy">Busy</string>
+    <string name="call_outcome_cancelled">Cancelled</string>
+    <string name="call_outcome_failed">Failed</string>
 </resources>
