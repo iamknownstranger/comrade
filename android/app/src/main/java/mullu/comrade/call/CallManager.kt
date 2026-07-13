@@ -614,7 +614,13 @@ object CallManager {
     private fun addRemoteIce(s: Session, ice: CallSignal.Ice) {
         val candidate = IceCandidate(ice.sdpMid, ice.sdpMLineIndex?.toInt() ?: 0, ice.candidate)
         val pc = s.pc
-        if (pc != null && s.remoteSet) pc.addIceCandidate(candidate) else s.pendingIce.add(candidate)
+        if (pc != null && s.remoteSet) {
+            Log.i(TAG, "remote ICE candidate (${candidate.sdp.iceCandidateType()}), callId=${s.callId}")
+            pc.addIceCandidate(candidate)
+        } else {
+            Log.i(TAG, "remote ICE candidate buffered before remote description set, callId=${s.callId}")
+            s.pendingIce.add(candidate)
+        }
     }
 
     private fun flushPendingIce(s: Session) {
@@ -632,10 +638,22 @@ object CallManager {
      * drives this; the callee answers the re-offer as a renegotiation. With no
      * TURN configured the widened list equals the STUN-only one, so we skip
      * straight to an honest "failed".
+     *
+     * The callee side deliberately does *not* end the call here: a Hangup
+     * sent the instant this side's ICE agent reports FAILED can reach the
+     * caller before the caller's own agent has reported anything at all,
+     * foreclosing the caller's rescue attempt every time a failure happens to
+     * show up on the callee first (WebRTC's failure timing between the two
+     * sides is not synchronized). The connect timeout already armed in
+     * [accept] is the callee's backstop if no rescuing re-offer arrives.
      */
     private fun tryTurnFallbackOrFail(s: Session) {
         if (s.ended) return
-        if (s.incoming || s.triedTurn) {
+        if (s.incoming) {
+            Log.w(TAG, "ICE failed on the callee side (callId=${s.callId}); waiting for a possible caller re-offer")
+            return
+        }
+        if (s.triedTurn) {
             endWith(HangupReason.FAILED, "failed", sendHangup = true)
             return
         }
@@ -1027,6 +1045,7 @@ object CallManager {
             delay(ms)
             synchronized(this@CallManager) {
                 if (session === s && !s.ended && s.connectedAtMs == 0L) {
+                    Log.w(TAG, "${ms}ms timeout fired without connecting; ending as \"$outcome\", callId=${s.callId}")
                     endWith(reason, outcome, sendHangup = true)
                 }
             }
@@ -1134,6 +1153,7 @@ object CallManager {
 
     private fun peerObserver(s: Session): PeerConnection.Observer = object : PeerConnection.Observer {
         override fun onIceCandidate(candidate: IceCandidate) {
+            Log.i(TAG, "local ICE candidate (${candidate.sdp.iceCandidateType()}), callId=${s.callId}")
             sendSignal(
                 s,
                 CallSignal.Ice(
@@ -1152,6 +1172,7 @@ object CallManager {
         }
 
         override fun onConnectionChange(newState: PeerConnection.PeerConnectionState) {
+            Log.i(TAG, "peerConnectionState → $newState, callId=${s.callId}")
             when (newState) {
                 PeerConnection.PeerConnectionState.CONNECTED ->
                     synchronized(this@CallManager) { if (session === s) onConnected(s) }
@@ -1161,15 +1182,28 @@ object CallManager {
             }
         }
 
+        // Diagnostic only — the state machine above reacts to onConnectionChange,
+        // not these; logged so a "stuck at Connecting" report is a logcat read
+        // (did ICE ever leave CHECKING? did gathering find any srflx/relay
+        // candidates at all?) instead of a guess.
+        override fun onIceConnectionChange(newState: PeerConnection.IceConnectionState) {
+            Log.i(TAG, "iceConnectionState → $newState, callId=${s.callId}")
+        }
+        override fun onIceGatheringChange(newState: PeerConnection.IceGatheringState) {
+            Log.i(TAG, "iceGatheringState → $newState, callId=${s.callId}")
+        }
+
         // Unused observer surface — required by the interface.
         override fun onSignalingChange(newState: PeerConnection.SignalingState) {}
-        override fun onIceConnectionChange(newState: PeerConnection.IceConnectionState) {}
         override fun onIceConnectionReceivingChange(receiving: Boolean) {}
-        override fun onIceGatheringChange(newState: PeerConnection.IceGatheringState) {}
         override fun onIceCandidatesRemoved(candidates: Array<out IceCandidate>) {}
         override fun onAddStream(stream: MediaStream) {}
         override fun onRemoveStream(stream: MediaStream) {}
         override fun onDataChannel(channel: org.webrtc.DataChannel) {}
         override fun onRenegotiationNeeded() {}
     }
+
+    /** Best-effort `typ host|srflx|relay` extraction from a candidate's SDP line, for logging only. */
+    private fun String.iceCandidateType(): String =
+        Regex("""\btyp (\w+)""").find(this)?.groupValues?.get(1) ?: "unknown"
 }
