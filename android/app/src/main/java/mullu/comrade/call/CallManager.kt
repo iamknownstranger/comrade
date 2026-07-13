@@ -2,6 +2,7 @@ package mullu.comrade.call
 
 import android.content.Context
 import android.media.AudioAttributes
+import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioFocusRequest
 import android.media.AudioManager
@@ -674,7 +675,7 @@ object CallManager {
 
     private var audioFocus: AudioFocusRequest? = null
     private var priorAudioMode = AudioManager.MODE_NORMAL
-    private var audioDeviceCallback: AudioManager.AudioDeviceCallback? = null
+    private var audioDeviceCallback: AudioDeviceCallback? = null
 
     /**
      * Enter communication audio mode, start watching for Bluetooth/wired
@@ -696,7 +697,7 @@ object CallManager {
         am.requestAudioFocus(focus)
         am.mode = AudioManager.MODE_IN_COMMUNICATION
 
-        val callback = object : AudioManager.AudioDeviceCallback() {
+        val callback = object : AudioDeviceCallback() {
             override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) = refreshAndMaybeSwitchRoute(am)
             override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) = refreshAndMaybeSwitchRoute(am)
         }
