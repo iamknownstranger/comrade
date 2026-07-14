@@ -362,7 +362,7 @@ object CallManager {
                         createSdpObserver(s) { answer ->
                             setLocalThen(s, answer) { sendSignalOrFail(s, CallSignal.Answer(answer.description)) }
                         },
-                        mediaConstraints(s.isVideo),
+                        MediaConstraints(), // Empty constraints for Answers
                     )
                 }
                 // Answered — now fail with "Couldn't connect" if ICE never completes.
@@ -539,7 +539,10 @@ object CallManager {
         beginAudioRouting(s.isVideo)
         // Keep the process alive & visible for the rest of the call even if
         // the app is backgrounded — see CallService's doc comment.
-        appContext?.let { CallService.start(it, s.peer, s.peerLabel, s.isVideo) }
+        appContext?.let { ctx ->
+            runCatching { CallService.start(ctx, s.peer, s.peerLabel, s.isVideo) }
+                .onFailure { Log.w(TAG, "Failed to start CallService (foreground restrictions)", it) }
+        }
         return true
     }
 
@@ -612,7 +615,7 @@ object CallManager {
     }
 
     private fun addRemoteIce(s: Session, ice: CallSignal.Ice) {
-        val candidate = IceCandidate(ice.sdpMid, ice.sdpMLineIndex?.toInt() ?: 0, ice.candidate)
+        val candidate = IceCandidate(ice.sdpMid ?: "", ice.sdpMLineIndex?.toInt() ?: 0, ice.candidate)
         val pc = s.pc
         if (pc != null && s.remoteSet) {
             Log.i(TAG, "remote ICE candidate (${candidate.sdp.iceCandidateType()}), callId=${s.callId}")
@@ -1159,7 +1162,7 @@ object CallManager {
                 CallSignal.Ice(
                     candidate = candidate.sdp,
                     sdpMid = candidate.sdpMid,
-                    sdpMLineIndex = candidate.sdpMLineIndex.toUShort(),
+                    sdpMLineIndex = if (candidate.sdpMLineIndex >= 0) candidate.sdpMLineIndex.toUShort() else null,
                 ),
             )
         }
