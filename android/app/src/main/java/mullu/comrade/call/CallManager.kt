@@ -465,7 +465,15 @@ object CallManager {
                 it.type == wantedType ||
                     (route == AudioRoute.WIRED && it.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES)
             }
-            if (device != null) am.setCommunicationDevice(device) else am.clearCommunicationDevice()
+            try {
+                if (device != null) am.setCommunicationDevice(device) else am.clearCommunicationDevice()
+            } catch (e: SecurityException) {
+                // Routing to a TYPE_BLUETOOTH_SCO device needs BLUETOOTH_CONNECT
+                // on API 31+; without it, fall back to the default route
+                // instead of crashing the call.
+                Log.w(TAG, "missing BLUETOOTH_CONNECT for setCommunicationDevice; clearing route", e)
+                am.clearCommunicationDevice()
+            }
         } else {
             applyAudioRouteLegacy(am, route)
         }
@@ -523,7 +531,13 @@ object CallManager {
                 val helper = SurfaceTextureHelper.create("CaptureThread", eglBase!!.eglBaseContext)
                 val videoSource = fac.createVideoSource(false)
                 capturer.initialize(helper, ctx, videoSource.capturerObserver)
-                capturer.startCapture(CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS)
+                // The physical camera can be unavailable (in use by another
+                // app, restricted by policy, hardware fault, …); an
+                // uncaught failure here would otherwise abort the whole call
+                // setup instead of just leaving this call without a live
+                // local preview.
+                runCatching { capturer.startCapture(CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS) }
+                    .onFailure { Log.e(TAG, "camera capture start failed; continuing without local video", it) }
                 val videoTrack = fac.createVideoTrack(LOCAL_VIDEO_ID, videoSource).apply { setEnabled(true) }
                 s.capturer = capturer
                 s.surfaceHelper = helper
@@ -573,7 +587,7 @@ object CallManager {
                                 sendSignal(existing, CallSignal.Answer(answer.description))
                             }
                         },
-                        mediaConstraints(existing.isVideo),
+                        MediaConstraints(), // Empty constraints for Answers — see accept()
                     )
                 }
                 return false
@@ -615,7 +629,7 @@ object CallManager {
     }
 
     private fun addRemoteIce(s: Session, ice: CallSignal.Ice) {
-        val candidate = IceCandidate(ice.sdpMid ?: "", ice.sdpMLineIndex?.toInt() ?: 0, ice.candidate)
+        val candidate = remoteIceCandidate(ice)
         val pc = s.pc
         if (pc != null && s.remoteSet) {
             Log.i(TAG, "remote ICE candidate (${candidate.sdp.iceCandidateType()}), callId=${s.callId}")
@@ -848,24 +862,30 @@ object CallManager {
     }
 
     /**
-     * Release every camera/microphone/PeerConnection handle. This is the
-     * teardown Phase 4 requires: stopping the capturer + disposing the sources
-     * frees the physical camera and mic, `pc.dispose()` closes the transport,
-     * and audio routing is restored to normal.
+     * Release every camera/microphone/PeerConnection handle. Called from
+     * inside [endWith]'s `@Synchronized` block, so everything here must
+     * return fast: the WebRTC `.dispose()` calls are synchronous native
+     * shutdowns that block the calling thread until the internal signaling
+     * threads join, and if one of those threads concurrently re-enters this
+     * object's monitor (e.g. [peerObserver]'s `onConnectionChange` firing
+     * mid-teardown), the two threads deadlock forever (an ANR). References
+     * are captured and the session's fields cleared immediately — cheap,
+     * non-blocking, so the UI/state layer updates synchronously as before —
+     * and the actual disposal is offloaded onto [io], entirely outside the
+     * monitor.
      */
     private fun teardownMedia(s: Session) {
         s.statsJob?.cancel()
         _localVideo.value = null
         _remoteVideo.value = null
 
-        runCatching { s.capturer?.stopCapture() }.onFailure { Log.w(TAG, "stopCapture", it) }
-        runCatching { s.capturer?.dispose() }
-        runCatching { s.videoTrack?.dispose() }
-        runCatching { s.videoSource?.dispose() }
-        runCatching { s.surfaceHelper?.dispose() }
-        runCatching { s.audioTrack?.dispose() }
-        runCatching { s.audioSource?.dispose() }
-        runCatching { s.pc?.dispose() }
+        val capturerToDispose = s.capturer
+        val videoTrackToDispose = s.videoTrack
+        val videoSourceToDispose = s.videoSource
+        val surfaceHelperToDispose = s.surfaceHelper
+        val audioTrackToDispose = s.audioTrack
+        val audioSourceToDispose = s.audioSource
+        val pcToDispose = s.pc
 
         s.pc = null
         s.capturer = null
@@ -883,6 +903,17 @@ object CallManager {
         _audioRoute.value = AudioRoute.EARPIECE
         _availableRoutes.value = listOf(AudioRoute.EARPIECE, AudioRoute.SPEAKER)
         _sasEmojis.value = null
+
+        io.launch {
+            runCatching { capturerToDispose?.stopCapture() }.onFailure { Log.w(TAG, "stopCapture failed", it) }
+            runCatching { capturerToDispose?.dispose() }
+            runCatching { videoTrackToDispose?.dispose() }
+            runCatching { videoSourceToDispose?.dispose() }
+            runCatching { surfaceHelperToDispose?.dispose() }
+            runCatching { audioTrackToDispose?.dispose() }
+            runCatching { audioSourceToDispose?.dispose() }
+            runCatching { pcToDispose?.dispose() }
+        }
     }
 
     // ── Audio routing ─────────────────────────────────────────────────────────
@@ -1060,6 +1091,26 @@ object CallManager {
         mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveVideo", if (video) "true" else "false"))
     }
 
+    /**
+     * Builds the [IceCandidate] WebRTC expects from a remote [CallSignal.Ice]
+     * payload. The wire `sdpMid` can legitimately be absent; passing a null
+     * string straight into the native constructor is a fatal JNI
+     * `JavaToStdString` crash, so a missing value maps to `""` instead.
+     * `internal` (not `private`) so it's directly unit-testable.
+     */
+    internal fun remoteIceCandidate(ice: CallSignal.Ice): IceCandidate =
+        IceCandidate(ice.sdpMid ?: "", ice.sdpMLineIndex?.toInt() ?: 0, ice.candidate)
+
+    /**
+     * WebRTC reports `sdpMLineIndex == -1` when a candidate isn't tied to an
+     * m-line yet. [UShort] has no negative range, so a bare `.toUShort()`
+     * wraps `-1` to `65535`; the remote side then rejects the line index as
+     * malformed and the call sticks on "Connecting…" forever. Map negative
+     * indices to `null` instead of wrapping them. `internal` (not `private`)
+     * so it's directly unit-testable.
+     */
+    internal fun outgoingSdpMLineIndex(index: Int): UShort? = if (index >= 0) index.toUShort() else null
+
     /** An [SdpObserver] whose only interesting callback is create-success. */
     private fun createSdpObserver(s: Session, onCreated: (SessionDescription) -> Unit) = object : SdpObserver {
         override fun onCreateSuccess(desc: SessionDescription) = onCreated(desc)
@@ -1162,7 +1213,7 @@ object CallManager {
                 CallSignal.Ice(
                     candidate = candidate.sdp,
                     sdpMid = candidate.sdpMid,
-                    sdpMLineIndex = if (candidate.sdpMLineIndex >= 0) candidate.sdpMLineIndex.toUShort() else null,
+                    sdpMLineIndex = outgoingSdpMLineIndex(candidate.sdpMLineIndex),
                 ),
             )
         }
