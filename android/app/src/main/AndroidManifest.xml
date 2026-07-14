@@ -48,10 +48,15 @@
         android:required="false" />
 
     <!-- allowBackup=false: the encrypted vault must not leave the device via
-         adb/cloud backup — an exported copy is an offline brute-force target. -->
+         adb/cloud backup — an exported copy is an offline brute-force target.
+         hasFragileUserData=true is unrelated to that: it just opts into the
+         platform's "keep app data" uninstall dialog (Android 10+) so a
+         reinstall doesn't silently wipe the vault/key material and chat
+         history the user never asked to delete. -->
     <application
         android:name=".ComradeApplication"
         android:allowBackup="false"
+        android:hasFragileUserData="true"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"

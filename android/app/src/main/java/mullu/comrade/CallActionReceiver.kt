@@ -4,6 +4,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import mullu.comrade.call.CallManager
+import mullu.comrade.call.CallService
 
 /**
  * Handles the Decline and Hang Up actions on the call notifications'
@@ -17,8 +18,12 @@ import mullu.comrade.call.CallManager
  * currently active: it both ends the call ([CallManager.reject]) and clears
  * the notification directly, rather than relying on the UI's state-observing
  * side effect (which only runs while an Activity is composed). Hanging up
- * needs no such direct clear — [CallManager.hangup] tears the call down, which
- * stops [mullu.comrade.call.CallService] and removes its notification with it.
+ * normally needs no such direct clear — [CallManager.hangup] tears the call
+ * down, which stops [CallService] and removes its notification with it — but
+ * that only works while [CallManager]'s in-memory session survived; if the
+ * process was killed under memory pressure and only just restarted to
+ * deliver this broadcast, [CallManager.hangup] silently no-ops on a null
+ * session, so the service/notification are stopped/cleared directly too.
  */
 class CallActionReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
@@ -28,7 +33,11 @@ class CallActionReceiver : BroadcastReceiver() {
                 CallManager.reject()
                 Notifier.clearCall(context, peer)
             }
-            ACTION_HANGUP -> CallManager.hangup()
+            ACTION_HANGUP -> {
+                CallManager.hangup()
+                runCatching { context.stopService(Intent(context, CallService::class.java)) }
+                Notifier.clearCall(context, peer)
+            }
         }
     }
 

@@ -2,6 +2,7 @@ package mullu.comrade.call
 
 import android.content.Context
 import android.os.PowerManager
+import android.util.Log
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -491,7 +492,12 @@ private fun ProximityScreenControl(active: Boolean) {
                 lock.acquire(60 * 60 * 1000L)
             }
         }
-        onDispose { if (lock?.isHeld == true) lock.release() }
+        onDispose {
+            // Some vendor ROMs silently clear proximity wake locks themselves;
+            // releasing an already-cleared lock throws RuntimeException.
+            runCatching { if (lock?.isHeld == true) lock.release() }
+                .onFailure { Log.w("ProximityControl", "wake lock already released by the platform", it) }
+        }
     }
 }
 

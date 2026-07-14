@@ -30,7 +30,16 @@ import mullu.comrade.Notifier
 class CallService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val peer = intent?.getStringExtra(EXTRA_PEER).orEmpty()
+        val peer = intent?.getStringExtra(EXTRA_PEER)
+        if (peer.isNullOrEmpty()) {
+            // A system-triggered restart (e.g. the process was killed under
+            // memory pressure) can redeliver a blank/null intent with no
+            // guarantee the original extras survived. Starting a foreground
+            // service with a blank ongoing-call notification is worse than
+            // not starting one — bail before startForegroundNotified.
+            stopSelf()
+            return START_NOT_STICKY
+        }
         val peerLabel = intent?.getStringExtra(EXTRA_PEER_LABEL)?.ifBlank { null } ?: peer
         val video = intent?.getBooleanExtra(EXTRA_VIDEO, false) ?: false
         startForegroundNotified(peer, peerLabel, video)
