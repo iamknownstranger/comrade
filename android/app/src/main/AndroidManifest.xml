@@ -18,6 +18,9 @@
          on Android 14+ (see CallService/the <service> entry below); video
          calls additionally use the camera type. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+    <!-- ProximityScreenControl (CallScreen.kt) holds a PROXIMITY_SCREEN_OFF_WAKE_LOCK
+         for the duration of a call. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <!-- Voice/video calls (WebRTC): camera capture for video calls and in-call
          audio routing (earpiece/speaker/Bluetooth/wired headset — see
