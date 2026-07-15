@@ -202,9 +202,26 @@ object CallManager {
     val sasEmojis: StateFlow<List<String>?> = _sasEmojis.asStateFlow()
 
     // ── WebRTC singletons (lazily built on the first call, never at startup) ──
-    private var appContext: Context? = null
-    private var eglBase: EglBase? = null
-    private var factory: PeerConnectionFactory? = null
+    // @Volatile: written under [factoryLock] (see ensureFactory) but read from
+    // other threads without it — the [eglBaseContext] getter on the UI thread,
+    // and [factory]/[appContext] on the call-setup coroutine — so their
+    // initialised values must be visible across threads.
+    @Volatile private var appContext: Context? = null
+    @Volatile private var eglBase: EglBase? = null
+    @Volatile private var factory: PeerConnectionFactory? = null
+
+    /**
+     * Serializes [ensureFactory]'s one-time native init on a lock that is
+     * **not** this object's own monitor. The init is a synchronous, multi-second
+     * `PeerConnectionFactory.initialize` + `EglBase.create()` +
+     * `createPeerConnectionFactory()` build; every user-facing call control
+     * ([accept], [hangup], [reject], [toggleMute], …) is `@Synchronized` on
+     * `this`. When init held the shared monitor, a hang-up tapped on a still
+     * "Connecting…" screen blocked the **main thread** for the entire init →
+     * "Comrade isn't responding" (ANR). A dedicated lock preserves the
+     * double-initialisation guard while leaving the main-thread monitor free.
+     */
+    private val factoryLock = Any()
 
     /** The shared EGL context renderers must init against (null until a call runs). */
     val eglBaseContext: EglBase.Context? get() = eglBase?.eglBaseContext
@@ -238,7 +255,8 @@ object CallManager {
          */
         var callId: String,
         val peer: String,
-        val peerLabel: String,
+        /** Display title; starts as the short key and is upgraded to the alias/@handle off the monitor (see [upgradePeerLabel]). */
+        var peerLabel: String,
         val media: CallMediaKind,
         val incoming: Boolean,
     ) {
@@ -898,7 +916,13 @@ object CallManager {
     /** Start ringing a brand-new incoming offer — the fresh-call path, also reused by the glare loser. */
     private fun ringFreshIncoming(dto: CallSignalDto, sdp: String): Boolean {
         val media = mediaKindOf(dto.media)
-        val s = Session(dto.callId, dto.peer, resolvePeerLabel(dto.peer), media, incoming = true)
+        // Seed the label with the cheap, non-blocking short key. This runs
+        // inside the @Synchronized onIncomingSignal monitor, so it must NOT
+        // call the blocking JNI store read resolvePeerLabel used to do — that
+        // held the monitor across a full-history decrypt scan, blocking any
+        // main-thread call control (accept/hangup/…) that arrived meanwhile.
+        // The alias/@handle is resolved off the monitor in upgradePeerLabel.
+        val s = Session(dto.callId, dto.peer, mullu.comrade.ui.shortNpub(dto.peer), media, incoming = true)
         s.offerSdp = sdp
         session = s
         _state.value = CallUiState.Ringing(s.peer, s.peerLabel, s.isVideo, incoming = true)
@@ -906,7 +930,31 @@ object CallManager {
         sendSignal(s, CallSignal.Ringing)
         // Auto-miss the call if the user never accepts.
         armTimeout(s, RING_TIMEOUT_MS, HangupReason.MISSED, "missed")
+        // Upgrade the short key to the contact's alias/@handle without holding
+        // the monitor across the blocking store read.
+        upgradePeerLabel(s)
         return true
+    }
+
+    /**
+     * Resolve [Session.peerLabel] from the short key to the contact's
+     * alias/published @handle off the signal-handling monitor (the lookup is a
+     * blocking JNI store read), then republish the ringing state so the screen
+     * and any already-shown notification title agree once it lands. A lookup
+     * failure (e.g. store locked) simply leaves the short key in place.
+     */
+    private fun upgradePeerLabel(s: Session) {
+        io.launch {
+            val resolved = resolvePeerLabel(s.peer)
+            synchronized(this@CallManager) {
+                if (session !== s || s.ended || resolved == s.peerLabel) return@launch
+                s.peerLabel = resolved
+                val current = _state.value
+                if (current is CallUiState.Ringing && current.incoming) {
+                    _state.value = CallUiState.Ringing(s.peer, resolved, s.isVideo, incoming = true)
+                }
+            }
+        }
     }
 
     /**
@@ -1429,12 +1477,14 @@ object CallManager {
 
     // Called from startOutgoingCall/accept's io.launch before either takes the
     // CallManager monitor (T3.4: this is a synchronous native init with no
-    // business running on the caller's Compose-click thread) — so the
-    // check-then-act below needs its own synchronization, unlike every other
-    // field access in this class, to stay safe if two call-setup attempts
-    // (e.g. a glare loser whose coroutine is still finishing a non-suspend
-    // native call when a new session starts one of its own) ever overlap.
-    private fun ensureFactory(context: Context) = synchronized(this) {
+    // business running on the caller's Compose-click thread). It guards the
+    // check-then-act with [factoryLock] — deliberately NOT this object's own
+    // monitor — so two overlapping call-setup attempts (e.g. a glare loser
+    // whose non-suspend native call is still finishing when a new session
+    // starts its own) can't double-initialise, while a main-thread call
+    // control (`@Synchronized` on `this`) is never blocked behind the
+    // multi-second native build. See [factoryLock].
+    private fun ensureFactory(context: Context) = synchronized(factoryLock) {
         if (factory != null) return@synchronized
         val app = context.applicationContext
         appContext = app
