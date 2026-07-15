@@ -23,8 +23,13 @@ import org.vosk.android.SpeechService
 import org.vosk.android.StorageService
 import java.util.concurrent.Executors
 
-/** An independent feature that can need the mic exclusively (see [MicHolderSet]). */
-internal enum class MicHolder { CALL, VOICE_NOTE }
+/**
+ * An independent feature that can need the mic exclusively (see
+ * [MicHolderSet]). Public, not `internal`: it's a parameter type on
+ * [WakeWordService.pause]/[WakeWordService.resume], which callers outside
+ * this file (`CallManager`, `VoiceRecorder`) need to reference by name.
+ */
+enum class MicHolder { CALL, VOICE_NOTE }
 
 /**
  * Tracks which [MicHolder]s currently need the wake-word recogniser paused,
