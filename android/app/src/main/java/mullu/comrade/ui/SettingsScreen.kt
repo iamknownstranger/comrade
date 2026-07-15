@@ -535,6 +535,7 @@ fun VoiceSection() {
 
     val tts = remember { ComradeTts(context) }
     val dispatcher = remember { CommandDispatcher(ComradeCoreBackend()) }
+    val scope = rememberCoroutineScope()
     DisposableEffect(Unit) { onDispose { tts.shutdown() } }
 
     fun runTapToTalk() {
@@ -546,11 +547,20 @@ fun VoiceSection() {
                     lastReply = "I didn't catch that."
                     busy = false
                 } else {
-                    val reply = runCatching { dispatcher.handle(VoiceCommand.parse(heard)) }
-                        .getOrElse { "Something went wrong." }
-                    lastReply = "“$heard” → $reply"
-                    tts.speak(reply)
-                    busy = false
+                    // Off the main thread — dispatcher.handle can do blocking
+                    // I/O (store reads, a relay round-trip for e.g. /pay),
+                    // same as WakeWordService.dispatch()'s worker executor;
+                    // the recognizer's onText callback runs on the main
+                    // looper, which must stay free for the UI.
+                    scope.launch {
+                        val reply = withContext(Dispatchers.IO) {
+                            runCatching { dispatcher.handle(VoiceCommand.parse(heard)) }
+                                .getOrElse { "Something went wrong." }
+                        }
+                        lastReply = "“$heard” → $reply"
+                        tts.speak(reply)
+                        busy = false
+                    }
                 }
             },
             onError = { lastReply = "Voice unavailable: ${it.message}"; busy = false },

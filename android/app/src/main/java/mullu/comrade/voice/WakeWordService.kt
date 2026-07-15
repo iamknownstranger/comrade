@@ -24,6 +24,38 @@ import org.vosk.android.StorageService
 import java.util.concurrent.Executors
 
 /**
+ * An independent feature that can need the mic exclusively (see
+ * [MicHolderSet]). Public, not `internal`: it's a parameter type on
+ * [WakeWordService.pause]/[WakeWordService.resume], which callers outside
+ * this file (`CallManager`, `VoiceRecorder`) need to reference by name.
+ */
+enum class MicHolder { CALL, VOICE_NOTE }
+
+/**
+ * Tracks which [MicHolder]s currently need the wake-word recogniser paused,
+ * so it only actually restarts once every holder has released it — a call
+ * and a voice-note recording can overlap (see [mullu.comrade.call.CallManager]
+ * and [mullu.comrade.media.VoiceRecorder]), and whichever one finishes first
+ * must not hand the mic back while the other still holds it.
+ *
+ * Pure bookkeeping, no Android/Vosk dependency, safe to call unevenly: a
+ * duplicate [acquire], or a [release] with no matching [acquire] (e.g. a call
+ * that ends before its own setup ever paused), is always a harmless no-op —
+ * see `WakeWordServiceTest`.
+ */
+internal class MicHolderSet {
+    private val holders = mutableSetOf<MicHolder>()
+
+    /** Returns `true` iff [holder] just became the *first* active holder — the caller should actually pause. */
+    @Synchronized
+    fun acquire(holder: MicHolder): Boolean = holders.add(holder) && holders.size == 1
+
+    /** Returns `true` iff [holder] just released the *last* active holder — the caller should actually resume. */
+    @Synchronized
+    fun release(holder: MicHolder): Boolean = holders.remove(holder) && holders.isEmpty()
+}
+
+/**
  * Always-listening foreground service implementing the "Hey Comrade" wake word
  * with the offline Vosk recogniser.
  *
@@ -62,6 +94,7 @@ class WakeWordService : Service(), RecognitionListener {
     override fun onCreate() {
         super.onCreate()
         isRunning = true
+        instance = this
         dispatcher = CommandDispatcher(ComradeCoreBackend())
         tts = ComradeTts(this)
     }
@@ -226,6 +259,7 @@ class WakeWordService : Service(), RecognitionListener {
 
     override fun onDestroy() {
         isRunning = false
+        instance = null
         mainHandler.removeCallbacks(revertToIdle)
         speechService?.stop()
         speechService?.shutdown()
@@ -240,6 +274,20 @@ class WakeWordService : Service(), RecognitionListener {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    private val pauseHolders = MicHolderSet()
+
+    /** Stop the Vosk recogniser (releasing the mic) without tearing down the foreground service/notification. */
+    private fun pauseListening(holder: MicHolder) {
+        if (!pauseHolders.acquire(holder)) return
+        runCatching { speechService?.stop() }.onFailure { Log.w(TAG, "pauseListening failed", it) }
+    }
+
+    /** Restart the Vosk recogniser once every [MicHolder] from [pauseListening] has released it. */
+    private fun resumeListening(holder: MicHolder) {
+        if (!pauseHolders.release(holder)) return
+        runCatching { speechService?.startListening(this) }.onFailure { Log.w(TAG, "resumeListening failed", it) }
+    }
+
     companion object {
         private const val TAG = "WakeWordService"
         const val ACTION_START = "mullu.comrade.voice.START"
@@ -252,6 +300,26 @@ class WakeWordService : Service(), RecognitionListener {
          */
         @Volatile var isRunning: Boolean = false
             private set
+
+        /** The live instance, if the service is running — backs [pause]/[resume]. */
+        @Volatile private var instance: WakeWordService? = null
+
+        /**
+         * Release the mic (Vosk [SpeechService] stopped) without stopping the
+         * foreground service/notification — for another mic consumer (a call,
+         * a voice-note recording) to use it exclusively for a while. A no-op
+         * if the service isn't running. The recogniser stays paused until
+         * every [holder] that has called [pause] has also called [resume] —
+         * see [MicHolderSet].
+         */
+        fun pause(holder: MicHolder) {
+            instance?.pauseListening(holder)
+        }
+
+        /** Restart the wake-word recogniser once [holder] is the last to call this after [pause]. A no-op if the service isn't running. */
+        fun resume(holder: MicHolder) {
+            instance?.resumeListening(holder)
+        }
 
         private const val CHANNEL_ID = "comrade_voice"
         private const val NOTIFICATION_ID = 0x0C0DE

@@ -18,7 +18,6 @@ use nostr_sdk::nips::nip04;
 use nostr_sdk::prelude::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use crate::error::VaultError;
@@ -191,7 +190,6 @@ pub struct VaultEngine {
     client: Client,
     our_keys: Keys,
     pay_regex: Arc<Regex>,
-    inbox: Arc<RwLock<Vec<VaultMessage>>>,
 }
 
 impl VaultEngine {
@@ -208,7 +206,6 @@ impl VaultEngine {
             client,
             our_keys: keys.clone(),
             pay_regex,
-            inbox: Arc::new(RwLock::new(Vec::new())),
         })
     }
 
@@ -283,30 +280,25 @@ impl VaultEngine {
         Ok(*output.id())
     }
 
-    /// Subscribe to incoming DMs addressed to our public key, caching each
-    /// decrypted message in the inbox snapshot.
-    pub async fn subscribe_inbox(&self) -> Result<(), VaultError> {
-        self.subscribe_inbox_with_callback(Box::new(|_| {})).await
-    }
-
     /// Subscribe to incoming DMs, invoking `callback` for every decrypted
-    /// message *in addition to* caching it in the inbox snapshot.
+    /// message.
     ///
     /// The IPC bridge passes a callback here that forwards each `VaultMessage`
     /// onto the event bus so the desktop webview / Android layer can render new
     /// encrypted DMs the instant they land — all inside the background Tokio
     /// task, leaving the UI thread free.
+    ///
+    /// `since_floor` is the caller's persisted high-watermark (unix seconds of
+    /// the newest message it has already processed), if any — see
+    /// [`inbox_since`]. Pass `None` on a fresh identity with nothing to widen
+    /// against; the standard gift-wrap skew window is used either way.
     pub async fn subscribe_inbox_with_callback(
         &self,
         callback: VaultCallback,
+        since_floor: Option<u64>,
     ) -> Result<(), VaultError> {
         let our_pk = self.our_keys.public_key();
-        // Gift-wrapped (NIP-17/59) events carry a randomized `created_at` up
-        // to `GIFT_WRAP_TIMESTAMP_SKEW` in the past (see `send_dm_reply`), so
-        // a naive `since(now())` would drop messages sent this instant. Widen
-        // the window by the same amount; legacy Kind-4 DMs are unaffected —
-        // they just get a slightly wider (harmless) backfill too.
-        let since = Timestamp::now() - GIFT_WRAP_TIMESTAMP_SKEW_SECS;
+        let since = inbox_since(Timestamp::now(), since_floor);
         let filter = Filter::new()
             .kinds([Kind::GiftWrap, Kind::EncryptedDirectMessage])
             .pubkey(our_pk)
@@ -321,14 +313,12 @@ impl VaultEngine {
 
         let our_keys = self.our_keys.clone();
         let pay_regex = self.pay_regex.clone();
-        let inbox = self.inbox.clone();
         let callback = Arc::new(callback);
 
         self.client
             .handle_notifications(move |notification| {
                 let our_keys = our_keys.clone();
                 let pay_regex = pay_regex.clone();
-                let inbox = inbox.clone();
                 let callback = callback.clone();
 
                 async move {
@@ -358,7 +348,6 @@ impl VaultEngine {
                         }
                         let msg = VaultMessage { upi_intents, ..msg };
 
-                        inbox.write().await.push(msg.clone());
                         callback(msg);
                     }
                     Ok::<bool, Box<dyn std::error::Error>>(false)
@@ -367,9 +356,24 @@ impl VaultEngine {
             .await
             .map_err(|e| VaultError::EncryptionFailed(e.to_string()))
     }
+}
 
-    pub async fn inbox_snapshot(&self) -> Vec<VaultMessage> {
-        self.inbox.read().await.clone()
+/// Compute the inbox subscription's effective `since` floor: normally
+/// `now - GIFT_WRAP_TIMESTAMP_SKEW_SECS` (gift-wrapped events carry a
+/// randomized `created_at` up to that far in the past — see
+/// `send_dm_reply` — so a naive `since(now())` would drop messages sent this
+/// instant), but widened further back when `since_floor` (the caller's
+/// persisted high-watermark) is older than that skew window — so a device
+/// that was offline longer than the skew still backfills everything since it
+/// was last seen. Never narrower than the skew floor: a fresh/missing
+/// watermark (`None`) must not backfill from the Unix epoch.
+fn inbox_since(now: Timestamp, since_floor: Option<u64>) -> Timestamp {
+    let skew_floor = now - GIFT_WRAP_TIMESTAMP_SKEW_SECS;
+    match since_floor {
+        Some(watermark) => skew_floor.min(Timestamp::from(
+            watermark.saturating_sub(GIFT_WRAP_TIMESTAMP_SKEW_SECS),
+        )),
+        None => skew_floor,
     }
 }
 
@@ -539,5 +543,62 @@ mod tests {
             .unwrap();
 
         assert!(decrypt_gift_wrapped_dm(&eve, &wrapped).await.is_none());
+    }
+
+    #[test]
+    fn inbox_since_stays_at_the_skew_floor_with_no_watermark() {
+        let now = Timestamp::from(2_000_000);
+        assert_eq!(inbox_since(now, None), now - GIFT_WRAP_TIMESTAMP_SKEW_SECS);
+    }
+
+    #[test]
+    fn inbox_since_tracks_the_watermark_for_a_fresh_watermark() {
+        // Last seen 10s ago — since a watermark can never be in the future,
+        // `watermark - SKEW` is always <= `now - SKEW`, so the fresh case
+        // just barely widens the window by the watermark's own (tiny) age
+        // rather than snapping back to exactly `now - SKEW`.
+        let now = Timestamp::from(2_000_000);
+        let fresh_watermark = now.as_secs() - 10;
+        let since = inbox_since(now, Some(fresh_watermark));
+        assert_eq!(
+            since,
+            Timestamp::from(fresh_watermark) - GIFT_WRAP_TIMESTAMP_SKEW_SECS
+        );
+        // …and stays close to the standard floor — nowhere near the 5-day
+        // widening the next test exercises.
+        assert!((now - GIFT_WRAP_TIMESTAMP_SKEW_SECS).as_secs() - since.as_secs() <= 10);
+    }
+
+    #[test]
+    fn inbox_since_widens_for_a_watermark_older_than_the_skew() {
+        // Offline for 5 days — well past the 2-day skew — must widen the
+        // backfill window back to just before the watermark, not stay
+        // clamped at the standard 2-day floor (which would miss messages).
+        let now = Timestamp::from(10_000_000);
+        let five_days_secs = 5 * 24 * 60 * 60;
+        let old_watermark = now.as_secs() - five_days_secs;
+
+        let since = inbox_since(now, Some(old_watermark));
+        assert_eq!(
+            since,
+            Timestamp::from(old_watermark - GIFT_WRAP_TIMESTAMP_SKEW_SECS)
+        );
+        assert!(
+            since < now - GIFT_WRAP_TIMESTAMP_SKEW_SECS,
+            "an old watermark must widen the window further back than the standard floor"
+        );
+    }
+
+    #[test]
+    fn inbox_since_never_narrower_than_the_skew_floor() {
+        // A watermark newer than `now` (clock skew / bogus data) must never
+        // produce a `since` more recent than the standard skew floor — the
+        // gift-wrap randomization risk applies regardless.
+        let now = Timestamp::from(5_000_000);
+        let future_watermark = now.as_secs() + 1_000;
+        assert_eq!(
+            inbox_since(now, Some(future_watermark)),
+            now - GIFT_WRAP_TIMESTAMP_SKEW_SECS
+        );
     }
 }

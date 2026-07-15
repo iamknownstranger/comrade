@@ -5,6 +5,8 @@ import android.media.MediaRecorder
 import android.os.Build
 import android.util.Log
 import java.io.File
+import mullu.comrade.voice.MicHolder
+import mullu.comrade.voice.WakeWordService
 
 /**
  * A minimal push-to-talk audio recorder for chat voice notes, built on the
@@ -46,6 +48,12 @@ class VoiceRecorder(private val context: Context) {
     fun start(): Boolean {
         if (recorder != null) return false // already recording
 
+        // Release the wake-word recogniser's hold on the mic first — two
+        // consumers fighting over MediaRecorder.AudioSource.MIC is exactly
+        // the kind of contention that used to make this fail with a busy
+        // device. Restored in stop()/cancel(), and on a failed start below.
+        WakeWordService.pause(MicHolder.VOICE_NOTE)
+
         val dir = File(context.cacheDir, "voice-notes").apply { mkdirs() }
         // A non-colliding name; the file is short-lived and deleted after send.
         val file = File(dir, "vn-${System.nanoTime()}.aac")
@@ -74,6 +82,7 @@ class VoiceRecorder(private val context: Context) {
             file.delete()
             recorder = null
             outputFile = null
+            WakeWordService.resume(MicHolder.VOICE_NOTE) // never got the mic — give it back
             false
         }
     }
@@ -111,6 +120,8 @@ class VoiceRecorder(private val context: Context) {
             runCatching { rec.release() }
             file?.delete()
             null
+        } finally {
+            WakeWordService.resume(MicHolder.VOICE_NOTE)
         }
     }
 
@@ -123,6 +134,7 @@ class VoiceRecorder(private val context: Context) {
         runCatching { rec.stop() }
         runCatching { rec.release() }
         file?.delete()
+        WakeWordService.resume(MicHolder.VOICE_NOTE)
     }
 
     private fun newRecorder(): MediaRecorder =

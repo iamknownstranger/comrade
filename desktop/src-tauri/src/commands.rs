@@ -83,24 +83,31 @@ pub async fn fetch_sabha_timeline(
 }
 
 /// Broadcast a Chitthi, optionally as a NIP-10 reply. Returns the event id.
+///
+/// See [`sync_ledger`]'s doc comment for the lock discipline.
 #[tauri::command]
 pub async fn broadcast_chitthi(
     state: tauri::State<'_, Runtime>,
     content: String,
     reply_to: Option<String>,
 ) -> Result<String, String> {
-    state
-        .read()
-        .await
+    let handles = state.read().await.handles();
+    handles
         .broadcast_chitthi(&content, reply_to)
         .await
         .map_err(|e| e.to_string())
 }
 
 /// Sync the Sakha/Sakhi shared CRDT ledger to the partner. Returns the event id.
+///
+/// Takes a cheap, synchronous handle snapshot under the guard (see
+/// `comrade_ui::ComradeRuntime::handles`) and runs the relay round-trip after
+/// it is dropped — AUDIT P2: never hold the runtime lock across a network
+/// await, or one slow/unreachable relay stalls every other command behind it.
 #[tauri::command]
 pub async fn sync_ledger(state: tauri::State<'_, Runtime>) -> Result<String, String> {
-    state.read().await.sync_ledger().await.map_err(|e| e.to_string())
+    let handles = state.read().await.handles();
+    handles.sync_ledger().await.map_err(|e| e.to_string())
 }
 
 // ── Sakha/Sakhi pairing handshake + shared ledger ────────────────────────────
@@ -131,6 +138,8 @@ pub async fn sakha_status(state: tauri::State<'_, Runtime>) -> Result<SakhaStatu
 
 /// Append an entry to the shared Sakha/Sakhi ledger. Returns the merged
 /// ledger text. Requires a completed pairing (see [`pair_sakha`]).
+///
+/// See [`sync_ledger`]'s doc comment for the lock discipline.
 #[tauri::command]
 pub async fn sakha_add_entry(
     state: tauri::State<'_, Runtime>,
@@ -138,9 +147,8 @@ pub async fn sakha_add_entry(
     amount_inr: f64,
     paid_by: String,
 ) -> Result<String, String> {
-    state
-        .read()
-        .await
+    let handles = state.read().await.handles();
+    handles
         .sakha_add_entry(&description, amount_inr, &paid_by)
         .await
         .map_err(|e| e.to_string())
@@ -161,18 +169,16 @@ pub async fn sakha_read_ledger(state: tauri::State<'_, Runtime>) -> Result<Strin
 
 /// Send an E2E-encrypted DM to `target` (npub or hex pubkey). The message is
 /// persisted to the offline history; returns the stored message DTO.
+///
+/// See [`sync_ledger`]'s doc comment for the lock discipline.
 #[tauri::command]
 pub async fn send_dm(
     state: tauri::State<'_, Runtime>,
     target: String,
     content: String,
 ) -> Result<MessageDto, String> {
-    state
-        .read()
-        .await
-        .send_dm(&target, &content)
-        .await
-        .map_err(|e| e.to_string())
+    let handles = state.read().await.handles();
+    handles.send_dm(&target, &content).await.map_err(|e| e.to_string())
 }
 
 /// The chat list (one entry per peer, newest first) from the offline history.
@@ -204,6 +210,8 @@ pub async fn media_with(
 }
 
 /// Send a DM as a reply to a prior message (`reply_to` = replied event id hex).
+///
+/// See [`sync_ledger`]'s doc comment for the lock discipline.
 #[tauri::command]
 pub async fn send_dm_reply(
     state: tauri::State<'_, Runtime>,
@@ -211,9 +219,8 @@ pub async fn send_dm_reply(
     content: String,
     reply_to: Option<String>,
 ) -> Result<MessageDto, String> {
-    state
-        .read()
-        .await
+    let handles = state.read().await.handles();
+    handles
         .send_dm_reply(&target, &content, reply_to.as_deref())
         .await
         .map_err(|e| e.to_string())
@@ -293,6 +300,8 @@ pub async fn place_call(
 }
 
 /// Send one call-signaling payload (`signal_json` = a CallSignal) to `peer`.
+///
+/// See [`sync_ledger`]'s doc comment for the lock discipline.
 #[tauri::command]
 pub async fn send_call_signal(
     state: tauri::State<'_, Runtime>,
@@ -301,15 +310,16 @@ pub async fn send_call_signal(
     media: String,
     signal_json: String,
 ) -> Result<(), String> {
-    state
-        .read()
-        .await
+    let handles = state.read().await.handles();
+    handles
         .send_call_signal(&peer, &call_id, &media, &signal_json)
         .await
         .map_err(|e| e.to_string())
 }
 
 /// Send a `Hangup` with `reason` to end/reject a call.
+///
+/// See [`sync_ledger`]'s doc comment for the lock discipline.
 #[tauri::command]
 pub async fn hangup_call(
     state: tauri::State<'_, Runtime>,
@@ -318,9 +328,8 @@ pub async fn hangup_call(
     media: String,
     reason: String,
 ) -> Result<(), String> {
-    state
-        .read()
-        .await
+    let handles = state.read().await.handles();
+    handles
         .hangup_call(&peer, &call_id, &media, &reason)
         .await
         .map_err(|e| e.to_string())
@@ -439,17 +448,15 @@ pub async fn list_contacts(state: tauri::State<'_, Runtime>) -> Result<Vec<Conta
 }
 
 /// Best-effort people search by handle over NIP-50-capable relays.
+///
+/// See [`sync_ledger`]'s doc comment for the lock discipline.
 #[tauri::command]
 pub async fn search_profiles(
     state: tauri::State<'_, Runtime>,
     query: String,
 ) -> Result<Vec<FoundProfileDto>, String> {
-    state
-        .read()
-        .await
-        .search_profiles(&query)
-        .await
-        .map_err(|e| e.to_string())
+    let handles = state.read().await.handles();
+    handles.search_profiles(&query).await.map_err(|e| e.to_string())
 }
 
 // ── Journal (strictly local, never networked) ──────────────────────────────────
@@ -562,6 +569,10 @@ pub async fn extract_payments(
 
 /// Read a file from disk, encrypt + upload it, and deliver the reference to
 /// `target_pubkey`. For path-based callers (e.g. a native file dialog).
+///
+/// See [`sync_ledger`]'s doc comment for the lock discipline (the guard here
+/// is taken right before the upload, after the file I/O above — which never
+/// touches the runtime state at all).
 #[tauri::command]
 pub async fn upload_and_send_media(
     state: tauri::State<'_, Runtime>,
@@ -590,9 +601,8 @@ pub async fn upload_and_send_media(
         .and_then(|n| n.to_str())
         .unwrap_or("")
         .to_string();
-    state
-        .read()
-        .await
+    let handles = state.read().await.handles();
+    handles
         .upload_and_send_media(&target_pubkey, bytes, &mime, &caption)
         .await
         .map_err(|e| e.to_string())
@@ -620,9 +630,8 @@ pub async fn send_media_bytes(
     if bytes.len() > MAX_MEDIA_BYTES {
         return Err("file exceeds the 10 MB limit".to_string());
     }
-    state
-        .read()
-        .await
+    let handles = state.read().await.handles();
+    handles
         .upload_and_send_media(&target_pubkey, bytes, &mime_type, &caption)
         .await
         .map_err(|e| e.to_string())
@@ -630,14 +639,15 @@ pub async fn send_media_bytes(
 
 /// Resolve a NIP-94 reference, fetch the encrypted blob, and decrypt it.
 /// Returns `{ mime_type, base64 }` for the frontend to turn into a `Blob`.
+///
+/// See [`sync_ledger`]'s doc comment for the lock discipline.
 #[tauri::command]
 pub async fn download_and_decrypt_media(
     state: tauri::State<'_, Runtime>,
     event_id: String,
 ) -> Result<MediaBytesDto, String> {
-    state
-        .read()
-        .await
+    let handles = state.read().await.handles();
+    handles
         .download_and_decrypt_media(&event_id)
         .await
         .map_err(|e| e.to_string())

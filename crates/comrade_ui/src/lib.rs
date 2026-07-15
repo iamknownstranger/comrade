@@ -36,7 +36,7 @@ pub use runtime::{
     BridgeEvent, CallRecordDto, CallSessionDto, CallSignalDto, ChitthiDto, ComradeRuntime,
     ContactDto, ConversationDto, DirectMessageDto, FoundProfileDto, IceServerDto, JournalEntryDto,
     MediaBytesDto, MediaMessageDto, MeshStatusDto, MessageDto, MessageRequestDto, ProfileDto,
-    SakhaStatusDto, TurnServerStatusDto,
+    RuntimeHandles, SakhaStatusDto, TurnServerStatusDto,
 };
 
 // ── Errors ──────────────────────────────────────────────────────────────────────
