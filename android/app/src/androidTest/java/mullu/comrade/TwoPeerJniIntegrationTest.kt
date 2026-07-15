@@ -74,13 +74,17 @@ class TwoPeerJniIntegrationTest {
                 "(see deploy/test-relay/README.md); skipping rather than hitting the public relay pool",
             !relayUrl.isNullOrBlank(),
         )
+        // Assume.assumeTrue doesn't smart-cast — relayUrl is still `String?` to
+        // the compiler below, even though the assume above already guarantees
+        // it's non-blank at runtime.
+        val testRelayUrl = requireNotNull(relayUrl)
 
         val context = ApplicationProvider.getApplicationContext<android.content.Context>()
         val aliceDir = File(context.filesDir, "jni-2peer-alice")
         val bobDir = File(context.filesDir, "jni-2peer-bob")
 
-        val alice = Comrade.newWithRelays(listOf(relayUrl))
-        val bob = Comrade.newWithRelays(listOf(relayUrl))
+        val alice = Comrade.newWithRelays(listOf(testRelayUrl))
+        val bob = Comrade.newWithRelays(listOf(testRelayUrl))
         val aliceEvents = RecordingListener()
         val bobEvents = RecordingListener()
 
