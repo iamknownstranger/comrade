@@ -103,12 +103,19 @@ class CallManagerLifecycleTest {
             "Second",
             CallMediaKind.AUDIO,
         )
+        // Capture the state and cancel again immediately — startOutgoingCall
+        // sets Ringing synchronously before any async work begins, so the
+        // assertion needs no delay to observe it truthfully. Any intervening
+        // work here (even just the assertion itself) is enough time for the
+        // background placeCallTyped continuation to reach setupPeer on a real
+        // device, which this test doesn't need and which only risks a real
+        // CallService foreground-service start this test isn't exercising.
         val state = CallManager.state.value
+        CallManager.hangup()
         assertTrue(
             "starting a new call after a cancelled one must actually ring, not be ignored as \"already in progress\"",
             state is CallUiState.Ringing && state.peer == secondPeer,
         )
-        CallManager.hangup()
     }
 
     /**
@@ -137,7 +144,20 @@ class CallManagerLifecycleTest {
      */
     @Test
     fun incoming_offer_during_outgoing_provisional_phase_does_not_override_local_state() {
+        // Both peers (and the DTO built from the second) are generated before
+        // startOutgoingCall, and everything below is captured into locals and
+        // hung up immediately — minimizing how long the outgoing call's
+        // background placeCallTyped continuation has to reach setupPeer/
+        // CallService on a real device, which this test doesn't exercise and
+        // only risks a real foreground-service start.
         val outgoingPeer = freshStrangerNpub()
+        val incomingDto = uniffi.comrade_ui.CallSignalDto(
+            callId = "unrelated-incoming-call",
+            peer = freshStrangerNpub(),
+            media = "audio",
+            signal = uniffi.comrade_core.CallSignal.Offer(sdp = "v=0\r\n"),
+        )
+
         CallManager.startOutgoingCall(
             ApplicationProvider.getApplicationContext(),
             outgoingPeer,
@@ -145,21 +165,15 @@ class CallManagerLifecycleTest {
             CallMediaKind.AUDIO,
         )
         val stateBeforeIncoming = CallManager.state.value
-        assertTrue(stateBeforeIncoming is CallUiState.Ringing && !stateBeforeIncoming.incoming)
-
-        val incomingDto = uniffi.comrade_ui.CallSignalDto(
-            callId = "unrelated-incoming-call",
-            peer = freshStrangerNpub(),
-            media = "audio",
-            signal = uniffi.comrade_core.CallSignal.Offer(sdp = "v=0\r\n"),
-        )
         val raisedNotification = CallManager.onIncomingSignal(incomingDto)
+        val stateAfterIncoming = CallManager.state.value
+        CallManager.hangup()
 
+        assertTrue(stateBeforeIncoming is CallUiState.Ringing && !stateBeforeIncoming.incoming)
         assertTrue(
             "an incoming offer while already busy must not ask for a ringing notification",
             !raisedNotification,
         )
-        val stateAfterIncoming = CallManager.state.value
         assertTrue(
             "the outgoing call's own ringing state must survive an unrelated incoming offer",
             stateAfterIncoming is CallUiState.Ringing &&
@@ -167,6 +181,5 @@ class CallManagerLifecycleTest {
                 !stateAfterIncoming.incoming,
         )
         assertNotEquals(incomingDto.peer, (stateAfterIncoming as CallUiState.Ringing).peer)
-        CallManager.hangup()
     }
 }

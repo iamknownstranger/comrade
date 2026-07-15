@@ -180,13 +180,20 @@ fun ComradeApp() {
     // explicitly on lock, below.
     LaunchedEffect(phase is AppPhase.Ready) {
         if (phase is AppPhase.Ready) {
-            // Foreground-service starts can throw on platform restrictions
+            // Off the main/Compose dispatcher: LaunchedEffect otherwise runs
+            // this on the same thread Compose needs free to keep recomposing
+            // and to answer test/semantics queries, and a foreground-service
+            // start (context.startForegroundService, plus whatever the
+            // platform does around it) has no need to be on it. Foreground
+            // -service starts can also throw on platform restrictions
             // (background-start limits, quota, …) — never let that crash the
-            // composition; the app is just as usable without it, only without
-            // the background-delivery guarantee. Matches CallService.start's
-            // own guard in CallManager.setupPeer.
-            runCatching { RelayConnectionService.start(context) }
-                .onFailure { Log.w("ComradeApp", "Failed to start RelayConnectionService", it) }
+            // composition either; the app is just as usable without it, only
+            // without the background-delivery guarantee. Matches
+            // CallService.start's own guard in CallManager.setupPeer.
+            withContext(Dispatchers.IO) {
+                runCatching { RelayConnectionService.start(context) }
+                    .onFailure { Log.w("ComradeApp", "Failed to start RelayConnectionService", it) }
+            }
         }
     }
 
