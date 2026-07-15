@@ -2,6 +2,7 @@ package mullu.comrade
 
 import android.util.Log
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -56,12 +57,14 @@ object ComradeCore {
 
     /**
      * Guards [initializeEventBridge] so only the first caller actually
-     * registers the FFI listener — every later call (e.g. an Activity
-     * recreation re-running the same startup path) is a harmless no-op,
-     * exactly like [uniffi.comrade.Comrade.setEventListener]'s own
-     * Rust-side idempotency guard.
+     * registers the FFI listener. `compareAndSet` picks exactly one winner;
+     * every other (concurrent or later) caller — e.g. an Activity recreation
+     * re-running the same startup path — suspends on [bridgeInitDone] instead
+     * of returning early, so nobody observes "initialized" before the
+     * registration actually finished (see [initializeEventBridge]).
      */
-    private val bridgeInitialized = AtomicBoolean(false)
+    private val bridgeInitStarted = AtomicBoolean(false)
+    private val bridgeInitDone = CompletableDeferred<Unit>()
 
     /**
      * Register the native event listener and **await** its registration
@@ -77,19 +80,33 @@ object ComradeCore {
      * [mullu.comrade.ComradeApplication]) must call this and await it — not
      * rely on class-init timing.
      *
-     * Idempotent: safe to call from more than one place (application startup
-     * *and*, defensively, the first [unlockVaultTyped]) without double
-     * -registering.
+     * Idempotent and race-safe: safe to call from more than one place
+     * (application startup *and*, defensively, the first [unlockVaultTyped])
+     * without double-registering — and every caller, winner or not, only
+     * returns once the real FFI registration has completed, so none of them
+     * can race ahead of it.
      */
     suspend fun initializeEventBridge() {
-        if (bridgeInitialized.getAndSet(true)) return
-        ffi.setEventListener(
-            object : BridgeEventListener {
-                override fun onEvent(event: BridgeEvent) {
-                    eventQueue.offer(event)
-                }
-            },
-        )
+        if (bridgeInitStarted.compareAndSet(false, true)) {
+            try {
+                ffi.setEventListener(
+                    object : BridgeEventListener {
+                        override fun onEvent(event: BridgeEvent) {
+                            eventQueue.offer(event)
+                        }
+                    },
+                )
+                bridgeInitDone.complete(Unit)
+            } catch (e: Throwable) {
+                // Otherwise every caller waiting on bridgeInitDone below would
+                // suspend forever: a Deferred that's never completed (and
+                // never failed) simply never resumes its awaiters.
+                bridgeInitDone.completeExceptionally(e)
+                throw e
+            }
+        } else {
+            bridgeInitDone.await()
+        }
     }
 
     private inline fun <T> rethrowing(what: String, block: () -> T): T =

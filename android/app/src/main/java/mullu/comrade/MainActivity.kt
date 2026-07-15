@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.Context
 import android.os.Build
 import android.os.Bundle
+import android.util.Log
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -178,7 +179,15 @@ fun ComradeApp() {
     // startForegroundService while already running); it is stopped
     // explicitly on lock, below.
     LaunchedEffect(phase is AppPhase.Ready) {
-        if (phase is AppPhase.Ready) RelayConnectionService.start(context)
+        if (phase is AppPhase.Ready) {
+            // Foreground-service starts can throw on platform restrictions
+            // (background-start limits, quota, …) — never let that crash the
+            // composition; the app is just as usable without it, only without
+            // the background-delivery guarantee. Matches CallService.start's
+            // own guard in CallManager.setupPeer.
+            runCatching { RelayConnectionService.start(context) }
+                .onFailure { Log.w("ComradeApp", "Failed to start RelayConnectionService", it) }
+        }
     }
 
     when (val p = phase) {
