@@ -5,6 +5,7 @@ import android.media.MediaRecorder
 import android.os.Build
 import android.util.Log
 import java.io.File
+import mullu.comrade.voice.MicHolder
 import mullu.comrade.voice.WakeWordService
 
 /**
@@ -51,7 +52,7 @@ class VoiceRecorder(private val context: Context) {
         // consumers fighting over MediaRecorder.AudioSource.MIC is exactly
         // the kind of contention that used to make this fail with a busy
         // device. Restored in stop()/cancel(), and on a failed start below.
-        WakeWordService.pause()
+        WakeWordService.pause(MicHolder.VOICE_NOTE)
 
         val dir = File(context.cacheDir, "voice-notes").apply { mkdirs() }
         // A non-colliding name; the file is short-lived and deleted after send.
@@ -81,7 +82,7 @@ class VoiceRecorder(private val context: Context) {
             file.delete()
             recorder = null
             outputFile = null
-            WakeWordService.resume() // never got the mic — give it back
+            WakeWordService.resume(MicHolder.VOICE_NOTE) // never got the mic — give it back
             false
         }
     }
@@ -120,7 +121,7 @@ class VoiceRecorder(private val context: Context) {
             file?.delete()
             null
         } finally {
-            WakeWordService.resume()
+            WakeWordService.resume(MicHolder.VOICE_NOTE)
         }
     }
 
@@ -133,7 +134,7 @@ class VoiceRecorder(private val context: Context) {
         runCatching { rec.stop() }
         runCatching { rec.release() }
         file?.delete()
-        WakeWordService.resume()
+        WakeWordService.resume(MicHolder.VOICE_NOTE)
     }
 
     private fun newRecorder(): MediaRecorder =

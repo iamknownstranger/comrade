@@ -21,6 +21,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import mullu.comrade.ComradeCore
+import mullu.comrade.voice.MicHolder
 import mullu.comrade.voice.WakeWordService
 import org.webrtc.AudioSource
 import org.webrtc.AudioTrack
@@ -755,7 +756,7 @@ object CallManager {
         // and the always-listening "Hey Comrade" recogniser both wanting
         // AudioSource.MIC is exactly the contention that must not happen.
         // Resumed once the call ends, in endWith.
-        WakeWordService.pause()
+        WakeWordService.pause(MicHolder.CALL)
         val fac = factory ?: return false
         val config = rtcConfig(iceServers)
         val pc = fac.createPeerConnection(config, peerObserver(s)) ?: run {
@@ -1204,8 +1205,9 @@ object CallManager {
 
         teardownMedia(s)
         // Give the mic back to the wake-word recogniser now that the call's
-        // own hold on it (see setupPeer) is gone.
-        WakeWordService.resume()
+        // own hold on it (see setupPeer) is gone — a no-op while a voice-note
+        // recording still holds it (see MicHolderSet).
+        WakeWordService.resume(MicHolder.CALL)
         session = null
         _state.value = CallUiState.Ended(s.peer, s.peerLabel, s.isVideo, s.incoming, outcome)
         io.launch {
@@ -1425,8 +1427,15 @@ object CallManager {
 
     // ── WebRTC bootstrap (idempotent) ─────────────────────────────────────────
 
-    private fun ensureFactory(context: Context) {
-        if (factory != null) return
+    // Called from startOutgoingCall/accept's io.launch before either takes the
+    // CallManager monitor (T3.4: this is a synchronous native init with no
+    // business running on the caller's Compose-click thread) — so the
+    // check-then-act below needs its own synchronization, unlike every other
+    // field access in this class, to stay safe if two call-setup attempts
+    // (e.g. a glare loser whose coroutine is still finishing a non-suspend
+    // native call when a new session starts one of its own) ever overlap.
+    private fun ensureFactory(context: Context) = synchronized(this) {
+        if (factory != null) return@synchronized
         val app = context.applicationContext
         appContext = app
         PeerConnectionFactory.initialize(
@@ -1723,7 +1732,8 @@ object CallManager {
                 synchronized(this@CallManager) { if (session === s) onConnected(s) }
                 return
             }
-            when (decideConnectionStateAction(newState, hasConnectedBefore = s.connectedAtMs > 0)) {
+            val hasConnectedBefore = synchronized(this@CallManager) { s.connectedAtMs > 0 }
+            when (decideConnectionStateAction(newState, hasConnectedBefore)) {
                 // A call that was already Active lost its media path — arm a
                 // bounded recovery window rather than the pre-connect TURN
                 // retry (which only the caller drives) or leaving it hanging
