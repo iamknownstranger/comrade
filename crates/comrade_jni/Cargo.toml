@@ -30,3 +30,6 @@ default = []
 # the Android build can actually send/receive attachments. The APK workflows
 # pass `--features media-http`; the lean workspace test build leaves it off.
 media-http = ["comrade_ui/media-http"]
+
+[dev-dependencies]
+tempfile = { workspace = true }

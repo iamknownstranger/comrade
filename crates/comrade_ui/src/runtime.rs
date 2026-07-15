@@ -31,8 +31,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use comrade_core::call::{
-    derive_sas, ice_servers_for, new_call_id, parse_call_envelope, CallEnvelope, CallMediaKind,
-    CallSignal, HangupReason, IceServer, IceStrategy,
+    derive_sas, ice_servers_for, new_call_id, parse_call_envelope, validate_turn_url, CallEnvelope,
+    CallMediaKind, CallSignal, HangupReason, IceServer, IceStrategy,
 };
 use comrade_core::crypto::derive_media_key;
 use comrade_core::dm::{parse_profile_share, parse_receipt, ProfileShare, Receipt, ReceiptKind};
@@ -41,7 +41,9 @@ use comrade_core::media::{
     MAX_MEDIA_BYTES,
 };
 use comrade_core::saathi::SaathiEngine;
-use comrade_core::sabha::{display_name_of, ChitthiCallback, SabhaEngine, DEFAULT_RELAYS};
+use comrade_core::sabha::{
+    display_name_of, ChitthiCallback, FeedFilterSpec, FeedScope, SabhaEngine, DEFAULT_RELAYS,
+};
 use comrade_core::sakha::{LedgerEntry, SakhaEngine, SakhaSyncCallback};
 use comrade_core::vault::{VaultCallback, VaultEngine, VaultMessage};
 use nostr_sdk::{EventId, Metadata, PublicKey, ToBech32};
@@ -51,9 +53,28 @@ use tracing::warn;
 
 use crate::{IdentityDto, UiError, UiService, UpiIntentDto, WorkspaceDto};
 
-/// Capacity of the event bus. Slow consumers lag rather than block producers —
-/// the relay loop never stalls waiting on the webview.
+/// Capacity of the *critical* event bus — DMs, message requests, call
+/// signals, message status, mesh status, ledger updates. Slow consumers lag
+/// rather than block producers, but this channel is never intentionally
+/// flooded (a peer sends a human's worth of DMs/calls, not a relay's worth of
+/// public notes), so its capacity only needs to absorb a slow consumer
+/// briefly falling behind, not an adversarial volume.
 const EVENT_BUS_CAPACITY: usize = 256;
+
+/// Capacity of the separate, deliberately small *feed* event bus —
+/// `IncomingChitthi` only. AUDIT.md COMMS-04: a public-feed flood must be
+/// able to drop old, unconsumed Chitthis under load without ever competing
+/// for the same ring-buffer slots a call signal or DM needs — hence a wholly
+/// separate [`broadcast::Sender`], not just "the same channel, hope the
+/// consumer drains it fast enough". See [`ComradeRuntime::subscribe_feed_events`].
+const FEED_EVENT_BUS_CAPACITY: usize = 64;
+
+/// How far back the Chitthi feed subscription looks, in both the
+/// authors-scoped and bootstrap cases (see [`ComradeRuntime::feed_filter_spec`]).
+const FEED_SINCE_SECS: u64 = 3600;
+/// Event cap for the no-contacts-yet bootstrap feed — an explicit bound so a
+/// fresh identity's feed is never the unbounded relay-wide firehose either.
+const FEED_BOOTSTRAP_LIMIT: usize = 200;
 
 /// HKDF label binding the ECDH shared secret to media encryption.
 const MEDIA_LABEL: &str = "comrade-media-v1";
@@ -169,6 +190,17 @@ pub struct IceServerDto {
     pub urls: Vec<String>,
     pub username: Option<String>,
     pub credential: Option<String>,
+}
+
+/// The support/diagnostic "is a relay configured" status — see
+/// [`ComradeRuntime::turn_server_status`]. Deliberately carries the URL only,
+/// never `username`/`credential`: this DTO is meant to be safe to show
+/// directly in a settings screen (and safe to log), unlike the write-only
+/// fields [`ComradeRuntime::set_turn_server`] takes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct TurnServerStatusDto {
+    pub configured: bool,
+    pub url: Option<String>,
 }
 
 impl From<comrade_core::call::IceServer> for IceServerDto {
@@ -516,6 +548,10 @@ pub struct ComradeRuntime {
     /// once at unlock, since mDNS/Gossipsub only make sense while off-grid.
     saathi: Option<Arc<SaathiEngine>>,
     events: broadcast::Sender<BridgeEvent>,
+    /// The separate, small-capacity, deliberately-lossy bus for
+    /// `IncomingChitthi` only — see [`FEED_EVENT_BUS_CAPACITY`] and
+    /// [`Self::subscribe_feed_events`].
+    feed_events: broadcast::Sender<BridgeEvent>,
     /// Guards [`spawn_event_loops`] against re-spawning the feed/DM tasks if it
     /// is called more than once. [`spawn_event_loops`]: ComradeRuntime::spawn_event_loops
     loops_spawned: bool,
@@ -526,6 +562,21 @@ pub struct ComradeRuntime {
     /// whenever the handle changes, so a stale retry loop can never republish
     /// an old name over a new one.
     publish_task: Option<tokio::task::JoinHandle<()>>,
+    /// The Sabha feed-subscription task spawned by [`Self::spawn_event_loops`].
+    /// Tracked (unlike a bare `tokio::spawn`) so [`Self::lock_vault`] can abort
+    /// it — dropping the `Arc<SabhaEngine>` alone would not stop it, since the
+    /// task itself holds its own clone.
+    feed_task: Option<tokio::task::JoinHandle<()>>,
+    /// The Vault inbox-subscription task, tracked for the same reason as
+    /// [`Self::feed_task`].
+    vault_task: Option<tokio::task::JoinHandle<()>>,
+    /// The Sakha sync-subscription task, tracked for the same reason as
+    /// [`Self::feed_task`].
+    sakha_sync_task: Option<tokio::task::JoinHandle<()>>,
+    /// The relay set new engines are built against — [`DEFAULT_RELAYS`] in
+    /// production ([`Self::new`]), or an explicit override ([`Self::with_relays`])
+    /// for an isolated test environment (AUDIT.md COMMS-03).
+    relays: Vec<String>,
 }
 
 impl Default for ComradeRuntime {
@@ -536,7 +587,17 @@ impl Default for ComradeRuntime {
 
 impl ComradeRuntime {
     pub fn new() -> Self {
+        Self::with_relays(DEFAULT_RELAYS.iter().map(|r| r.to_string()).collect())
+    }
+
+    /// Build a runtime that connects new engines to `relays` instead of
+    /// [`DEFAULT_RELAYS`] — for an isolated test relay (no public-internet
+    /// dependency) or a future "selected relays" setting. Production call
+    /// sites (`comrade_jni`, the Tauri desktop shell) always use [`Self::new`];
+    /// this constructor exists for tests and is not itself exposed over FFI.
+    pub fn with_relays(relays: Vec<String>) -> Self {
         let (events, _) = broadcast::channel(EVENT_BUS_CAPACITY);
+        let (feed_events, _) = broadcast::channel(FEED_EVENT_BUS_CAPACITY);
         Self {
             ui: UiService::new(),
             sabha: None,
@@ -544,9 +605,14 @@ impl ComradeRuntime {
             sakha: None,
             saathi: None,
             events,
+            feed_events,
             loops_spawned: false,
             sakha_sync_spawned: false,
             publish_task: None,
+            feed_task: None,
+            vault_task: None,
+            sakha_sync_task: None,
+            relays,
         }
     }
 
@@ -561,10 +627,25 @@ impl ComradeRuntime {
 
     // ── Event bus ──────────────────────────────────────────────────────────
 
-    /// Subscribe to the push-event stream. The desktop layer forwards each event
-    /// to the webview; the JNI layer drains it via `pollEvent`.
+    /// Subscribe to the *critical* push-event stream (everything except
+    /// `IncomingChitthi` — see [`Self::subscribe_feed_events`]). The desktop
+    /// layer forwards each event to the webview; the JNI layer forwards it to
+    /// the registered [`comrade_jni::BridgeEventListener`].
     pub fn subscribe_events(&self) -> broadcast::Receiver<BridgeEvent> {
         self.events.subscribe()
+    }
+
+    /// Subscribe to the separate, small-capacity `IncomingChitthi` stream
+    /// (AUDIT.md COMMS-04). A public-feed flood drops old, unconsumed
+    /// Chitthis from *this* channel under load — it can never crowd out or
+    /// delay a call signal, DM, message request, or terminal call event
+    /// waiting on [`Self::subscribe_events`], because those live on a wholly
+    /// separate channel. A host forwards both streams to the same listener
+    /// (two loops feeding one callback, e.g. `comrade_jni::Comrade::set_event_listener`)
+    /// — the split is an internal backpressure boundary, not a second API
+    /// a caller needs to reason about differently.
+    pub fn subscribe_feed_events(&self) -> broadcast::Receiver<BridgeEvent> {
+        self.feed_events.subscribe()
     }
 
     /// A clonable handle to the event bus, for hosts that want to inject events
@@ -626,10 +707,10 @@ impl ComradeRuntime {
         };
 
         let keys = self.ui.identity_keys().ok_or(UiError::NoIdentity)?;
-        let relays: Vec<String> = DEFAULT_RELAYS.iter().map(|r| r.to_string()).collect();
+        let relays = self.relays.clone();
 
         self.sabha = Some(Arc::new(
-            SabhaEngine::new(&keys)
+            SabhaEngine::new_with_relays(&keys, relays.clone())
                 .await
                 .map_err(|e| UiError::Engine(e.to_string()))?,
         ));
@@ -661,6 +742,50 @@ impl ComradeRuntime {
         self.sabha.is_some()
     }
 
+    /// Re-lock the vault: abort every background loop, drop the engines, the
+    /// open encrypted store, and the in-memory identity — the deliberate,
+    /// user-initiated counterpart to what process death does by accident (see
+    /// AUDIT.md COMMS-01's security-boundary note on `RelayConnectionService`).
+    /// After this, [`Self::is_vault_unlocked`] is `false` and every store/engine
+    /// -backed method fails with [`UiError::VaultLocked`]/[`UiError::NoIdentity`]
+    /// again, exactly as before the first unlock — calling [`Self::unlock_vault`]
+    /// resumes normally (a fresh Sabha/Vault/Sakha build, fresh loops).
+    ///
+    /// Idempotent: locking an already-locked runtime is a harmless no-op.
+    pub async fn lock_vault(&mut self) {
+        // `abort()` only *requests* cancellation at the task's next await
+        // point — it does not synchronously drop the task's captured state.
+        // Each of these tasks holds its own `Arc` clone of the store/engines
+        // (captured once, before the task loop started, so the callbacks
+        // inside it work while `self`'s own fields below are cleared) —
+        // notably `EncryptedStore`, whose underlying redb file enforces a
+        // single-writer lock. Awaiting the (now-erroring) handle after abort
+        // blocks until that drop has actually happened, so a `unlock_vault`
+        // immediately following a `lock_vault` never races the old store
+        // handle for the same file lock.
+        for task in [
+            self.publish_task.take(),
+            self.feed_task.take(),
+            self.vault_task.take(),
+            self.sakha_sync_task.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            task.abort();
+            let _ = task.await;
+        }
+        if self.saathi.is_some() {
+            self.stop_saathi().await;
+        }
+        self.sabha = None;
+        self.vault = None;
+        self.sakha = None;
+        self.loops_spawned = false;
+        self.sakha_sync_spawned = false;
+        self.ui.lock();
+    }
+
     // ── Milestone 2: connect & stream into the event bus ─────────────────────
 
     /// Connect the engines and spawn the background Tokio loops that capture
@@ -688,18 +813,22 @@ impl ComradeRuntime {
         }
 
         if let Some(sabha) = self.sabha.clone() {
-            let tx = self.events.clone();
-            tokio::spawn(async move {
+            // The small, deliberately-lossy feed channel (not `self.events`,
+            // the critical one) — a public-feed flood must never compete with
+            // a call signal or DM for ring-buffer space (AUDIT.md COMMS-04).
+            let tx = self.feed_events.clone();
+            let spec = self.feed_filter_spec();
+            self.feed_task = Some(tokio::spawn(async move {
                 sabha.connect().await;
                 let cb: ChitthiCallback = Box::new(move |event| {
                     // A send error only means no subscribers are listening yet;
                     // the relay loop must keep running regardless.
                     let _ = tx.send(BridgeEvent::IncomingChitthi(ChitthiDto::from_event(&event)));
                 });
-                if let Err(e) = sabha.subscribe_chitthi_feed(3600, cb).await {
+                if let Err(e) = sabha.subscribe_chitthi_feed(spec, cb).await {
                     warn!("sabha feed loop ended: {e}");
                 }
-            });
+            }));
         }
 
         if let Some(vault) = self.vault.clone() {
@@ -708,7 +837,7 @@ impl ComradeRuntime {
             // A clone of the vault handle the callback can use to send back
             // delivered receipts (the callback itself is sync; it spawns).
             let vault_cb = vault.clone();
-            tokio::spawn(async move {
+            self.vault_task = Some(tokio::spawn(async move {
                 vault.connect().await;
                 let cb: VaultCallback = Box::new(move |msg| {
                     dispatch_incoming_dm(&vault_cb, store.as_ref(), &tx, msg);
@@ -716,7 +845,7 @@ impl ComradeRuntime {
                 if let Err(e) = vault.subscribe_inbox_with_callback(cb).await {
                     warn!("vault inbox loop ended: {e}");
                 }
-            });
+            }));
         }
 
         // A pairing restored from a previous launch (see `restore_sakha_pairing`,
@@ -724,6 +853,34 @@ impl ComradeRuntime {
         // a fresh pairing via `pair_sakha` starts it itself.
         if self.sakha.as_ref().is_some_and(|s| s.is_paired()) {
             self.spawn_sakha_sync_loop();
+        }
+    }
+
+    /// The public-feed subscription policy (AUDIT.md COMMS-04): self plus
+    /// every accepted contact when any are known, else a capped, time-windowed
+    /// bootstrap feed for a fresh identity that hasn't added anyone yet — never
+    /// the unbounded relay-wide firehose `subscribe_chitthi_feed` used to get.
+    fn feed_filter_spec(&self) -> FeedFilterSpec {
+        let mut authors: Vec<nostr_sdk::PublicKey> = Vec::new();
+        if let Some(id) = self.ui.current_identity() {
+            if let Ok(pk) = parse_pubkey(&id.npub) {
+                authors.push(pk);
+            }
+        }
+        if let Ok(contacts) = self.list_contacts() {
+            authors.extend(contacts.iter().filter_map(|c| parse_pubkey(&c.npub).ok()));
+        }
+        // More than just self means at least one real contact is followed.
+        let scope = if authors.len() > 1 {
+            FeedScope::Authors(authors)
+        } else {
+            FeedScope::BoundedGlobal {
+                limit: FEED_BOOTSTRAP_LIMIT,
+            }
+        };
+        FeedFilterSpec {
+            scope,
+            since_secs: FEED_SINCE_SECS,
         }
     }
 
@@ -1182,6 +1339,12 @@ impl ComradeRuntime {
 
     /// Configure (or, with a blank `url`, clear) the TURN relay used for calls
     /// that cannot connect over STUN alone. Persisted in the encrypted store.
+    ///
+    /// Rejects (without persisting or ever logging `username`/`credential`) a
+    /// non-blank `url` that isn't a well-formed `turn:`/`turns:` URI — see
+    /// [`validate_turn_url`] — so a copy-paste mistake fails loudly in the
+    /// settings UI instead of silently producing a `RTCPeerConnection` that
+    /// can never reach the relay.
     pub fn set_turn_server(
         &self,
         url: &str,
@@ -1194,6 +1357,7 @@ impl ComradeRuntime {
                 .delete(SETTINGS_TREE, TURN_CONFIG_KEY)
                 .map_err(|e| UiError::Storage(e.to_string()))?;
         } else {
+            validate_turn_url(url).map_err(UiError::Engine)?;
             let cfg = TurnConfig {
                 url: url.trim().to_string(),
                 username: username.to_string(),
@@ -1204,6 +1368,24 @@ impl ComradeRuntime {
                 .map_err(|e| UiError::Storage(e.to_string()))?;
         }
         store.flush().map_err(|e| UiError::Storage(e.to_string()))
+    }
+
+    /// An honest "is a relay configured" status for a support/diagnostic
+    /// screen — the URL (not secret) only, never the username/credential, so
+    /// this is safe to log or display without masking. `None` when the vault
+    /// is locked (rather than erroring): a settings screen showing "no relay
+    /// configured" pre-unlock is more useful than a thrown exception.
+    pub fn turn_server_status(&self) -> TurnServerStatusDto {
+        match self.configured_turn_server() {
+            Some(turn) => TurnServerStatusDto {
+                configured: true,
+                url: turn.urls.first().cloned(),
+            },
+            None => TurnServerStatusDto {
+                configured: false,
+                url: None,
+            },
+        }
     }
 
     /// Begin a call to `peer`: mint a call id and return the session the
@@ -1953,7 +2135,7 @@ impl ComradeRuntime {
         let tx = self.events.clone();
         let store = self.ui.store_arc();
         let sakha_for_snapshot = sakha.clone();
-        tokio::spawn(async move {
+        self.sakha_sync_task = Some(tokio::spawn(async move {
             sakha.connect().await;
             let cb: SakhaSyncCallback = Box::new(move |ledger| {
                 let _ = tx.send(BridgeEvent::LedgerUpdated { ledger });
@@ -1964,7 +2146,7 @@ impl ComradeRuntime {
             if let Err(e) = sakha.subscribe_sync(cb).await {
                 warn!("sakha sync loop ended: {e}");
             }
-        });
+        }));
     }
 
     /// Perform the Sakha/Sakhi pairing handshake with `partner_pubkey` (npub
@@ -2728,6 +2910,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn feed_filter_spec_is_bounded_global_with_no_contacts_then_authors_scoped_once_one_exists(
+    ) {
+        // AUDIT.md COMMS-04: the feed subscription must never be the
+        // unbounded relay-wide firehose — a fresh identity gets an explicit
+        // capped bootstrap scope, and adding a contact narrows it to authors.
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+        rt.unlock_vault(dir.path(), "pin").await.unwrap();
+
+        let bootstrap = rt.feed_filter_spec();
+        assert_eq!(
+            bootstrap.scope,
+            FeedScope::BoundedGlobal {
+                limit: FEED_BOOTSTRAP_LIMIT
+            },
+            "no contacts yet must never fall back to an unbounded author-less firehose"
+        );
+        assert_eq!(bootstrap.since_secs, FEED_SINCE_SECS);
+
+        let (_hex, peer) = stranger();
+        rt.add_contact(&peer, "friend").unwrap();
+        let scoped = rt.feed_filter_spec();
+        match scoped.scope {
+            FeedScope::Authors(authors) => {
+                // Self + the one contact just added.
+                assert_eq!(authors.len(), 2);
+            }
+            other => panic!("expected an authors-scoped feed once a contact exists, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn second_unlock_is_idempotent_and_keeps_the_same_identity() {
         // A repeated unlock must return the existing identity without rebuilding
         // engines (which would orphan the running ones and duplicate loops).
@@ -2756,6 +2970,39 @@ mod tests {
         let mut rt2 = ComradeRuntime::new();
         let second = rt2.unlock_vault(dir.path(), "pin").await.unwrap().npub;
         assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn lock_vault_drops_engines_and_store_and_relock_works() {
+        // AUDIT.md COMMS-01: locking must actually remove decrypted state, not
+        // just flip a UI flag — every store/engine-backed call must reject
+        // exactly as it did before the first unlock.
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+        let identity = rt.unlock_vault(dir.path(), "pin").await.unwrap();
+        assert!(rt.is_vault_unlocked());
+        assert!(rt.is_store_unlocked());
+
+        rt.lock_vault().await;
+        assert!(!rt.is_vault_unlocked());
+        assert!(!rt.is_store_unlocked());
+        assert!(matches!(
+            rt.fetch_sabha_timeline(),
+            Err(UiError::VaultLocked)
+        ));
+        assert!(matches!(rt.profile(), Err(UiError::NoIdentity)));
+
+        // Locking twice in a row must not panic (idempotent).
+        rt.lock_vault().await;
+        assert!(!rt.is_vault_unlocked());
+
+        // Unlocking again resumes normally with the same on-disk identity, and
+        // the feed/DM loops can be (re)spawned — the `loops_spawned` guard
+        // must have been reset by the lock, not left permanently tripped.
+        let relocked = rt.unlock_vault(dir.path(), "pin").await.unwrap();
+        assert_eq!(relocked.npub, identity.npub);
+        assert!(rt.is_vault_unlocked());
+        rt.spawn_event_loops();
     }
 
     #[tokio::test]
@@ -2894,6 +3141,43 @@ mod tests {
         assert!(json.contains("\"type\":\"incoming_chitthi\""));
         let back: BridgeEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(back, event);
+    }
+
+    #[tokio::test]
+    async fn feed_events_and_critical_events_are_independent_channels() {
+        // AUDIT.md COMMS-04: pins the channel split itself (not just the
+        // production wiring in `spawn_event_loops`) — a subscriber to one
+        // channel must never see what was sent on the other, in either
+        // direction, and each channel must accept a send with no subscriber
+        // to the *other* one blocking or erroring.
+        let rt = ComradeRuntime::new();
+        let mut critical_rx = rt.subscribe_events();
+        let mut feed_rx = rt.subscribe_feed_events();
+
+        let chitthi = BridgeEvent::IncomingChitthi(ChitthiDto {
+            id: "id1".into(),
+            author: "npub1x".into(),
+            content: "hi".into(),
+            created_at: 1,
+            reply_to: None,
+        });
+        rt.feed_events.send(chitthi.clone()).unwrap();
+        assert_eq!(feed_rx.recv().await.unwrap(), chitthi);
+        assert!(
+            critical_rx.try_recv().is_err(),
+            "IncomingChitthi sent on the feed bus must never reach a critical-bus subscriber"
+        );
+
+        let mesh = BridgeEvent::MeshStatusChanged(MeshStatusDto {
+            active: true,
+            peer_count: 1,
+        });
+        rt.events.send(mesh.clone()).unwrap();
+        assert_eq!(critical_rx.recv().await.unwrap(), mesh);
+        assert!(
+            feed_rx.try_recv().is_err(),
+            "a critical event must never reach a feed-bus subscriber"
+        );
     }
 
     #[test]
@@ -3597,6 +3881,55 @@ mod tests {
         assert_eq!(with_turn.last().unwrap().username.as_deref(), Some("u"));
         rt.set_turn_server("", "", "").unwrap();
         assert_eq!(rt.call_ice_servers().len(), defaults.len());
+    }
+
+    #[tokio::test]
+    async fn set_turn_server_rejects_a_malformed_url_and_does_not_persist_it() {
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+        rt.unlock_vault(dir.path(), "pin").await.unwrap();
+
+        let err = rt.set_turn_server("not-a-turn-url", "u", "p");
+        assert!(matches!(err, Err(UiError::Engine(_))));
+        assert_eq!(
+            rt.turn_server_status(),
+            TurnServerStatusDto {
+                configured: false,
+                url: None
+            },
+            "a rejected URL must never be persisted"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_server_status_reports_url_but_never_the_credential() {
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+
+        // Pre-unlock: an honest "nothing configured", not an error.
+        assert_eq!(
+            rt.turn_server_status(),
+            TurnServerStatusDto {
+                configured: false,
+                url: None
+            }
+        );
+
+        rt.unlock_vault(dir.path(), "pin").await.unwrap();
+        rt.set_turn_server("turn:turn.example.com:3478", "u", "top-secret")
+            .unwrap();
+        let status = rt.turn_server_status();
+        assert!(status.configured);
+        assert_eq!(status.url.as_deref(), Some("turn:turn.example.com:3478"));
+        // `TurnServerStatusDto` structurally has no credential field to leak —
+        // this asserts the serialised form as a belt-and-suspenders check
+        // that never regresses into adding one back.
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(!json.contains("top-secret"));
+        assert!(!json.contains("\"u\""));
+
+        rt.set_turn_server("", "", "").unwrap();
+        assert!(!rt.turn_server_status().configured);
     }
 
     #[tokio::test]

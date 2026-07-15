@@ -33,22 +33,51 @@ pub fn run() {
     tauri::Builder::default()
         .manage(runtime)
         .setup(|app| {
-            // Forward the runtime's event bus to the webview. Subscribing here —
-            // before any unlock — guarantees we never miss the first events.
+            // Forward the runtime's event buses to the webview. Subscribing
+            // here — before any unlock — guarantees we never miss the first
+            // events on either channel. Two independent forwarding loops (not
+            // one merged one) because the two channels are themselves
+            // independent: the critical stream (DMs, requests, call signals,
+            // terminal call events, mesh/ledger updates) and the separate,
+            // small, deliberately-lossy `IncomingChitthi` stream
+            // (`comrade_ui::ComradeRuntime::subscribe_feed_events`, AUDIT.md
+            // COMMS-04) — a public-feed flood dropping old, unconsumed
+            // Chitthis on its own channel must never delay or starve an
+            // event queued on the other.
             let handle = app.handle().clone();
             let state = app.state::<Runtime>().inner().clone();
 
             tauri::async_runtime::spawn(async move {
-                let mut rx = state.read().await.subscribe_events();
+                let guard = state.read().await;
+                let mut critical_rx = guard.subscribe_events();
+                let mut feed_rx = guard.subscribe_feed_events();
+                drop(guard);
+
+                let critical_handle = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    loop {
+                        match critical_rx.recv().await {
+                            Ok(event) => {
+                                if let Err(e) = critical_handle.emit(EVENT_CHANNEL, &event) {
+                                    tracing::warn!("failed to emit bridge event: {e}");
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                tracing::warn!("webview event forwarder lagged by {n} events");
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                });
                 loop {
-                    match rx.recv().await {
+                    match feed_rx.recv().await {
                         Ok(event) => {
                             if let Err(e) = handle.emit(EVENT_CHANNEL, &event) {
                                 tracing::warn!("failed to emit bridge event: {e}");
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::warn!("webview event forwarder lagged by {n} events");
+                            tracing::warn!("webview feed-event forwarder lagged by {n} events");
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }

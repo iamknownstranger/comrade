@@ -1,9 +1,11 @@
 package mullu.comrade
 
-import java.util.concurrent.ConcurrentLinkedQueue
-import kotlinx.coroutines.DelicateCoroutinesApi
-import kotlinx.coroutines.GlobalScope
-import kotlinx.coroutines.launch
+import android.util.Log
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.runBlocking
 import uniffi.comrade.BridgeEventListener
 import uniffi.comrade.Comrade
@@ -49,27 +51,45 @@ object ComradeCore {
 
     private val ffi: Comrade = Comrade()
 
-    /** Fed by [BridgeEventListener]; drained by [pollEvent]. */
-    private val eventQueue = ConcurrentLinkedQueue<BridgeEvent>()
+    /** Fed by [BridgeEventListener]; drained by [pollEvent]. See [EventBus]. */
+    private val eventQueue = EventBus()
 
-    init {
-        // Registered here, before anything calls unlockVaultTyped (which
-        // starts the background feed/DM loops), so no event is ever emitted
-        // with nobody listening yet.
-        registerEventListener()
-    }
+    /**
+     * Guards [initializeEventBridge] so only the first caller actually
+     * registers the FFI listener — every later call (e.g. an Activity
+     * recreation re-running the same startup path) is a harmless no-op,
+     * exactly like [uniffi.comrade.Comrade.setEventListener]'s own
+     * Rust-side idempotency guard.
+     */
+    private val bridgeInitialized = AtomicBoolean(false)
 
-    @OptIn(DelicateCoroutinesApi::class)
-    private fun registerEventListener() {
-        GlobalScope.launch {
-            ffi.setEventListener(
-                object : BridgeEventListener {
-                    override fun onEvent(event: BridgeEvent) {
-                        eventQueue.offer(event)
-                    }
-                },
-            )
-        }
+    /**
+     * Register the native event listener and **await** its registration
+     * completing before returning — replacing a `GlobalScope.launch` that
+     * used to fire-and-forget this from the class initialiser. That mattered:
+     * `GlobalScope.launch` only *schedules* the coroutine, so a caller that
+     * touched [ComradeCore] and immediately called [unlockVaultTyped] could
+     * race the Rust side actually subscribing to its broadcast channel —
+     * `unlockVaultTyped` starts the background feed/DM loops, and any event
+     * they publish before a subscriber exists is dropped (a `tokio::sync::
+     * broadcast` send with zero receivers is a silent no-op). Callers that
+     * need this to have happened before proceeding (see
+     * [mullu.comrade.ComradeApplication]) must call this and await it — not
+     * rely on class-init timing.
+     *
+     * Idempotent: safe to call from more than one place (application startup
+     * *and*, defensively, the first [unlockVaultTyped]) without double
+     * -registering.
+     */
+    suspend fun initializeEventBridge() {
+        if (bridgeInitialized.getAndSet(true)) return
+        ffi.setEventListener(
+            object : BridgeEventListener {
+                override fun onEvent(event: BridgeEvent) {
+                    eventQueue.offer(event)
+                }
+            },
+        )
     }
 
     private inline fun <T> rethrowing(what: String, block: () -> T): T =
@@ -106,14 +126,47 @@ object ComradeCore {
 
     // ── Vault unlock / lifecycle ─────────────────────────────────────────────
 
-    /** Unlock the vault, returning the active identity's npub, or throwing. */
+    /**
+     * Unlock the vault, returning the active identity's npub, or throwing.
+     *
+     * Also ensures [initializeEventBridge] has run first — idempotent, so
+     * this is a no-op if [mullu.comrade.ComradeApplication] already did it at
+     * startup (the common case), but it means correctness here never depends
+     * on that startup race having resolved a particular way: whichever of
+     * the two calls this, the background feed/DM/call-signal loops this
+     * unlock is about to start can never publish an event before a listener
+     * is subscribed to receive it.
+     */
     fun unlockVaultTyped(path: String, passphrase: String): String = rethrowing("Vault unlock") {
-        runBlocking { ffi.unlockVault(path, passphrase) }.npub
+        runBlocking {
+            initializeEventBridge()
+            ffi.unlockVault(path, passphrase)
+        }.npub
     }
 
     fun isVaultUnlocked(): Boolean = ffi.isVaultUnlocked()
 
     fun isStoreUnlocked(): Boolean = ffi.isStoreUnlocked()
+
+    /**
+     * Re-lock the vault: abort the background feed/DM/sakha loops and drop
+     * the store, engines, and in-memory identity/passphrase-derived key (see
+     * `comrade_ui::ComradeRuntime::lock_vault`). The caller (see
+     * [mullu.comrade.RelayConnectionService]) is responsible for the
+     * Android-side half of "locking": stopping the connection service and
+     * clearing any UI-held decrypted state — this call only tears down the
+     * native side.
+     *
+     * **Security boundary**: this is the deliberate, user-initiated version
+     * of what process death already does by accident to the in-memory vault
+     * key. It does not, and cannot, protect against a compromised or rooted
+     * device reading process memory before the lock happens — the design
+     * goal is a background-but-unlocked window with a real, honest "off"
+     * switch, not a stronger guarantee than that.
+     */
+    fun lockVaultTyped() {
+        runBlocking { ffi.lockVault() }
+    }
 
     // ── Identity / workspace controller ──────────────────────────────────────
 
@@ -388,9 +441,28 @@ object ComradeCore {
      */
     fun callSasTyped(localSdp: String, remoteSdp: String): List<String>? = ffi.callSas(localSdp, remoteSdp)
 
+    /**
+     * Configure (or, with a blank [url], clear) the TURN relay. Throws with a
+     * user-safe message (never the credential) if [url] isn't a well-formed
+     * `turn:`/`turns:` URI — see `comrade_core::call::validate_turn_url`.
+     * [username]/[credential] are write-only from here on: nothing in this
+     * facade ever logs them or reads them back (see [turnServerStatusTyped]).
+     */
     fun setTurnServerTyped(url: String, username: String, credential: String) {
         rethrowing("TURN config") { ffi.setTurnServer(url, username, credential) }
     }
+
+    /** A relay's URL only — never the username/credential. See [TurnServerStatus]. */
+    data class TurnServerStatus(val configured: Boolean, val url: String?)
+
+    /**
+     * The "is a relay configured" diagnostic for a support/settings screen —
+     * safe to display or log as-is, unlike the write-only credential
+     * [setTurnServerTyped] takes. Never throws (a locked vault is simply
+     * reported as "not configured", matching the Rust side).
+     */
+    fun turnServerStatusTyped(): TurnServerStatus =
+        ffi.turnServerStatus().let { TurnServerStatus(configured = it.configured, url = it.url) }
 
     data class CallSessionInfo(
         val callId: String,
@@ -459,10 +531,153 @@ object ComradeCore {
     // ── Push events ────────────────────────────────────────────────────────────
 
     /**
-     * Non-blocking drain of the next queued [BridgeEvent], or `null` when
-     * empty. Events are pushed live by the native core (see the `init` block
-     * above) into an in-memory queue — this is a local, in-process poll, not
-     * an FFI round-trip like the old JNI `pollEvent()` was.
+     * Non-blocking drain of the next queued [BridgeEvent] — highest priority
+     * first (see [EventBus]) — or `null` when empty. Events are pushed live
+     * by the native core (see [initializeEventBridge]) into an in-memory
+     * queue; this is a local, in-process poll, not an FFI round-trip.
      */
     fun pollEvent(): BridgeEvent? = eventQueue.poll()
+
+    /** Live queue-depth/drop/coalescing/lag counters — see [EventBus.Stats]. */
+    val eventBusStats: StateFlow<EventBus.Stats> get() = eventQueue.stats
+}
+
+/**
+ * Bounded, priority-aware home for events pushed from the native core, fed by
+ * [ComradeCore.initializeEventBridge]'s listener and drained by
+ * [ComradeCore.pollEvent] (single consumer — see [mullu.comrade.RelayConnectionService]).
+ *
+ * AUDIT.md COMMS-04 replaces the previous unbounded `ConcurrentLinkedQueue`
+ * with three placements ([Placement]), each with a distinct backpressure
+ * policy:
+ *  - [Placement.Critical] (calls, DMs, message requests): appended, never
+ *    dropped. A relay-wide public-feed flood cannot touch these — they queue
+ *    in their own bucket, drained before anything else.
+ *  - [Placement.Coalesced] (mesh/ledger/profile/receipt status): only the
+ *    *latest* per logical key is worth keeping — a stale status a newer one
+ *    already superseded is redundant, not lost information, so a fresh
+ *    update replaces (rather than queues behind) an already-pending one for
+ *    the same key.
+ *  - [Placement.Feed] (`IncomingChitthi` only): bounded and lossy by design —
+ *    an adversarial or merely busy relay must never be able to grow this
+ *    queue (or block the producer) without limit; old, unconsumed Chitthis
+ *    are dropped once the feed capacity is reached.
+ *
+ * All mutation is behind one monitor: [offer] runs on whatever thread the
+ * native listener callback fires on (not necessarily a Kotlin coroutine),
+ * [poll] runs on the drain loop's thread — the same cross-thread-via-`synchronized`
+ * shape [mullu.comrade.call.CallManager] already uses throughout.
+ */
+class EventBus internal constructor() {
+    /**
+     * Where one [BridgeEvent] belongs — a single classification per event
+     * (rather than two separate "which tier"/"what coalescing key" functions
+     * that could silently drift out of sync) so [Placement.Coalesced] and its
+     * key can never disagree about which events are coalesced.
+     */
+    private sealed interface Placement {
+        data object Critical : Placement
+        data class Coalesced(val key: String) : Placement
+        data object Feed : Placement
+    }
+
+    private fun placementOf(event: BridgeEvent): Placement = when (event) {
+        is BridgeEvent.IncomingChitthi -> Placement.Feed
+        is BridgeEvent.MeshStatusChanged -> Placement.Coalesced("mesh_status")
+        is BridgeEvent.LedgerUpdated -> Placement.Coalesced("ledger")
+        is BridgeEvent.PeerProfileUpdated -> Placement.Coalesced("profile:${event.peer}")
+        is BridgeEvent.MessageStatus -> Placement.Coalesced("receipt:${event.peer}")
+        // DMs, media, message requests, call signals (offer/answer/ICE/hangup).
+        else -> Placement.Critical
+    }
+
+    data class Stats(
+        val criticalDepth: Int = 0,
+        val coalescedDepth: Int = 0,
+        val feedDepth: Int = 0,
+        val feedDrops: Long = 0,
+        val coalesceSuppressions: Long = 0,
+        val lastDequeueLagMs: Long = 0,
+    )
+
+    private companion object {
+        /** Bounded, but generously — a human never produces this many DMs/calls/requests. */
+        const val CRITICAL_CAPACITY = 4_000
+
+        /** Small and deliberately lossy — see the class doc. */
+        const val FEED_CAPACITY = 300
+
+        const val TAG = "EventBus"
+    }
+
+    private val lock = Any()
+    private val critical = ArrayDeque<Timestamped>()
+
+    /** Insertion order preserved so coalescing still drains oldest-superseded-key first. */
+    private val coalesced = LinkedHashMap<String, Timestamped>()
+    private val feed = ArrayDeque<Timestamped>()
+
+    private val _stats = MutableStateFlow(Stats())
+    val stats: StateFlow<Stats> = _stats.asStateFlow()
+
+    private class Timestamped(val event: BridgeEvent, val enqueuedAtMs: Long)
+
+    fun offer(event: BridgeEvent) {
+        synchronized(lock) {
+            val wrapped = Timestamped(event, System.currentTimeMillis())
+            when (val placement = placementOf(event)) {
+                is Placement.Critical -> {
+                    critical.addLast(wrapped)
+                    if (critical.size > CRITICAL_CAPACITY) {
+                        // Never drop a call/DM/request — but a queue this deep
+                        // means the drain loop is stuck (or dead), which is
+                        // worth knowing about loudly rather than silently
+                        // growing memory forever.
+                        Log.e(TAG, "critical event queue exceeded $CRITICAL_CAPACITY — is the drain loop stuck?")
+                    }
+                }
+                is Placement.Coalesced -> {
+                    if (coalesced.put(placement.key, wrapped) != null) {
+                        _stats.update { it.copy(coalesceSuppressions = it.coalesceSuppressions + 1) }
+                    }
+                }
+                is Placement.Feed -> {
+                    if (feed.size >= FEED_CAPACITY) {
+                        feed.removeFirst()
+                        _stats.update { it.copy(feedDrops = it.feedDrops + 1) }
+                    }
+                    feed.addLast(wrapped)
+                }
+            }
+            _stats.update {
+                it.copy(
+                    criticalDepth = critical.size,
+                    coalescedDepth = coalesced.size,
+                    feedDepth = feed.size,
+                )
+            }
+        }
+    }
+
+    /** Highest priority first: critical, then coalesced-status, then feed. */
+    fun poll(): BridgeEvent? = synchronized(lock) {
+        val wrapped = when {
+            critical.isNotEmpty() -> critical.removeFirst()
+            coalesced.isNotEmpty() -> {
+                val key = coalesced.keys.first()
+                coalesced.remove(key)
+            }
+            feed.isNotEmpty() -> feed.removeFirst()
+            else -> null
+        } ?: return null
+        _stats.update {
+            it.copy(
+                criticalDepth = critical.size,
+                coalescedDepth = coalesced.size,
+                feedDepth = feed.size,
+                lastDequeueLagMs = System.currentTimeMillis() - wrapped.enqueuedAtMs,
+            )
+        }
+        wrapped.event
+    }
 }

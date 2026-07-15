@@ -1,0 +1,31 @@
+# Isolated Nostr relay for integration/device testing (AUDIT.md COMMS-03).
+#
+# NOT used by the hermetic Rust integration suite (crates/comrade_ui/tests/) —
+# that suite embeds its own minimal in-process relay (tests/support) so it
+# needs neither Docker nor a network. This compose file is for tests that
+# genuinely need a relay reachable over a real socket:
+#   - The Android two-peer instrumented test
+#     (android/app/src/androidTest/.../TwoPeerJniIntegrationTest.kt), which
+#     needs an address the emulator can reach (10.0.2.2:<port> is the
+#     standard Android-emulator-to-host loopback).
+#   - Manual/local end-to-end testing against a real relay implementation
+#     instead of the public relay pool.
+#
+# Usage:
+#   docker compose -f deploy/test-relay/docker-compose.yml up -d
+#   # relay is now at ws://localhost:8090 (host) / ws://10.0.2.2:8090 (emulator)
+#
+# Not independently verified in this change (built without a local Docker
+# daemon available) — validate in CI/locally before relying on it.
+services:
+  test-relay:
+    image: scsibug/nostr-rs-relay:latest
+    ports:
+      - "8090:8080"
+    volumes:
+      - ./config.toml:/usr/src/app/config.toml:ro
+      - test-relay-data:/usr/src/app/db
+    restart: unless-stopped
+
+volumes:
+  test-relay-data:

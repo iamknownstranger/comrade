@@ -36,7 +36,7 @@ pub use runtime::{
     BridgeEvent, CallRecordDto, CallSessionDto, CallSignalDto, ChitthiDto, ComradeRuntime,
     ContactDto, ConversationDto, DirectMessageDto, FoundProfileDto, IceServerDto, JournalEntryDto,
     MediaBytesDto, MediaMessageDto, MeshStatusDto, MessageDto, MessageRequestDto, ProfileDto,
-    SakhaStatusDto,
+    SakhaStatusDto, TurnServerStatusDto,
 };
 
 // ── Errors ──────────────────────────────────────────────────────────────────────
@@ -215,6 +215,17 @@ impl UiService {
 
     pub fn is_store_unlocked(&self) -> bool {
         self.store.is_some()
+    }
+
+    /// Drop the open store and every in-memory identity/handle — the
+    /// view-model half of [`crate::runtime::ComradeRuntime::lock_vault`]. Safe
+    /// to call when already locked (each field is simply already `None`).
+    /// Background tasks holding their own `Arc<EncryptedStore>` clone are
+    /// unaffected by this alone; the runtime aborts those separately.
+    pub fn lock(&mut self) {
+        self.store = None;
+        self.identity = None;
+        self.username = None;
     }
 
     /// Crate-internal: clone the live keypair for engine construction. Kept

@@ -36,3 +36,6 @@ media-http = ["comrade_core/media-http"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# In-process test relay (tests/support) for the two-peer integration suite.
+tokio-tungstenite = { workspace = true }
+futures-util      = { workspace = true }

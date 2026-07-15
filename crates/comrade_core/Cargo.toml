@@ -23,6 +23,8 @@ hkdf          = { workspace = true }
 base64        = { workspace = true }
 secp256k1     = { workspace = true }
 hex           = { workspace = true }
+hmac          = { workspace = true }
+sha1          = { workspace = true }
 # Record/Enum derives on the plain-data types the Vault/Sabha/Identity
 # engines expose (e.g. `UpiPaymentIntent`, `CallSignal`) so comrade_jni's
 # uniffi scaffolding can lower/lift them with no hand-written FFI mirror.

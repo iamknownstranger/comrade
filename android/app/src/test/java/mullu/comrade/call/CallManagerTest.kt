@@ -11,6 +11,15 @@ import uniffi.comrade_core.CallSignal
  * remote `sdpMid` must not reach the native `IceCandidate` constructor as
  * `null`, and a local candidate's `sdpMLineIndex == -1` must not wrap to
  * `65535` when narrowed to `UShort`.
+ *
+ * These two are the only pieces of [CallManager] pure enough to run as a
+ * plain JVM unit test — everything else drives a real `org.webrtc.
+ * PeerConnectionFactory` and crosses the real JNI boundary into the Rust
+ * core, neither loadable here. The call-setup cancellation/lifecycle tests
+ * (AUDIT.md COMMS-05: cancel-before-session, place failure, late callback
+ * after cancellation, simultaneous offers) live in
+ * `androidTest/.../call/CallManagerLifecycleTest.kt` instead, where the real
+ * device runtime makes them meaningful.
  */
 class CallManagerTest {
 

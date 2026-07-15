@@ -41,8 +41,8 @@ use comrade_state::AppWorkspace;
 use comrade_ui::{
     BridgeEvent, CallRecordDto, CallSessionDto, ChitthiDto, ComradeRuntime, ContactDto,
     ConversationDto, FoundProfileDto, IceServerDto, IdentityDto, JournalEntryDto, MediaBytesDto,
-    MediaMessageDto, MeshStatusDto, MessageDto, MessageRequestDto, ProfileDto, UiError,
-    UpiIntentDto, WorkspaceDto,
+    MediaMessageDto, MeshStatusDto, MessageDto, MessageRequestDto, ProfileDto, TurnServerStatusDto,
+    UiError, UpiIntentDto, WorkspaceDto,
 };
 use tokio::sync::RwLock;
 
@@ -120,6 +120,26 @@ pub trait BridgeEventListener: Send + Sync {
     fn on_event(&self, event: BridgeEvent);
 }
 
+/// Drain one `BridgeEvent` channel to `listener` until it closes. A `Lagged`
+/// error means this receiver fell behind that channel's own capacity and
+/// some events on *that* channel were skipped — never a cross-channel
+/// effect, since each of the two channels `set_event_listener` forwards has
+/// its own independent ring buffer.
+fn spawn_event_forwarder(
+    mut rx: tokio::sync::broadcast::Receiver<BridgeEvent>,
+    listener: Arc<dyn BridgeEventListener>,
+) {
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(event) => listener.on_event(event),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+}
+
 // ── Comrade — the live runtime handle ────────────────────────────────────────
 
 /// The single, process-lifetime handle to the native core. Kotlin constructs
@@ -143,25 +163,42 @@ impl Comrade {
         })
     }
 
+    /// Like [`Comrade::new`], but connecting new engines to `relays` instead
+    /// of the public default set. AUDIT.md COMMS-03's isolated-relay test
+    /// hook: a two-installation/two-instance device test points both sides
+    /// at one local relay instead of the public internet. Not used by the
+    /// shipping app (which always calls [`Comrade::new`]).
+    #[uniffi::constructor]
+    pub fn new_with_relays(relays: Vec<String>) -> Arc<Self> {
+        Arc::new(Self {
+            inner: RwLock::new(ComradeRuntime::with_relays(relays)),
+            listener_registered: AtomicBool::new(false),
+        })
+    }
+
     // ── Push events ───────────────────────────────────────────────────────
 
     /// Register `listener` to receive every future [`BridgeEvent`]. Only the
     /// first call takes effect (idempotent, like [`Comrade::unlock_vault`]) —
     /// the app registers one listener for its lifetime.
+    ///
+    /// Forwards *two* independent channels to the same `listener` — the
+    /// critical stream (DMs, requests, call signals, terminal call events,
+    /// mesh/ledger updates) and the separate, small, deliberately-lossy
+    /// `IncomingChitthi` stream (see `comrade_ui::ComradeRuntime::subscribe_feed_events`,
+    /// AUDIT.md COMMS-04) — so a public-feed flood dropping old, unconsumed
+    /// Chitthis on its own channel can never delay or starve a call
+    /// signal/DM/request queued behind it on the critical one.
     pub async fn set_event_listener(&self, listener: Arc<dyn BridgeEventListener>) {
         if self.listener_registered.swap(true, Ordering::SeqCst) {
             return;
         }
-        let mut rx = self.inner.read().await.subscribe_events();
-        tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(event) => listener.on_event(event),
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        });
+        let guard = self.inner.read().await;
+        let critical_rx = guard.subscribe_events();
+        let feed_rx = guard.subscribe_feed_events();
+        drop(guard);
+        spawn_event_forwarder(critical_rx, listener.clone());
+        spawn_event_forwarder(feed_rx, listener);
     }
 
     // ── Vault unlock / lifecycle ────────────────────────────────────────────
@@ -186,6 +223,15 @@ impl Comrade {
 
     pub fn is_store_unlocked(&self) -> bool {
         self.inner.blocking_read().is_store_unlocked()
+    }
+
+    /// Re-lock the vault: abort the background feed/DM/sakha loops and drop
+    /// the store, engines, and in-memory identity — see
+    /// `comrade_ui::ComradeRuntime::lock_vault`. Async because stopping a
+    /// live Saathi mesh engine (if the workspace has one running) awaits its
+    /// shutdown; every other step is synchronous state teardown.
+    pub async fn lock_vault(&self) {
+        self.inner.write().await.lock_vault().await
     }
 
     // ── Identity ────────────────────────────────────────────────────────────
@@ -398,6 +444,13 @@ impl Comrade {
             .set_turn_server(&url, &username, &credential)
     }
 
+    /// The "is a relay configured" diagnostic status — see
+    /// `comrade_ui::ComradeRuntime::turn_server_status`. Carries the URL only;
+    /// never the username/credential.
+    pub fn turn_server_status(&self) -> TurnServerStatusDto {
+        self.inner.blocking_read().turn_server_status()
+    }
+
     pub fn place_call(
         &self,
         peer: String,
@@ -566,6 +619,13 @@ mod tests {
     }
 
     #[test]
+    fn new_with_relays_is_reachable_through_the_ffi_constructor() {
+        let c = Comrade::new_with_relays(vec!["wss://relay.example.test".to_string()]);
+        assert!(!c.is_vault_unlocked());
+        assert_eq!(c.current_workspace().key, "Base");
+    }
+
+    #[test]
     fn sync_calls_reject_gracefully_before_unlock() {
         // Mirrors comrade_ui::runtime::tests::commands_reject_gracefully_when_vault_locked
         // — this wrapper must not panic or silently succeed pre-unlock.
@@ -604,6 +664,47 @@ mod tests {
             .await,
             Err(UiError::VaultLocked)
         ));
+    }
+
+    #[test]
+    fn lock_vault_is_reachable_through_the_ffi_object_and_is_idempotent() {
+        // A plain (non-async) `#[test]`, like `comrade_starts_locked_on_the_base_workspace`
+        // above: `is_vault_unlocked`/`profile` go through `blocking_read`, which
+        // panics if called from inside an ambient Tokio runtime (i.e. under
+        // `#[tokio::test]`) — see that test's doc comment. The async methods
+        // (`unlock_vault`/`lock_vault`) instead run on a runtime built and
+        // driven by hand via `block_on`, exactly like a real JNA/native caller
+        // would (there is no surrounding reactor on that thread either).
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        let c = Comrade::new();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        rt.block_on(c.unlock_vault(path.clone(), "pin".to_string()))
+            .unwrap();
+        assert!(c.is_vault_unlocked());
+
+        rt.block_on(c.lock_vault());
+        assert!(!c.is_vault_unlocked());
+        assert!(matches!(c.profile(), Err(UiError::NoIdentity)));
+
+        // Idempotent — locking an already-locked runtime must not panic.
+        rt.block_on(c.lock_vault());
+        assert!(!c.is_vault_unlocked());
+
+        // Unlocking again resumes normally.
+        rt.block_on(c.unlock_vault(path, "pin".to_string()))
+            .unwrap();
+        assert!(c.is_vault_unlocked());
+    }
+
+    #[test]
+    fn turn_server_status_is_reachable_through_the_ffi_object() {
+        let c = Comrade::new();
+        // Pre-unlock: honest "nothing configured", not an error.
+        let status = c.turn_server_status();
+        assert!(!status.configured);
+        assert_eq!(status.url, None);
     }
 
     #[tokio::test]
