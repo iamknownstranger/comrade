@@ -62,6 +62,7 @@ class WakeWordService : Service(), RecognitionListener {
     override fun onCreate() {
         super.onCreate()
         isRunning = true
+        instance = this
         dispatcher = CommandDispatcher(ComradeCoreBackend())
         tts = ComradeTts(this)
     }
@@ -226,6 +227,7 @@ class WakeWordService : Service(), RecognitionListener {
 
     override fun onDestroy() {
         isRunning = false
+        instance = null
         mainHandler.removeCallbacks(revertToIdle)
         speechService?.stop()
         speechService?.shutdown()
@@ -240,6 +242,29 @@ class WakeWordService : Service(), RecognitionListener {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    /**
+     * Not reference-counted across independent callers (a call, a voice-note
+     * recording, tap-to-talk) — just idempotent against repeated/unbalanced
+     * pause()/resume() from any one of them, so an extra resume() can never
+     * double-start the recogniser and a redundant pause() can never no-op
+     * the one that actually needs the mic released.
+     */
+    @Volatile private var listening = true
+
+    /** Stop the Vosk recogniser (releasing the mic) without tearing down the foreground service/notification. */
+    private fun pauseListening() {
+        if (!listening) return
+        listening = false
+        runCatching { speechService?.stop() }.onFailure { Log.w(TAG, "pauseListening failed", it) }
+    }
+
+    /** Restart the Vosk recogniser after [pauseListening] released the mic. */
+    private fun resumeListening() {
+        if (listening) return
+        listening = true
+        runCatching { speechService?.startListening(this) }.onFailure { Log.w(TAG, "resumeListening failed", it) }
+    }
+
     companion object {
         private const val TAG = "WakeWordService"
         const val ACTION_START = "mullu.comrade.voice.START"
@@ -252,6 +277,24 @@ class WakeWordService : Service(), RecognitionListener {
          */
         @Volatile var isRunning: Boolean = false
             private set
+
+        /** The live instance, if the service is running — backs [pause]/[resume]. */
+        @Volatile private var instance: WakeWordService? = null
+
+        /**
+         * Release the mic (Vosk [SpeechService] stopped) without stopping the
+         * foreground service/notification — for another mic consumer (a call,
+         * a voice-note recording) to use it exclusively for a while. A no-op
+         * if the service isn't running. See [resume].
+         */
+        fun pause() {
+            instance?.pauseListening()
+        }
+
+        /** Restart the wake-word recogniser after [pause]. A no-op if the service isn't running. */
+        fun resume() {
+            instance?.resumeListening()
+        }
 
         private const val CHANNEL_ID = "comrade_voice"
         private const val NOTIFICATION_ID = 0x0C0DE

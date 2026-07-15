@@ -30,6 +30,19 @@
  *  • [`BridgeEventListener`] — a uniffi callback interface Kotlin implements
  *    to receive [`BridgeEvent`]s pushed live, replacing the old `pollEvent()`
  *    JNI call that Kotlin had to re-invoke on a 600ms timer.
+ *
+ * # Invariant: listener callbacks run off the Tokio runtime
+ *
+ * [`BridgeEventListener::on_event`] is always invoked from a dedicated,
+ * plain `std::thread` (see [`spawn_event_forwarder`]) — never from a Tokio
+ * worker. This is deliberate: if Kotlin's implementation re-enters any of
+ * this crate's *synchronous* methods (the ones using `.blocking_read()`/
+ * `.blocking_write()`, e.g. [`Comrade::workspaces`]) from inside `on_event`,
+ * that call is safe precisely because the callback is not running on a
+ * thread with an ambient Tokio reactor — `blocking_read`/`blocking_write`
+ * panic when called from *inside* one. Keep this true for any future change
+ * to the forwarding path: never invoke `on_event` from a `tokio::spawn`ed
+ * task or any other Tokio-driven context.
  */
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,6 +58,7 @@ use comrade_ui::{
     UiError, UpiIntentDto, WorkspaceDto,
 };
 use tokio::sync::RwLock;
+use tracing::warn;
 
 uniffi::setup_scaffolding!("comrade");
 
@@ -120,23 +134,120 @@ pub trait BridgeEventListener: Send + Sync {
     fn on_event(&self, event: BridgeEvent);
 }
 
-/// Drain one `BridgeEvent` channel to `listener` until it closes. A `Lagged`
-/// error means this receiver fell behind that channel's own capacity and
-/// some events on *that* channel were skipped — never a cross-channel
-/// effect, since each of the two channels `set_event_listener` forwards has
-/// its own independent ring buffer.
+/// Bounded, drop-oldest queue of [`BridgeEvent`]s bridging the async
+/// forwarder task (producer, on a Tokio worker) and the dedicated listener
+/// thread (consumer, see [`spawn_event_forwarder`]). `std::sync::mpsc` has no
+/// way to evict from the middle of its buffer, so a slow/absent consumer
+/// would either grow it unboundedly (`channel()`) or block the producer
+/// (`sync_channel()`) — neither is acceptable here — hence this small
+/// hand-rolled `Mutex<VecDeque<_>>` + `Condvar` instead of a new dependency.
+struct EventQueue {
+    state: std::sync::Mutex<EventQueueState>,
+    ready: std::sync::Condvar,
+}
+
+struct EventQueueState {
+    items: std::collections::VecDeque<BridgeEvent>,
+    closed: bool,
+}
+
+impl EventQueue {
+    /// Comfortably above a burst of ordinary traffic; a listener that's
+    /// fallen behind by this much has bigger problems than a dropped event.
+    const CAPACITY: usize = 1024;
+
+    fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(EventQueueState {
+                items: std::collections::VecDeque::new(),
+                closed: false,
+            }),
+            ready: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Push `event`, dropping (and logging) the oldest queued event first if
+    /// already at capacity — the queue must never grow unboundedly, and the
+    /// producer (a Tokio worker forwarding the broadcast channel) must never
+    /// block waiting for the consumer thread to catch up.
+    fn push(&self, event: BridgeEvent) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.items.len() >= Self::CAPACITY {
+            state.items.pop_front();
+            warn!(
+                capacity = Self::CAPACITY,
+                "event listener queue at capacity; dropped the oldest queued event"
+            );
+        }
+        state.items.push_back(event);
+        drop(state);
+        self.ready.notify_one();
+    }
+
+    /// Block the calling (dedicated) thread until an event is ready, or
+    /// return `None` once [`Self::close`] has been called and the queue has
+    /// drained.
+    fn pop_blocking(&self) -> Option<BridgeEvent> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(event) = state.items.pop_front() {
+                return Some(event);
+            }
+            if state.closed {
+                return None;
+            }
+            state = self.ready.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    fn close(&self) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
+        self.ready.notify_all();
+    }
+}
+
+/// Forward one `BridgeEvent` channel to `listener` until it closes.
+///
+/// Two parts: a Tokio task drains the broadcast channel and pushes onto a
+/// bounded, drop-oldest [`EventQueue`]; a dedicated, named `std::thread`
+/// drains that queue and calls `listener.on_event` — deliberately off the
+/// Tokio runtime (see the module-header invariant) so a Kotlin listener that
+/// synchronously re-enters a `blocking_read`/`blocking_write` method from
+/// inside `on_event` can never panic.
+///
+/// A `Lagged` error means this receiver fell behind *that broadcast
+/// channel's own* capacity and some events on it were skipped — never a
+/// cross-channel effect, since each of the two channels `set_event_listener`
+/// forwards has its own independent ring buffer — logged with the skip count
+/// rather than silently continuing.
 fn spawn_event_forwarder(
     mut rx: tokio::sync::broadcast::Receiver<BridgeEvent>,
     listener: Arc<dyn BridgeEventListener>,
 ) {
+    let queue = Arc::new(EventQueue::new());
+
+    let consumer_queue = queue.clone();
+    std::thread::Builder::new()
+        .name("comrade-event-listener".to_string())
+        .spawn(move || {
+            while let Some(event) = consumer_queue.pop_blocking() {
+                listener.on_event(event);
+            }
+        })
+        .expect("failed to spawn the dedicated event-listener thread");
+
+    let producer_queue = queue;
     tokio::spawn(async move {
         loop {
             match rx.recv().await {
-                Ok(event) => listener.on_event(event),
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Ok(event) => producer_queue.push(event),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(skipped, "event listener fell behind the broadcast channel's own capacity; some events were skipped");
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
+        producer_queue.close();
     });
 }
 
@@ -284,33 +395,37 @@ impl Comrade {
         self.inner.blocking_read().fetch_sabha_timeline()
     }
 
+    /// Takes a cheap, synchronous handle snapshot under the guard (see
+    /// `comrade_ui::ComradeRuntime::handles`) and runs the relay round-trip
+    /// after it is dropped — AUDIT P2: never hold the runtime lock across a
+    /// network await, or one slow/unreachable relay stalls every other
+    /// bridge call behind it.
     pub async fn broadcast_chitthi(
         &self,
         content: String,
         reply_to: Option<String>,
     ) -> Result<String, UiError> {
-        self.inner
-            .read()
-            .await
-            .broadcast_chitthi(&content, reply_to)
-            .await
+        let handles = self.inner.read().await.handles();
+        handles.broadcast_chitthi(&content, reply_to).await
     }
 
     // ── Vault (E2E DMs) ──────────────────────────────────────────────────────
 
+    /// See [`Comrade::broadcast_chitthi`]'s doc comment for the lock discipline.
     pub async fn send_dm(&self, target: String, content: String) -> Result<MessageDto, UiError> {
-        self.inner.read().await.send_dm(&target, &content).await
+        let handles = self.inner.read().await.handles();
+        handles.send_dm(&target, &content).await
     }
 
+    /// See [`Comrade::broadcast_chitthi`]'s doc comment for the lock discipline.
     pub async fn send_dm_reply(
         &self,
         target: String,
         content: String,
         reply_to: Option<String>,
     ) -> Result<MessageDto, UiError> {
-        self.inner
-            .read()
-            .await
+        let handles = self.inner.read().await.handles();
+        handles
             .send_dm_reply(&target, &content, reply_to.as_deref())
             .await
     }
@@ -380,8 +495,10 @@ impl Comrade {
         self.inner.blocking_read().list_contacts()
     }
 
+    /// See [`Comrade::broadcast_chitthi`]'s doc comment for the lock discipline.
     pub async fn search_profiles(&self, query: String) -> Result<Vec<FoundProfileDto>, UiError> {
-        self.inner.read().await.search_profiles(&query).await
+        let handles = self.inner.read().await.handles();
+        handles.search_profiles(&query).await
     }
 
     /// Detaches the refresher and drops the shared lock before the relay
@@ -463,6 +580,8 @@ impl Comrade {
     /// only this crate still round-trips it through JSON internally, since
     /// that's the wire format `comrade_ui::ComradeRuntime::send_call_signal`
     /// puts on the encrypted DM channel.
+    ///
+    /// See [`Comrade::broadcast_chitthi`]'s doc comment for the lock discipline.
     pub async fn send_call_signal(
         &self,
         peer: String,
@@ -472,13 +591,13 @@ impl Comrade {
     ) -> Result<(), UiError> {
         let signal_json =
             serde_json::to_string(&signal).map_err(|e| UiError::Engine(e.to_string()))?;
-        self.inner
-            .read()
-            .await
+        let handles = self.inner.read().await.handles();
+        handles
             .send_call_signal(&peer, &call_id, media.as_str(), &signal_json)
             .await
     }
 
+    /// See [`Comrade::broadcast_chitthi`]'s doc comment for the lock discipline.
     pub async fn hangup_call(
         &self,
         peer: String,
@@ -486,9 +605,8 @@ impl Comrade {
         media: CallMediaKind,
         reason: HangupReason,
     ) -> Result<(), UiError> {
-        self.inner
-            .read()
-            .await
+        let handles = self.inner.read().await.handles();
+        handles
             .hangup_call(&peer, &call_id, media.as_str(), reason.as_str())
             .await
     }
@@ -524,6 +642,8 @@ impl Comrade {
     /// `bytes` crosses as a native byte array — uniffi handles `Vec<u8>`
     /// directly, so the base64 encode/decode the old JNI bridge needed
     /// (Kotlin `String` was the only wire type available) is gone.
+    ///
+    /// See [`Comrade::broadcast_chitthi`]'s doc comment for the lock discipline.
     pub async fn upload_and_send_media(
         &self,
         target_pubkey: String,
@@ -531,28 +651,27 @@ impl Comrade {
         mime_type: String,
         caption: String,
     ) -> Result<MediaMessageDto, UiError> {
-        self.inner
-            .read()
-            .await
+        let handles = self.inner.read().await.handles();
+        handles
             .upload_and_send_media(&target_pubkey, bytes, &mime_type, &caption)
             .await
     }
 
+    /// See [`Comrade::broadcast_chitthi`]'s doc comment for the lock discipline.
     pub async fn download_and_decrypt_media(
         &self,
         event_id: String,
     ) -> Result<MediaBytesDto, UiError> {
-        self.inner
-            .read()
-            .await
-            .download_and_decrypt_media(&event_id)
-            .await
+        let handles = self.inner.read().await.handles();
+        handles.download_and_decrypt_media(&event_id).await
     }
 
     // ── Sakha/Sakhi CRDT ledger ──────────────────────────────────────────────
 
+    /// See [`Comrade::broadcast_chitthi`]'s doc comment for the lock discipline.
     pub async fn sync_ledger(&self) -> Result<String, UiError> {
-        self.inner.read().await.sync_ledger().await
+        let handles = self.inner.read().await.handles();
+        handles.sync_ledger().await
     }
 }
 
@@ -723,5 +842,66 @@ mod tests {
         // A second registration must be a no-op, not a second forwarder task.
         c.set_event_listener(listener).await;
         assert!(c.listener_registered.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn listener_can_synchronously_call_a_blocking_read_method_from_on_event() {
+        // Regression guard for the module-header invariant: `on_event` runs
+        // on the dedicated listener thread, never a Tokio worker, so a
+        // Kotlin listener that re-enters a sync (`blocking_read`) method from
+        // inside its callback must never panic. Before this fix the forwarder
+        // called `on_event` from a `tokio::spawn`ed task, where `blocking_read`
+        // panics unconditionally.
+        struct ReentrantListener {
+            comrade: Arc<Comrade>,
+            called: Arc<AtomicBool>,
+            panicked: Arc<AtomicBool>,
+        }
+        impl BridgeEventListener for ReentrantListener {
+            fn on_event(&self, _event: BridgeEvent) {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.comrade.workspaces();
+                }));
+                self.called.store(true, Ordering::SeqCst);
+                if outcome.is_err() {
+                    self.panicked.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+
+        let c = Comrade::new();
+        let called = Arc::new(AtomicBool::new(false));
+        let panicked = Arc::new(AtomicBool::new(false));
+        let listener: Arc<dyn BridgeEventListener> = Arc::new(ReentrantListener {
+            comrade: c.clone(),
+            called: called.clone(),
+            panicked: panicked.clone(),
+        });
+        c.set_event_listener(listener).await;
+
+        c.inner
+            .read()
+            .await
+            .event_sender()
+            .send(BridgeEvent::MeshStatusChanged(MeshStatusDto {
+                active: false,
+                peer_count: 0,
+            }))
+            .unwrap();
+
+        for _ in 0..100 {
+            if called.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            called.load(Ordering::SeqCst),
+            "the dedicated listener thread must have delivered the event"
+        );
+        assert!(
+            !panicked.load(Ordering::SeqCst),
+            "on_event must be able to call a blocking_read method with no panic"
+        );
     }
 }

@@ -24,6 +24,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import mullu.comrade.call.CallManager
+import mullu.comrade.call.CallUiState
 import mullu.comrade.ui.shortNpub
 import uniffi.comrade_ui.BridgeEvent
 
@@ -345,10 +346,17 @@ object ChatEventRouter {
                 // even when the app isn't in the foreground.
                 val freshIncoming = CallManager.onIncomingSignal(event.v1)
                 if (freshIncoming) {
+                    // CallManager already resolved the caller's alias/published
+                    // name (the same precedence the chat list and call history
+                    // use) into the ringing state's peerLabel — read it back
+                    // instead of falling to the bare key here too, so the
+                    // notification and the ringing screen agree.
+                    val title = (CallManager.state.value as? CallUiState.Ringing)?.peerLabel
+                        ?: shortNpub(event.v1.peer)
                     Notifier.notifyIncomingCall(
                         context,
                         event.v1.peer,
-                        shortNpub(event.v1.peer),
+                        title,
                         video = event.v1.media == "video",
                     )
                 }

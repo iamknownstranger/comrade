@@ -21,6 +21,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import mullu.comrade.ComradeCore
+import mullu.comrade.voice.WakeWordService
 import org.webrtc.AudioSource
 import org.webrtc.AudioTrack
 import org.webrtc.Camera2Enumerator
@@ -110,6 +111,30 @@ object CallManager {
     private const val CONNECT_TIMEOUT_MS = 30_000L
 
     /**
+     * Recovery window for a call that was already [CallUiState.Active] and
+     * then lost its media path (ICE `FAILED`, or `DISCONNECTED` for longer
+     * than [DISCONNECT_GRACE_MS]): if it hasn't reported `CONNECTED` again
+     * within this long, end it honestly instead of leaving it "Active" with
+     * dead audio/video forever — the callee in particular has no TURN-retry
+     * mechanism of its own (only the caller re-offers), so without this it
+     * waits forever. See [armRecoveryTimeout].
+     */
+    private const val RECOVERY_TIMEOUT_MS = 20_000L
+
+    /**
+     * How long a mid-call `DISCONNECTED` is tolerated as transient (e.g. a
+     * brief network blip, or the caller's own ICE restart in progress) before
+     * [armRecoveryTimeout] is armed for it, same as a `FAILED`.
+     */
+    private const val DISCONNECT_GRACE_MS = 15_000L
+
+    /**
+     * Bound on [endedCallIds] — comfortably above how many calls could
+     * plausibly overlap the 2-day relay backfill window in practice.
+     */
+    private const val ENDED_CALL_IDS_CAP = 32
+
+    /**
      * How often [startStatsPolling] samples [PeerConnection.getStats] for the
      * connection-quality indicator. Frequent enough that the indicator feels
      * live, cheap enough that the extra wakeups don't matter.
@@ -184,6 +209,22 @@ object CallManager {
     val eglBaseContext: EglBase.Context? get() = eglBase?.eglBaseContext
 
     private var session: Session? = null
+
+    /**
+     * Bounded (cap [ENDED_CALL_IDS_CAP]) memory of recently-ended call ids —
+     * lets [onIncomingSignal] silently drop a redelivered `Offer` for a call
+     * we already tore down (relay at-least-once delivery, or the 2-day inbox
+     * backfill re-scanning on every launch) instead of ringing again.
+     * Recorded in [endWith]; oldest evicted first once at capacity.
+     */
+    private val endedCallIds = ArrayDeque<String>()
+
+    /** Record `callId` as ended — see [endedCallIds]. A blank/provisional id (never placed) is not worth remembering. */
+    private fun rememberEnded(callId: String) {
+        if (callId.isEmpty()) return
+        endedCallIds.addLast(callId)
+        while (endedCallIds.size > ENDED_CALL_IDS_CAP) endedCallIds.removeFirst()
+    }
 
     /** Everything mutable about the one in-flight call. */
     private class Session(
@@ -260,6 +301,19 @@ object CallManager {
 
         /** Caller side: the callee's device has acked with a `Ringing` signal. */
         var remoteRinging = false
+
+        /**
+         * Whether a post-connect recovery countdown is currently armed — see
+         * [armRecoveryTimeout]. Checked (not just `recoveryJob`'s cancellation)
+         * inside that countdown's own body, mirroring how [timeoutJob] guards
+         * itself with `connectedAtMs == 0L`: a reconnect and the countdown
+         * firing can race to acquire this object's monitor, and this flag is
+         * what's still correct by the time the loser gets it.
+         */
+        var recovering = false
+
+        /** The pending post-connect recovery timeout, cancelled on reconnect or teardown. */
+        var recoveryJob: Job? = null
     }
 
     // ── Public API: outgoing ─────────────────────────────────────────────────
@@ -304,17 +358,21 @@ object CallManager {
             Log.w(TAG, "startOutgoingCall ignored: a call is already in progress")
             return
         }
-        ensureFactory(context)
+        val appCtx = context.applicationContext
         val s = Session(callId = "", peer = peer, peerLabel = peerLabel, media = media, incoming = false)
         session = s
-        // Optimistic ringing state so the UI opens immediately; the placeCall +
-        // offer happen on IO because placeCall touches the store and the signal
-        // send is a blocking DM round-trip.
+        // Optimistic ringing state so the UI opens immediately; the factory
+        // init, placeCall, and offer all happen on IO — ensureFactory is a
+        // synchronous native init (PeerConnectionFactory.initialize +
+        // EglBase.create()) that has no business running on the caller's
+        // (Compose click) thread, and placeCall touches the store and the
+        // signal send is a blocking DM round-trip.
         _state.value = CallUiState.Ringing(peer, peerLabel, media == CallMediaKind.VIDEO, incoming = false)
         // Give up with "No answer" if the callee never picks up — armed now,
         // not after the offer sends, so a slow placeCall is covered too.
         armTimeout(s, RING_TIMEOUT_MS, HangupReason.MISSED, "missed")
         s.placingJob = io.launch {
+            ensureFactory(appCtx)
             val placed = runCatching { ComradeCore.placeCallTyped(peer, media) }
                 .getOrElse {
                     Log.e(TAG, "placeCall failed", it)
@@ -353,6 +411,13 @@ object CallManager {
      */
     @Synchronized
     fun onIncomingSignal(dto: CallSignalDto): Boolean {
+        if (dto.signal is CallSignal.Offer && isOfferForEndedCall(dto.callId, endedCallIds)) {
+            // The peer already received a terminal Hangup/Busy for this call
+            // id — a redelivered Offer (at-least-once relay delivery, or the
+            // 2-day backfill re-scanning on every launch) must not ring again.
+            Log.i(TAG, "dropping offer for already-ended callId=${dto.callId}")
+            return false
+        }
         val s = session
         return when (val signal = dto.signal) {
             is CallSignal.Offer -> handleRemoteOffer(dto, signal.sdp)
@@ -398,9 +463,14 @@ object CallManager {
             endWith(HangupReason.FAILED, "failed", sendHangup = true)
             return
         }
-        ensureFactory(context)
+        val appCtx = context.applicationContext
         _state.value = CallUiState.Connecting(s.peer, s.peerLabel, s.isVideo, incoming = true)
         io.launch {
+            // Synchronous native init (PeerConnectionFactory.initialize +
+            // EglBase.create()) — off the caller's (Compose click) thread,
+            // same as startOutgoingCall. The optimistic Connecting state
+            // above is already set, so the UI doesn't wait on this either.
+            ensureFactory(appCtx)
             synchronized(this@CallManager) {
                 if (session !== s || s.ended) return@launch
                 // The callee starts STUN-only too; the fallback (below) widens to
@@ -681,6 +751,11 @@ object CallManager {
 
     /** Build the [PeerConnection] and local tracks. Returns false (and tears down) on failure. */
     private fun setupPeer(s: Session, iceServers: List<PeerConnection.IceServer>): Boolean {
+        // Release the wake-word recogniser's hold on the mic first — a call
+        // and the always-listening "Hey Comrade" recogniser both wanting
+        // AudioSource.MIC is exactly the contention that must not happen.
+        // Resumed once the call ends, in endWith.
+        WakeWordService.pause()
         val fac = factory ?: return false
         val config = rtcConfig(iceServers)
         val pc = fac.createPeerConnection(config, peerObserver(s)) ?: run {
@@ -747,13 +822,20 @@ object CallManager {
 
     // ── Remote signal application ─────────────────────────────────────────────
 
-    /** A fresh offer: ring (or renegotiate an existing call, or reject as busy). */
+    /**
+     * A fresh offer: renegotiate an existing call, no-op a duplicate, resolve
+     * glare (mutual simultaneous calls), ring, or reject as busy — see
+     * [decideOfferForExistingSession] for the pure decision this dispatches on.
+     */
     private fun handleRemoteOffer(dto: CallSignalDto, sdp: String): Boolean {
         val existing = session
-        if (existing != null) {
-            // A re-offer for the current call (e.g. the caller's TURN ICE-restart)
-            // is a renegotiation, not a new call — answer it on the existing pc.
-            if (existing.callId == dto.callId && existing.pc != null) {
+        if (existing == null) return ringFreshIncoming(dto, sdp)
+
+        when (decideOfferForExistingSession(dto.callId, existing.callId, existing.pc != null)) {
+            OfferDecision.RENEGOTIATE -> {
+                // A re-offer for the current call (e.g. the caller's TURN
+                // ICE-restart) is a renegotiation, not a new call — answer it
+                // on the existing pc.
                 setRemoteThen(existing, SessionDescription(SessionDescription.Type.OFFER, sdp)) {
                     existing.pc?.createAnswer(
                         createSdpObserver(existing) { answer ->
@@ -766,22 +848,56 @@ object CallManager {
                 }
                 return false
             }
-            // Otherwise we're already busy on another call — auto-reject.
-            val busyMedia = mediaKindOf(dto.media)
-            io.launch {
-                runCatching {
-                    ComradeCore.sendCallSignalTyped(dto.peer, dto.callId, busyMedia, CallSignal.Busy)
-                    ComradeCore.logCallTyped(
-                        dto.peer, dto.callId, busyMedia,
-                        incoming = true, outcome = "busy", startedAt = 0, durationSecs = 0,
-                    )
-                }.onFailure { Log.w(TAG, "busy-reject failed", it) }
+            OfferDecision.DUPLICATE_NOOP -> {
+                // The same offer redelivered while we're still ringing on it
+                // (pre-accept, no pc yet) — at-least-once relay delivery or a
+                // backfill re-scan. Drop it silently: re-ringing would only
+                // restart the ring timeout for no reason.
+                return false
             }
-            return false
+            OfferDecision.BUSY -> {
+                if (isGlareCandidate(existing, dto.peer)) {
+                    val ourNpub = runCatching { ComradeCore.currentIdentityTyped() }.getOrNull()
+                    if (ourNpub != null && decideGlare(ourNpub, dto.peer) == GlareDecision.WE_LOSE_TAKE_INCOMING) {
+                        // Mutual simultaneous calls to each other. Deterministic
+                        // tiebreak: yield our own outgoing attempt (silently —
+                        // no Busy, they already know about this call, they
+                        // placed it) and ring their incoming offer instead.
+                        Log.i(TAG, "glare with ${dto.peer}: yielding our outgoing call (lower npub wins)")
+                        existing.placingJob?.cancel()
+                        teardownMedia(existing)
+                        session = null
+                        return ringFreshIncoming(dto, sdp)
+                    }
+                    // We win the tiebreak (or couldn't resolve our own
+                    // identity) — keep our outgoing call, ignore theirs.
+                    return false
+                }
+                // Otherwise we're already busy on an unrelated call — auto-reject.
+                val busyMedia = mediaKindOf(dto.media)
+                io.launch {
+                    runCatching {
+                        ComradeCore.sendCallSignalTyped(dto.peer, dto.callId, busyMedia, CallSignal.Busy)
+                        ComradeCore.logCallTyped(
+                            dto.peer, dto.callId, busyMedia,
+                            incoming = true, outcome = "busy",
+                            startedAt = nowEpochSecs(), durationSecs = 0,
+                        )
+                    }.onFailure { Log.w(TAG, "busy-reject failed", it) }
+                }
+                return false
+            }
         }
+    }
 
+    /** Glare candidate: an outgoing, not-yet-connected call of ours to the exact peer who just offered us one. */
+    private fun isGlareCandidate(existing: Session, remotePeer: String): Boolean =
+        !existing.incoming && existing.connectedAtMs == 0L && existing.peer == remotePeer
+
+    /** Start ringing a brand-new incoming offer — the fresh-call path, also reused by the glare loser. */
+    private fun ringFreshIncoming(dto: CallSignalDto, sdp: String): Boolean {
         val media = mediaKindOf(dto.media)
-        val s = Session(dto.callId, dto.peer, mullu.comrade.ui.shortNpub(dto.peer), media, incoming = true)
+        val s = Session(dto.callId, dto.peer, resolvePeerLabel(dto.peer), media, incoming = true)
         s.offerSdp = sdp
         session = s
         _state.value = CallUiState.Ringing(s.peer, s.peerLabel, s.isVideo, incoming = true)
@@ -792,7 +908,31 @@ object CallManager {
         return true
     }
 
+    /**
+     * Display name for an incoming call's peer: the same alias/published-name
+     * precedence [mullu.comrade.ui.peerTitle] applies across the rest of the
+     * app (chat list, call history), so the ringing screen and the call
+     * notification ([mullu.comrade.ChatEventRouter] reads it back off
+     * [CallUiState.Ringing.peerLabel]) show the same name. Falls back to the
+     * shortened key on any lookup failure (e.g. store locked) — never blocks
+     * or throws on the signal-handling path.
+     */
+    private fun resolvePeerLabel(peer: String): String {
+        val convo = runCatching { ComradeCore.conversations() }.getOrDefault(emptyList())
+            .find { it.peer == peer }
+        return mullu.comrade.ui.peerTitle(peer, convo?.alias, convo?.peerName)
+    }
+
     private fun applyRemoteAnswer(s: Session, sdp: String) {
+        val signalingState = s.pc?.signalingState()
+        if (decideAnswer(signalingState) != AnswerDecision.APPLY) {
+            // A duplicate/out-of-order Answer (relay redelivery, or one that
+            // arrived after we'd already moved on) — WebRTC rejects
+            // setRemoteDescription outside HAVE_LOCAL_OFFER, tearing down the
+            // live call; dropping it here is what keeps that call alive.
+            Log.i(TAG, "ignoring answer: signalingState=$signalingState (not HAVE_LOCAL_OFFER), callId=${s.callId}")
+            return
+        }
         setRemoteThen(s, SessionDescription(SessionDescription.Type.ANSWER, sdp)) {
             if (_state.value is CallUiState.Ringing) {
                 _state.value = CallUiState.Connecting(s.peer, s.peerLabel, s.isVideo, incoming = false)
@@ -837,6 +977,10 @@ object CallManager {
      * show up on the callee first (WebRTC's failure timing between the two
      * sides is not synchronized). The connect timeout already armed in
      * [accept] is the callee's backstop if no rescuing re-offer arrives.
+     *
+     * Only ever reached pre-connect now (`peerObserver`'s `onConnectionChange`
+     * routes a *post*-connect FAILED to [armRecoveryTimeout] instead, which
+     * does apply to the callee — see that function).
      */
     private fun tryTurnFallbackOrFail(s: Session) {
         if (s.ended) return
@@ -879,9 +1023,38 @@ object CallManager {
     private fun onConnected(s: Session) {
         if (s.connectedAtMs == 0L) s.connectedAtMs = System.currentTimeMillis()
         s.timeoutJob?.cancel() // connected — no timeout applies any more
+        cancelRecoveryTimeout(s) // back to CONNECTED cancels any pending recovery countdown
         _state.value = CallUiState.Active(s.peer, s.peerLabel, s.isVideo, s.incoming, s.connectedAtMs)
         startStatsPolling(s)
         maybeDeriveSas(s)
+    }
+
+    /**
+     * A previously-CONNECTED call's media path just failed, or has been
+     * DISCONNECTED for longer than [DISCONNECT_GRACE_MS] — arm a bounded
+     * recovery window: if ICE hasn't reported CONNECTED again within [ms],
+     * end the call honestly rather than leaving it "Active" with dead media
+     * forever. A no-op if already counting down.
+     */
+    private fun armRecoveryTimeout(s: Session, ms: Long) {
+        if (s.recovering) return
+        s.recovering = true
+        s.recoveryJob?.cancel()
+        s.recoveryJob = io.launch {
+            delay(ms)
+            synchronized(this@CallManager) {
+                if (session === s && !s.ended && s.recovering) {
+                    Log.w(TAG, "connection did not recover within ${ms}ms; ending, callId=${s.callId}")
+                    endWith(HangupReason.FAILED, "connection lost", sendHangup = true)
+                }
+            }
+        }
+    }
+
+    private fun cancelRecoveryTimeout(s: Session) {
+        s.recovering = false
+        s.recoveryJob?.cancel()
+        s.recoveryJob = null
     }
 
     /**
@@ -994,11 +1167,17 @@ object CallManager {
         if (s.ended) return
         s.ended = true
         s.timeoutJob?.cancel()
+        s.recovering = false
+        s.recoveryJob?.cancel()
         // Belt-and-suspenders alongside the `session !== s || s.ended` guards
         // in startOutgoingCall's continuation and setLocalThen/setRemoteThen:
         // whatever path reached endWith, a still-pending placeCall/offer
         // coroutine must never proceed afterward (AUDIT.md COMMS-05).
         s.placingJob?.cancel()
+        // Remember this callId so a redelivered terminal Offer (relay
+        // at-least-once delivery, or the 2-day backfill re-scan) doesn't ring
+        // again — see onIncomingSignal/endedCallIds.
+        rememberEnded(s.callId)
 
         if (sendHangup) {
             io.launch {
@@ -1024,6 +1203,9 @@ object CallManager {
         }
 
         teardownMedia(s)
+        // Give the mic back to the wake-word recogniser now that the call's
+        // own hold on it (see setupPeer) is gone.
+        WakeWordService.resume()
         session = null
         _state.value = CallUiState.Ended(s.peer, s.peerLabel, s.isVideo, s.incoming, outcome)
         io.launch {
@@ -1115,6 +1297,7 @@ object CallManager {
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build(),
             )
+            .setOnAudioFocusChangeListener { change -> onAudioFocusChange(change) }
             .build()
         audioFocus = focus
         am.requestAudioFocus(focus)
@@ -1136,6 +1319,26 @@ object CallManager {
             else -> AudioRoute.EARPIECE
         }
         setAudioRoute(initial)
+    }
+
+    /**
+     * React to a system audio-focus change mid-call — e.g. another app
+     * briefly grabs focus for a notification sound, or a higher-priority
+     * call app takes over. Mutes our outgoing audio while we don't hold
+     * focus, restores it on regain. Deliberately doesn't touch [_muted] (the
+     * user's own mute toggle): this is a transient, focus-driven mute, so
+     * regaining focus must restore whatever the user's own mute state
+     * actually was, not force-unmute them.
+     */
+    @Synchronized
+    private fun onAudioFocusChange(focusChange: Int) {
+        val s = session ?: return
+        when (focusChange) {
+            AudioManager.AUDIOFOCUS_LOSS, AudioManager.AUDIOFOCUS_LOSS_TRANSIENT ->
+                s.audioTrack?.setEnabled(false)
+            AudioManager.AUDIOFOCUS_GAIN ->
+                s.audioTrack?.setEnabled(!_muted.value)
+        }
     }
 
     /** Re-scan connected devices; switch route if a headset just appeared/vanished. */
@@ -1310,6 +1513,93 @@ object CallManager {
      */
     internal fun outgoingSdpMLineIndex(index: Int): UShort? = if (index >= 0) index.toUShort() else null
 
+    // ── Pure signal/state decisions (unit-testable without WebRTC) ───────────
+    //
+    // Each of these mirrors `remoteIceCandidate`/`outgoingSdpMLineIndex` above:
+    // `internal`, side-effect-free, and taking only plain values or WebRTC
+    // *enum* types (safe to reference in a JVM unit test — see
+    // `CallManagerTest`'s existing use of `IceCandidate`/`CallSignal`; unlike
+    // `PeerConnectionFactory` these carry no native object, just a value) so
+    // the actual call-handling functions above can stay thin dispatchers.
+
+    /** Whether an incoming `Offer` for `callId` must be dropped because that call already ended — see [endedCallIds]. */
+    internal fun isOfferForEndedCall(callId: String, endedCallIds: Collection<String>): Boolean =
+        callId in endedCallIds
+
+    /**
+     * Wall-clock now, in unix seconds — used for the busy-reject call-history
+     * entry, which used to hard-code `startedAt = 0` (rendering as the 1970
+     * epoch in [mullu.comrade.ui.CallHistoryScreen]). `internal` so a test can
+     * pin "never zero" without waiting on a real busy-reject round-trip.
+     */
+    internal fun nowEpochSecs(): Long = System.currentTimeMillis() / 1000
+
+    internal enum class AnswerDecision { APPLY, IGNORE }
+
+    /**
+     * An `Answer` is only meaningful while we're the caller still waiting on
+     * our own outstanding offer (`HAVE_LOCAL_OFFER`). Applying one outside
+     * that state — a redelivered duplicate, or one that arrives late — makes
+     * WebRTC's `setRemoteDescription` fail and tears down the live call.
+     */
+    internal fun decideAnswer(signalingState: PeerConnection.SignalingState?): AnswerDecision =
+        if (signalingState == PeerConnection.SignalingState.HAVE_LOCAL_OFFER) {
+            AnswerDecision.APPLY
+        } else {
+            AnswerDecision.IGNORE
+        }
+
+    internal enum class OfferDecision { RENEGOTIATE, DUPLICATE_NOOP, BUSY }
+
+    /**
+     * How to handle an incoming `Offer` while a [Session] already exists.
+     * `BUSY` covers both "genuinely busy on another call" and "glare with
+     * this same peer" — [handleRemoteOffer] tells those apart with
+     * [isGlareCandidate]/[decideGlare] before actually sending a `Busy` signal.
+     */
+    internal fun decideOfferForExistingSession(
+        incomingCallId: String,
+        existingCallId: String,
+        existingHasPc: Boolean,
+    ): OfferDecision = when {
+        incomingCallId == existingCallId && existingHasPc -> OfferDecision.RENEGOTIATE
+        incomingCallId == existingCallId -> OfferDecision.DUPLICATE_NOOP
+        else -> OfferDecision.BUSY
+    }
+
+    internal enum class GlareDecision { WE_WIN_KEEP_OUTGOING, WE_LOSE_TAKE_INCOMING }
+
+    /**
+     * Deterministic tiebreak for "glare" — both peers dialled each other at
+     * about the same moment. Whoever has the lexicographically smaller npub
+     * wins as caller; the loser silently cancels its own outgoing ring (no
+     * `Busy` — the winner already knows about this call, they placed it) and
+     * answers the incoming offer instead. Both sides reach the same outcome
+     * independently: this is symmetric under swapping the two npubs.
+     */
+    internal fun decideGlare(ourNpub: String, remoteNpub: String): GlareDecision =
+        if (ourNpub < remoteNpub) GlareDecision.WE_WIN_KEEP_OUTGOING else GlareDecision.WE_LOSE_TAKE_INCOMING
+
+    internal enum class ConnectionStateAction { NONE, RECOVER_NOW, RECOVER_AFTER_GRACE, TRY_TURN_FALLBACK }
+
+    /**
+     * What a [PeerConnection.PeerConnectionState] change should do, given
+     * whether this call had already reached `CONNECTED` at least once.
+     * `CONNECTED` itself isn't decided here — [peerObserver] handles it
+     * directly via [onConnected], since that path does real state-machine
+     * work, not just a decision.
+     */
+    internal fun decideConnectionStateAction(
+        newState: PeerConnection.PeerConnectionState,
+        hasConnectedBefore: Boolean,
+    ): ConnectionStateAction = when (newState) {
+        PeerConnection.PeerConnectionState.FAILED ->
+            if (hasConnectedBefore) ConnectionStateAction.RECOVER_NOW else ConnectionStateAction.TRY_TURN_FALLBACK
+        PeerConnection.PeerConnectionState.DISCONNECTED ->
+            if (hasConnectedBefore) ConnectionStateAction.RECOVER_AFTER_GRACE else ConnectionStateAction.NONE
+        else -> ConnectionStateAction.NONE
+    }
+
     /** An [SdpObserver] whose only interesting callback is create-success. */
     private fun createSdpObserver(s: Session, onCreated: (SessionDescription) -> Unit) = object : SdpObserver {
         override fun onCreateSuccess(desc: SessionDescription) = onCreated(desc)
@@ -1340,6 +1630,9 @@ object CallManager {
                 override fun onCreateFailure(p0: String?) {}
                 override fun onSetFailure(error: String?) {
                     Log.e(TAG, "setLocalDescription failed: $error")
+                    synchronized(this@CallManager) {
+                        if (session === s) endWith(HangupReason.FAILED, "failed", sendHangup = true)
+                    }
                 }
             },
             desc,
@@ -1426,12 +1719,28 @@ object CallManager {
 
         override fun onConnectionChange(newState: PeerConnection.PeerConnectionState) {
             Log.i(TAG, "peerConnectionState → $newState, callId=${s.callId}")
-            when (newState) {
-                PeerConnection.PeerConnectionState.CONNECTED ->
-                    synchronized(this@CallManager) { if (session === s) onConnected(s) }
-                PeerConnection.PeerConnectionState.FAILED ->
+            if (newState == PeerConnection.PeerConnectionState.CONNECTED) {
+                synchronized(this@CallManager) { if (session === s) onConnected(s) }
+                return
+            }
+            when (decideConnectionStateAction(newState, hasConnectedBefore = s.connectedAtMs > 0)) {
+                // A call that was already Active lost its media path — arm a
+                // bounded recovery window rather than the pre-connect TURN
+                // retry (which only the caller drives) or leaving it hanging
+                // forever (the callee's prior behavior).
+                ConnectionStateAction.RECOVER_NOW ->
+                    synchronized(this@CallManager) { if (session === s) armRecoveryTimeout(s, RECOVERY_TIMEOUT_MS) }
+                // DISCONNECTED can be transient (a brief blip, or an ICE
+                // restart in progress) — tolerate it for a grace period
+                // before starting the same recovery countdown.
+                ConnectionStateAction.RECOVER_AFTER_GRACE ->
+                    synchronized(this@CallManager) {
+                        if (session === s) armRecoveryTimeout(s, DISCONNECT_GRACE_MS + RECOVERY_TIMEOUT_MS)
+                    }
+                // Pre-connect FAILED: the caller's existing STUN→TURN fallback.
+                ConnectionStateAction.TRY_TURN_FALLBACK ->
                     synchronized(this@CallManager) { if (session === s) tryTurnFallbackOrFail(s) }
-                else -> Unit // DISCONNECTED can be transient (ICE restart) — don't tear down.
+                ConnectionStateAction.NONE -> Unit
             }
         }
 

@@ -156,6 +156,7 @@ class CallManagerLifecycleTest {
             peer = freshStrangerNpub(),
             media = "audio",
             signal = uniffi.comrade_core.CallSignal.Offer(sdp = "v=0\r\n"),
+            createdAt = (System.currentTimeMillis() / 1000).toULong(),
         )
 
         CallManager.startOutgoingCall(

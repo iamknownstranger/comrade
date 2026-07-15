@@ -27,7 +27,17 @@ import mullu.comrade.ui.shortNpub
 object Notifier {
     const val CHANNEL_MESSAGES = "comrade_messages"
     const val CHANNEL_REQUESTS = "comrade_requests"
-    const val CHANNEL_CALLS = "comrade_calls"
+
+    /**
+     * `_v2`: channel settings (including sound) are sticky once created — the
+     * OS never lets an app change them after the fact, so an existing install
+     * would keep its original ringtone forever. Bumping the id is what makes
+     * a silent channel actually take effect for upgrading users, not just
+     * fresh installs. See [Ringer], which owns call audio exclusively; this
+     * channel deliberately posts silent (see [ensureChannels]) so the two
+     * never sound at once.
+     */
+    const val CHANNEL_CALLS = "comrade_calls_v2"
     const val CHANNEL_CONNECTION = "comrade_connection"
 
     private const val GROUP_MESSAGES = "comrade_messages_group"
@@ -55,7 +65,13 @@ object Notifier {
                 CHANNEL_CALLS,
                 "Calls",
                 NotificationManager.IMPORTANCE_HIGH,
-            ).apply { description = "Incoming voice and video calls" },
+            ).apply {
+                description = "Incoming voice and video calls"
+                // Ringer (CallScreen/MainActivity) owns call audio exclusively
+                // — a second ringtone from the notification itself would
+                // double up on top of it.
+                setSound(null, null)
+            },
         )
         mgr.createNotificationChannel(
             NotificationChannel(

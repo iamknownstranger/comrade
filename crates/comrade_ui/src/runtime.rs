@@ -100,6 +100,18 @@ const PUBLISH_ATTEMPTS: u32 = 5;
 const SETTINGS_TREE: &str = "app_settings";
 /// Settings key holding the optional [`TurnConfig`] for WebRTC calls.
 const TURN_CONFIG_KEY: &str = "turn_server";
+/// Settings key holding the high-watermark (unix seconds) of the newest
+/// inbox message this device has processed — see [`advance_watermark`] and
+/// [`ComradeRuntime::spawn_event_loops`]'s `since_floor` computation.
+const VAULT_WATERMARK_KEY: &str = "vault_last_seen_at";
+
+/// A call signal older than this is meaningless — the ring timeout has long
+/// since passed on the sender's side (an `Offer`), and every other signal
+/// kind (`Answer`/`Ice`/`Hangup`/…) is equally transient. Relays redeliver
+/// at-least-once and the Vault inbox subscription backfills up to 2 days on
+/// every launch, so without this a days-old `Offer` re-rings on every app
+/// start.
+const CALL_SIGNAL_MAX_AGE_SECS: u64 = 90;
 /// Encrypted-store tree holding the Sakha/Sakhi pairing record (there is only
 /// ever one partner per device, but a tree keeps the storage shape uniform
 /// with the rest of the repository layer).
@@ -233,6 +245,12 @@ pub struct CallSignalDto {
     pub peer: String,
     pub media: String,
     pub signal: CallSignal,
+    /// The signal's true send time (unix seconds) — the DM's own `created_at`
+    /// (already de-randomized from the gift-wrap's timestamp skew; see
+    /// `comrade_core::vault::VaultMessage`), not when it was received. Lets a
+    /// frontend apply its own freshness judgement in addition to the runtime's
+    /// own staleness drop (see `CALL_SIGNAL_MAX_AGE_SECS` in `dispatch_incoming_dm`).
+    pub created_at: u64,
 }
 
 /// A voice/video call-log entry as the frontend sees it.
@@ -577,6 +595,11 @@ pub struct ComradeRuntime {
     /// production ([`Self::new`]), or an explicit override ([`Self::with_relays`])
     /// for an isolated test environment (AUDIT.md COMMS-03).
     relays: Vec<String>,
+    /// Bounded LRU of call-envelope wrapper event ids already dispatched onto
+    /// the event bus this session — see [`dispatch_incoming_dm`]'s call-signal
+    /// branch. Behind an `Arc` so the vault callback (which outlives `&self`
+    /// borrows) can hold its own clone.
+    call_signal_dedup: Arc<CallSignalDedup>,
 }
 
 impl Default for ComradeRuntime {
@@ -613,6 +636,7 @@ impl ComradeRuntime {
             vault_task: None,
             sakha_sync_task: None,
             relays,
+            call_signal_dedup: Arc::new(CallSignalDedup::new()),
         }
     }
 
@@ -837,12 +861,17 @@ impl ComradeRuntime {
             // A clone of the vault handle the callback can use to send back
             // delivered receipts (the callback itself is sync; it spawns).
             let vault_cb = vault.clone();
+            let dedup = self.call_signal_dedup.clone();
+            // Widen the backfill window past the standard gift-wrap skew when
+            // this device was last seen longer ago than that (see
+            // `VaultEngine::subscribe_inbox_with_callback`'s `since_floor`).
+            let since_floor = store.as_ref().and_then(|s| read_watermark(s));
             self.vault_task = Some(tokio::spawn(async move {
                 vault.connect().await;
                 let cb: VaultCallback = Box::new(move |msg| {
-                    dispatch_incoming_dm(&vault_cb, store.as_ref(), &tx, msg);
+                    dispatch_incoming_dm(&vault_cb, store.as_ref(), &tx, &dedup, msg);
                 });
-                if let Err(e) = vault.subscribe_inbox_with_callback(cb).await {
+                if let Err(e) = vault.subscribe_inbox_with_callback(cb, since_floor).await {
                     warn!("vault inbox loop ended: {e}");
                 }
             }));
@@ -898,102 +927,43 @@ impl ComradeRuntime {
     /// Broadcast a Chitthi to the public relay set, optionally as a NIP-10 reply.
     /// On success the Chitthi is also cached locally for offline rendering.
     /// Returns the new event id (hex).
+    ///
+    /// Delegates to [`RuntimeHandles::broadcast_chitthi`] — see [`Self::send_dm`].
     pub async fn broadcast_chitthi(
         &self,
         content: &str,
         reply_to: Option<String>,
     ) -> Result<String, UiError> {
-        let sabha = self.sabha.clone().ok_or(UiError::VaultLocked)?;
-
-        let parent = match reply_to.as_deref() {
-            Some(hex) => Some(
-                EventId::from_hex(hex)
-                    .map_err(|e| UiError::Engine(format!("invalid reply_to id: {e}")))?,
-            ),
-            None => None,
-        };
-
-        let id = sabha
-            .broadcast_chitthi_reply(content, parent)
-            .await
-            .map_err(|e| UiError::Engine(e.to_string()))?;
-
-        // Best-effort: persist our own Chitthi to the encrypted cache so it
-        // shows up in the offline timeline immediately.
-        if let Some(store) = self.ui.store_ref() {
-            let row = comrade_storage::Chitthi {
-                id: id.to_hex(),
-                author_npub: self
-                    .ui
-                    .current_identity()
-                    .map(|i| i.npub)
-                    .unwrap_or_default(),
-                content: content.to_string(),
-                created_at: now_secs(),
-                reply_to,
-            };
-            if let Err(e) = store.cache_chitthi(&row).and_then(|()| store.flush()) {
-                warn!("failed to cache outgoing chitthi: {e}");
-            }
-        }
-
-        Ok(id.to_hex())
+        self.handles().broadcast_chitthi(content, reply_to).await
     }
 
     // ── Direct messages (Telegram-like chat flow) ────────────────────────────
 
     /// Send an end-to-end encrypted DM to `target` (npub or hex pubkey) and
     /// persist it to the offline history. Returns the stored message DTO.
+    ///
+    /// Delegates to [`RuntimeHandles::send_dm`] after a cheap, synchronous
+    /// handle snapshot (AUDIT P2: never hold the runtime lock across the
+    /// relay round-trip inside — see [`Self::handles`]).
     pub async fn send_dm(&self, target: &str, content: &str) -> Result<MessageDto, UiError> {
-        self.send_dm_reply(target, content, None).await
+        self.handles().send_dm(target, content).await
     }
 
     /// Send an E2E DM, optionally as a reply to a prior message (`reply_to` is
     /// the replied message's event id, hex). Sending to someone accepts the
     /// conversation on our side and shares our @handle once (so they can title
     /// the chat) — the sender-side half of "username shared once engaged".
+    ///
+    /// Delegates to [`RuntimeHandles::send_dm_reply`] — see [`Self::send_dm`].
     pub async fn send_dm_reply(
         &self,
         target: &str,
         content: &str,
         reply_to: Option<&str>,
     ) -> Result<MessageDto, UiError> {
-        if content.trim().is_empty() {
-            return Err(UiError::Engine("message is empty".into()));
-        }
-        let vault = self.vault.clone().ok_or(UiError::VaultLocked)?;
-        let peer = parse_pubkey(target)?;
-        let id = vault
-            .send_dm_reply(&peer, content, reply_to)
+        self.handles()
+            .send_dm_reply(target, content, reply_to)
             .await
-            .map_err(|e| UiError::Engine(e.to_string()))?;
-
-        let peer_npub = to_npub(target);
-        let dto = MessageDto {
-            id: id.to_hex(),
-            peer: peer_npub.clone(),
-            content: content.to_string(),
-            created_at: now_secs(),
-            outgoing: true,
-            status: Some("sent".into()),
-            reply_to: reply_to.map(str::to_string),
-        };
-        if let Some(store) = self.ui.store_ref() {
-            let row = comrade_storage::StoredMessage {
-                id: dto.id.clone(),
-                peer_npub: dto.peer.clone(),
-                content: dto.content.clone(),
-                created_at: dto.created_at,
-                outgoing: true,
-                status: Some("sent".into()),
-                reply_to: dto.reply_to.clone(),
-            };
-            if let Err(e) = store.save_message(&row).and_then(|()| store.flush()) {
-                warn!("failed to persist outgoing DM: {e}");
-            }
-        }
-        self.mark_accepted_and_share_profile(&peer_npub, &peer);
-        Ok(dto)
     }
 
     /// The chat list: one entry per **accepted** peer, newest thread first, with
@@ -1211,55 +1181,17 @@ impl ComradeRuntime {
     }
 
     /// Record the conversation as accepted and, once, share our @handle with the
-    /// peer over the encrypted channel. The share runs in the background so the
-    /// user's action is never blocked on the network; the `profile_shared` flag
-    /// flips only on a successful send, so a failed share retries next time.
+    /// peer over the encrypted channel. See free function
+    /// [`share_profile_on_accept`] for the implementation (shared with
+    /// [`RuntimeHandles::send_dm_reply`]).
     fn mark_accepted_and_share_profile(&self, peer_npub: &str, peer: &PublicKey) {
-        let Some(store) = self.ui.store_arc() else {
-            return;
-        };
-        let already_shared = store
-            .get_conversation_meta(peer_npub)
-            .ok()
-            .flatten()
-            .map(|m| m.profile_shared)
-            .unwrap_or(false);
-        let meta = comrade_storage::ConversationMeta {
-            peer_npub: peer_npub.to_string(),
-            state: STATE_ACCEPTED.to_string(),
-            profile_shared: already_shared,
-            updated_at: now_secs(),
-        };
-        if let Err(e) = store
-            .set_conversation_meta(&meta)
-            .and_then(|()| store.flush())
-        {
-            warn!("failed to record accepted conversation: {e}");
-        }
-        if already_shared {
-            return;
-        }
-        let (Some(vault), username) = (self.vault.clone(), self.ui.username()) else {
-            return;
-        };
-        let peer = *peer;
-        let peer_npub = peer_npub.to_string();
-        tokio::spawn(async move {
-            let Ok(json) = ProfileShare::new(username).to_json() else {
-                return;
-            };
-            if vault.send_dm(&peer, &json).await.is_ok() {
-                let meta = comrade_storage::ConversationMeta {
-                    peer_npub,
-                    state: STATE_ACCEPTED.to_string(),
-                    profile_shared: true,
-                    updated_at: now_secs(),
-                };
-                let _ = store
-                    .set_conversation_meta(&meta)
-                    .and_then(|()| store.flush());
-            }
-        });
+        share_profile_on_accept(
+            self.ui.store_arc(),
+            self.vault.clone(),
+            self.ui.username(),
+            peer_npub,
+            peer,
+        );
     }
 
     /// Fire-and-forget a receipt DM (delivered/read) to `peer`.
@@ -1413,6 +1345,8 @@ impl ComradeRuntime {
     /// Send one call-signaling payload to `peer` over the encrypted DM channel.
     /// `signal_json` is a serialised [`comrade_core::call::CallSignal`], e.g.
     /// `{"kind":"offer","sdp":"…"}` or `{"kind":"ice","candidate":"…"}`.
+    ///
+    /// Delegates to [`RuntimeHandles::send_call_signal`] — see [`Self::send_dm`].
     pub async fn send_call_signal(
         &self,
         peer: &str,
@@ -1420,25 +1354,15 @@ impl ComradeRuntime {
         media: &str,
         signal_json: &str,
     ) -> Result<(), UiError> {
-        let vault = self.vault.clone().ok_or(UiError::VaultLocked)?;
-        let peer_pk = parse_pubkey(peer)?;
-        let signal: CallSignal = serde_json::from_str(signal_json)
-            .map_err(|e| UiError::Engine(format!("invalid call signal: {e}")))?;
-        let env = CallEnvelope::new(
-            call_id.to_string(),
-            CallMediaKind::from_str_lenient(media),
-            signal,
-        );
-        let json = env.to_json().map_err(|e| UiError::Engine(e.to_string()))?;
-        vault
-            .send_dm(&peer_pk, &json)
+        self.handles()
+            .send_call_signal(peer, call_id, media, signal_json)
             .await
-            .map_err(|e| UiError::Engine(e.to_string()))?;
-        Ok(())
     }
 
     /// Convenience: send a `Hangup` signal with `reason` (`normal`, `declined`,
     /// `busy`, `missed`, `cancelled`, `failed`) to end/reject a call.
+    ///
+    /// Delegates to [`RuntimeHandles::hangup_call`] — see [`Self::send_dm`].
     pub async fn hangup_call(
         &self,
         peer: &str,
@@ -1446,11 +1370,9 @@ impl ComradeRuntime {
         media: &str,
         reason: &str,
     ) -> Result<(), UiError> {
-        let signal = CallSignal::Hangup {
-            reason: HangupReason::from_str_lenient(reason),
-        };
-        let json = serde_json::to_string(&signal).map_err(|e| UiError::Engine(e.to_string()))?;
-        self.send_call_signal(peer, call_id, media, &json).await
+        self.handles()
+            .hangup_call(peer, call_id, media, reason)
+            .await
     }
 
     /// Persist a finished call to the call log. `outcome` is one of
@@ -1642,59 +1564,10 @@ impl ComradeRuntime {
     /// A query that *is* a key (npub/hex) resolves that identity's profile
     /// directly instead of a name search. Every result is cached into the
     /// local profile store so the chat UI can name the peer immediately.
+    ///
+    /// Delegates to [`RuntimeHandles::search_profiles`] — see [`Self::send_dm`].
     pub async fn search_profiles(&self, query: &str) -> Result<Vec<FoundProfileDto>, UiError> {
-        let sabha = self.sabha.clone().ok_or(UiError::VaultLocked)?;
-        let query = query.trim().trim_start_matches('@');
-        if query.is_empty() {
-            return Ok(vec![]);
-        }
-
-        // Exact-key lookup: fetch that author's Kind-0 (name may be absent —
-        // the key alone is still a valid, addressable result). Otherwise a
-        // NIP-50 name search. Both branches share the DTO mapping and cache.
-        let dtos: Vec<FoundProfileDto> = if let Ok(pk) = PublicKey::parse(query) {
-            let meta = sabha
-                .fetch_profile(&pk)
-                .await
-                .map_err(|e| UiError::Engine(e.to_string()))?;
-            vec![found_profile_dto(&pk, meta.as_ref())]
-        } else {
-            sabha
-                .search_profiles(query, 10)
-                .await
-                .map_err(|e| UiError::Engine(e.to_string()))?
-                .into_iter()
-                .map(|(pk, meta)| found_profile_dto(&pk, Some(&meta)))
-                .collect()
-        };
-        self.cache_found_profiles(&dtos);
-        Ok(dtos)
-    }
-
-    /// Persist discovered profiles into the local cache (best-effort) so the
-    /// chat list can title peers by their handle without another fetch.
-    fn cache_found_profiles(&self, found: &[FoundProfileDto]) {
-        let Some(store) = self.ui.store_ref() else {
-            return;
-        };
-        let now = now_secs();
-        let mut wrote = false;
-        for profile in found {
-            if profile.name.is_none() {
-                continue; // nothing displayable; don't shadow a future fetch
-            }
-            let record = PeerProfileRecord {
-                name: profile.name.clone(),
-                about: profile.about.clone(),
-                updated_at: now,
-            };
-            wrote |= store_profile_record(store, &profile.npub, &record);
-        }
-        if wrote {
-            if let Err(e) = store.flush() {
-                warn!("failed to flush profile cache: {e}");
-            }
-        }
+        self.handles().search_profiles(query).await
     }
 
     /// Detach a [`ProfileRefresher`] holding only the engine/store handles.
@@ -1781,6 +1654,8 @@ impl ComradeRuntime {
     /// The AES key is derived from the ECDH shared secret, so it is never
     /// uploaded and never placed in the public event — the recipient re-derives
     /// it from their own private key and our pubkey.
+    ///
+    /// Delegates to [`RuntimeHandles::upload_and_send_media`] — see [`Self::send_dm`].
     pub async fn upload_and_send_media(
         &self,
         target_pubkey: &str,
@@ -1788,121 +1663,21 @@ impl ComradeRuntime {
         mime_type: &str,
         caption: &str,
     ) -> Result<MediaMessageDto, UiError> {
-        if bytes.len() > MAX_MEDIA_BYTES {
-            return Err(UiError::Engine(format!(
-                "media is {} bytes; the limit is {MAX_MEDIA_BYTES}",
-                bytes.len()
-            )));
-        }
-        let keys = self.ui.identity_keys().ok_or(UiError::NoIdentity)?;
-        let peer = parse_pubkey(target_pubkey)?;
-        let key = derive_media_key(keys.secret_key(), &peer, MEDIA_LABEL)
-            .map_err(|e| UiError::Engine(e.to_string()))?;
-
-        let (media, _secret) =
-            encrypt_media(&bytes, mime_type, &key).map_err(|e| UiError::Engine(e.to_string()))?;
-        let size = media.size as u64;
-        let sha256_hex = media.sha256_hex.clone();
-
-        // Upload ciphertext only — the host sees opaque bytes.
-        let url = self.upload_blob(media.ciphertext, mime_type).await?;
-
-        // Zero-knowledge NIP-94 event: URL + ciphertext hash, no key, no `ox`.
-        let meta = FileMetadata {
-            url: url.clone(),
-            mime_type: mime_type.to_string(),
-            sha256_hex,
-            original_sha256_hex: None,
-            size: Some(media.size),
-            caption: caption.to_string(),
-        };
-        let event =
-            build_file_metadata_event(&keys, &meta).map_err(|e| UiError::Engine(e.to_string()))?;
-        let event_id = event.id.to_hex();
-        let created_at = now_secs();
-
-        // Persist a local ref so download_and_decrypt_media(event_id) resolves.
-        let reff = MediaRef {
-            event_id: event_id.clone(),
-            url: url.clone(),
-            peer_pubkey: peer.to_hex(),
-            mime_type: mime_type.to_string(),
-            caption: caption.to_string(),
-            size,
-            sha256_hex: media.sha256_hex.clone(),
-            outgoing: true,
-            created_at,
-        };
-        if let Some(store) = self.ui.store_ref() {
-            store
-                .put(MEDIA_REFS_TREE, &event_id, &reff)
-                .and_then(|()| store.flush())
-                .map_err(|e| UiError::Storage(e.to_string()))?;
-        }
-
-        // Privately deliver the reference to the recipient over NIP-04.
-        let envelope = MediaEnvelope {
-            comrade_media: 1,
-            event_id: event_id.clone(),
-            url: url.clone(),
-            mime: mime_type.to_string(),
-            caption: caption.to_string(),
-            size,
-            sha256_hex: media.sha256_hex.clone(),
-        };
-        let envelope_json =
-            serde_json::to_string(&envelope).map_err(|e| UiError::Engine(e.to_string()))?;
-        let vault = self.vault.clone().ok_or(UiError::VaultLocked)?;
-        vault
-            .send_dm(&peer, &envelope_json)
+        self.handles()
+            .upload_and_send_media(target_pubkey, bytes, mime_type, caption)
             .await
-            .map_err(|e| UiError::Engine(e.to_string()))?;
-
-        let sender = keys
-            .public_key()
-            .to_bech32()
-            .unwrap_or_else(|_| keys.public_key().to_hex());
-        Ok(MediaMessageDto {
-            event_id,
-            url,
-            mime_type: mime_type.to_string(),
-            caption: caption.to_string(),
-            sender,
-            created_at,
-            size,
-            outgoing: true,
-        })
     }
 
     /// Resolve a NIP-94 reference by event id, fetch the encrypted blob, and
     /// decrypt it with the re-derived ECDH key. Returns base64 bytes + MIME.
+    ///
+    /// Delegates to [`RuntimeHandles::download_and_decrypt_media`] — see
+    /// [`Self::send_dm`].
     pub async fn download_and_decrypt_media(
         &self,
         event_id: &str,
     ) -> Result<MediaBytesDto, UiError> {
-        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
-        let reff: MediaRef = store
-            .get(MEDIA_REFS_TREE, event_id)
-            .map_err(|e| UiError::Storage(e.to_string()))?
-            .ok_or_else(|| UiError::Engine(format!("unknown media event {event_id}")))?;
-
-        let keys = self.ui.identity_keys().ok_or(UiError::NoIdentity)?;
-        let peer = parse_pubkey(&reff.peer_pubkey)?;
-        let key = derive_media_key(keys.secret_key(), &peer, MEDIA_LABEL)
-            .map_err(|e| UiError::Engine(e.to_string()))?;
-
-        // Verify the ciphertext hash when we recorded one (fail fast on a
-        // wrong/tampered blob; older refs without it fall back to the AES-GCM
-        // tag alone, which still rejects tampering).
-        let expected = (!reff.sha256_hex.is_empty()).then_some(reff.sha256_hex.as_str());
-        let bytes = fetch_and_decrypt_media(&reff.url, &key, expected)
-            .await
-            .map_err(|e| UiError::Engine(e.to_string()))?;
-
-        Ok(MediaBytesDto {
-            mime_type: reff.mime_type,
-            base64: B64.encode(&bytes),
-        })
+        self.handles().download_and_decrypt_media(event_id).await
     }
 
     /// Full encrypted-media history with `peer` (npub or hex), oldest first —
@@ -1942,31 +1717,6 @@ impl ComradeRuntime {
             .collect();
         items.sort_by_key(|m| m.created_at);
         Ok(items)
-    }
-
-    /// Upload an encrypted blob to Blossom, signed with a BUD-01 auth event.
-    /// Gated on the `media-http` feature; degrades to a typed error otherwise.
-    ///
-    /// The BUD-01 auth event is signed with a **fresh ephemeral key**, never the
-    /// user's chat identity: the blob is already zero-knowledge, and signing
-    /// with the identity key would let the host link "npub X uploaded blob Y at
-    /// time T from IP Z" — a metadata leak at odds with the privacy model.
-    #[cfg(feature = "media-http")]
-    async fn upload_blob(&self, blob: Vec<u8>, mime: &str) -> Result<String, UiError> {
-        use comrade_core::media::{BlossomUploader, MediaUploader, DEFAULT_BLOSSOM_SERVER};
-        let uploader = BlossomUploader::new(DEFAULT_BLOSSOM_SERVER, nostr_sdk::Keys::generate());
-        let receipt = uploader
-            .upload(&blob, mime)
-            .await
-            .map_err(|e| UiError::Engine(e.to_string()))?;
-        Ok(receipt.url)
-    }
-
-    #[cfg(not(feature = "media-http"))]
-    async fn upload_blob(&self, _blob: Vec<u8>, _mime: &str) -> Result<String, UiError> {
-        Err(UiError::Engine(
-            "media upload requires the `media-http` feature".into(),
-        ))
     }
 
     // ── Milestone 3: progressive-disclosure workspace controller ─────────────
@@ -2206,31 +1956,17 @@ impl ComradeRuntime {
     /// Append an entry to the shared Sakha/Sakhi CRDT ledger, persist a fresh
     /// local snapshot, and return the merged ledger text. Requires a
     /// completed pairing — use [`Self::pair_sakha`] first.
+    ///
+    /// Delegates to [`RuntimeHandles::sakha_add_entry`] — see [`Self::send_dm`].
     pub async fn sakha_add_entry(
         &self,
         description: &str,
         amount_inr: f64,
         paid_by: &str,
     ) -> Result<String, UiError> {
-        if description.trim().is_empty() {
-            return Err(UiError::Engine("description is empty".into()));
-        }
-        let sakha = self.sakha.clone().ok_or(UiError::VaultLocked)?;
-        if !sakha.is_paired() {
-            return Err(UiError::Engine(
-                "not paired with a partner yet — open the Partner Portal first".into(),
-            ));
-        }
-        let entry = LedgerEntry::new(description, amount_inr, paid_by);
-        sakha
-            .add_entry(entry)
+        self.handles()
+            .sakha_add_entry(description, amount_inr, paid_by)
             .await
-            .map_err(|e| UiError::Engine(e.to_string()))?;
-        let ledger = sakha.read_ledger().await;
-        if let Some(store) = self.ui.store_arc() {
-            persist_ledger_snapshot(&store, &sakha).await;
-        }
-        Ok(ledger)
     }
 
     /// The current Sakha/Sakhi ledger text (local CRDT state — no network
@@ -2243,13 +1979,10 @@ impl ComradeRuntime {
     /// Publish the current Sakha/Sakhi shared CRDT ledger state to the partner.
     /// Returns the sync event id (hex). Without a completed pairing handshake the
     /// engine returns a typed error rather than panicking.
+    ///
+    /// Delegates to [`RuntimeHandles::sync_ledger`] — see [`Self::send_dm`].
     pub async fn sync_ledger(&self) -> Result<String, UiError> {
-        let sakha = self.sakha.clone().ok_or(UiError::VaultLocked)?;
-        let id = sakha
-            .publish_sync()
-            .await
-            .map_err(|e| UiError::Engine(e.to_string()))?;
-        Ok(id.to_hex())
+        self.handles().sync_ledger().await
     }
 
     // ── Sync view-model delegations (shared with the existing desktop UI) ────
@@ -2278,6 +2011,400 @@ impl ComradeRuntime {
     pub fn is_store_unlocked(&self) -> bool {
         self.ui.is_store_unlocked()
     }
+
+    /// A cheap, synchronous snapshot of the live engine handles + identity
+    /// bits a network operation needs — see [`RuntimeHandles`]. Bridges
+    /// (Tauri commands, `comrade_jni`) call this to run a network operation
+    /// without holding the shared `Arc<RwLock<ComradeRuntime>>` guard across
+    /// the round trip (AUDIT P2 — the same discipline [`Self::profile_refresher`]
+    /// already established for profile refreshes, generalised to every other
+    /// network-touching method).
+    pub fn handles(&self) -> RuntimeHandles {
+        RuntimeHandles {
+            sabha: self.sabha.clone(),
+            vault: self.vault.clone(),
+            sakha: self.sakha.clone(),
+            store: self.ui.store_arc(),
+            keys: self.ui.identity_keys(),
+            username: self.ui.username(),
+            identity: self.ui.current_identity(),
+        }
+    }
+}
+
+// ── Detached network operations (AUDIT P2) ──────────────────────────────────
+//
+// Every method below mirrors a `ComradeRuntime` method of the same name
+// (which delegates to it via `ComradeRuntime::handles`), but takes owned data
+// instead of `&self`. That is the whole point: `&self` methods on
+// `ComradeRuntime` are called through `Arc<RwLock<ComradeRuntime>>` in every
+// bridge, and Rust ties an `async fn(&self, …)`'s returned future to `&self`'s
+// lifetime for its *entire* body — even the part after the method stops
+// touching `self` — so a bridge calling `state.read().await.send_dm(…).await`
+// holds the guard across the relay round trip no matter how the method body
+// is written. `RuntimeHandles` breaks that tie: a bridge takes a snapshot
+// under a briefly-held guard (`state.read().await.handles()`, cheap Arc/Option
+// clones, no `.await` of its own) and the guard is dropped at the end of that
+// statement — then the actual network operation runs guard-free.
+#[derive(Clone)]
+pub struct RuntimeHandles {
+    sabha: Option<Arc<SabhaEngine>>,
+    vault: Option<Arc<VaultEngine>>,
+    sakha: Option<Arc<SakhaEngine>>,
+    store: Option<Arc<comrade_storage::EncryptedStore>>,
+    keys: Option<nostr_sdk::Keys>,
+    username: Option<String>,
+    identity: Option<IdentityDto>,
+}
+
+impl RuntimeHandles {
+    pub async fn send_dm(&self, target: &str, content: &str) -> Result<MessageDto, UiError> {
+        self.send_dm_reply(target, content, None).await
+    }
+
+    pub async fn send_dm_reply(
+        &self,
+        target: &str,
+        content: &str,
+        reply_to: Option<&str>,
+    ) -> Result<MessageDto, UiError> {
+        if content.trim().is_empty() {
+            return Err(UiError::Engine("message is empty".into()));
+        }
+        let vault = self.vault.clone().ok_or(UiError::VaultLocked)?;
+        let peer = parse_pubkey(target)?;
+        let id = vault
+            .send_dm_reply(&peer, content, reply_to)
+            .await
+            .map_err(|e| UiError::Engine(e.to_string()))?;
+
+        let peer_npub = to_npub(target);
+        let dto = MessageDto {
+            id: id.to_hex(),
+            peer: peer_npub.clone(),
+            content: content.to_string(),
+            created_at: now_secs(),
+            outgoing: true,
+            status: Some("sent".into()),
+            reply_to: reply_to.map(str::to_string),
+        };
+        if let Some(store) = &self.store {
+            let row = comrade_storage::StoredMessage {
+                id: dto.id.clone(),
+                peer_npub: dto.peer.clone(),
+                content: dto.content.clone(),
+                created_at: dto.created_at,
+                outgoing: true,
+                status: Some("sent".into()),
+                reply_to: dto.reply_to.clone(),
+            };
+            if let Err(e) = store.save_message(&row).and_then(|()| store.flush()) {
+                warn!("failed to persist outgoing DM: {e}");
+            }
+        }
+        share_profile_on_accept(
+            self.store.clone(),
+            self.vault.clone(),
+            self.username.clone(),
+            &peer_npub,
+            &peer,
+        );
+        Ok(dto)
+    }
+
+    pub async fn broadcast_chitthi(
+        &self,
+        content: &str,
+        reply_to: Option<String>,
+    ) -> Result<String, UiError> {
+        let sabha = self.sabha.clone().ok_or(UiError::VaultLocked)?;
+
+        let parent = match reply_to.as_deref() {
+            Some(hex) => Some(
+                EventId::from_hex(hex)
+                    .map_err(|e| UiError::Engine(format!("invalid reply_to id: {e}")))?,
+            ),
+            None => None,
+        };
+
+        let id = sabha
+            .broadcast_chitthi_reply(content, parent)
+            .await
+            .map_err(|e| UiError::Engine(e.to_string()))?;
+
+        // Best-effort: persist our own Chitthi to the encrypted cache so it
+        // shows up in the offline timeline immediately.
+        if let Some(store) = &self.store {
+            let row = comrade_storage::Chitthi {
+                id: id.to_hex(),
+                author_npub: self
+                    .identity
+                    .as_ref()
+                    .map(|i| i.npub.clone())
+                    .unwrap_or_default(),
+                content: content.to_string(),
+                created_at: now_secs(),
+                reply_to,
+            };
+            if let Err(e) = store.cache_chitthi(&row).and_then(|()| store.flush()) {
+                warn!("failed to cache outgoing chitthi: {e}");
+            }
+        }
+
+        Ok(id.to_hex())
+    }
+
+    pub async fn send_call_signal(
+        &self,
+        peer: &str,
+        call_id: &str,
+        media: &str,
+        signal_json: &str,
+    ) -> Result<(), UiError> {
+        let vault = self.vault.clone().ok_or(UiError::VaultLocked)?;
+        let peer_pk = parse_pubkey(peer)?;
+        let signal: CallSignal = serde_json::from_str(signal_json)
+            .map_err(|e| UiError::Engine(format!("invalid call signal: {e}")))?;
+        let env = CallEnvelope::new(
+            call_id.to_string(),
+            CallMediaKind::from_str_lenient(media),
+            signal,
+        );
+        let json = env.to_json().map_err(|e| UiError::Engine(e.to_string()))?;
+        vault
+            .send_dm(&peer_pk, &json)
+            .await
+            .map_err(|e| UiError::Engine(e.to_string()))?;
+        Ok(())
+    }
+
+    pub async fn hangup_call(
+        &self,
+        peer: &str,
+        call_id: &str,
+        media: &str,
+        reason: &str,
+    ) -> Result<(), UiError> {
+        let signal = CallSignal::Hangup {
+            reason: HangupReason::from_str_lenient(reason),
+        };
+        let json = serde_json::to_string(&signal).map_err(|e| UiError::Engine(e.to_string()))?;
+        self.send_call_signal(peer, call_id, media, &json).await
+    }
+
+    pub async fn upload_and_send_media(
+        &self,
+        target_pubkey: &str,
+        bytes: Vec<u8>,
+        mime_type: &str,
+        caption: &str,
+    ) -> Result<MediaMessageDto, UiError> {
+        if bytes.len() > MAX_MEDIA_BYTES {
+            return Err(UiError::Engine(format!(
+                "media is {} bytes; the limit is {MAX_MEDIA_BYTES}",
+                bytes.len()
+            )));
+        }
+        let keys = self.keys.clone().ok_or(UiError::NoIdentity)?;
+        let peer = parse_pubkey(target_pubkey)?;
+        let key = derive_media_key(keys.secret_key(), &peer, MEDIA_LABEL)
+            .map_err(|e| UiError::Engine(e.to_string()))?;
+
+        let (media, _secret) =
+            encrypt_media(&bytes, mime_type, &key).map_err(|e| UiError::Engine(e.to_string()))?;
+        let size = media.size as u64;
+        let sha256_hex = media.sha256_hex.clone();
+
+        // Upload ciphertext only — the host sees opaque bytes.
+        let url = upload_blob(media.ciphertext, mime_type).await?;
+
+        // Zero-knowledge NIP-94 event: URL + ciphertext hash, no key, no `ox`.
+        let meta = FileMetadata {
+            url: url.clone(),
+            mime_type: mime_type.to_string(),
+            sha256_hex,
+            original_sha256_hex: None,
+            size: Some(media.size),
+            caption: caption.to_string(),
+        };
+        let event =
+            build_file_metadata_event(&keys, &meta).map_err(|e| UiError::Engine(e.to_string()))?;
+        let event_id = event.id.to_hex();
+        let created_at = now_secs();
+
+        // Persist a local ref so download_and_decrypt_media(event_id) resolves.
+        let reff = MediaRef {
+            event_id: event_id.clone(),
+            url: url.clone(),
+            peer_pubkey: peer.to_hex(),
+            mime_type: mime_type.to_string(),
+            caption: caption.to_string(),
+            size,
+            sha256_hex: media.sha256_hex.clone(),
+            outgoing: true,
+            created_at,
+        };
+        if let Some(store) = &self.store {
+            store
+                .put(MEDIA_REFS_TREE, &event_id, &reff)
+                .and_then(|()| store.flush())
+                .map_err(|e| UiError::Storage(e.to_string()))?;
+        }
+
+        // Privately deliver the reference to the recipient over NIP-04.
+        let envelope = MediaEnvelope {
+            comrade_media: 1,
+            event_id: event_id.clone(),
+            url: url.clone(),
+            mime: mime_type.to_string(),
+            caption: caption.to_string(),
+            size,
+            sha256_hex: media.sha256_hex.clone(),
+        };
+        let envelope_json =
+            serde_json::to_string(&envelope).map_err(|e| UiError::Engine(e.to_string()))?;
+        let vault = self.vault.clone().ok_or(UiError::VaultLocked)?;
+        vault
+            .send_dm(&peer, &envelope_json)
+            .await
+            .map_err(|e| UiError::Engine(e.to_string()))?;
+
+        let sender = keys
+            .public_key()
+            .to_bech32()
+            .unwrap_or_else(|_| keys.public_key().to_hex());
+        Ok(MediaMessageDto {
+            event_id,
+            url,
+            mime_type: mime_type.to_string(),
+            caption: caption.to_string(),
+            sender,
+            created_at,
+            size,
+            outgoing: true,
+        })
+    }
+
+    pub async fn download_and_decrypt_media(
+        &self,
+        event_id: &str,
+    ) -> Result<MediaBytesDto, UiError> {
+        let store = self.store.as_deref().ok_or(UiError::VaultLocked)?;
+        let reff: MediaRef = store
+            .get(MEDIA_REFS_TREE, event_id)
+            .map_err(|e| UiError::Storage(e.to_string()))?
+            .ok_or_else(|| UiError::Engine(format!("unknown media event {event_id}")))?;
+
+        let keys = self.keys.clone().ok_or(UiError::NoIdentity)?;
+        let peer = parse_pubkey(&reff.peer_pubkey)?;
+        let key = derive_media_key(keys.secret_key(), &peer, MEDIA_LABEL)
+            .map_err(|e| UiError::Engine(e.to_string()))?;
+
+        // Verify the ciphertext hash when we recorded one (fail fast on a
+        // wrong/tampered blob; older refs without it fall back to the AES-GCM
+        // tag alone, which still rejects tampering).
+        let expected = (!reff.sha256_hex.is_empty()).then_some(reff.sha256_hex.as_str());
+        let bytes = fetch_and_decrypt_media(&reff.url, &key, expected)
+            .await
+            .map_err(|e| UiError::Engine(e.to_string()))?;
+
+        Ok(MediaBytesDto {
+            mime_type: reff.mime_type,
+            base64: B64.encode(&bytes),
+        })
+    }
+
+    pub async fn search_profiles(&self, query: &str) -> Result<Vec<FoundProfileDto>, UiError> {
+        let sabha = self.sabha.clone().ok_or(UiError::VaultLocked)?;
+        let query = query.trim().trim_start_matches('@');
+        if query.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Exact-key lookup: fetch that author's Kind-0 (name may be absent —
+        // the key alone is still a valid, addressable result). Otherwise a
+        // NIP-50 name search. Both branches share the DTO mapping and cache.
+        let dtos: Vec<FoundProfileDto> = if let Ok(pk) = PublicKey::parse(query) {
+            let meta = sabha
+                .fetch_profile(&pk)
+                .await
+                .map_err(|e| UiError::Engine(e.to_string()))?;
+            vec![found_profile_dto(&pk, meta.as_ref())]
+        } else {
+            sabha
+                .search_profiles(query, 10)
+                .await
+                .map_err(|e| UiError::Engine(e.to_string()))?
+                .into_iter()
+                .map(|(pk, meta)| found_profile_dto(&pk, Some(&meta)))
+                .collect()
+        };
+        cache_found_profiles(self.store.as_deref(), &dtos);
+        Ok(dtos)
+    }
+
+    pub async fn sync_ledger(&self) -> Result<String, UiError> {
+        let sakha = self.sakha.clone().ok_or(UiError::VaultLocked)?;
+        let id = sakha
+            .publish_sync()
+            .await
+            .map_err(|e| UiError::Engine(e.to_string()))?;
+        Ok(id.to_hex())
+    }
+
+    pub async fn sakha_add_entry(
+        &self,
+        description: &str,
+        amount_inr: f64,
+        paid_by: &str,
+    ) -> Result<String, UiError> {
+        if description.trim().is_empty() {
+            return Err(UiError::Engine("description is empty".into()));
+        }
+        let sakha = self.sakha.clone().ok_or(UiError::VaultLocked)?;
+        if !sakha.is_paired() {
+            return Err(UiError::Engine(
+                "not paired with a partner yet — open the Partner Portal first".into(),
+            ));
+        }
+        let entry = LedgerEntry::new(description, amount_inr, paid_by);
+        sakha
+            .add_entry(entry)
+            .await
+            .map_err(|e| UiError::Engine(e.to_string()))?;
+        let ledger = sakha.read_ledger().await;
+        if let Some(store) = &self.store {
+            persist_ledger_snapshot(store, &sakha).await;
+        }
+        Ok(ledger)
+    }
+}
+
+/// Upload an encrypted blob to Blossom, signed with a BUD-01 auth event.
+/// Gated on the `media-http` feature; degrades to a typed error otherwise.
+///
+/// The BUD-01 auth event is signed with a **fresh ephemeral key**, never the
+/// user's chat identity: the blob is already zero-knowledge, and signing
+/// with the identity key would let the host link "npub X uploaded blob Y at
+/// time T from IP Z" — a metadata leak at odds with the privacy model. Free
+/// function (not a `ComradeRuntime`/`RuntimeHandles` method) since it needs
+/// no engine/store state at all.
+#[cfg(feature = "media-http")]
+async fn upload_blob(blob: Vec<u8>, mime: &str) -> Result<String, UiError> {
+    use comrade_core::media::{BlossomUploader, MediaUploader, DEFAULT_BLOSSOM_SERVER};
+    let uploader = BlossomUploader::new(DEFAULT_BLOSSOM_SERVER, nostr_sdk::Keys::generate());
+    let receipt = uploader
+        .upload(&blob, mime)
+        .await
+        .map_err(|e| UiError::Engine(e.to_string()))?;
+    Ok(receipt.url)
+}
+
+#[cfg(not(feature = "media-http"))]
+async fn upload_blob(_blob: Vec<u8>, _mime: &str) -> Result<String, UiError> {
+    Err(UiError::Engine(
+        "media upload requires the `media-http` feature".into(),
+    ))
 }
 
 fn now_secs() -> u64 {
@@ -2376,6 +2503,37 @@ fn store_profile_record(
     }
 }
 
+/// Persist discovered profiles into the local cache (best-effort) so the
+/// chat list can title peers by their handle without another fetch. Free
+/// function so [`RuntimeHandles::search_profiles`] can call it with no
+/// runtime lock held.
+fn cache_found_profiles(
+    store: Option<&comrade_storage::EncryptedStore>,
+    found: &[FoundProfileDto],
+) {
+    let Some(store) = store else {
+        return;
+    };
+    let now = now_secs();
+    let mut wrote = false;
+    for profile in found {
+        if profile.name.is_none() {
+            continue; // nothing displayable; don't shadow a future fetch
+        }
+        let record = PeerProfileRecord {
+            name: profile.name.clone(),
+            about: profile.about.clone(),
+            updated_at: now,
+        };
+        wrote |= store_profile_record(store, &profile.npub, &record);
+    }
+    if wrote {
+        if let Err(e) = store.flush() {
+            warn!("failed to flush profile cache: {e}");
+        }
+    }
+}
+
 /// A user-configured TURN relay for WebRTC calls, sealed in the encrypted store.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TurnConfig {
@@ -2446,6 +2604,68 @@ fn cache_pushed_peer_name(store: &comrade_storage::EncryptedStore, npub: &str, n
     }
 }
 
+/// Record `peer_npub`'s conversation as accepted and, once, share our
+/// @handle with them over the encrypted channel. Free function (rather than
+/// a `ComradeRuntime` method) so it can run from [`RuntimeHandles::send_dm_reply`]
+/// with no runtime lock held, as well as from [`ComradeRuntime::accept_request`].
+///
+/// The share itself runs in the background so the caller is never blocked on
+/// the network; the `profile_shared` flag flips only on a successful send,
+/// so a failed share retries next time.
+fn share_profile_on_accept(
+    store: Option<Arc<comrade_storage::EncryptedStore>>,
+    vault: Option<Arc<VaultEngine>>,
+    username: Option<String>,
+    peer_npub: &str,
+    peer: &PublicKey,
+) {
+    let Some(store) = store else {
+        return;
+    };
+    let already_shared = store
+        .get_conversation_meta(peer_npub)
+        .ok()
+        .flatten()
+        .map(|m| m.profile_shared)
+        .unwrap_or(false);
+    let meta = comrade_storage::ConversationMeta {
+        peer_npub: peer_npub.to_string(),
+        state: STATE_ACCEPTED.to_string(),
+        profile_shared: already_shared,
+        updated_at: now_secs(),
+    };
+    if let Err(e) = store
+        .set_conversation_meta(&meta)
+        .and_then(|()| store.flush())
+    {
+        warn!("failed to record accepted conversation: {e}");
+    }
+    if already_shared {
+        return;
+    }
+    let Some(vault) = vault else {
+        return;
+    };
+    let peer = *peer;
+    let peer_npub = peer_npub.to_string();
+    tokio::spawn(async move {
+        let Ok(json) = ProfileShare::new(username).to_json() else {
+            return;
+        };
+        if vault.send_dm(&peer, &json).await.is_ok() {
+            let meta = comrade_storage::ConversationMeta {
+                peer_npub,
+                state: STATE_ACCEPTED.to_string(),
+                profile_shared: true,
+                updated_at: now_secs(),
+            };
+            let _ = store
+                .set_conversation_meta(&meta)
+                .and_then(|()| store.flush());
+        }
+    });
+}
+
 /// Fire a delivered receipt back to `sender_hex` for `message_id` (best-effort;
 /// only ever called for accepted conversations).
 fn send_delivered_receipt(vault: &Arc<VaultEngine>, sender_hex: &str, message_id: &str) {
@@ -2464,15 +2684,98 @@ fn send_delivered_receipt(vault: &Arc<VaultEngine>, sender_hex: &str, message_id
     });
 }
 
+/// Bounded, hand-rolled LRU set of call-envelope wrapper event ids already
+/// dispatched onto the event bus this session. At-least-once relay delivery
+/// and the 2-day inbox backfill mean the exact same `Offer`/`Answer`/`Ice`/
+/// `Hangup` wrapper can arrive more than once; without this a duplicate
+/// `Answer` gets re-applied downstream and a duplicate terminal `Hangup`
+/// re-processed. Capacity-bounded (not just a growing `HashSet`) so a
+/// long-running session's memory use stays flat.
+struct CallSignalDedup {
+    state: std::sync::Mutex<CallSignalDedupState>,
+}
+
+#[derive(Default)]
+struct CallSignalDedupState {
+    /// Insertion order, oldest first — evicted from the front once at capacity.
+    order: std::collections::VecDeque<String>,
+    seen: std::collections::HashSet<String>,
+}
+
+impl CallSignalDedup {
+    /// Comfortably above one call's signal count (offer/answer/several ICE
+    /// candidates/hangup is a handful of events), so a single call can never
+    /// evict its own earlier signals mid-negotiation.
+    const CAPACITY: usize = 512;
+
+    fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(CallSignalDedupState::default()),
+        }
+    }
+
+    /// Returns `true` if `event_id` was already recorded (the caller should
+    /// drop the signal); otherwise records it and returns `false`.
+    fn already_seen(&self, event_id: &str) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.seen.contains(event_id) {
+            return true;
+        }
+        if state.order.len() >= Self::CAPACITY {
+            if let Some(oldest) = state.order.pop_front() {
+                state.seen.remove(&oldest);
+            }
+        }
+        state.order.push_back(event_id.to_string());
+        state.seen.insert(event_id.to_string());
+        false
+    }
+}
+
+/// Read the persisted inbox high-watermark (unix seconds of the newest
+/// message processed so far), if any has been recorded yet.
+fn read_watermark(store: &comrade_storage::EncryptedStore) -> Option<u64> {
+    store.get(SETTINGS_TREE, VAULT_WATERMARK_KEY).ok().flatten()
+}
+
+/// Advance the persisted inbox high-watermark to `created_at` if it is newer
+/// than what's stored (a monotonic max — out-of-order delivery must never
+/// move it backwards). Read back at the next launch by
+/// [`ComradeRuntime::spawn_event_loops`] to widen the backfill window past
+/// the standard gift-wrap skew when this device was offline longer than that.
+fn advance_watermark(store: &comrade_storage::EncryptedStore, created_at: u64) {
+    let current = read_watermark(store).unwrap_or(0);
+    if created_at > current {
+        if let Err(e) = store
+            .put(SETTINGS_TREE, VAULT_WATERMARK_KEY, &created_at)
+            .and_then(|()| store.flush())
+        {
+            warn!("failed to advance vault watermark: {e}");
+        }
+    }
+}
+
 /// Route one decrypted incoming DM: block-drop, control envelopes
 /// (receipt/profile-share/call), media, or plain chat — applying the message
 /// -request gate throughout. Runs inside the Vault inbox Tokio task.
+///
+/// Idempotent end-to-end: relays redeliver at-least-once and the inbox
+/// subscription backfills up to 2 days (widened further on `since_floor`) on
+/// every launch, so this may see the exact same wrapper event more than
+/// once. Plain-text/media DMs are deduped by checking persistence *before*
+/// emitting/receipting (persist first, so a crash between persist and emit
+/// self-heals as "already seen, no event" next time); call signals are
+/// deduped by `dedup` and dropped once stale — see the call-envelope branch.
 fn dispatch_incoming_dm(
     vault: &Arc<VaultEngine>,
     store: Option<&Arc<comrade_storage::EncryptedStore>>,
     tx: &broadcast::Sender<BridgeEvent>,
+    dedup: &CallSignalDedup,
     msg: VaultMessage,
 ) {
+    if let Some(store) = store {
+        advance_watermark(store, msg.created_at);
+    }
     let peer_npub = to_npub(&msg.sender_pubkey);
     let gate = store
         .map(|s| conversation_gate(s, &peer_npub))
@@ -2519,22 +2822,43 @@ fn dispatch_incoming_dm(
     }
 
     // 3) Call signaling — only from an established conversation, so a stranger
-    //    cannot ring you before their message request is accepted.
+    //    cannot ring you before their message request is accepted. Stale or
+    //    already-dispatched signals are dropped: offers older than the ring
+    //    timeout are meaningless, and a redelivered wrapper (relay
+    //    at-least-once delivery, or the 2-day backfill re-scanning on every
+    //    launch) must not re-ring or re-apply a signal already handled.
     if let Some(env) = parse_call_envelope(&msg.content) {
         if matches!(gate, IncomingGate::Accepted) {
-            let _ = tx.send(BridgeEvent::IncomingCallSignal(CallSignalDto {
-                call_id: env.call_id,
-                peer: peer_npub,
-                media: env.media.as_str().to_string(),
-                signal: env.signal,
-            }));
+            let age = now_secs().saturating_sub(msg.created_at);
+            if age > CALL_SIGNAL_MAX_AGE_SECS {
+                tracing::debug!(event_id = %msg.event_id, age, "dropping stale call signal");
+            } else if dedup.already_seen(&msg.event_id) {
+                tracing::debug!(event_id = %msg.event_id, "dropping duplicate call signal");
+            } else {
+                let _ = tx.send(BridgeEvent::IncomingCallSignal(CallSignalDto {
+                    call_id: env.call_id,
+                    peer: peer_npub,
+                    media: env.media.as_str().to_string(),
+                    signal: env.signal,
+                    created_at: msg.created_at,
+                }));
+            }
         }
         return;
     }
 
-    // 4) Media envelope — persist the NIP-94 ref, then surface (gated).
+    // 4) Media envelope — dedup by the NIP-94 event id (a redelivered wrapper
+    //    carries the same reference), persist the ref, then surface (gated).
     if let Some(env) = parse_media_envelope(&msg.content) {
         if let Some(store) = store {
+            if store
+                .get::<MediaRef>(MEDIA_REFS_TREE, &env.event_id)
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                return;
+            }
             let reff = MediaRef {
                 event_id: env.event_id.clone(),
                 url: env.url.clone(),
@@ -2581,8 +2905,13 @@ fn dispatch_incoming_dm(
         return;
     }
 
-    // 5) Plain chat text — persist, then deliver or gate into a request.
+    // 5) Plain chat text — dedup by event id (a redelivered wrapper must not
+    //    re-notify or re-send a delivered receipt), persist first, then
+    //    deliver or gate into a request.
     if let Some(store) = store {
+        if store.get_message(&msg.event_id).ok().flatten().is_some() {
+            return;
+        }
         let row = comrade_storage::StoredMessage {
             id: msg.event_id.clone(),
             peer_npub: peer_npub.clone(),
@@ -4049,9 +4378,16 @@ mod tests {
         let store = Arc::new(comrade_storage::EncryptedStore::open(dir.path(), "pin").unwrap());
         let vault = test_vault().await;
         let (tx, mut rx) = broadcast::channel(16);
+        let dedup = CallSignalDedup::new();
         let (hex, peer) = stranger();
 
-        dispatch_incoming_dm(&vault, Some(&store), &tx, incoming(&hex, "e1", "hello?"));
+        dispatch_incoming_dm(
+            &vault,
+            Some(&store),
+            &tx,
+            &dedup,
+            incoming(&hex, "e1", "hello?"),
+        );
 
         assert_eq!(
             store.get_conversation_meta(&peer).unwrap().unwrap().state,
@@ -4073,6 +4409,7 @@ mod tests {
         let store = Arc::new(comrade_storage::EncryptedStore::open(dir.path(), "pin").unwrap());
         let vault = test_vault().await;
         let (tx, mut rx) = broadcast::channel(16);
+        let dedup = CallSignalDedup::new();
         let (hex, peer) = stranger();
         store
             .set_conversation_meta(&comrade_storage::ConversationMeta {
@@ -4084,7 +4421,13 @@ mod tests {
             .unwrap();
 
         // Plain text from an accepted peer is delivered (not gated).
-        dispatch_incoming_dm(&vault, Some(&store), &tx, incoming(&hex, "e1", "yo"));
+        dispatch_incoming_dm(
+            &vault,
+            Some(&store),
+            &tx,
+            &dedup,
+            incoming(&hex, "e1", "yo"),
+        );
         assert!(matches!(
             rx.try_recv().unwrap(),
             BridgeEvent::IncomingDirectMessage(_)
@@ -4105,7 +4448,13 @@ mod tests {
         let receipt = Receipt::new(ReceiptKind::Read, vec!["out1".into()])
             .to_json()
             .unwrap();
-        dispatch_incoming_dm(&vault, Some(&store), &tx, incoming(&hex, "e2", &receipt));
+        dispatch_incoming_dm(
+            &vault,
+            Some(&store),
+            &tx,
+            &dedup,
+            incoming(&hex, "e2", &receipt),
+        );
         assert_eq!(
             store
                 .get_message("out1")
@@ -4134,6 +4483,7 @@ mod tests {
         let store = Arc::new(comrade_storage::EncryptedStore::open(dir.path(), "pin").unwrap());
         let vault = test_vault().await;
         let (tx, mut rx) = broadcast::channel(16);
+        let dedup = CallSignalDedup::new();
         let (hex, peer) = stranger();
         store
             .set_conversation_meta(&comrade_storage::ConversationMeta {
@@ -4143,7 +4493,13 @@ mod tests {
                 updated_at: 1,
             })
             .unwrap();
-        dispatch_incoming_dm(&vault, Some(&store), &tx, incoming(&hex, "e1", "let me in"));
+        dispatch_incoming_dm(
+            &vault,
+            Some(&store),
+            &tx,
+            &dedup,
+            incoming(&hex, "e1", "let me in"),
+        );
         assert!(store.messages_with(&peer).unwrap().is_empty());
         assert!(rx.try_recv().is_err(), "blocked peer emits nothing");
 
@@ -4154,6 +4510,7 @@ mod tests {
             &vault,
             Some(&store),
             &tx,
+            &dedup,
             incoming(&other_hex, "e2", &share),
         );
         match rx.try_recv().unwrap() {
@@ -4163,5 +4520,236 @@ mod tests {
             }
             other => panic!("expected PeerProfileUpdated, got {other:?}"),
         }
+    }
+
+    // ── T1: call-signal freshness + dedup ────────────────────────────────────
+
+    #[tokio::test]
+    async fn dispatch_drops_a_stale_call_signal_and_dedups_a_fresh_one() {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(comrade_storage::EncryptedStore::open(dir.path(), "pin").unwrap());
+        let vault = test_vault().await;
+        let (tx, mut rx) = broadcast::channel(16);
+        let dedup = CallSignalDedup::new();
+        let (hex, peer) = stranger();
+        store
+            .set_conversation_meta(&comrade_storage::ConversationMeta {
+                peer_npub: peer.clone(),
+                state: "accepted".into(),
+                profile_shared: true,
+                updated_at: 1,
+            })
+            .unwrap();
+
+        let envelope = CallEnvelope::new(
+            "call-1",
+            CallMediaKind::Audio,
+            CallSignal::Offer {
+                sdp: "v=0\r\n".into(),
+            },
+        )
+        .to_json()
+        .unwrap();
+
+        // A days-old backfilled offer (e.g. relaunch re-scanning the 2-day
+        // window) must never ring.
+        let mut stale = incoming(&hex, "e1", &envelope);
+        stale.created_at = now_secs().saturating_sub(7200);
+        dispatch_incoming_dm(&vault, Some(&store), &tx, &dedup, stale);
+        assert!(
+            rx.try_recv().is_err(),
+            "a call signal older than CALL_SIGNAL_MAX_AGE_SECS must not reach the bus"
+        );
+
+        // A fresh signal reaches the bus once; the exact same wrapper event id
+        // redelivered (at-least-once relay delivery) must not fire twice.
+        let mut fresh = incoming(&hex, "e2", &envelope);
+        fresh.created_at = now_secs();
+        dispatch_incoming_dm(&vault, Some(&store), &tx, &dedup, fresh.clone());
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            BridgeEvent::IncomingCallSignal(_)
+        ));
+        dispatch_incoming_dm(&vault, Some(&store), &tx, &dedup, fresh);
+        assert!(
+            rx.try_recv().is_err(),
+            "the same wrapper event id must only ever dispatch one IncomingCallSignal"
+        );
+    }
+
+    // ── T2: DM dedup + durable receive watermark ─────────────────────────────
+
+    #[tokio::test]
+    async fn dispatch_dedups_a_redelivered_plain_text_dm() {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(comrade_storage::EncryptedStore::open(dir.path(), "pin").unwrap());
+        let vault = test_vault().await;
+        let (tx, mut rx) = broadcast::channel(16);
+        let dedup = CallSignalDedup::new();
+        let (hex, peer) = stranger();
+        store
+            .set_conversation_meta(&comrade_storage::ConversationMeta {
+                peer_npub: peer.clone(),
+                state: "accepted".into(),
+                profile_shared: true,
+                updated_at: 1,
+            })
+            .unwrap();
+
+        let msg = incoming(&hex, "dup1", "hello twice");
+        dispatch_incoming_dm(&vault, Some(&store), &tx, &dedup, msg.clone());
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            BridgeEvent::IncomingDirectMessage(_)
+        ));
+        assert_eq!(store.messages_with(&peer).unwrap().len(), 1);
+
+        // Redelivered (same event id — relay at-least-once, or a backfill
+        // re-scan on the next launch) must not re-notify or duplicate the row.
+        dispatch_incoming_dm(&vault, Some(&store), &tx, &dedup, msg);
+        assert!(
+            rx.try_recv().is_err(),
+            "an already-persisted event id must not re-fire IncomingDirectMessage"
+        );
+        assert_eq!(store.messages_with(&peer).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dispatch_dedups_a_redelivered_media_envelope() {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(comrade_storage::EncryptedStore::open(dir.path(), "pin").unwrap());
+        let vault = test_vault().await;
+        let (tx, mut rx) = broadcast::channel(16);
+        let dedup = CallSignalDedup::new();
+        let (hex, peer) = stranger();
+        store
+            .set_conversation_meta(&comrade_storage::ConversationMeta {
+                peer_npub: peer.clone(),
+                state: "accepted".into(),
+                profile_shared: true,
+                updated_at: 1,
+            })
+            .unwrap();
+
+        let envelope = MediaEnvelope {
+            comrade_media: 1,
+            event_id: "media1".into(),
+            url: "https://blob.example/x".into(),
+            mime: "image/png".into(),
+            caption: "pic".into(),
+            size: 10,
+            sha256_hex: "a".repeat(64),
+        };
+        let json = serde_json::to_string(&envelope).unwrap();
+
+        dispatch_incoming_dm(
+            &vault,
+            Some(&store),
+            &tx,
+            &dedup,
+            incoming(&hex, "w1", &json),
+        );
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            BridgeEvent::IncomingMedia(_)
+        ));
+
+        // Redelivered wrapper (same NIP-94 event id) must not re-notify.
+        dispatch_incoming_dm(
+            &vault,
+            Some(&store),
+            &tx,
+            &dedup,
+            incoming(&hex, "w2", &json),
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "an already-persisted media event id must not re-fire IncomingMedia"
+        );
+    }
+
+    #[test]
+    fn vault_watermark_round_trips_and_only_advances() {
+        let dir = TempDir::new().unwrap();
+        let store = comrade_storage::EncryptedStore::open(dir.path(), "pin").unwrap();
+        assert_eq!(read_watermark(&store), None);
+
+        advance_watermark(&store, 100);
+        assert_eq!(read_watermark(&store), Some(100));
+
+        // Out-of-order delivery must never move the watermark backwards.
+        advance_watermark(&store, 50);
+        assert_eq!(read_watermark(&store), Some(100));
+
+        advance_watermark(&store, 200);
+        assert_eq!(read_watermark(&store), Some(200));
+    }
+
+    #[tokio::test]
+    async fn dispatch_advances_the_watermark_for_every_message_kind() {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(comrade_storage::EncryptedStore::open(dir.path(), "pin").unwrap());
+        let vault = test_vault().await;
+        let (tx, _rx) = broadcast::channel(16);
+        let dedup = CallSignalDedup::new();
+        let (hex, _peer) = stranger();
+
+        let mut msg = incoming(&hex, "e1", "hi");
+        msg.created_at = 12_345;
+        dispatch_incoming_dm(&vault, Some(&store), &tx, &dedup, msg);
+        assert_eq!(read_watermark(&store), Some(12_345));
+    }
+
+    // ── T4: no runtime lock held across a network await ──────────────────────
+
+    #[tokio::test]
+    async fn toggle_workspace_is_not_blocked_by_a_slow_send_dm() {
+        // AUDIT P2 regression guard: send_dm must not hold the shared runtime
+        // lock across its relay round-trip, or one slow/unreachable relay
+        // freezes every other bridge command behind it. Points the vault
+        // engine at a non-routable address (RFC 5737 TEST-NET-1) and never
+        // calls `spawn_event_loops`, so the relay never connects and
+        // `send_dm`'s internal `wait_for_any_relay` blocks for its full ~5s
+        // bound — long enough that this test would time out if the fix
+        // regressed.
+        let dir = TempDir::new().unwrap();
+        let rt = Arc::new(tokio::sync::RwLock::new(ComradeRuntime::with_relays(vec![
+            "wss://192.0.2.1:9".to_string(),
+        ])));
+        rt.write()
+            .await
+            .unlock_vault(dir.path(), "pin")
+            .await
+            .unwrap();
+
+        let (_hex, peer) = stranger();
+        let send_rt = rt.clone();
+        let send_task = tokio::spawn(async move {
+            // The guard-scoped snapshot bridges take — see `ComradeRuntime::handles`.
+            let handles = send_rt.read().await.handles();
+            handles.send_dm(&peer, "hello").await
+        });
+
+        // Give the send a moment to actually start (and start blocking on the
+        // relay wait) before racing the write-locking command against it.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let toggle_rt = rt.clone();
+        let toggled = tokio::time::timeout(std::time::Duration::from_secs(1), async move {
+            toggle_rt
+                .write()
+                .await
+                .toggle_workspace("OffGridTravel")
+                .await
+        })
+        .await;
+
+        assert!(
+            toggled.is_ok(),
+            "toggle_workspace must not be stuck behind a slow send_dm holding the runtime lock"
+        );
+        assert!(toggled.unwrap().is_ok());
+
+        send_task.abort();
     }
 }
