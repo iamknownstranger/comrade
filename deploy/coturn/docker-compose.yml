@@ -1,0 +1,24 @@
+# TLS-enabled coturn deployment for Comrade calls (AUDIT.md COMMS-02).
+#
+# This provisions the *server* — pairing it with time-limited REST
+# credentials (see turnserver.conf's `use-auth-secret`, and
+# comrade_core::call::mint_turn_rest_credentials for the minting side an
+# operator's own broker calls) is what makes this "user-safe": no static
+# shared TURN username/password ships inside the app.
+#
+# Usage:
+#   1. Point a DNS A/AAAA record at this host.
+#   2. Obtain a TLS certificate for that name (see README.md — certbot).
+#   3. Fill in turnserver.conf's REPLACE_ME_* fields.
+#   4. docker compose -f deploy/coturn/docker-compose.yml up -d
+#
+# Not independently verified in this change (built without a Docker daemon
+# available) — validate in a real deployment before relying on it.
+services:
+  coturn:
+    image: coturn/coturn:latest
+    network_mode: host # TURN needs the real relay port range reachable directly
+    volumes:
+      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+      - ./certs:/etc/coturn/certs:ro
+    restart: unless-stopped

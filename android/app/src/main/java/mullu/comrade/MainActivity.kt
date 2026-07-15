@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.Context
 import android.os.Build
 import android.os.Bundle
+import android.util.Log
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -45,7 +46,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -62,8 +62,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import java.io.File
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import mullu.comrade.ui.ArticleIcon
@@ -90,8 +88,6 @@ import mullu.comrade.call.CallScreen
 import mullu.comrade.call.CallUiState
 import mullu.comrade.call.Ringer
 import uniffi.comrade_core.CallMediaKind
-import uniffi.comrade_ui.BridgeEvent
-import uniffi.comrade_ui.CallSignalDto
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -176,6 +172,31 @@ fun ComradeApp() {
         if (phase !is AppPhase.Checking) activity?.reportFullyDrawn()
     }
 
+    // Start the background relay-connection service as soon as (and every
+    // time) the vault is unlocked — including an activity recreation that
+    // finds the runtime already unlocked, not just a fresh passphrase entry.
+    // Starting it twice is harmless (RelayConnectionService no-ops a second
+    // startForegroundService while already running); it is stopped
+    // explicitly on lock, below.
+    LaunchedEffect(phase is AppPhase.Ready) {
+        if (phase is AppPhase.Ready) {
+            // Off the main/Compose dispatcher: LaunchedEffect otherwise runs
+            // this on the same thread Compose needs free to keep recomposing
+            // and to answer test/semantics queries, and a foreground-service
+            // start (context.startForegroundService, plus whatever the
+            // platform does around it) has no need to be on it. Foreground
+            // -service starts can also throw on platform restrictions
+            // (background-start limits, quota, …) — never let that crash the
+            // composition either; the app is just as usable without it, only
+            // without the background-delivery guarantee. Matches
+            // CallService.start's own guard in CallManager.setupPeer.
+            withContext(Dispatchers.IO) {
+                runCatching { RelayConnectionService.start(context) }
+                    .onFailure { Log.w("ComradeApp", "Failed to start RelayConnectionService", it) }
+            }
+        }
+    }
+
     when (val p = phase) {
         AppPhase.Checking -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             CircularProgressIndicator(Modifier.size(28.dp))
@@ -192,6 +213,10 @@ fun ComradeApp() {
         is AppPhase.Ready -> MainShell(
             profile = p.profile,
             onProfileChange = { phase = AppPhase.Ready(it) },
+            onLock = {
+                RelayConnectionService.stop(context)
+                phase = AppPhase.Locked(vaultExists = true)
+            },
         )
     }
 }
@@ -220,48 +245,33 @@ private sealed interface ChatNav {
     ) : ChatNav
 }
 
-/** Events drained from the native bridge, reduced to what the shell reacts to. */
-private sealed interface PumpEvent {
-    data class Chitthi(val info: ComradeCore.ChitthiInfo) : PumpEvent
-
-    /** A DM from an accepted conversation — reload + notify. */
-    data class IncomingDm(val peer: String, val preview: String) : PumpEvent
-
-    /** A stranger's gated DM — refresh requests + notify. */
-    data class Request(val peer: String, val preview: String) : PumpEvent
-
-    /** Media / receipt / profile update — just reload the chat lists. */
-    data object HistoryChanged : PumpEvent
-
-    /** The off-grid mesh's live connectivity changed. */
-    data class MeshStatusChanged(val status: ComradeCore.MeshStatus) : PumpEvent
-
-    /** A WebRTC call-signaling payload (offer/answer/ICE/hangup) for the call layer. */
-    data class CallSignal(val dto: CallSignalDto) : PumpEvent
-}
-
-/** Bound on the in-memory public feed (the relay stream is unbounded). */
-private const val FEED_CAP = 500
-
-/** Floor between peer-name refreshes; the Rust side is TTL-gated too. */
-private const val NAME_REFRESH_MIN_INTERVAL_MS = 30_000L
-
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun MainShell(
     profile: ComradeCore.Profile,
     onProfileChange: (ComradeCore.Profile) -> Unit,
+    onLock: () -> Unit,
 ) {
     val context = LocalContext.current
     val activity = context as? Activity
     var tab by rememberSaveable { mutableStateOf(MainTab.Chats) }
     var chatNav by remember { mutableStateOf<ChatNav>(ChatNav.List) }
-    // Bumped whenever the DM history changed; list + open thread reload on it.
-    var chatTick by remember { mutableStateOf(0) }
-    // Bumped when a new message request arrives; the requests list reloads on it.
-    var requestTick by remember { mutableStateOf(0) }
-    val feedItems = remember { mutableStateListOf<ComradeCore.ChitthiInfo>() }
-    val seenFeedIds = remember { HashSet<String>() }
+    // Owned by RelayConnectionService/ChatEventRouter now — the single
+    // consumer of the native event stream (see its doc comment) — rather
+    // than each read locally here and reloaded by an Activity-scoped pump
+    // loop, so a backgrounded Activity (or one recreated mid-session) never
+    // duplicates, or simply stops, event handling.
+    val chatTick by ChatEventRouter.chatTick.collectAsState()
+    val requestTick by ChatEventRouter.requestTick.collectAsState()
+    val feedItems by ChatEventRouter.feedItems.collectAsState()
+
+    // Tell the router which conversation (if any) is on screen, so it can
+    // suppress a DM notification for the thread the user is already
+    // looking at — mirrors what the old in-Activity pump loop checked
+    // inline before every notification.
+    LaunchedEffect(chatNav) {
+        ChatEventRouter.setOpenConversation((chatNav as? ChatNav.Open)?.peer)
+    }
 
     // Notification channels + runtime permission (Android 13+). Notifications
     // fire for incoming DMs/requests while the app process is alive.
@@ -345,106 +355,6 @@ private fun MainShell(
                 Ringer.stop()
                 activity?.setShowOverLockScreen(false)
             }
-        }
-    }
-
-    fun addToFeed(item: ComradeCore.ChitthiInfo, front: Boolean) {
-        if (!seenFeedIds.add(item.id)) return
-        if (front) feedItems.add(0, item) else feedItems.add(item)
-        while (feedItems.size > FEED_CAP) {
-            seenFeedIds.remove(feedItems.removeAt(feedItems.size - 1).id)
-        }
-    }
-
-    // Offline-first load of the cached feed, then the live event pump.
-    LaunchedEffect(Unit) {
-        val cached = withContext(Dispatchers.IO) {
-            runCatching { ComradeCore.sabhaTimeline() }.getOrDefault(emptyList())
-        }
-        for (item in cached.sortedByDescending { it.createdAt }) addToFeed(item, front = false)
-
-        // Seed the mesh indicator with a real snapshot before the first
-        // mesh_status_changed event arrives (e.g. a fresh process that was
-        // already off-grid — an activity recreation, not a cold identity).
-        val initialMesh = withContext(Dispatchers.IO) {
-            runCatching { ComradeCore.meshStatusTyped() }
-                .getOrDefault(ComradeCore.MeshStatus(active = false, peerCount = 0))
-        }
-        MeshStatusMonitor.update(initialMesh)
-
-        // Fetch the published @handles of people we already talk to, so chats
-        // are titled by name instead of key. Launched on its own coroutine —
-        // never awaited by the pump, so a slow relay can't stall event
-        // draining — single-flight, and rate-limited (the Rust side is also
-        // TTL-gated). > 0 changes means the chat list needs a reload.
-        var refreshingNames = false
-        var lastNameRefreshAt = 0L
-        fun maybeRefreshNames() {
-            val now = System.currentTimeMillis()
-            if (refreshingNames || now - lastNameRefreshAt < NAME_REFRESH_MIN_INTERVAL_MS) return
-            refreshingNames = true
-            lastNameRefreshAt = now
-            launch {
-                try {
-                    val changed = withContext(Dispatchers.IO) {
-                        runCatching { ComradeCore.refreshPeerProfilesTyped() }.getOrDefault(0)
-                    }
-                    if (changed > 0) chatTick++
-                } finally {
-                    refreshingNames = false
-                }
-            }
-        }
-        maybeRefreshNames()
-
-        while (isActive) {
-            val events = withContext(Dispatchers.IO) { drainEvents() }
-            var historyChanged = false
-            for (event in events) {
-                when (event) {
-                    is PumpEvent.Chitthi -> addToFeed(event.info, front = true)
-                    is PumpEvent.IncomingDm -> {
-                        historyChanged = true
-                        // Suppress a notification for the conversation on screen.
-                        val openPeer = (chatNav as? ChatNav.Open)?.peer
-                        if (event.peer != openPeer) {
-                            Notifier.notifyMessage(
-                                context,
-                                event.peer,
-                                shortNpub(event.peer),
-                                event.preview,
-                            )
-                        }
-                    }
-                    is PumpEvent.Request -> {
-                        requestTick++
-                        Notifier.notifyRequest(context, event.peer, event.preview)
-                    }
-                    PumpEvent.HistoryChanged -> historyChanged = true
-                    is PumpEvent.MeshStatusChanged -> MeshStatusMonitor.update(event.status)
-                    is PumpEvent.CallSignal -> {
-                        // Feed every signal into the WebRTC layer (answers + ICE
-                        // land in the live PeerConnection); a fresh incoming offer
-                        // returns true → raise the ringing notification so a call
-                        // is visible even when the app isn't in the foreground.
-                        val freshIncoming = CallManager.onIncomingSignal(event.dto)
-                        if (freshIncoming) {
-                            Notifier.notifyIncomingCall(
-                                context,
-                                event.dto.peer,
-                                shortNpub(event.dto.peer),
-                                video = event.dto.media == "video",
-                            )
-                        }
-                    }
-                }
-            }
-            if (historyChanged) {
-                chatTick++
-                // A DM from an unknown key may now be nameable.
-                maybeRefreshNames()
-            }
-            delay(600)
         }
     }
 
@@ -623,12 +533,13 @@ private fun MainShell(
                 MainTab.Journal -> JournalScreen(modifier = content)
                 MainTab.Feed -> FeedScreen(
                     feedItems = feedItems,
-                    onPosted = { addToFeed(it, front = true) },
+                    onPosted = { ChatEventRouter.addChitthi(it, front = true) },
                     modifier = content,
                 )
                 MainTab.Settings -> SettingsScreen(
                     profile = profile,
                     onProfileChange = onProfileChange,
+                    onLock = onLock,
                     modifier = content,
                 )
             }
@@ -654,7 +565,7 @@ private fun MainShell(
                     alias = saved.alias.ifBlank { null },
                     username = openChat.username ?: saved.name,
                 )
-                chatTick++ // the chat list titles change too
+                ChatEventRouter.bumpChatTick() // the chat list titles change too
             },
         )
     }
@@ -793,51 +704,3 @@ private fun EditAliasDialog(
     )
 }
 
-/**
- * Non-blocking drain of the native event bus (bounded per round). Chitthis are
- * parsed for the feed; DM/media arrivals just signal "history changed" — the
- * chat screens reload from the Rust-side offline history, the source of truth.
- *
- * [ComradeCore.pollEvent] hands back a typed [BridgeEvent] straight from the
- * native core's push listener — no JSON parsing here any more.
- */
-private fun drainEvents(max: Int = 200): List<PumpEvent> {
-    val out = mutableListOf<PumpEvent>()
-    repeat(max) {
-        val event = ComradeCore.pollEvent() ?: return out
-        when (event) {
-            is BridgeEvent.IncomingChitthi -> out += PumpEvent.Chitthi(
-                ComradeCore.ChitthiInfo(
-                    id = event.v1.id,
-                    author = event.v1.author,
-                    content = event.v1.content,
-                    createdAt = event.v1.createdAt.toLong(),
-                    replyTo = event.v1.replyTo,
-                ),
-            )
-            is BridgeEvent.IncomingDirectMessage -> out += PumpEvent.IncomingDm(
-                peer = event.v1.sender,
-                preview = event.v1.content.ifBlank { "New message" },
-            )
-            is BridgeEvent.IncomingMessageRequest -> out += PumpEvent.Request(
-                peer = event.v1.peer,
-                preview = event.v1.lastMessage.ifBlank { "New message request" },
-            )
-            is BridgeEvent.IncomingMedia -> out += PumpEvent.IncomingDm(
-                peer = event.v1.sender,
-                preview = "📎 " + event.v1.caption.ifBlank { "Attachment" },
-            )
-            // Receipt + profile updates only need a chat-list reload (ticks, titles).
-            is BridgeEvent.MessageStatus, is BridgeEvent.PeerProfileUpdated -> out += PumpEvent.HistoryChanged
-            // Call signaling (offer/answer/ICE/hangup) → the WebRTC call layer.
-            is BridgeEvent.IncomingCallSignal -> out += PumpEvent.CallSignal(event.v1)
-            is BridgeEvent.MeshStatusChanged -> out += PumpEvent.MeshStatusChanged(
-                ComradeCore.MeshStatus(active = event.v1.active, peerCount = event.v1.peerCount.toInt()),
-            )
-            // Sakha/ledger sync isn't wired into the Android UI yet (desktop-only
-            // via Tauri commands, see comrade_jni::lib.rs) — drop, like call signals.
-            is BridgeEvent.LedgerUpdated -> Unit
-        }
-    }
-    return out
-}

@@ -31,6 +31,11 @@ rand           = "0.8"
 sha2           = "0.10"
 hkdf           = "0.12"
 base64         = "0.22"
+# HMAC-SHA1 is what coturn's `use-auth-secret` TURN REST credential mechanism
+# is defined in terms of (see comrade_core::call::mint_turn_rest_credentials) —
+# not a choice for new protocol work, just matching an existing server API.
+hmac           = "0.12"
+sha1           = "0.10"
 secp256k1      = { version = "0.29",  features = ["hashes", "rand-std"] }
 hex            = "0.4"
 anyhow         = "1"
@@ -50,6 +55,10 @@ zeroize        = { version = "1",      features = ["derive"] }
 tempfile       = "3"
 pyo3           = "0.29"
 pythonize      = "0.29"
+# Test-only: backs the in-process Nostr relay used by comrade_ui's two-peer
+# integration tests (COMMS-03) so they need no Docker/public-internet relay.
+tokio-tungstenite = "0.26"
+futures-util       = "0.3"
 
 # ── Release profile ─────────────────────────────────────────────────────────
 # Tuned for the artifacts users actually launch — above all the Android

@@ -23,8 +23,11 @@
  * connect" rather than pretending. Group calls (SFU territory) are out of scope.
  */
 
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use hmac::{Hmac, Mac};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use sha1::Sha1;
 use sha2::{Digest, Sha256};
 
 /// Envelope marker for a call-signaling payload riding inside a DM body. A DM
@@ -251,6 +254,113 @@ pub fn default_ice_servers() -> Vec<IceServer> {
         IceServer::stun("stun:stun1.l.google.com:19302"),
         IceServer::stun("stun:stun.cloudflare.com:3478"),
     ]
+}
+
+// ── TURN server configuration: validation + time-limited REST credentials ───
+//
+// Two related but distinct concerns a deployable TURN capability needs beyond
+// "STUN plus one static relay" (see AUDIT.md COMMS-02):
+//  1. Whatever URL a user pastes into settings must at least be a plausible
+//     `turn:`/`turns:` URI before it is persisted or handed to a
+//     `RTCPeerConnection` — [`validate_turn_url`].
+//  2. A credential a client holds indefinitely is a standing liability: if the
+//     app ever shipped one fixed username/password (or, worse, the operator's
+//     shared secret itself) baked into every install, it could never be
+//     revoked short of rotating it for every user at once. coturn's
+//     `use-auth-secret` mode (the "TURN REST API" convention documented at
+//     <https://datatracker.ietf.org/doc/html/draft-uberti-behave-turn-rest>,
+//     configured in `deploy/coturn/turnserver.conf`) solves this: an operator
+//     keeps one shared secret on the *server* (and on a small credential
+//     broker they run — never inside the app), and mints a fresh
+//     username/password pair per request that coturn accepts only until the
+//     encoded expiry — [`mint_turn_rest_credentials`] is that minting
+//     function. Comrade ships no broker of its own (it has no account server
+//     to host one on), but any operator-run broker can call this directly.
+
+/// Validate a TURN/STUN server URI well enough to catch obviously-wrong input
+/// before it is persisted or handed to a `RTCPeerConnection`: scheme must be
+/// `turn`/`turns` (case-insensitive), written the RFC 7065 way (a single
+/// colon, e.g. `turn:example.com:3478`, never `turn://example.com`), with a
+/// non-empty host and no whitespace/control characters anywhere.
+///
+/// This is deliberately a lightweight presence/shape check, not a full RFC
+/// 3986 URI parser — it exists to reject blank fields, copy-paste mistakes
+/// (a `https://` pasted into the wrong box), and typos, not to validate every
+/// exotic host form (bracketed IPv6 literals are accepted but not fully
+/// parsed). Returns `Ok(())` for an acceptable URL, or an `Err` string safe to
+/// show the user directly.
+pub fn validate_turn_url(url: &str) -> Result<(), String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return Err("TURN server URL is required".to_string());
+    }
+    if trimmed.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("URL must not contain whitespace".to_string());
+    }
+    let Some((scheme, rest)) = trimmed.split_once(':') else {
+        return Err("must be a turn:/turns: URL, e.g. turn:example.com:3478".to_string());
+    };
+    let scheme_lower = scheme.to_lowercase();
+    if scheme_lower != "turn" && scheme_lower != "turns" {
+        return Err(format!(
+            "unsupported scheme '{scheme}' — use turn: or turns: (STUN-only needs no configuration here)"
+        ));
+    }
+    if let Some(after) = rest.strip_prefix('/') {
+        let _ = after;
+        return Err("TURN URIs use a single colon, not turn://".to_string());
+    }
+    let host = rest
+        .split('?')
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("");
+    if host.is_empty() {
+        return Err("missing host".to_string());
+    }
+    Ok(())
+}
+
+/// Mint one coturn "TURN REST API" time-limited long-term credential pair:
+/// `username = "<unix-expiry>"` (or `"<unix-expiry>:<label>"` when `label` is
+/// given — coturn accepts an arbitrary suffix after the colon, commonly used
+/// for a per-caller identifier in server logs), `password =
+/// base64(HMAC-SHA1(shared_secret, username))`. coturn (configured with
+/// `use-auth-secret` + the matching `static-auth-secret`, see
+/// `deploy/coturn/turnserver.conf`) independently recomputes the same HMAC to
+/// accept the pair, and rejects it once `now` passes the encoded expiry — so
+/// the credential is only ever useful for `ttl_secs` from `now_unix_secs`,
+/// unlike a static long-term username/password that works forever until
+/// someone manually revokes it.
+///
+/// `shared_secret` is the operator's server-side TURN REST secret — it must
+/// never reach a client device; only the *minted* username/password pair
+/// (this function's return value) is meant to travel to a caller. `now_unix_secs`
+/// is a parameter rather than read from the clock so this stays a pure,
+/// deterministically testable function; callers pass real wall-clock time.
+pub fn mint_turn_rest_credentials(
+    shared_secret: &[u8],
+    now_unix_secs: u64,
+    ttl_secs: u64,
+    label: Option<&str>,
+) -> (String, String) {
+    let expiry = now_unix_secs.saturating_add(ttl_secs);
+    let username = match label {
+        Some(l) if !l.is_empty() => format!("{expiry}:{l}"),
+        _ => expiry.to_string(),
+    };
+    // A `Hmac<Sha1>` key can be any length (it's hashed down internally when
+    // longer than the block size), so this never fails in practice — but the
+    // API is fallible, and an empty/misconfigured secret is exactly the kind
+    // of operator mistake worth surfacing loudly rather than silently, so a
+    // panic (not a swallowed default) is the right failure mode here.
+    let mut mac = Hmac::<Sha1>::new_from_slice(shared_secret)
+        .expect("HMAC-SHA1 accepts a key of any length, including empty");
+    mac.update(username.as_bytes());
+    let password = B64.encode(mac.finalize().into_bytes());
+    (username, password)
 }
 
 // ── STUN-first, TURN-on-failure ──────────────────────────────────────────────
@@ -700,6 +810,89 @@ mod tests {
         assert!(derive_sas(&with_fp, &without_fp).is_none());
         assert!(derive_sas(&without_fp, &with_fp).is_none());
         assert!(derive_sas(&without_fp, &without_fp).is_none());
+    }
+
+    #[test]
+    fn validate_turn_url_accepts_well_formed_turn_and_turns_uris() {
+        assert!(validate_turn_url("turn:example.com:3478").is_ok());
+        assert!(validate_turn_url("turns:example.com:5349").is_ok());
+        assert!(validate_turn_url("turn:example.com:3478?transport=tcp").is_ok());
+        assert!(
+            validate_turn_url("TURN:example.com:3478").is_ok(),
+            "scheme is case-insensitive"
+        );
+        assert!(
+            validate_turn_url("  turn:example.com:3478  ").is_ok(),
+            "surrounding whitespace is trimmed"
+        );
+    }
+
+    #[test]
+    fn validate_turn_url_rejects_blank_and_missing_host() {
+        assert!(validate_turn_url("").is_err());
+        assert!(validate_turn_url("   ").is_err());
+        assert!(validate_turn_url("turn:").is_err());
+        assert!(validate_turn_url("turn::3478").is_err());
+    }
+
+    #[test]
+    fn validate_turn_url_rejects_wrong_scheme() {
+        assert!(validate_turn_url("https://example.com").is_err());
+        assert!(
+            validate_turn_url("stun:example.com:19302").is_err(),
+            "STUN needs no TURN configuration"
+        );
+        assert!(validate_turn_url("example.com:3478").is_err());
+    }
+
+    #[test]
+    fn validate_turn_url_rejects_double_slash_and_whitespace() {
+        assert!(
+            validate_turn_url("turn://example.com:3478").is_err(),
+            "turn URIs use one colon, not turn://"
+        );
+        assert!(validate_turn_url("turn:exa mple.com:3478").is_err());
+        // A leading/trailing newline is exactly the copy-paste noise `trim()`
+        // is supposed to absorb (see the "surrounding whitespace is trimmed"
+        // acceptance test) — this checks an *embedded* control character,
+        // which trimming cannot and must not hide.
+        assert!(validate_turn_url("turn:exam\nple.com:3478").is_err());
+    }
+
+    #[test]
+    fn turn_rest_credentials_match_independently_computed_hmac_sha1() {
+        // Known-answer test computed independently in Python:
+        //   hmac.new(b"test-shared-secret", b"1799999999:alice", hashlib.sha1)
+        // — pins this function to the exact coturn REST API construction,
+        // not just "produces something base64-shaped".
+        let (username, password) =
+            mint_turn_rest_credentials(b"test-shared-secret", 1_799_999_999, 0, Some("alice"));
+        assert_eq!(username, "1799999999:alice");
+        assert_eq!(password, "mduJh+ql8gT3UMViKWYnFuZf/rQ=");
+    }
+
+    #[test]
+    fn turn_rest_credentials_encode_expiry_as_now_plus_ttl() {
+        let (username, _) = mint_turn_rest_credentials(b"secret", 1_000, 3_600, None);
+        assert_eq!(username, "4600");
+    }
+
+    #[test]
+    fn turn_rest_credentials_omit_label_when_none_or_empty() {
+        let (username, _) = mint_turn_rest_credentials(b"secret", 1_000, 60, None);
+        assert_eq!(username, "1060");
+        let (username, _) = mint_turn_rest_credentials(b"secret", 1_000, 60, Some(""));
+        assert_eq!(username, "1060");
+    }
+
+    #[test]
+    fn turn_rest_credentials_are_deterministic_and_secret_dependent() {
+        let a = mint_turn_rest_credentials(b"secret-one", 1_000, 60, Some("bob"));
+        let b = mint_turn_rest_credentials(b"secret-one", 1_000, 60, Some("bob"));
+        assert_eq!(a, b, "same inputs must mint the same pair");
+
+        let c = mint_turn_rest_credentials(b"secret-two", 1_000, 60, Some("bob"));
+        assert_ne!(a.1, c.1, "different secrets must mint different passwords");
     }
 
     #[test]

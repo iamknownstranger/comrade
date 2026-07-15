@@ -231,6 +231,53 @@ pub fn build_chitthi_thread(events: Vec<Event>) -> ChitthiThread {
     ChitthiThread { roots }
 }
 
+// ── Feed subscription policy (AUDIT.md COMMS-04) ────────────────────────────
+//
+// `subscribe_chitthi_feed` used to take only a `since_secs` window, which
+// meant "every Kind-1 note any pool relay has" — a relay-wide firehose with no
+// author or count bound. [`FeedFilterSpec`] replaces that with an explicit,
+// always-bounded product policy: every call site must pick one of
+// [`FeedScope`]'s variants rather than getting the firehose as a silent
+// default.
+
+/// Which authors' notes the feed subscription matches. Never "everyone,
+/// unbounded" — [`FeedScope::BoundedGlobal`] is the closest equivalent, and it
+/// still caps the result count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FeedScope {
+    /// Only notes from these authors — the normal case: self plus accepted
+    /// contacts. An empty vec is a valid (if unusual) choice that simply
+    /// matches nothing; it is never silently widened to "everyone".
+    Authors(Vec<PublicKey>),
+    /// No author filter, but capped to the most recent `limit` events within
+    /// the subscription's time window — for a fresh identity with no
+    /// contacts yet. Still an explicit, bounded product choice, not a
+    /// firehose: relays are free to return fewer, never asked for more.
+    BoundedGlobal { limit: usize },
+}
+
+/// The full feed-subscription policy: a [`FeedScope`] plus how far back to
+/// look. Constructed once per subscription (typically by
+/// `comrade_ui::ComradeRuntime` from the caller's contact list) and consumed
+/// by [`SabhaEngine::subscribe_chitthi_feed`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedFilterSpec {
+    pub scope: FeedScope,
+    pub since_secs: u64,
+}
+
+impl FeedFilterSpec {
+    fn into_filter(self) -> Filter {
+        let filter = Filter::new()
+            .kind(Kind::TextNote)
+            .since(Timestamp::now() - self.since_secs);
+        match self.scope {
+            FeedScope::Authors(authors) => filter.authors(authors),
+            FeedScope::BoundedGlobal { limit } => filter.limit(limit),
+        }
+    }
+}
+
 // ── Sabha Engine ─────────────────────────────────────────────────────────────
 
 pub type ChitthiCallback = Box<dyn Fn(Event) + Send + Sync + 'static>;
@@ -243,19 +290,33 @@ pub struct SabhaEngine {
 }
 
 impl SabhaEngine {
+    /// Connect to the default public relay set (see [`DEFAULT_RELAYS`]).
     pub async fn new(keys: &Keys) -> Result<Self, SabhaError> {
+        Self::new_with_relays(keys, DEFAULT_RELAYS.iter().map(|r| r.to_string())).await
+    }
+
+    /// Connect to an explicit relay set instead of [`DEFAULT_RELAYS`] — the
+    /// hook an isolated test environment (COMMS-03: a local relay, no public
+    /// internet dependency) or a future "selected relays" product setting
+    /// needs. Search relays ([`SEARCH_RELAYS`]) are unaffected: profile search
+    /// is a separate, opt-in query path, not part of the main feed/publish set.
+    pub async fn new_with_relays(
+        keys: &Keys,
+        relays: impl IntoIterator<Item = String>,
+    ) -> Result<Self, SabhaError> {
         let our_pk = keys.public_key();
         let client = Client::new(keys.clone());
-        for relay in DEFAULT_RELAYS {
+        let relays: Vec<String> = relays.into_iter().collect();
+        for relay in &relays {
             client
-                .add_relay(*relay)
+                .add_relay(relay)
                 .await
                 .map_err(|e| SabhaError::RelayError(e.to_string()))?;
         }
         // Search relays join read-only: we query them for NIP-50 profile
         // lookups but never publish feed events or subscribe writes to them.
         for relay in SEARCH_RELAYS {
-            if !DEFAULT_RELAYS.contains(relay) {
+            if !relays.iter().any(|r| r == relay) {
                 client
                     .add_read_relay(*relay)
                     .await
@@ -432,15 +493,15 @@ impl SabhaEngine {
         Ok(profiles)
     }
 
-    /// Subscribe to the Chitthi feed (Kind-1 events) since `since_secs` seconds ago.
+    /// Subscribe to the Chitthi feed under an explicit, bounded [`FeedFilterSpec`]
+    /// — never the relay-wide firehose (AUDIT.md COMMS-04). See [`FeedScope`]
+    /// for the two shapes a caller can pick.
     pub async fn subscribe_chitthi_feed(
         &self,
-        since_secs: u64,
+        spec: FeedFilterSpec,
         callback: ChitthiCallback,
     ) -> Result<(), SabhaError> {
-        let filter = Filter::new()
-            .kind(Kind::TextNote)
-            .since(Timestamp::now() - since_secs);
+        let filter = spec.into_filter();
 
         self.client
             .subscribe(filter, None)

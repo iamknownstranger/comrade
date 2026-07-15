@@ -63,4 +63,32 @@
     <string name="call_outcome_busy">Busy</string>
     <string name="call_outcome_cancelled">Cancelled</string>
     <string name="call_outcome_failed">Failed</string>
+
+    <!-- Background relay connection -->
+    <string name="relay_connection_notification_title">Comrade</string>
+    <string name="relay_connection_notification_text">Staying connected in the background</string>
+    <string name="settings_background_connectivity_title">Stay connected in the background</string>
+    <string name="settings_background_connectivity_summary">Keep receiving messages and calls while the app is unlocked but not on screen. Shows a low-priority notification while active; turning this off means messages and calls only arrive while Comrade is open.</string>
+
+    <!-- Vault lock -->
+    <string name="settings_lock_vault_title">Lock vault now</string>
+    <string name="settings_lock_vault_summary">Drops the decrypted key from memory immediately. You’ll need your passphrase to unlock again.</string>
+
+    <!-- TURN relay (calls) -->
+    <string name="settings_turn_title">Calls relay (TURN)</string>
+    <string name="settings_turn_explainer">Direct calls work for most pairs of devices. Some networks (notably carrier-grade NAT) need a relay server to connect at all — configure one here if calls fail to connect. Calls always try a direct connection first; the relay is only used if that fails.</string>
+    <string name="settings_turn_url_label">Server URL (turn: or turns:)</string>
+    <string name="settings_turn_username_label">Username</string>
+    <string name="settings_turn_credential_label">Credential</string>
+    <string name="settings_turn_save">Save</string>
+    <string name="settings_turn_clear">Clear</string>
+    <string name="settings_turn_configured">Relay configured: %1$s</string>
+    <string name="settings_turn_not_configured">No relay configured — calls that can’t connect directly will fail instead of falling back</string>
+    <string name="settings_turn_test">Test relay connectivity</string>
+    <string name="settings_turn_test_relay_available">Relay reachable — calls can fall back to it if a direct path fails</string>
+    <string name="settings_turn_test_relay_unavailable">Relay unreachable — check the server URL and credentials</string>
+    <string name="settings_turn_test_no_server">No relay configured to test</string>
+
+    <!-- Bluetooth call routing -->
+    <string name="call_route_bluetooth_denied">Bluetooth audio needs the Bluetooth permission — falling back to speaker</string>
 </resources>

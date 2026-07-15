@@ -68,6 +68,22 @@ android {
         versionCode = project.findProperty("versionCode")?.toString()?.toInt() ?: 2
         versionName = project.findProperty("versionName")?.toString() ?: "0.1.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        // Two-installation device harness (AUDIT.md COMMS-03): pass
+        // `-PdeviceHarnessRole=caller` / `=callee` to produce a second,
+        // independently-installable app (own applicationId, own storage —
+        // vault/redb/SharedPreferences are all keyed by applicationId's data
+        // directory) alongside the normal one, so a test can install both on
+        // one emulator and drive a real call between two genuinely separate
+        // processes. Deliberately a plain conditional suffix rather than a
+        // product flavor dimension: a flavor dimension changes every
+        // existing Gradle task name (`assembleDebug` → `assembleXDebug`),
+        // which would also require rewriting android-apk.yml/release.yml's
+        // task invocations. Unset — the default, and every existing
+        // build/release/CI invocation — leaves applicationId untouched.
+        project.findProperty("deviceHarnessRole")?.toString()?.takeIf { it.isNotBlank() }?.let { role ->
+            applicationIdSuffix = ".$role"
+        }
     }
 
     signingConfigs {

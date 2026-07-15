@@ -8,6 +8,7 @@ import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.os.Build
 import android.util.Log
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -17,11 +18,14 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import mullu.comrade.ComradeCore
 import org.webrtc.AudioSource
 import org.webrtc.AudioTrack
 import org.webrtc.Camera2Enumerator
 import org.webrtc.CameraVideoCapturer
+import org.webrtc.DataChannel
 import org.webrtc.DefaultVideoDecoderFactory
 import org.webrtc.DefaultVideoEncoderFactory
 import org.webrtc.EglBase
@@ -183,7 +187,14 @@ object CallManager {
 
     /** Everything mutable about the one in-flight call. */
     private class Session(
-        val callId: String,
+        /**
+         * Empty until [ComradeCore.placeCallTyped] mints the real id (caller
+         * side, provisional phase only — see [startOutgoingCall]); `var`,
+         * not `val`, so the same [Session] object can be filled in in place
+         * rather than replaced once the id is known. An incoming session
+         * always constructs with the real id already known.
+         */
+        var callId: String,
         val peer: String,
         val peerLabel: String,
         val media: CallMediaKind,
@@ -235,6 +246,15 @@ object CallManager {
         /** The pending ring/connect timeout, cancelled on connect or teardown. */
         var timeoutJob: Job? = null
 
+        /**
+         * Caller side only: the coroutine running [ComradeCore.placeCallTyped]
+         * and (once it resolves) building the peer connection and sending the
+         * offer. Cancelled by [hangup] so a cancel-before-placed never lets a
+         * late continuation send an offer after the UI has already gone back
+         * to [CallUiState.Idle] (AUDIT.md COMMS-05).
+         */
+        var placingJob: Job? = null
+
         /** The connection-quality stats-polling loop, started on connect and cancelled on teardown. */
         var statsJob: Job? = null
 
@@ -251,6 +271,32 @@ object CallManager {
      *
      * Permissions (mic, + camera for video) must already be granted — the UI
      * gates on that before calling in.
+     *
+     * ## Provisional session (AUDIT.md COMMS-05)
+     * The [Session] is created **synchronously, here** — before the async
+     * [ComradeCore.placeCallTyped] request even begins — rather than only
+     * once it resolves. That used to be a real bug: [session] stayed `null`
+     * for the whole `placeCallTyped` round-trip, so [hangup] called during
+     * that window found nothing to act on (`session ?: return`) and silently
+     * no-opped, leaving the UI stuck on "Calling…" — and the *later*
+     * continuation, seeing `session == null` (because the no-op hangup never
+     * set anything), proceeded to build the peer connection and send the
+     * offer anyway, after the user had already tried to cancel. Creating the
+     * provisional session up front means [hangup] always finds a session to
+     * mark [Session.ended] on and a [Session.placingJob] to cancel, and the
+     * continuation below re-checks both before doing anything observable.
+     *
+     * A ring/connect timeout is armed immediately too (not only once the
+     * offer is sent), so a slow or hanging `placeCallTyped` call can't leave
+     * the UI on "Calling…" with no timeout backstop either.
+     *
+     * ## Incoming offer during the provisional window
+     * The provisional session already occupies [session], so
+     * [handleRemoteOffer] treats a fresh incoming offer exactly like it would
+     * during an established call: not the same `callId` and no live `pc` yet
+     * ⇒ "already busy", auto-rejected with [CallSignal.Busy]. This is the
+     * documented policy — an outgoing call in flight always wins over a
+     * simultaneous incoming one, the same as after it connects.
      */
     @Synchronized
     fun startOutgoingCall(context: Context, peer: String, peerLabel: String, media: CallMediaKind) {
@@ -259,21 +305,29 @@ object CallManager {
             return
         }
         ensureFactory(context)
+        val s = Session(callId = "", peer = peer, peerLabel = peerLabel, media = media, incoming = false)
+        session = s
         // Optimistic ringing state so the UI opens immediately; the placeCall +
         // offer happen on IO because placeCall touches the store and the signal
         // send is a blocking DM round-trip.
         _state.value = CallUiState.Ringing(peer, peerLabel, media == CallMediaKind.VIDEO, incoming = false)
-        io.launch {
+        // Give up with "No answer" if the callee never picks up — armed now,
+        // not after the offer sends, so a slow placeCall is covered too.
+        armTimeout(s, RING_TIMEOUT_MS, HangupReason.MISSED, "missed")
+        s.placingJob = io.launch {
             val placed = runCatching { ComradeCore.placeCallTyped(peer, media) }
                 .getOrElse {
                     Log.e(TAG, "placeCall failed", it)
-                    endWith(HangupReason.FAILED, "failed", sendHangup = false)
+                    synchronized(this@CallManager) {
+                        if (session === s && !s.ended) endWith(HangupReason.FAILED, "failed", sendHangup = false)
+                    }
                     return@launch
                 }
             synchronized(this@CallManager) {
-                if (session != null) return@launch // raced with a teardown
-                val s = Session(placed.callId, placed.peer, peerLabel, media, incoming = false)
-                session = s
+                // Cancelled (hangup) while placeCallTyped was in flight — never
+                // build a peer connection or send an offer after that.
+                if (session !== s || s.ended) return@launch
+                s.callId = placed.callId
                 val ice = placed.iceServers.map { it.toWebRtc() }
                 if (!setupPeer(s, ice)) return@launch
                 // Caller creates the offer, sets it local, then signals it. A
@@ -285,8 +339,6 @@ object CallManager {
                     },
                     mediaConstraints(s.isVideo),
                 )
-                // Give up with "No answer" if the callee never picks up.
-                armTimeout(s, RING_TIMEOUT_MS, HangupReason.MISSED, "missed")
             }
         }
     }
@@ -378,11 +430,21 @@ object CallManager {
         endWith(HangupReason.DECLINED, "declined", sendHangup = true)
     }
 
-    /** Hang up / cancel the current call from the local UI. */
+    /**
+     * Hang up / cancel the current call from the local UI.
+     *
+     * A call cancelled before [ComradeCore.placeCallTyped] has even returned
+     * (`!s.incoming && s.pc == null` — the provisional window [startOutgoingCall]
+     * documents) has no offer on the wire yet to hang up: there is nothing for
+     * a [CallSignal.Hangup] to reach, so this ends the call locally only and
+     * cancels the in-flight [Session.placingJob] instead, which is what
+     * actually stops a late offer from being sent (see [endWith]).
+     */
     @Synchronized
     fun hangup() {
         val s = session ?: return
         val connected = s.connectedAtMs > 0
+        val stillPlacing = !s.incoming && s.pc == null
         val reason = when {
             connected -> HangupReason.NORMAL
             s.incoming -> HangupReason.DECLINED
@@ -393,7 +455,7 @@ object CallManager {
             s.incoming -> "declined"
             else -> "cancelled"
         }
-        endWith(reason, outcome, sendHangup = true)
+        endWith(reason, outcome, sendHangup = !stillPlacing)
     }
 
     // ── Toggles ──────────────────────────────────────────────────────────────
@@ -498,17 +560,129 @@ object CallManager {
         (session?.capturer as? CameraVideoCapturer)?.switchCamera(null)
     }
 
+    // ── TURN connectivity diagnostic (AUDIT.md COMMS-02) ─────────────────────
+
+    /** An honest, support-screen-ready read on TURN relay reachability. */
+    enum class TurnDiagnostic {
+        /** No TURN server is configured at all — nothing to test. */
+        NO_SERVER_CONFIGURED,
+
+        /** A `relay`-typed local ICE candidate was gathered — the relay is reachable. */
+        RELAY_AVAILABLE,
+
+        /** A server is configured but no relay candidate came back in time. */
+        RELAY_UNAVAILABLE,
+    }
+
+    /**
+     * Best-effort "is the configured TURN relay actually reachable" check for
+     * a settings/support screen — gathers ICE candidates against *only* the
+     * configured TURN server (`iceTransportsType = RELAY`, no STUN, no
+     * signaling, no remote peer, never touches [session]) and reports
+     * whether a `relay`-typed local candidate came back within [timeoutMs].
+     * Safe to call at any time, including mid-call, since it never touches
+     * the live session — it allocates its own throwaway [PeerConnection] and
+     * always disposes it before returning.
+     */
+    suspend fun testTurnConnectivity(context: Context, timeoutMs: Long = 8_000L): TurnDiagnostic {
+        val turnConfigured = runCatching { ComradeCore.turnServerStatusTyped().configured }.getOrDefault(false)
+        if (!turnConfigured) return TurnDiagnostic.NO_SERVER_CONFIGURED
+
+        val iceServers = runCatching { ComradeCore.callIceServersForTyped(IceStrategy.STUN_AND_TURN) }
+            .getOrDefault(emptyList())
+            .filter { it.username != null } // the TURN entry only — nothing to "test" about public STUN
+            .map { it.toWebRtc() }
+        if (iceServers.isEmpty()) return TurnDiagnostic.NO_SERVER_CONFIGURED
+
+        ensureFactory(context)
+        val fac = factory ?: return TurnDiagnostic.RELAY_UNAVAILABLE
+        val relayFound = CompletableDeferred<Boolean>()
+        val config = rtcConfig(iceServers).apply { iceTransportsType = PeerConnection.IceTransportsType.RELAY }
+        val observer = object : PeerConnection.Observer {
+            override fun onIceCandidate(candidate: IceCandidate) {
+                if (candidate.sdp.iceCandidateType() == "relay") relayFound.complete(true)
+            }
+            override fun onIceGatheringChange(newState: PeerConnection.IceGatheringState) {
+                if (newState == PeerConnection.IceGatheringState.COMPLETE) relayFound.complete(false)
+            }
+            // Unused observer surface — required by the interface (mirrors peerObserver's).
+            override fun onSignalingChange(newState: PeerConnection.SignalingState) {}
+            override fun onIceConnectionChange(newState: PeerConnection.IceConnectionState) {}
+            override fun onIceConnectionReceivingChange(receiving: Boolean) {}
+            override fun onIceCandidatesRemoved(candidates: Array<out IceCandidate>) {}
+            override fun onAddStream(stream: MediaStream) {}
+            override fun onRemoveStream(stream: MediaStream) {}
+            override fun onDataChannel(channel: DataChannel) {}
+            override fun onRenegotiationNeeded() {}
+            override fun onAddTrack(receiver: RtpReceiver, mediaStreams: Array<out MediaStream>) {}
+            override fun onConnectionChange(newState: PeerConnection.PeerConnectionState) {}
+        }
+        val pc = fac.createPeerConnection(config, observer)
+        if (pc == null) {
+            return TurnDiagnostic.RELAY_UNAVAILABLE
+        }
+        // ICE gathering needs at least one m-line to negotiate; a bare data
+        // channel is enough and never touches the microphone/camera.
+        pc.createDataChannel("turn-connectivity-test", DataChannel.Init())
+        pc.createOffer(
+            object : SdpObserver {
+                override fun onCreateSuccess(desc: SessionDescription) {
+                    pc.setLocalDescription(NoopSdpObserver, desc)
+                }
+                override fun onSetSuccess() {}
+                override fun onCreateFailure(error: String?) {
+                    Log.w(TAG, "testTurnConnectivity: createOffer failed: $error")
+                    relayFound.complete(false)
+                }
+                override fun onSetFailure(error: String?) {}
+            },
+            MediaConstraints(),
+        )
+        val result = withTimeoutOrNull(timeoutMs) { relayFound.await() } ?: false
+        withContext(Dispatchers.IO) {
+            runCatching { pc.close() }
+            runCatching { pc.dispose() }
+        }
+        return if (result) TurnDiagnostic.RELAY_AVAILABLE else TurnDiagnostic.RELAY_UNAVAILABLE
+    }
+
+    /** An [SdpObserver] that ignores every callback — for a `setLocalDescription` this diagnostic doesn't need to react to. */
+    private object NoopSdpObserver : SdpObserver {
+        override fun onCreateSuccess(desc: SessionDescription?) {}
+        override fun onSetSuccess() {}
+        override fun onCreateFailure(error: String?) {}
+        override fun onSetFailure(error: String?) {}
+    }
+
     // ── Peer connection setup ─────────────────────────────────────────────────
 
-    /** Build the [PeerConnection] and local tracks. Returns false (and tears down) on failure. */
-    private fun setupPeer(s: Session, iceServers: List<PeerConnection.IceServer>): Boolean {
-        val fac = factory ?: return false
-        val config = PeerConnection.RTCConfiguration(iceServers).apply {
+    /**
+     * Test-only override: when set, every [rtcConfig] this object builds from
+     * now on forces [PeerConnection.IceTransportsType.RELAY] — the standard
+     * WebRTC mechanism for "only use relay candidates", regardless of what
+     * direct/STUN paths actually exist. This is the fixture AUDIT.md
+     * COMMS-02/03 asks for to test TURN fallback without needing to actually
+     * firewall UDP on a device: an instrumented test (or a hidden developer
+     * setting) flips this before placing/accepting a call. Never touched by
+     * any production code path.
+     */
+    @Volatile
+    var forceRelayOnly: Boolean = false
+
+    /** The [PeerConnection.RTCConfiguration] every new/renegotiated peer connection uses. */
+    private fun rtcConfig(iceServers: List<PeerConnection.IceServer>) =
+        PeerConnection.RTCConfiguration(iceServers).apply {
             sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
             continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
             bundlePolicy = PeerConnection.BundlePolicy.MAXBUNDLE
             rtcpMuxPolicy = PeerConnection.RtcpMuxPolicy.REQUIRE
+            if (forceRelayOnly) iceTransportsType = PeerConnection.IceTransportsType.RELAY
         }
+
+    /** Build the [PeerConnection] and local tracks. Returns false (and tears down) on failure. */
+    private fun setupPeer(s: Session, iceServers: List<PeerConnection.IceServer>): Boolean {
+        val fac = factory ?: return false
+        val config = rtcConfig(iceServers)
         val pc = fac.createPeerConnection(config, peerObserver(s)) ?: run {
             Log.e(TAG, "createPeerConnection returned null")
             endWith(HangupReason.FAILED, "failed", sendHangup = false)
@@ -686,13 +860,7 @@ object CallManager {
                     endWith(HangupReason.FAILED, "failed", sendHangup = true)
                     return@launch
                 }
-                val config = PeerConnection.RTCConfiguration(widened.map { it.toWebRtc() }).apply {
-                    sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
-                    continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
-                    bundlePolicy = PeerConnection.BundlePolicy.MAXBUNDLE
-                    rtcpMuxPolicy = PeerConnection.RtcpMuxPolicy.REQUIRE
-                }
-                pc.setConfiguration(config)
+                pc.setConfiguration(rtcConfig(widened.map { it.toWebRtc() }))
                 s.remoteSet = false
                 pc.createOffer(
                     createSdpObserver(s) { offer ->
@@ -826,6 +994,11 @@ object CallManager {
         if (s.ended) return
         s.ended = true
         s.timeoutJob?.cancel()
+        // Belt-and-suspenders alongside the `session !== s || s.ended` guards
+        // in startOutgoingCall's continuation and setLocalThen/setRemoteThen:
+        // whatever path reached endWith, a still-pending placeCall/offer
+        // coroutine must never proceed afterward (AUDIT.md COMMS-05).
+        s.placingJob?.cancel()
 
         if (sendHangup) {
             io.launch {
@@ -929,6 +1102,11 @@ object CallManager {
      */
     private fun beginAudioRouting(video: Boolean) {
         val am = appContext?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+        // Each call gets a fresh chance to route to Bluetooth — a denial on a
+        // past call must not permanently hide the option (the user may have
+        // since granted it via system settings, or just wants to be asked
+        // again on the next call).
+        bluetoothPermissionDenied = false
         priorAudioMode = am.mode
         val focus = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
             .setAudioAttributes(
@@ -984,6 +1162,26 @@ object CallManager {
         }
     }
 
+    /**
+     * Set once the user explicitly selected the Bluetooth route but denied
+     * the `BLUETOOTH_CONNECT` runtime prompt (API 31+, requested by the UI —
+     * see `AudioRouteButton` in CallScreen.kt) — [refreshAvailableRoutes] then
+     * excludes Bluetooth from [availableRoutes] for the rest of *this* call
+     * rather than re-offering (and re-denying) it on every device-callback
+     * re-scan. Reset per call in [beginAudioRouting].
+     */
+    @Volatile
+    private var bluetoothPermissionDenied = false
+
+    /** Called by the UI once the user denies the Bluetooth permission prompt after selecting that route. */
+    @Synchronized
+    fun onBluetoothPermissionDenied() {
+        bluetoothPermissionDenied = true
+        if (_audioRoute.value == AudioRoute.BLUETOOTH) setAudioRoute(AudioRoute.EARPIECE)
+        val am = appContext?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+        refreshAvailableRoutes(am)
+    }
+
     /** Rebuild [availableRoutes] from the platform's current output devices. */
     private fun refreshAvailableRoutes(am: AudioManager) {
         val routes = linkedSetOf(AudioRoute.EARPIECE, AudioRoute.SPEAKER)
@@ -994,7 +1192,8 @@ object CallManager {
         }
         for (type in types) {
             when (type) {
-                AudioDeviceInfo.TYPE_BLUETOOTH_SCO, AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> routes.add(AudioRoute.BLUETOOTH)
+                AudioDeviceInfo.TYPE_BLUETOOTH_SCO, AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ->
+                    if (!bluetoothPermissionDenied) routes.add(AudioRoute.BLUETOOTH)
                 AudioDeviceInfo.TYPE_WIRED_HEADSET, AudioDeviceInfo.TYPE_WIRED_HEADPHONES -> routes.add(AudioRoute.WIRED)
             }
         }

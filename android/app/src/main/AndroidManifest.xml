@@ -18,6 +18,12 @@
          on Android 14+ (see CallService/the <service> entry below); video
          calls additionally use the camera type. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+    <!-- RelayConnectionService: keeps the relay connection (and therefore
+         notification delivery) alive while the vault is unlocked but no
+         Activity is visible — see its doc comment for the security boundary.
+         "dataSync" is the closest stock foregroundServiceType to "maintaining
+         a network connection and delivering the data it carries". -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <!-- ProximityScreenControl (CallScreen.kt) holds a PROXIMITY_SCREEN_OFF_WAKE_LOCK
          for the duration of a call. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
@@ -26,11 +32,16 @@
          audio routing (earpiece/speaker/Bluetooth/wired headset — see
          CallManager's AudioRoute). RECORD_AUDIO above already covers the
          microphone. The camera is declared optional so the app still installs
-         on camera-less devices — voice calls don't need it. Bluetooth headset
-         routing uses only AudioManager APIs (device enumeration + legacy SCO),
-         never android.bluetooth.*, so no BLUETOOTH_CONNECT permission is needed. -->
+         on camera-less devices — voice calls don't need it. -->
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <!-- Bluetooth call-audio routing on API 31+: AudioManager.setCommunicationDevice
+         to a TYPE_BLUETOOTH_SCO device requires this even though CallManager
+         never touches android.bluetooth.* directly. Requested at runtime only
+         when the user actually selects the Bluetooth route (CallManager /
+         AudioRouteButton) — declaring it here just makes that request
+         possible; it does not grant it. -->
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
     <!-- Ringing/vibrating for an incoming call (Ringer.kt). Normal permission —
          no runtime prompt. -->
     <uses-permission android:name="android.permission.VIBRATE" />
@@ -95,6 +106,14 @@
             android:name=".voice.WakeWordService"
             android:exported="false"
             android:foregroundServiceType="microphone" />
+
+        <!-- Keeps the relay connection alive while the vault is unlocked but
+             the app is backgrounded — see RelayConnectionService's doc
+             comment for scope and the security boundary. -->
+        <service
+            android:name=".RelayConnectionService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
 
         <!-- Assist app: the assist gesture (long-press power) opens Comrade -->
         <service

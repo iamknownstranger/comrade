@@ -28,6 +28,7 @@ object Notifier {
     const val CHANNEL_MESSAGES = "comrade_messages"
     const val CHANNEL_REQUESTS = "comrade_requests"
     const val CHANNEL_CALLS = "comrade_calls"
+    const val CHANNEL_CONNECTION = "comrade_connection"
 
     private const val GROUP_MESSAGES = "comrade_messages_group"
 
@@ -55,6 +56,13 @@ object Notifier {
                 "Calls",
                 NotificationManager.IMPORTANCE_HIGH,
             ).apply { description = "Incoming voice and video calls" },
+        )
+        mgr.createNotificationChannel(
+            NotificationChannel(
+                CHANNEL_CONNECTION,
+                "Background connection",
+                NotificationManager.IMPORTANCE_MIN,
+            ).apply { description = "Comrade is staying connected while unlocked in the background" },
         )
     }
 

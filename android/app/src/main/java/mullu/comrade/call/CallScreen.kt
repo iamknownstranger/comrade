@@ -1,8 +1,14 @@
 package mullu.comrade.call
 
+import android.Manifest
 import android.content.Context
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.PowerManager
 import android.util.Log
+import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -45,6 +51,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.delay
 import mullu.comrade.R
 import mullu.comrade.ui.CallEndIcon
@@ -408,12 +415,39 @@ private fun CallActionButton(
  * The audio-output control: a button showing the current [AudioRoute] that
  * opens a menu of every currently-present route ([availableRoutes] — earpiece
  * and speaker are always listed; Bluetooth/wired only while connected).
- * Tapping an entry calls [CallManager.setAudioRoute] directly.
+ * Tapping an entry calls [CallManager.setAudioRoute] — except Bluetooth on
+ * API 31+, which needs `BLUETOOTH_CONNECT` requested first (AUDIT.md
+ * COMMS-06): granted, it proceeds exactly the same; denied, this reports it
+ * to [CallManager.onBluetoothPermissionDenied] (which drops Bluetooth from
+ * [availableRoutes] for the rest of the call) and explains the fallback via
+ * a toast rather than leaving a tap silently do nothing.
  */
 @Composable
 private fun AudioRouteButton(current: AudioRoute, availableRoutes: List<AudioRoute>) {
     var expanded by remember { mutableStateOf(false) }
     val active = current != AudioRoute.EARPIECE
+    val context = LocalContext.current
+    val bluetoothPermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        if (granted) {
+            CallManager.setAudioRoute(AudioRoute.BLUETOOTH)
+        } else {
+            CallManager.onBluetoothPermissionDenied()
+            Toast.makeText(context, R.string.call_route_bluetooth_denied, Toast.LENGTH_LONG).show()
+        }
+    }
+    fun selectRoute(route: AudioRoute) {
+        val needsBluetoothPermission = route == AudioRoute.BLUETOOTH &&
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) !=
+                PackageManager.PERMISSION_GRANTED
+        if (needsBluetoothPermission) {
+            bluetoothPermission.launch(Manifest.permission.BLUETOOTH_CONNECT)
+        } else {
+            CallManager.setAudioRoute(route)
+        }
+    }
     Box {
         CallActionButton(
             icon = SpeakerIcon,
@@ -427,7 +461,7 @@ private fun AudioRouteButton(current: AudioRoute, availableRoutes: List<AudioRou
                 DropdownMenuItem(
                     text = { Text(audioRouteLabel(route)) },
                     onClick = {
-                        CallManager.setAudioRoute(route)
+                        selectRoute(route)
                         expanded = false
                     },
                 )
