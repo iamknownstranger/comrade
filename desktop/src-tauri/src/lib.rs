@@ -123,7 +123,10 @@ pub fn run() {
             commands::mark_conversation_read,
             // Calls (voice/video signalling over the DM channel)
             commands::call_ice_servers,
+            commands::call_ice_servers_for,
+            commands::call_sas,
             commands::set_turn_server,
+            commands::turn_server_status,
             commands::place_call,
             commands::send_call_signal,
             commands::hangup_call,

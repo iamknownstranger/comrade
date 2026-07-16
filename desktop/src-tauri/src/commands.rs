@@ -17,7 +17,8 @@ use std::sync::Arc;
 use comrade_ui::{
     CallRecordDto, CallSessionDto, ChitthiDto, ComradeRuntime, ContactDto, ConversationDto,
     FoundProfileDto, IceServerDto, IdentityDto, JournalEntryDto, MediaBytesDto, MediaMessageDto,
-    MessageDto, MessageRequestDto, ProfileDto, SakhaStatusDto, UpiIntentDto, WorkspaceDto,
+    MessageDto, MessageRequestDto, ProfileDto, SakhaStatusDto, TurnServerStatusDto, UpiIntentDto,
+    WorkspaceDto,
 };
 use tokio::sync::RwLock;
 
@@ -274,6 +275,32 @@ pub async fn call_ice_servers(
     Ok(state.read().await.call_ice_servers())
 }
 
+/// ICE servers for one connection attempt under `strategy` (`"stun_only"` or
+/// `"stun_and_turn"`) — see `comrade_ui::ComradeRuntime::call_ice_servers_for`.
+/// Every call starts `"stun_only"` (see [`place_call`]); the frontend retries
+/// with `"stun_and_turn"` if the connection never reaches
+/// `connected`/`completed`, restarting ICE against the widened server list.
+#[tauri::command]
+pub async fn call_ice_servers_for(
+    state: tauri::State<'_, Runtime>,
+    strategy: String,
+) -> Result<Vec<IceServerDto>, String> {
+    Ok(state.read().await.call_ice_servers_for(&strategy))
+}
+
+/// The 4-emoji short authentication string (SAS) for the in-progress call's
+/// `local_sdp`/`remote_sdp`, to read aloud and compare. `None` when either
+/// side's SDP has no `a=fingerprint:` line to derive one from — an honest
+/// "can't verify", not an error. See `comrade_ui::ComradeRuntime::call_sas`.
+#[tauri::command]
+pub async fn call_sas(
+    state: tauri::State<'_, Runtime>,
+    local_sdp: String,
+    remote_sdp: String,
+) -> Result<Option<Vec<String>>, String> {
+    Ok(state.read().await.call_sas(&local_sdp, &remote_sdp))
+}
+
 /// Configure (blank `url` clears) the TURN relay used for calls.
 #[tauri::command]
 pub async fn set_turn_server(
@@ -287,6 +314,16 @@ pub async fn set_turn_server(
         .await
         .set_turn_server(&url, &username, &credential)
         .map_err(|e| e.to_string())
+}
+
+/// The "is a relay configured" diagnostic status for a settings screen — the
+/// URL only, never the username/credential, so it is safe to show or log
+/// directly. See `comrade_ui::ComradeRuntime::turn_server_status`.
+#[tauri::command]
+pub async fn turn_server_status(
+    state: tauri::State<'_, Runtime>,
+) -> Result<TurnServerStatusDto, String> {
+    Ok(state.read().await.turn_server_status())
 }
 
 /// Begin a call to `peer` (`media` = "audio"/"video"); returns the call session.

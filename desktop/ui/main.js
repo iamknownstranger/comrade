@@ -30,6 +30,19 @@
       }
     : mockBackend();
 
+  // ── Call decision helpers (desktop/ui/call_decisions.mjs) ──────────────────
+  // This file is a plain classic script (index.html loads it as
+  // `<script src="main.js">`, no type="module"), so a static `import`
+  // statement isn't available here. Dynamic `import()` is spec'd to work
+  // from classic scripts too (it isn't restricted to module scripts), so we
+  // kick the load off once, at parse time — long before any call signal can
+  // plausibly arrive — and every call site below awaits this same cached
+  // promise. That's a smaller, safer diff than flipping main.js to
+  // type="module" (which would also change the whole file to always-strict
+  // semantics and defer-by-default execution timing) for a change that only
+  // needs to reuse a couple of pure functions from another file.
+  const callDecisionsReady = import("./call_decisions.mjs");
+
   // ── Tiny DOM helpers ──────────────────────────────────────────────────────
   const $ = (sel) => document.querySelector(sel);
 
@@ -158,6 +171,10 @@
     peerNames: new Map(), // peer pubkey -> published display handle
     replyTo: null, // { id, content, outgoing } while composing a reply
     call: null, // active call session (see newCallState)
+    // Bounded memory of recently-ended call ids (see call_decisions.mjs
+    // rememberEndedCall) — mirrors Android's CallManager.endedCallIds, so a
+    // redelivered Offer for a call we already tore down doesn't ring again.
+    endedCallIds: [],
   };
 
   // Prefer a peer's published handle over the raw npub when we have one.
@@ -834,6 +851,14 @@
     );
   }
 
+  // Mirror of Android's CONNECT_TIMEOUT_MS (CallManager.kt:112): once a side is
+  // in the connecting phase (has an answer in hand / has sent its answer), fail
+  // the call honestly if ICE never reaches "connected" within this window. This
+  // is the backstop the callee's WAIT-on-failed relies on — Android's callee
+  // wait is only safe because this 30s timer sits under it. NOT the 45s ring
+  // timeout (a separate, deferred WP): this covers the connect phase only.
+  const CONNECT_TIMEOUT_MS = 30_000;
+
   function newCallState(base) {
     return Object.assign(
       {
@@ -848,10 +873,16 @@
         offerSdp: null, // buffered offer (callee) until Accept
         pendingIce: [], // remote candidates buffered until remoteDescription set
         remoteSet: false,
+        // Caller-only STUN->TURN fallback one-shot: set true the first (and
+        // only) time we widen to TURN and re-offer with an ICE restart, so a
+        // second pre-connect "failed" is terminal instead of looping. Mirrors
+        // Android's Session.triedTurn (CallManager.kt:1069-1073). See WP3.
+        triedTurn: false,
         connected: false,
         startedAt: null, // connect time (unix secs) that drives the timer
         initAt: nowSecs(), // call-initiation time; the log's started_at fallback
         timerId: null,
+        connectTimeoutId: null, // connect-phase timeout handle (see armConnectTimeout)
         muted: false,
         ended: false,
       },
@@ -939,15 +970,103 @@
     };
     pc.onconnectionstatechange = () => {
       const st = pc.connectionState;
-      if (st === "connected") onCallConnected();
-      else if (st === "failed")
-        finishCall({ sendHangup: true, reason: "failed", outcome: "failed" });
-      // "disconnected" can be transient (ICE restart); don't tear down on it.
+      if (st === "connected") {
+        onCallConnected();
+        return;
+      }
+      // Every other state routes through the pure decision table
+      // (call_decisions.decideConnectionStateAction), which folds Android's
+      // decideConnectionStateAction + tryTurnFallbackOrFail (WP3). `c` is the
+      // session this pc belongs to, so a late event can't act on a different
+      // call. Fire-and-forget: the handler is async only because the caller's
+      // TURN fallback awaits.
+      onConnectionStateChanged(c, st);
     };
 
     attachLocalMedia();
     attachRemoteMedia();
     return true;
+  }
+
+  // React to a non-"connected" peer-connection state change. Replaces the old
+  // hardcoded "failed -> finishCall" (which broke the caller's CGNAT case: no
+  // TURN fallback, no ICE restart) with Android's proven decision table.
+  async function onConnectionStateChanged(c, st) {
+    // Bail if this event is for a call that has since ended or been replaced.
+    if (!c || c.ended || state.call !== c) return;
+    const { decideConnectionStateAction, CONNECTION_ACTION } = await callDecisionsReady;
+    const action = decideConnectionStateAction({
+      connectionState: st,
+      hasConnectedBefore: c.connected, // set once in onCallConnected, never cleared
+      isCaller: !c.incoming,
+      triedTurn: c.triedTurn,
+    });
+    // Re-check liveness across the await above.
+    if (c.ended || state.call !== c) return;
+    switch (action) {
+      case CONNECTION_ACTION.RESTART_WITH_TURN:
+        await tryTurnFallback(c);
+        break;
+      // Post-connect "failed" (RECOVER_NOW): desktop has no media-recovery
+      // countdown yet — that is deferred beyond WP3 (the pure function still
+      // returns Android's RECOVER_NOW so the conformance suite stays honest),
+      // so we map it to the same terminal treatment desktop always gave a
+      // "failed" connection. FAIL is the caller's already-tried-TURN terminal.
+      case CONNECTION_ACTION.RECOVER_NOW:
+      case CONNECTION_ACTION.FAIL:
+        await finishCall({ sendHangup: true, reason: "failed", outcome: "failed" });
+        break;
+      // WAIT: callee pre-connect "failed" — wait for the caller's rescue
+      // re-offer (Android has no callee TURN retry; CallManager.kt:1065-1068).
+      // RECOVER_AFTER_GRACE: post-connect "disconnected" — desktop already
+      // tolerated "disconnected" as transient (ICE restart), so keep ignoring
+      // it here rather than starting a countdown (deferred, as above). NONE:
+      // nothing to do.
+      case CONNECTION_ACTION.WAIT:
+      case CONNECTION_ACTION.RECOVER_AFTER_GRACE:
+      case CONNECTION_ACTION.NONE:
+      default:
+        break;
+    }
+  }
+
+  // Caller-only STUN->TURN fallback: the direct/STUN path failed to connect, so
+  // widen to STUN+TURN and restart ICE with a fresh offer. That re-offer is a
+  // same-call_id offer the callee answers as a renegotiation (WP1), and the
+  // second answer comes back into applyRemoteAnswer (accepted via decideAnswer,
+  // not a one-shot flag). Reuses the EXISTING pc: no getUserMedia re-run, no new
+  // pc, no duration timer touched. Mirrors Android's tryTurnFallbackOrFail
+  // (CallManager.kt:1063-1097). One-shot via c.triedTurn.
+  async function tryTurnFallback(c) {
+    if (!c || !c.pc || c.ended) return;
+    // Set the one-shot BEFORE any await, so a second pre-connect "failed" during
+    // the async gap below decides FAIL (terminal) rather than a restart loop.
+    c.triedTurn = true;
+    setCallStatusText("Connecting…"); // subtle status: fall back to "connecting"
+    let widened = [];
+    try {
+      widened =
+        (await safeInvoke("call_ice_servers_for", { strategy: "stun_and_turn" }, { silent: true })) ||
+        [];
+    } catch {
+      // If we can't widen, the re-offer below still runs on whatever we have and
+      // the next "failed" is terminal (triedTurn is already set).
+    }
+    // Re-check liveness after the await.
+    if (!c.pc || c.ended || state.call !== c) return;
+    try {
+      c.pc.setConfiguration({ iceServers: normalizeIce(widened) });
+      // Buffer any new-generation remote ICE until the fresh answer's
+      // setRemoteDescription runs — mirrors Android setting s.remoteSet = false
+      // before the re-offer (CallManager.kt:1086). applyRemoteAnswer sets
+      // remoteSet = true and flushes pendingIce when the second answer lands.
+      c.remoteSet = false;
+      const offer = await c.pc.createOffer({ iceRestart: true });
+      await c.pc.setLocalDescription(offer);
+      await sendSignal({ kind: "offer", sdp: offer.sdp });
+    } catch (e) {
+      await finishCall({ sendHangup: true, reason: "failed", outcome: "failed" });
+    }
   }
 
   // Caller: place the call, negotiate locally, and send the offer.
@@ -991,10 +1110,56 @@
     }
   }
 
-  // Callee: an offer arrived. Ring (Accept/Decline), or auto-reject if busy.
+  // Callee: an offer arrived. Depending on call_decisions.decideOfferDisposition
+  // this either rings fresh (no call yet), renegotiates the existing pc (a
+  // same-call_id re-offer — e.g. the caller's STUN->TURN ICE-restart
+  // fallback), silently no-ops a duplicate/ended call_id, or auto-rejects as
+  // busy (a genuinely different call_id). See call_decisions.mjs for the
+  // pure decision this mirrors from Android's CallManager.
   async function handleIncomingOffer(p, sig) {
-    if (state.call) {
-      // Busy: politely reject the new caller and log the missed attempt.
+    const { decideOfferDisposition, OFFER_DISPOSITION, isEndedCallId } = await callDecisionsReady;
+    const c = state.call;
+    const disposition = decideOfferDisposition({
+      hasCall: !!c,
+      sameCallId: !!c && c.callId === p.call_id,
+      hasPc: !!c && !!c.pc,
+      isEndedCallId: isEndedCallId(state.endedCallIds, p.call_id),
+    });
+
+    if (disposition === OFFER_DISPOSITION.ENDED_NOOP) {
+      // Redelivered offer for a call we already tore down (relay
+      // at-least-once delivery, or a backfill re-scan) — drop silently,
+      // don't ring again.
+      console.log(`call ${p.call_id}: ignoring offer for an already-ended call`);
+      return;
+    }
+
+    if (disposition === OFFER_DISPOSITION.RENEGOTIATE) {
+      // Same call_id re-offer on a live pc (the P0 fix: this used to be
+      // answered `busy`, which broke an Android caller's STUN->TURN
+      // ICE-restart fallback). Answer on the existing pc — do NOT touch
+      // getUserMedia, do NOT recreate the pc, do NOT reset the duration
+      // timer or any UI state.
+      try {
+        await c.pc.setRemoteDescription({ type: "offer", sdp: sig.sdp });
+        const answer = await c.pc.createAnswer();
+        await c.pc.setLocalDescription(answer);
+        await sendSignal({ kind: "answer", sdp: answer.sdp });
+      } catch (e) {
+        showToast(`Could not renegotiate the call — ${errText(e)}`, "error");
+      }
+      return;
+    }
+
+    if (disposition === OFFER_DISPOSITION.DUPLICATE_NOOP) {
+      // Same call_id redelivered while still ringing, pre-accept (no pc
+      // yet) — drop silently; re-ringing would only restart the ring state.
+      return;
+    }
+
+    if (disposition === OFFER_DISPOSITION.BUSY) {
+      // Genuinely busy on a different call: politely reject the new caller
+      // and log the missed attempt.
       try {
         await safeInvoke(
           "send_call_signal",
@@ -1012,6 +1177,8 @@
       logCall(p.peer, p.call_id, p.media, true, "busy", nowSecs(), 0);
       return;
     }
+
+    // NEW_INCOMING: no live call — ring as usual (happy path, unchanged).
     if (!callSupported()) {
       try {
         await safeInvoke(
@@ -1062,6 +1229,12 @@
       const answer = await c.pc.createAnswer();
       await c.pc.setLocalDescription(answer);
       await sendSignal({ kind: "answer", sdp: answer.sdp });
+      // Answer sent — now fail honestly if ICE never connects, so the call
+      // can't hang on "Connecting…" forever (mirrors Android arming
+      // CONNECT_TIMEOUT_MS right after the callee's answer, CallManager.kt:510).
+      // This is the backstop under the callee's WAIT-on-failed: if the caller
+      // dies mid-fallback or its hangup never arrives, this timer ends the call.
+      armConnectTimeout(c);
     } catch (e) {
       showToast(`Could not answer the call — ${errText(e)}`, "error");
       await finishCall({ sendHangup: true, reason: "failed", outcome: "failed" });
@@ -1117,10 +1290,28 @@
   async function applyRemoteAnswer(sdp) {
     const c = state.call;
     if (!c || !c.pc) return;
+    // Apply an answer only while this pc is still holding our own unanswered
+    // local offer ("have-local-offer") — mirrors Android's decideAnswer
+    // (CallManager.kt:1648). This is what lets the STUN->TURN fallback's SECOND
+    // answer apply (after the ICE-restart re-offer's setLocalDescription the pc
+    // is back in "have-local-offer"), while a redelivered duplicate answer that
+    // arrives once the pc has settled to "stable" is ignored instead of
+    // throwing in setRemoteDescription and tearing the live call down. Keying
+    // off signalingState (not a one-shot flag like c.remoteSet) is deliberate:
+    // a latch would drop the legitimate second answer and hang the fallback.
+    const { decideAnswer, ANSWER_DECISION } = await callDecisionsReady;
+    if (decideAnswer(c.pc.signalingState) !== ANSWER_DECISION.APPLY) return;
     try {
       await c.pc.setRemoteDescription({ type: "answer", sdp });
       c.remoteSet = true;
       await flushPendingIce();
+      // Answer in hand — (re)arm the connect timeout (mirrors Android,
+      // CallManager.kt:1019). Re-arming here is also what gives the STUN->TURN
+      // fallback's SECOND answer a fresh window; tryTurnFallback deliberately
+      // does NOT touch the timer, so the original window rides through the
+      // re-offer exactly as Android's does, and this re-arm starts a fresh 30s
+      // for the relayed attempt.
+      armConnectTimeout(c);
       if (!c.connected) setCallStatusText("Connecting…");
     } catch (e) {
       await finishCall({ sendHangup: true, reason: "failed", outcome: "failed" });
@@ -1171,11 +1362,85 @@
 
   function onCallConnected() {
     const c = state.call;
-    if (!c || c.connected) return;
-    c.connected = true;
-    c.phase = "connected";
-    c.startedAt = nowSecs();
-    startDurationTimer();
+    if (!c) return;
+    if (!c.connected) {
+      c.connected = true;
+      c.phase = "connected";
+      c.startedAt = nowSecs();
+      // Connected — the connect timeout no longer applies (mirrors CallManager.kt:1103).
+      clearConnectTimeout(c);
+      startDurationTimer();
+    }
+    // Re-derive the SAS on every connected transition, not just the first —
+    // mirrors Android's onConnected calling maybeDeriveSas unconditionally on
+    // every CONNECTED observation (CallManager.kt:1101-1108), so a mid-call
+    // ICE-restart reconnect (WP3's TURN fallback) recomputes against the
+    // fresh post-restart SDPs instead of leaving a stale pre-restart code on
+    // screen. Fire-and-forget: a DOM update, nothing here needs to block on it.
+    updateCallSas(c);
+  }
+
+  // ── SAS (short authentication string) — encryption verification (WP4) ────
+  //
+  // Once a call is connected, both sides' negotiated SDPs carry a DTLS-SRTP
+  // certificate fingerprint (`a=fingerprint:` line); `call_sas` derives a
+  // 4-emoji code from the pair that must match on both ends to rule out a
+  // man-in-the-middle on the call's media path — mirrors Android's
+  // maybeDeriveSas (CallManager.kt:1207-1230), fired from the same
+  // connected-transition site (onConnected there, onCallConnected here).
+  // `call_sas` returns None/null when either side's SDP has no fingerprint
+  // line at all — an honest "can't verify", never a fabricated code (see
+  // crates/comrade_ui/src/runtime.rs:1258-1270) — which this renders as
+  // visible text on the call panel (see renderSasResult below).
+
+  /** Hide/clear the SAS row. Called whenever the call panel (re)opens for a
+   * call that hasn't been verified yet (ringing/connecting) and when the
+   * call ends, so a new or absent call never shows a stale SAS. */
+  function resetSasRow() {
+    const row = $("#call-sas");
+    if (!row) return;
+    row.hidden = true;
+    row.classList.remove("no-sas");
+    $("#call-sas-value").textContent = "";
+  }
+
+  /** Fetch both SDPs off the live pc and ask the backend to derive the SAS,
+   * then paint the result. Guards against the call having ended or been
+   * replaced by the time the (async) invoke returns, both before and after
+   * the network round-trip, per WP4. */
+  async function updateCallSas(c) {
+    if (!c || !c.pc) return;
+    const localSdp = c.pc.localDescription && c.pc.localDescription.sdp;
+    const remoteSdp = c.pc.remoteDescription && c.pc.remoteDescription.sdp;
+    let sas = null;
+    if (localSdp && remoteSdp) {
+      try {
+        sas = await safeInvoke(
+          "call_sas",
+          { localSdp, remoteSdp },
+          { silent: true }, // honest "can't verify" is not an error toast
+        );
+      } catch {
+        sas = null; // treat a transport error the same as an honest can't-verify
+      }
+    }
+    // Re-check liveness after the await: the call may have ended, or been
+    // replaced by a newer one, while the invoke was in flight.
+    if (!c || c.ended || state.call !== c) return;
+    const { formatSas } = await callDecisionsReady;
+    renderSasResult(formatSas(sas));
+  }
+
+  /** Paint the call panel's SAS row from an already-formatted string (or
+   * `null` for the honest can't-verify state). Always updates the same fixed
+   * DOM nodes — never appends — so re-deriving after an ICE restart repaints
+   * in place instead of duplicating anything. */
+  function renderSasResult(formatted) {
+    const row = $("#call-sas");
+    if (!row) return;
+    row.hidden = false;
+    row.classList.toggle("no-sas", !formatted);
+    $("#call-sas-value").textContent = formatted || "Can't verify — no encryption fingerprint";
   }
 
   // Best-effort call-log write (never surfaces its own error).
@@ -1192,6 +1457,17 @@
     const c = state.call;
     if (!c || c.ended) return;
     c.ended = true;
+    // Cancel the connect timeout up front so it can never fire into a *later*
+    // call (zombie timer) — mirrors Android clearing timeoutJob in endWith
+    // (CallManager.kt:1247). The c.ended guard above + shouldConnectTimeoutFire
+    // together also make the timeout-vs-hangup race a no-op either way.
+    clearConnectTimeout(c);
+    // Remember this call_id as ended so a redelivered terminal Offer
+    // (relay at-least-once delivery, or a backfill re-scan) doesn't ring
+    // again — see call_decisions.mjs rememberEndedCall, mirroring Android's
+    // CallManager.endedCallIds/rememberEnded.
+    const { rememberEndedCall } = await callDecisionsReady;
+    state.endedCallIds = rememberEndedCall(state.endedCallIds, c.callId);
     stopDurationTimer();
     const duration = c.startedAt ? Math.max(0, nowSecs() - c.startedAt) : 0;
     if (sendHangup) {
@@ -1262,6 +1538,7 @@
     $("#call-peer").textContent = displayName(c.peer);
     $("#call-media-label").textContent = c.media === "video" ? "Video call" : "Voice call";
     $("#call-timer").hidden = true;
+    resetSasRow(); // this call hasn't reached connected yet — no SAS to show
     attachLocalMedia();
     attachRemoteMedia();
     $("#call-active").hidden = false;
@@ -1269,6 +1546,7 @@
 
   function hideCallOverlay() {
     $("#call-active").hidden = true;
+    resetSasRow();
     const mb = $("#call-mute");
     mb.classList.remove("is-muted");
     mb.textContent = "🎙";
@@ -1346,6 +1624,41 @@
     if (state.call && state.call.timerId) {
       clearInterval(state.call.timerId);
       state.call.timerId = null;
+    }
+  }
+
+  // Connect-phase timeout — the desktop mirror of Android's armTimeout +
+  // CONNECT_TIMEOUT_MS (CallManager.kt:1581-1592, 112). Armed by the caller when
+  // the answer applies (applyRemoteAnswer) and by the callee once its answer is
+  // sent (acceptIncoming); cleared on connect (onCallConnected) and teardown
+  // (finishCall). armConnectTimeout cancels any prior timer first, so re-arming
+  // on the fallback's second answer just replaces the window — matching
+  // Android's armTimeout, which does `timeoutJob?.cancel()` before re-launching.
+  function armConnectTimeout(c) {
+    if (!c) return;
+    clearConnectTimeout(c);
+    c.connectTimeoutId = setTimeout(async () => {
+      c.connectTimeoutId = null; // fired — no longer pending
+      const { shouldConnectTimeoutFire } = await callDecisionsReady;
+      // Only end the call if it's still current, un-ended, and never connected
+      // (mirrors the guard in Android's armTimeout body, CallManager.kt:1586).
+      if (
+        !shouldConnectTimeoutFire({
+          isCurrentCall: state.call === c,
+          ended: c.ended,
+          connected: c.connected,
+        })
+      )
+        return;
+      // Same terminal shape the FAIL connection-state action uses.
+      await finishCall({ sendHangup: true, reason: "failed", outcome: "failed" });
+    }, CONNECT_TIMEOUT_MS);
+  }
+
+  function clearConnectTimeout(c) {
+    if (c && c.connectTimeoutId) {
+      clearTimeout(c.connectTimeoutId);
+      c.connectTimeoutId = null;
     }
   }
 
@@ -1965,6 +2278,17 @@
           return null;
         case "call_ice_servers":
           return ICE_DEMO.slice();
+        case "call_ice_servers_for":
+          // Browser preview has no TURN relay configured, so both the
+          // "stun_only" and "stun_and_turn" strategies resolve to the same
+          // STUN-only demo list — matching the real runtime when no relay is
+          // set (the widened list equals the STUN-only one). Keeps WP3's caller
+          // TURN-fallback path from throwing "unknown command" in preview.
+          return ICE_DEMO.slice();
+        case "call_sas":
+          // Fixed 4-emoji demo code so the SAS row is visible in browser
+          // preview without a real WebRTC connection or backend (WP4).
+          return ["🐶", "🦊", "🐝", "🐳"];
         case "set_turn_server":
           return null;
         case "place_call":

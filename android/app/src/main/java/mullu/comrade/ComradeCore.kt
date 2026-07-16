@@ -434,10 +434,11 @@ object ComradeCore {
 
     // ── Calls (voice/video signaling) ─────────────────────────────────────────
     //
-    // No Android call screen exists yet, so these take/return the same typed
-    // enums `Comrade` itself does (`CallMediaKind`, `HangupReason`, `CallSignal`)
-    // rather than the old JNI bridge's ad hoc strings — whichever screen wires
-    // these up next gets a compiler-checked contract for free.
+    // The call UI lives in `call/CallManager.kt` (state machine + WebRTC) and
+    // `call/CallScreen.kt` (Compose UI); both consume the same typed enums
+    // `Comrade` itself does (`CallMediaKind`, `HangupReason`, `CallSignal`)
+    // rather than the old JNI bridge's ad hoc strings — a compiler-checked
+    // contract for that wiring.
 
     data class IceServerInfo(val urls: List<String>, val username: String?, val credential: String?)
 

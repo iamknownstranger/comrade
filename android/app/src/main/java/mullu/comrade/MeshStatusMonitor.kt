@@ -9,10 +9,11 @@ import kotlinx.coroutines.flow.asStateFlow
  * a persistent status indicator.
  *
  * [ComradeCore.pollEvent] drains a single process-global native receiver, so
- * only one pump loop may ever consume it ([MainActivity] already owns that
+ * only one pump loop may ever consume it ([RelayConnectionService] owns that
  * loop for Chitthis/DMs/requests). This object holds no polling logic of its
- * own — [MainActivity] pushes updates in as `mesh_status_changed` events
- * arrive, and seeds the initial value from [ComradeCore.meshStatusTyped].
+ * own — [RelayConnectionService]'s [ChatEventRouter] pushes updates in as
+ * `mesh_status_changed` events arrive, and seeds the initial value from
+ * [ComradeCore.meshStatusTyped].
  */
 object MeshStatusMonitor {
     private val _status = MutableStateFlow(ComradeCore.MeshStatus(active = false, peerCount = 0))
