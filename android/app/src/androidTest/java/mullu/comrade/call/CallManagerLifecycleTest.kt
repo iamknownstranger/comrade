@@ -1,13 +1,16 @@
 package mullu.comrade.call
 
+import android.Manifest
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.rule.GrantPermissionRule
 import kotlinx.coroutines.runBlocking
 import mullu.comrade.ComradeCore
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.BeforeClass
+import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 import uniffi.comrade_core.CallMediaKind
@@ -32,6 +35,23 @@ import java.io.File
  */
 @RunWith(AndroidJUnit4::class)
 class CallManagerLifecycleTest {
+
+    // Placing a real call drives CallManager -> setupPeer -> CallService.start,
+    // which promotes a microphone-typed foreground service. On API 34+ a
+    // mic-typed FGS *requires* the RECORD_AUDIO runtime permission to be held,
+    // or startForeground throws SecurityException and kills the whole
+    // instrumentation process — which then surfaces as a collateral
+    // window-focus failure in whatever test runs next (e.g. MainActivityUiTest).
+    // Production always holds these before a call (withCallPermissions gates
+    // startOutgoingCall); the test must grant them the same way. CAMERA covers
+    // any video placement, POST_NOTIFICATIONS lets the ongoing-call
+    // notification post.
+    @get:Rule
+    val permissions: GrantPermissionRule = GrantPermissionRule.grant(
+        Manifest.permission.RECORD_AUDIO,
+        Manifest.permission.CAMERA,
+        Manifest.permission.POST_NOTIFICATIONS,
+    )
 
     companion object {
         /** How long the [CallUiState.Ended] card lingers before [CallManager] itself returns to Idle. */
