@@ -125,6 +125,8 @@ class MainActivityUiTest {
 
     private companion object {
         const val USERNAME = "ci_tester"
-        const val PASSCODE = "comrade-ci-passcode"
+        // Digits only — OnboardingScreen's create-time validation now rejects
+        // anything else, to match the numeric keypad on the passcode fields.
+        const val PASSCODE = "135790"
     }
 }

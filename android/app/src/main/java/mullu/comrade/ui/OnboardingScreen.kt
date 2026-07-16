@@ -77,6 +77,8 @@ fun OnboardingScreen(
                     "Only letters, numbers and _ are allowed."
                 !claimOnly && passcode.length < 6 ->
                     "Passcode must be at least 6 characters."
+                !claimOnly && !isValidPasscode(passcode) ->
+                    "Passcode must contain only numbers."
                 !claimOnly && passcode != confirm ->
                     "Passcodes don't match."
                 else -> null
@@ -171,7 +173,7 @@ fun OnboardingScreen(
                 singleLine = true,
                 enabled = !busy,
                 visualTransformation = PasswordVisualTransformation(),
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
                 modifier = Modifier
                     .fillMaxWidth()
                     .testTag("onboarding-passcode"),
@@ -184,7 +186,7 @@ fun OnboardingScreen(
                     singleLine = true,
                     enabled = !busy,
                     visualTransformation = PasswordVisualTransformation(),
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
                     modifier = Modifier
                         .fillMaxWidth()
                         .testTag("onboarding-confirm"),
@@ -231,3 +233,13 @@ fun OnboardingScreen(
         }
     }
 }
+
+/**
+ * True when [passcode] is non-empty and made up of digits only.
+ *
+ * The create/confirm/unlock fields all show a numeric keypad
+ * ([KeyboardType.NumberPassword]), so this is enforced here too — at create
+ * time — rather than relying on the keypad alone to keep non-digit input out.
+ */
+fun isValidPasscode(passcode: String): Boolean =
+    passcode.isNotEmpty() && passcode.all { it.isDigit() }
