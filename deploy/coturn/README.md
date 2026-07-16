@@ -66,6 +66,45 @@ directly in `turnserver.conf` via coturn's `user=` directive instead of
 "this credential works forever until someone manually revokes it" tradeoff
 the REST mode exists to avoid.
 
+## Baked-in default relay (the CI `TURN_URL`/`TURN_USERNAME`/`TURN_PASSWORD` values)
+
+The Android workflows bake `TURN_URL`/`TURN_USERNAME`/`TURN_PASSWORD` (GitHub
+Actions secrets, or repository variables as a fallback) into the APK as the
+default relay (`CallRelayDefaults`). That pair is sent to coturn **as-is, as a
+long-term credential** — the app never re-derives anything from it. So the
+server and the baked-in values must agree on the auth mode:
+
+| coturn mode | GitHub values that work |
+|---|---|
+| `lt-cred-mech` + `user=alice:s3cret` | `TURN_USERNAME=alice`, `TURN_PASSWORD=s3cret` |
+| `use-auth-secret` (this template) | Only a pre-minted REST pair (`TURN_USERNAME=<unix-expiry>`, `TURN_PASSWORD=base64(HMAC-SHA1(secret, username))`) — which **expires at `<unix-expiry>`**, silently breaking every install built from it after that moment |
+
+The common failure looks like this: coturn deployed from this template
+(`use-auth-secret`), and the `static-auth-secret` — or an arbitrary made-up
+user/password — set as `TURN_USERNAME`/`TURN_PASSWORD`. coturn then answers
+every allocation with 401, the app gathers no `relay` candidates, and calls
+that need the relay (CGNAT, strict NATs) sit on "Connecting…" until the
+connect timeout fails them. If you want a baked-in default that keeps working
+across builds, run coturn with a static user instead:
+
+```
+# turnserver.conf — static-credential variant (replaces the REST block)
+lt-cred-mech
+user=comrade:REPLACE_ME_WITH_A_LONG_RANDOM_PASSWORD
+realm=REPLACE_ME_WITH_YOUR_DOMAIN
+```
+
+and set the same pair as the GitHub values. (Accepting the tradeoff above:
+that pair ships inside every APK and works until you rotate it.)
+
+**Verify before shipping**: the app's Settings screen has a TURN relay
+diagnostic (`CallManager.testTurnConnectivity`) that performs a real
+allocation against the configured relay and reports whether a `relay`
+candidate came back — run it on a build with the baked-in values (or after
+typing the same values into Settings) rather than assuming the handshake
+works. From a shell, `turnutils_uclient -u <user> -w <password> -y
+turn.example.com` exercises the same path.
+
 ## Never logged
 
 Neither the shared secret nor any minted credential is ever written to a log

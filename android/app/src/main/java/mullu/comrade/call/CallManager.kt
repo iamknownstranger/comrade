@@ -11,6 +11,7 @@ import android.util.Log
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
@@ -81,6 +82,10 @@ import uniffi.comrade_ui.CallSignalDto
  * publish from any thread); the blocking FFI sends run on [io]. Mutating call
  * transitions are `@Synchronized` on this object so the pump thread, the WebRTC
  * threads, and the UI thread can't interleave a teardown with a fresh signal.
+ *
+ * One hard rule inside that scheme: a callback delivered *on* a WebRTC thread
+ * must never take this object's monitor inline — it hops to [webRtcLane]
+ * first. See that field for the deadlock this prevents.
  */
 object CallManager {
 
@@ -157,6 +162,38 @@ object CallManager {
     private const val JITTER_GOOD_MS = 30.0
 
     private val io = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /**
+     * Ordered, single-lane dispatcher for WebRTC callbacks that need this
+     * object's monitor.
+     *
+     * `org.webrtc` delivers [PeerConnection.Observer]/[SdpObserver]/stats
+     * callbacks on its internal signaling thread — the same thread every
+     * blocking `PeerConnection` proxy method (`addIceCandidate`,
+     * `setConfiguration`, `signalingState`, `addTrack`, …) synchronously
+     * waits on. If a callback `synchronized`s on this object *inline* while
+     * another thread already holds the monitor and is inside one of those
+     * blocking proxy calls (the event pump does exactly that:
+     * [onIncomingSignal] is `@Synchronized` and [addRemoteIce] calls
+     * `addIceCandidate`), the two park on each other forever: the signaling
+     * thread waits for the monitor, the monitor holder waits for the
+     * signaling thread. From that moment *every* `synchronized` transition —
+     * [hangup], [reject], the armed ring/connect timeouts — blocks for good:
+     * the "stuck on Connecting… and End call does nothing" freeze, hitting
+     * the callee hardest because its pump applies the caller's trickled ICE
+     * candidates right while its own peer connection is firing
+     * CONNECTING/FAILED state changes.
+     *
+     * The invariant that breaks the cycle: a WebRTC-thread callback never
+     * takes the monitor inline — it hops here instead, so the signaling
+     * thread is always free and every blocking proxy call made under the
+     * monitor stays bounded. A single lane (not the whole [io] pool) so the
+     * hopped work preserves the signaling thread's delivery order — an SDP
+     * `onSetSuccess` still lands before the `onConnectionChange(CONNECTED)`
+     * that follows it.
+     */
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private val webRtcLane = Dispatchers.IO.limitedParallelism(1)
 
     // ── Observable state for the Compose layer ───────────────────────────────
     private val _state = MutableStateFlow<CallUiState>(CallUiState.Idle)
@@ -787,6 +824,26 @@ object CallManager {
     @Volatile
     var forceRelayOnly: Boolean = false
 
+    /**
+     * Test-only: a [PeerConnection.Observer] wired to a throwaway, never-current
+     * [Session] — lets an instrumented test deliver observer callbacks from its
+     * own stand-in "signaling thread" and assert they return promptly even
+     * while another thread holds this object's monitor (the deadlock
+     * [webRtcLane] exists to prevent). The throwaway session is never installed
+     * in [session], so every hopped `session === s` guard no-ops — nothing
+     * about live call state is reachable through it.
+     */
+    internal fun peerConnectionObserverForTest(): PeerConnection.Observer =
+        peerObserver(
+            Session(
+                callId = "monitor-hazard-test",
+                peer = "monitor-hazard-test-peer",
+                peerLabel = "monitor-hazard-test-peer",
+                media = CallMediaKind.AUDIO,
+                incoming = true,
+            ),
+        )
+
     /** The [PeerConnection.RTCConfiguration] every new/renegotiated peer connection uses. */
     private fun rtcConfig(iceServers: List<PeerConnection.IceServer>) =
         PeerConnection.RTCConfiguration(iceServers).apply {
@@ -884,6 +941,15 @@ object CallManager {
                 // A re-offer for the current call (e.g. the caller's TURN
                 // ICE-restart) is a renegotiation, not a new call — answer it
                 // on the existing pc.
+                //
+                // Pre-connect, this is the caller's rescue attempt after its
+                // STUN-only ICE failed: give it a fresh, full connect window
+                // instead of whatever remains of the timeout armed at accept
+                // (which may be moments from firing by the time ICE has
+                // failed and the widened re-offer has travelled here).
+                if (existing.connectedAtMs == 0L) {
+                    armTimeout(existing, CONNECT_TIMEOUT_MS, HangupReason.FAILED, "failed")
+                }
                 setRemoteThen(existing, SessionDescription(SessionDescription.Type.OFFER, sdp)) {
                     existing.pc?.createAnswer(
                         createSdpObserver(existing) { answer ->
@@ -1150,9 +1216,13 @@ object CallManager {
                 delay(STATS_POLL_MS)
                 val pc = synchronized(this@CallManager) { if (session === s && !s.ended) s.pc else null } ?: break
                 pc.getStats { report ->
+                    // classifyQuality is pure — safe on the WebRTC thread — but
+                    // the monitor is not (see [webRtcLane]).
                     val quality = classifyQuality(report)
-                    synchronized(this@CallManager) {
-                        if (session === s && !s.ended) _connectionQuality.value = quality
+                    io.launch(webRtcLane) {
+                        synchronized(this@CallManager) {
+                            if (session === s && !s.ended) _connectionQuality.value = quality
+                        }
                     }
                 }
             }
@@ -1709,8 +1779,11 @@ object CallManager {
         override fun onSetSuccess() {}
         override fun onCreateFailure(error: String?) {
             Log.e(TAG, "createOffer/Answer failed: $error")
-            synchronized(this@CallManager) {
-                if (session === s) endWith(HangupReason.FAILED, "failed", sendHangup = true)
+            // WebRTC-thread callback — hop before taking the monitor (see [webRtcLane]).
+            io.launch(webRtcLane) {
+                synchronized(this@CallManager) {
+                    if (session === s) endWith(HangupReason.FAILED, "failed", sendHangup = true)
+                }
             }
         }
         override fun onSetFailure(error: String?) {}
@@ -1721,20 +1794,25 @@ object CallManager {
             object : SdpObserver {
                 override fun onCreateSuccess(p0: SessionDescription?) {}
                 override fun onSetSuccess() {
-                    synchronized(this@CallManager) {
-                        if (session !== s) return
-                        // The offer for the caller, the answer for the callee — and
-                        // whichever of the two on a renegotiation, overwriting the
-                        // prior value so it can never go stale (see [Session.localSdp]).
-                        s.localSdp = desc.description
-                        onDone()
+                    // WebRTC-thread callback — hop before taking the monitor (see [webRtcLane]).
+                    io.launch(webRtcLane) {
+                        synchronized(this@CallManager) {
+                            if (session !== s || s.ended) return@launch
+                            // The offer for the caller, the answer for the callee — and
+                            // whichever of the two on a renegotiation, overwriting the
+                            // prior value so it can never go stale (see [Session.localSdp]).
+                            s.localSdp = desc.description
+                            onDone()
+                        }
                     }
                 }
                 override fun onCreateFailure(p0: String?) {}
                 override fun onSetFailure(error: String?) {
                     Log.e(TAG, "setLocalDescription failed: $error")
-                    synchronized(this@CallManager) {
-                        if (session === s) endWith(HangupReason.FAILED, "failed", sendHangup = true)
+                    io.launch(webRtcLane) {
+                        synchronized(this@CallManager) {
+                            if (session === s) endWith(HangupReason.FAILED, "failed", sendHangup = true)
+                        }
                     }
                 }
             },
@@ -1747,22 +1825,27 @@ object CallManager {
             object : SdpObserver {
                 override fun onCreateSuccess(p0: SessionDescription?) {}
                 override fun onSetSuccess() {
-                    synchronized(this@CallManager) {
-                        if (session !== s) return
-                        s.remoteSet = true
-                        // The answer for the caller, the offer for the callee — and
-                        // whichever of the two on a renegotiation, overwriting the
-                        // prior value so it can never go stale (see [Session.remoteSdp]).
-                        s.remoteSdp = desc.description
-                        flushPendingIce(s)
-                        onDone()
+                    // WebRTC-thread callback — hop before taking the monitor (see [webRtcLane]).
+                    io.launch(webRtcLane) {
+                        synchronized(this@CallManager) {
+                            if (session !== s || s.ended) return@launch
+                            s.remoteSet = true
+                            // The answer for the caller, the offer for the callee — and
+                            // whichever of the two on a renegotiation, overwriting the
+                            // prior value so it can never go stale (see [Session.remoteSdp]).
+                            s.remoteSdp = desc.description
+                            flushPendingIce(s)
+                            onDone()
+                        }
                     }
                 }
                 override fun onCreateFailure(p0: String?) {}
                 override fun onSetFailure(error: String?) {
                     Log.e(TAG, "setRemoteDescription failed: $error")
-                    synchronized(this@CallManager) {
-                        if (session === s) endWith(HangupReason.FAILED, "failed", sendHangup = true)
+                    io.launch(webRtcLane) {
+                        synchronized(this@CallManager) {
+                            if (session === s) endWith(HangupReason.FAILED, "failed", sendHangup = true)
+                        }
                     }
                 }
             },
@@ -1822,29 +1905,34 @@ object CallManager {
 
         override fun onConnectionChange(newState: PeerConnection.PeerConnectionState) {
             Log.i(TAG, "peerConnectionState → $newState, callId=${s.callId}")
-            if (newState == PeerConnection.PeerConnectionState.CONNECTED) {
-                synchronized(this@CallManager) { if (session === s) onConnected(s) }
-                return
-            }
-            val hasConnectedBefore = synchronized(this@CallManager) { s.connectedAtMs > 0 }
-            when (decideConnectionStateAction(newState, hasConnectedBefore)) {
-                // A call that was already Active lost its media path — arm a
-                // bounded recovery window rather than the pre-connect TURN
-                // retry (which only the caller drives) or leaving it hanging
-                // forever (the callee's prior behavior).
-                ConnectionStateAction.RECOVER_NOW ->
-                    synchronized(this@CallManager) { if (session === s) armRecoveryTimeout(s, RECOVERY_TIMEOUT_MS) }
-                // DISCONNECTED can be transient (a brief blip, or an ICE
-                // restart in progress) — tolerate it for a grace period
-                // before starting the same recovery countdown.
-                ConnectionStateAction.RECOVER_AFTER_GRACE ->
-                    synchronized(this@CallManager) {
-                        if (session === s) armRecoveryTimeout(s, DISCONNECT_GRACE_MS + RECOVERY_TIMEOUT_MS)
-                    }
-                // Pre-connect FAILED: the caller's existing STUN→TURN fallback.
-                ConnectionStateAction.TRY_TURN_FALLBACK ->
-                    synchronized(this@CallManager) { if (session === s) tryTurnFallbackOrFail(s) }
-                ConnectionStateAction.NONE -> Unit
+            // Delivered on the WebRTC signaling thread — taking the monitor
+            // inline here deadlocks against any monitor holder inside a
+            // blocking PeerConnection proxy call (see [webRtcLane]).
+            io.launch(webRtcLane) {
+                if (newState == PeerConnection.PeerConnectionState.CONNECTED) {
+                    synchronized(this@CallManager) { if (session === s) onConnected(s) }
+                    return@launch
+                }
+                val hasConnectedBefore = synchronized(this@CallManager) { s.connectedAtMs > 0 }
+                when (decideConnectionStateAction(newState, hasConnectedBefore)) {
+                    // A call that was already Active lost its media path — arm a
+                    // bounded recovery window rather than the pre-connect TURN
+                    // retry (which only the caller drives) or leaving it hanging
+                    // forever (the callee's prior behavior).
+                    ConnectionStateAction.RECOVER_NOW ->
+                        synchronized(this@CallManager) { if (session === s) armRecoveryTimeout(s, RECOVERY_TIMEOUT_MS) }
+                    // DISCONNECTED can be transient (a brief blip, or an ICE
+                    // restart in progress) — tolerate it for a grace period
+                    // before starting the same recovery countdown.
+                    ConnectionStateAction.RECOVER_AFTER_GRACE ->
+                        synchronized(this@CallManager) {
+                            if (session === s) armRecoveryTimeout(s, DISCONNECT_GRACE_MS + RECOVERY_TIMEOUT_MS)
+                        }
+                    // Pre-connect FAILED: the caller's existing STUN→TURN fallback.
+                    ConnectionStateAction.TRY_TURN_FALLBACK ->
+                        synchronized(this@CallManager) { if (session === s) tryTurnFallbackOrFail(s) }
+                    ConnectionStateAction.NONE -> Unit
+                }
             }
         }
 
