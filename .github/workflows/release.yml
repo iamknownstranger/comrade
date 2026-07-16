@@ -293,11 +293,14 @@ jobs:
           SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
           SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
           SIGNING_STORE_FILE: "app/keystore.jks"
-          # Baked-in default TURN relay (see app/build.gradle.kts). Empty if the
-          # secrets aren't set, in which case no default relay is compiled in.
-          TURN_URL: ${{ secrets.TURN_URL }}
-          TURN_USERNAME: ${{ secrets.TURN_USERNAME }}
-          TURN_PASSWORD: ${{ secrets.TURN_PASSWORD }}
+          # Baked-in default TURN relay (see app/build.gradle.kts). Accepts
+          # either Actions *secrets* or repository/environment *variables*
+          # (secrets win when both are set — vars are readable by anyone with
+          # repo read access, so prefer secrets for the credential pair).
+          # Empty if neither is set, in which case no default relay is compiled in.
+          TURN_URL: ${{ secrets.TURN_URL || vars.TURN_URL }}
+          TURN_USERNAME: ${{ secrets.TURN_USERNAME || vars.TURN_USERNAME }}
+          TURN_PASSWORD: ${{ secrets.TURN_PASSWORD || vars.TURN_PASSWORD }}
         # The .apk is for sideloading (GitHub Releases / Obtainium); the .aab
         # is what Google Play requires for new apps. Same signing config.
         run: |

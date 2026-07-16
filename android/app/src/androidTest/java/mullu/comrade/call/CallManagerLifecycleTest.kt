@@ -43,6 +43,12 @@ class CallManagerLifecycleTest {
             val context = ApplicationProvider.getApplicationContext<android.content.Context>()
             val dir = File(context.filesDir, "call-lifecycle-test-vault")
             runCatching { ComradeCore.unlockVaultTyped(dir.absolutePath, "test-passphrase") }
+            // These tests target the call *state machine*; the cancel-races
+            // they exercise can still reach setupPeer and start the real
+            // CallService foreground service, whose start→immediate-stop is
+            // exactly the "did not call startForeground" process kill on a
+            // loaded emulator — see [CallManager.disableCallServiceForTest].
+            CallManager.disableCallServiceForTest = true
         }
 
         /** A syntactically valid, but unreachable/unknown, peer for tests that never expect real delivery. */

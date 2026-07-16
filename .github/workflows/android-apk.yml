@@ -206,11 +206,14 @@ jobs:
       - name: Assemble debug APK
         working-directory: android
         env:
-          # Baked-in default TURN relay (see app/build.gradle.kts). Empty if the
-          # secrets aren't set → no default relay compiled in.
-          TURN_URL: ${{ secrets.TURN_URL }}
-          TURN_USERNAME: ${{ secrets.TURN_USERNAME }}
-          TURN_PASSWORD: ${{ secrets.TURN_PASSWORD }}
+          # Baked-in default TURN relay (see app/build.gradle.kts). Accepts
+          # either Actions *secrets* or repository/environment *variables*
+          # (secrets win when both are set — vars are readable by anyone with
+          # repo read access, so prefer secrets for the credential pair).
+          # Empty if neither is set → no default relay compiled in.
+          TURN_URL: ${{ secrets.TURN_URL || vars.TURN_URL }}
+          TURN_USERNAME: ${{ secrets.TURN_USERNAME || vars.TURN_USERNAME }}
+          TURN_PASSWORD: ${{ secrets.TURN_PASSWORD || vars.TURN_PASSWORD }}
         run: |
           ./gradlew assembleDebug \
             -PversionCode="$VERSION_CODE" \
@@ -329,10 +332,11 @@ jobs:
       - name: Run on-device smoke tests
         uses: reactivecircus/android-emulator-runner@v2
         env:
-          # Baked-in default TURN relay for the assembled test APK (empty if unset).
-          TURN_URL: ${{ secrets.TURN_URL }}
-          TURN_USERNAME: ${{ secrets.TURN_USERNAME }}
-          TURN_PASSWORD: ${{ secrets.TURN_PASSWORD }}
+          # Baked-in default TURN relay for the assembled test APK (empty if
+          # unset). Secrets or repo variables — see the assemble job above.
+          TURN_URL: ${{ secrets.TURN_URL || vars.TURN_URL }}
+          TURN_USERNAME: ${{ secrets.TURN_USERNAME || vars.TURN_USERNAME }}
+          TURN_PASSWORD: ${{ secrets.TURN_PASSWORD || vars.TURN_PASSWORD }}
         with:
           api-level: ${{ matrix.api-level }}
           arch: x86_64

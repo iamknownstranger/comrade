@@ -29,19 +29,35 @@ import mullu.comrade.Notifier
  */
 class CallService : Service() {
 
+    override fun onCreate() {
+        super.onCreate()
+        // Honor the foreground-service contract *immediately*: this service
+        // is always started with startForegroundService(), which demands a
+        // startForeground() call before the service stops — including when
+        // onStartCommand bails on a blank redelivered intent, and when
+        // CallManager's teardown stopService() lands before onStartCommand
+        // has even run (a call that failed in the same breath it was
+        // placed). Missing that window is not an error state Android logs —
+        // it is a hard crash of the whole process
+        // (ForegroundServiceDidNotStartInTimeException). Go foreground with
+        // a generic placeholder here; onStartCommand replaces it in place
+        // (same NOTIFICATION_ID) with the real peer-labeled notification.
+        startForegroundNotified(peer = "", peerLabel = getString(mullu.comrade.R.string.call_voice), video = false)
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val peer = intent?.getStringExtra(EXTRA_PEER)
         if (peer.isNullOrEmpty()) {
             // A system-triggered restart (e.g. the process was killed under
             // memory pressure) can redeliver a blank/null intent with no
-            // guarantee the original extras survived. Starting a foreground
-            // service with a blank ongoing-call notification is worse than
-            // not starting one — bail before startForegroundNotified.
+            // guarantee the original extras survived. There is no call to
+            // show — stop. Safe contract-wise: onCreate already called
+            // startForeground, and stopping removes its notification.
             stopSelf()
             return START_NOT_STICKY
         }
-        val peerLabel = intent?.getStringExtra(EXTRA_PEER_LABEL)?.ifBlank { null } ?: peer
-        val video = intent?.getBooleanExtra(EXTRA_VIDEO, false) ?: false
+        val peerLabel = intent.getStringExtra(EXTRA_PEER_LABEL)?.ifBlank { null } ?: peer
+        val video = intent.getBooleanExtra(EXTRA_VIDEO, false)
         startForegroundNotified(peer, peerLabel, video)
         return START_NOT_STICKY
     }
