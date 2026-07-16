@@ -123,6 +123,37 @@ android {
                 storeFile = keystore
             }
         }
+
+        // Debug builds: point AGP's built-in "debug" config at the keystore
+        // committed at android/debug.keystore instead of letting AGP fall
+        // back to its own default (a fresh key minted per machine, at
+        // ~/.android/debug.keystore the first time each runner/workstation
+        // builds). That per-machine default is exactly the bug this fixes:
+        // every CI run used to sign with its OWN throwaway debug key, so a
+        // sideloaded APK from one run could never update an install from
+        // another — Android refuses with "App not installed" on the
+        // signature mismatch, and the user loses local app data (vault,
+        // message history) crossing builds.
+        //
+        // Committed on purpose. These are the standard, deliberately-public
+        // Android debug credentials (alias "androiddebugkey", storepass/
+        // keypass "android") baked into AGP's own default debug keystore —
+        // debug keys are not secrets. Sharing this one file means every
+        // CI run and every local build produce the same signature, so
+        // sideloaded updates keep app data instead of forcing an
+        // uninstall/reinstall.
+        //
+        // NEVER for production: this only ever backs the "debug"
+        // signingConfig. Release builds prefer signingConfigs.findByName
+        // ("release") above and fall back to this "debug" one only when the
+        // SIGNING_* secrets are absent (see buildTypes.release below) — the
+        // SIGNING_* secret path always takes precedence when configured.
+        getByName("debug") {
+            storeFile = rootProject.file("debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
     }
 
     buildTypes {

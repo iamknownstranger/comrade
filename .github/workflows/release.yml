@@ -156,6 +156,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
+        with:
+          # Full history, not the default shallow (depth-1) clone: the
+          # version-code step below counts commits with `git rev-list
+          # --count HEAD`, which needs the whole history to be accurate.
+          fetch-depth: 0
 
       - name: Download all JNI libs
         uses: actions/download-artifact@v4
@@ -260,6 +265,27 @@ jobs:
           fi
           echo "VERSION=$v" >> "$GITHUB_ENV"
 
+      - name: Compute version code
+        # Scheme change: versionCode used to be `github.run_number`, which
+        # is local to this workflow's own run counter and not comparable to
+        # android-apk.yml's debug builds — the two artifact channels could
+        # (and did) end up out of order, which Android treats as a
+        # downgrade and refuses to install. Commit count on HEAD is history
+        # shared with android-apk.yml (see that workflow) and only ever
+        # increases, so debug and release artifacts now order correctly
+        # against each other no matter which workflow produced which build.
+        #
+        # Verified safe to switch: at the time of this change `git
+        # rev-list --count HEAD` is 127, versus 31 tagged releases
+        # (`git tag | wc -l` / GitHub Releases) and a `github.run_number`
+        # that had only reached 17 on direct runs of this workflow (25 on
+        # auto-release.yml, whose run number this workflow inherits when
+        # called via workflow_call). 127 is comfortably above every
+        # historical versionCode this workflow has ever produced, so every
+        # existing install sees the new scheme as an upgrade, never a
+        # downgrade.
+        run: echo "VERSION_CODE=$(git rev-list --count HEAD)" >> "$GITHUB_ENV"
+
       - name: Build release APK + App Bundle
         working-directory: android
         env:
@@ -276,7 +302,7 @@ jobs:
         # is what Google Play requires for new apps. Same signing config.
         run: |
           ./gradlew assembleRelease bundleRelease \
-            -PversionCode="${{ github.run_number }}" \
+            -PversionCode="$VERSION_CODE" \
             -PversionName="$VERSION" \
             --no-daemon
 

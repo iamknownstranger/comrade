@@ -12,6 +12,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -25,23 +26,30 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Create
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FloatingActionButton
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalDrawerSheet
+import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.NavigationDrawerItem
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -224,13 +232,12 @@ fun ComradeApp() {
     }
 }
 
-// ── Main shell: Chats · Feed · Settings ──────────────────────────────────────
+// ── Main shell: Chats · Journal · Feed (Settings & Call history via the drawer) ─
 
 private enum class MainTab(val label: String, val icon: ImageVector) {
     Chats("Chats", ChatBubbleIcon),
     Journal("Journal", BookIcon),
     Feed("Feed", ArticleIcon),
-    Settings("Settings", Icons.Filled.Settings),
 }
 
 /** Sub-navigation inside the Chats tab. */
@@ -259,6 +266,11 @@ private fun MainShell(
     val activity = context as? Activity
     var tab by rememberSaveable { mutableStateOf(MainTab.Chats) }
     var chatNav by remember { mutableStateOf<ChatNav>(ChatNav.List) }
+    // Settings is a pushed screen (Telegram-style), reached from the drawer,
+    // not a bottom-nav tab. The drawer is the app-wide navigation menu.
+    var settingsOpen by rememberSaveable { mutableStateOf(false) }
+    val drawerState = rememberDrawerState(DrawerValue.Closed)
+    val scope = rememberCoroutineScope()
     // Owned by RelayConnectionService/ChatEventRouter now — the single
     // consumer of the native event stream (see its doc comment) — rather
     // than each read locally here and reloaded by an Activity-scoped pump
@@ -363,190 +375,230 @@ private fun MainShell(
 
     val openChat = chatNav as? ChatNav.Open
     var editingAlias by remember { mutableStateOf(false) }
-    BackHandler(enabled = tab == MainTab.Chats && chatNav != ChatNav.List) {
-        chatNav = ChatNav.List
+    // Back priority, innermost first: an open drawer closes, then a pushed
+    // Settings screen closes, then a Chats sub-screen returns to the list.
+    BackHandler(
+        enabled = drawerState.isOpen ||
+            settingsOpen ||
+            (tab == MainTab.Chats && chatNav != ChatNav.List),
+    ) {
+        when {
+            drawerState.isOpen -> scope.launch { drawerState.close() }
+            settingsOpen -> settingsOpen = false
+            else -> chatNav = ChatNav.List
+        }
     }
 
     Box(modifier = Modifier.fillMaxSize()) {
-        Column(modifier = Modifier.fillMaxSize()) {
-        MeshStatusBanner()
-        Scaffold(
-            modifier = Modifier.weight(1f),
-            topBar = {
-                when {
-                    tab == MainTab.Chats && openChat != null -> TopAppBar(
-                        navigationIcon = {
-                            IconButton(onClick = { chatNav = ChatNav.List }) {
-                                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
-                            }
+        if (settingsOpen) {
+            SettingsPushedScreen(
+                profile = profile,
+                onProfileChange = onProfileChange,
+                onLock = onLock,
+                onBack = { settingsOpen = false },
+            )
+        } else {
+            ModalNavigationDrawer(
+                drawerState = drawerState,
+                drawerContent = {
+                    ComradeDrawerSheet(
+                        profile = profile,
+                        onOpenSettings = {
+                            scope.launch { drawerState.close() }
+                            settingsOpen = true
                         },
-                        title = {
-                            val title = peerTitle(openChat.peer, openChat.alias, openChat.username)
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(10.dp),
-                            ) {
-                                PeerAvatar(title, seed = openChat.peer, size = 36.dp)
-                                Column {
-                                    Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                    Text(
-                                        shortNpub(openChat.peer),
-                                        style = MaterialTheme.typography.labelSmall,
-                                        fontFamily = FontFamily.Monospace,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    )
-                                }
-                            }
-                        },
-                        actions = {
-                            val callLabel = peerTitle(openChat.peer, openChat.alias, openChat.username)
-                            IconButton(onClick = {
-                                withCallPermissions(video = false) {
-                                    CallManager.startOutgoingCall(
-                                        context, openChat.peer, callLabel, CallMediaKind.AUDIO,
-                                    )
-                                }
-                            }) {
-                                Icon(CallIcon, contentDescription = "Voice call")
-                            }
-                            IconButton(onClick = {
-                                withCallPermissions(video = true) {
-                                    CallManager.startOutgoingCall(
-                                        context, openChat.peer, callLabel, CallMediaKind.VIDEO,
-                                    )
-                                }
-                            }) {
-                                Icon(VideocamIcon, contentDescription = "Video call")
-                            }
-                            IconButton(
-                                onClick = { editingAlias = true },
-                                modifier = Modifier.testTag("edit-alias"),
-                            ) {
-                                Icon(Icons.Filled.Edit, contentDescription = "Set alias")
-                            }
+                        onOpenCallHistory = {
+                            scope.launch { drawerState.close() }
+                            tab = MainTab.Chats
+                            chatNav = ChatNav.CallHistory
                         },
                     )
-                    tab == MainTab.Chats && chatNav == ChatNav.NewChat -> TopAppBar(
-                        navigationIcon = {
-                            IconButton(onClick = { chatNav = ChatNav.List }) {
-                                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
-                            }
-                        },
-                        title = { Text("New chat") },
-                    )
-                    tab == MainTab.Chats && chatNav == ChatNav.Requests -> TopAppBar(
-                        navigationIcon = {
-                            IconButton(onClick = { chatNav = ChatNav.List }) {
-                                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
-                            }
-                        },
-                        title = { Text("Message requests") },
-                    )
-                    tab == MainTab.Chats && chatNav == ChatNav.CallHistory -> TopAppBar(
-                        navigationIcon = {
-                            IconButton(onClick = { chatNav = ChatNav.List }) {
-                                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
-                            }
-                        },
-                        title = { Text(stringResource(R.string.call_history_title)) },
-                    )
-                    else -> CenterAlignedTopAppBar(
-                        title = {
-                            Text(
-                                when (tab) {
-                                    MainTab.Chats -> "Comrade"
-                                    MainTab.Journal -> "Journal"
-                                    MainTab.Feed -> "Feed"
-                                    MainTab.Settings -> "Settings"
+                },
+            ) {
+                Column(modifier = Modifier.fillMaxSize()) {
+                MeshStatusBanner()
+                Scaffold(
+                    modifier = Modifier.weight(1f),
+                    topBar = {
+                        when {
+                            tab == MainTab.Chats && openChat != null -> TopAppBar(
+                                navigationIcon = {
+                                    IconButton(onClick = { chatNav = ChatNav.List }) {
+                                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                                    }
+                                },
+                                title = {
+                                    val title = peerTitle(openChat.peer, openChat.alias, openChat.username)
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                    ) {
+                                        PeerAvatar(title, seed = openChat.peer, size = 36.dp)
+                                        Column {
+                                            Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                            Text(
+                                                shortNpub(openChat.peer),
+                                                style = MaterialTheme.typography.labelSmall,
+                                                fontFamily = FontFamily.Monospace,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            )
+                                        }
+                                    }
+                                },
+                                actions = {
+                                    val callLabel = peerTitle(openChat.peer, openChat.alias, openChat.username)
+                                    IconButton(onClick = {
+                                        withCallPermissions(video = false) {
+                                            CallManager.startOutgoingCall(
+                                                context, openChat.peer, callLabel, CallMediaKind.AUDIO,
+                                            )
+                                        }
+                                    }) {
+                                        Icon(CallIcon, contentDescription = "Voice call")
+                                    }
+                                    IconButton(onClick = {
+                                        withCallPermissions(video = true) {
+                                            CallManager.startOutgoingCall(
+                                                context, openChat.peer, callLabel, CallMediaKind.VIDEO,
+                                            )
+                                        }
+                                    }) {
+                                        Icon(VideocamIcon, contentDescription = "Video call")
+                                    }
+                                    IconButton(
+                                        onClick = { editingAlias = true },
+                                        modifier = Modifier.testTag("edit-alias"),
+                                    ) {
+                                        Icon(Icons.Filled.Edit, contentDescription = "Set alias")
+                                    }
                                 },
                             )
-                        },
-                    )
-                }
-            },
-            bottomBar = {
-                // The conversation view owns the whole screen, Telegram-style.
-                if (openChat == null || tab != MainTab.Chats) {
-                    NavigationBar {
-                        MainTab.entries.forEach { t ->
-                            NavigationBarItem(
-                                selected = tab == t,
-                                onClick = { tab = t },
-                                icon = { Icon(t.icon, contentDescription = null) },
-                                label = { Text(t.label) },
+                            tab == MainTab.Chats && chatNav == ChatNav.NewChat -> TopAppBar(
+                                navigationIcon = {
+                                    IconButton(onClick = { chatNav = ChatNav.List }) {
+                                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                                    }
+                                },
+                                title = { Text("New chat") },
+                            )
+                            tab == MainTab.Chats && chatNav == ChatNav.Requests -> TopAppBar(
+                                navigationIcon = {
+                                    IconButton(onClick = { chatNav = ChatNav.List }) {
+                                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                                    }
+                                },
+                                title = { Text("Message requests") },
+                            )
+                            tab == MainTab.Chats && chatNav == ChatNav.CallHistory -> TopAppBar(
+                                navigationIcon = {
+                                    IconButton(onClick = { chatNav = ChatNav.List }) {
+                                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                                    }
+                                },
+                                title = { Text(stringResource(R.string.call_history_title)) },
+                            )
+                            tab == MainTab.Chats && chatNav == ChatNav.List -> CenterAlignedTopAppBar(
+                                navigationIcon = {
+                                    IconButton(
+                                        onClick = { scope.launch { drawerState.open() } },
+                                        modifier = Modifier.testTag("nav-drawer-button"),
+                                    ) {
+                                        Icon(Icons.Filled.Menu, contentDescription = "Open navigation menu")
+                                    }
+                                },
+                                title = { Text("Comrade") },
+                            )
+                            else -> CenterAlignedTopAppBar(
+                                title = {
+                                    Text(
+                                        when (tab) {
+                                            MainTab.Chats -> "Comrade"
+                                            MainTab.Journal -> "Journal"
+                                            MainTab.Feed -> "Feed"
+                                        },
+                                    )
+                                },
                             )
                         }
-                    }
-                }
-            },
-            floatingActionButton = {
-                if (tab == MainTab.Chats && chatNav == ChatNav.List) {
-                    FloatingActionButton(onClick = { chatNav = ChatNav.NewChat }) {
-                        Icon(Icons.Filled.Create, contentDescription = "New chat")
-                    }
-                }
-            },
-        ) { padding ->
-            val content = Modifier
-                .fillMaxSize()
-                .padding(padding)
-            when (tab) {
-                MainTab.Chats -> when (val nav = chatNav) {
-                    ChatNav.List -> ChatsScreen(
-                        chatTick = chatTick,
-                        requestTick = requestTick,
-                        onOpen = { peer, alias, username ->
-                            chatNav = ChatNav.Open(peer, alias, username)
-                        },
-                        onNewChat = { chatNav = ChatNav.NewChat },
-                        onOpenRequests = { chatNav = ChatNav.Requests },
-                        onOpenCallHistory = { chatNav = ChatNav.CallHistory },
-                        modifier = content,
-                    )
-                    ChatNav.NewChat -> NewChatScreen(
-                        onOpen = { peer, alias, username ->
-                            chatNav = ChatNav.Open(peer, alias, username)
-                        },
-                        modifier = content,
-                    )
-                    ChatNav.Requests -> RequestsScreen(
-                        chatTick = requestTick,
-                        onOpen = { peer, alias, username ->
-                            chatNav = ChatNav.Open(peer, alias, username)
-                        },
-                        modifier = content,
-                    )
-                    ChatNav.CallHistory -> CallHistoryScreen(
-                        onCallBack = { peer, peerLabel, video ->
-                            withCallPermissions(video) {
-                                CallManager.startOutgoingCall(
-                                    context, peer, peerLabel,
-                                    if (video) CallMediaKind.VIDEO else CallMediaKind.AUDIO,
-                                )
+                    },
+                    bottomBar = {
+                        // The conversation view owns the whole screen, Telegram-style.
+                        if (openChat == null || tab != MainTab.Chats) {
+                            NavigationBar {
+                                MainTab.entries.forEach { t ->
+                                    NavigationBarItem(
+                                        selected = tab == t,
+                                        onClick = { tab = t },
+                                        icon = { Icon(t.icon, contentDescription = null) },
+                                        label = { Text(t.label) },
+                                    )
+                                }
                             }
-                        },
-                        modifier = content,
-                    )
-                    is ChatNav.Open -> ConversationScreen(
-                        peer = nav.peer,
-                        chatTick = chatTick,
-                        modifier = content,
-                    )
+                        }
+                    },
+                    floatingActionButton = {
+                        if (tab == MainTab.Chats && chatNav == ChatNav.List) {
+                            FloatingActionButton(onClick = { chatNav = ChatNav.NewChat }) {
+                                Icon(Icons.Filled.Create, contentDescription = "New chat")
+                            }
+                        }
+                    },
+                ) { padding ->
+                    val content = Modifier
+                        .fillMaxSize()
+                        .padding(padding)
+                    when (tab) {
+                        MainTab.Chats -> when (val nav = chatNav) {
+                            ChatNav.List -> ChatsScreen(
+                                chatTick = chatTick,
+                                requestTick = requestTick,
+                                onOpen = { peer, alias, username ->
+                                    chatNav = ChatNav.Open(peer, alias, username)
+                                },
+                                onNewChat = { chatNav = ChatNav.NewChat },
+                                onOpenRequests = { chatNav = ChatNav.Requests },
+                                modifier = content,
+                            )
+                            ChatNav.NewChat -> NewChatScreen(
+                                onOpen = { peer, alias, username ->
+                                    chatNav = ChatNav.Open(peer, alias, username)
+                                },
+                                modifier = content,
+                            )
+                            ChatNav.Requests -> RequestsScreen(
+                                chatTick = requestTick,
+                                onOpen = { peer, alias, username ->
+                                    chatNav = ChatNav.Open(peer, alias, username)
+                                },
+                                modifier = content,
+                            )
+                            ChatNav.CallHistory -> CallHistoryScreen(
+                                onCallBack = { peer, peerLabel, video ->
+                                    withCallPermissions(video) {
+                                        CallManager.startOutgoingCall(
+                                            context, peer, peerLabel,
+                                            if (video) CallMediaKind.VIDEO else CallMediaKind.AUDIO,
+                                        )
+                                    }
+                                },
+                                modifier = content,
+                            )
+                            is ChatNav.Open -> ConversationScreen(
+                                peer = nav.peer,
+                                chatTick = chatTick,
+                                modifier = content,
+                            )
+                        }
+                        MainTab.Journal -> JournalScreen(modifier = content)
+                        MainTab.Feed -> FeedScreen(
+                            feedItems = feedItems,
+                            onPosted = { ChatEventRouter.addChitthi(it, front = true) },
+                            modifier = content,
+                        )
+                    }
                 }
-                MainTab.Journal -> JournalScreen(modifier = content)
-                MainTab.Feed -> FeedScreen(
-                    feedItems = feedItems,
-                    onPosted = { ChatEventRouter.addChitthi(it, front = true) },
-                    modifier = content,
-                )
-                MainTab.Settings -> SettingsScreen(
-                    profile = profile,
-                    onProfileChange = onProfileChange,
-                    onLock = onLock,
-                    modifier = content,
-                )
+                }
             }
-        }
         }
         // Call overlay — covers the app while a call is ringing/connected.
         CallScreen(onAccept = {
@@ -571,6 +623,102 @@ private fun MainShell(
                 ChatEventRouter.bumpChatTick() // the chat list titles change too
             },
         )
+    }
+}
+
+/**
+ * The navigation drawer sheet: a profile header (tap → Settings) over the
+ * app-wide destinations that don't belong in the bottom bar — Call history and
+ * Settings — Telegram-style. Message requests deliberately stay in the chat
+ * list, not here.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ComradeDrawerSheet(
+    profile: ComradeCore.Profile,
+    onOpenSettings: () -> Unit,
+    onOpenCallHistory: () -> Unit,
+) {
+    ModalDrawerSheet {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(onClick = onOpenSettings)
+                .testTag("drawer-profile")
+                .padding(horizontal = 20.dp, vertical = 20.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            PeerAvatar(profile.username ?: profile.npub, seed = profile.npub)
+            Column {
+                Text(
+                    profile.username?.let { "@$it" } ?: "No username yet",
+                    style = MaterialTheme.typography.titleMedium,
+                )
+                Text(
+                    shortNpub(profile.npub),
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        HorizontalDivider()
+        NavigationDrawerItem(
+            label = { Text(stringResource(R.string.call_history_title)) },
+            icon = { Icon(CallIcon, contentDescription = null) },
+            selected = false,
+            onClick = onOpenCallHistory,
+        )
+        NavigationDrawerItem(
+            label = { Text("Settings") },
+            icon = { Icon(Icons.Filled.Settings, contentDescription = null) },
+            selected = false,
+            onClick = onOpenSettings,
+            modifier = Modifier.testTag("drawer-settings"),
+        )
+    }
+}
+
+/**
+ * Settings as a full-screen pushed destination with a back arrow, replacing the
+ * shell (and its bottom bar) entirely while open — not a bottom-nav tab.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun SettingsPushedScreen(
+    profile: ComradeCore.Profile,
+    onProfileChange: (ComradeCore.Profile) -> Unit,
+    onLock: () -> Unit,
+    onBack: () -> Unit,
+) {
+    Column(modifier = Modifier.fillMaxSize()) {
+        MeshStatusBanner()
+        Scaffold(
+            modifier = Modifier.weight(1f),
+            topBar = {
+                TopAppBar(
+                    navigationIcon = {
+                        IconButton(onClick = onBack) {
+                            Icon(
+                                Icons.AutoMirrored.Filled.ArrowBack,
+                                contentDescription = "Back",
+                            )
+                        }
+                    },
+                    title = { Text("Settings") },
+                )
+            },
+        ) { padding ->
+            SettingsScreen(
+                profile = profile,
+                onProfileChange = onProfileChange,
+                onLock = onLock,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(padding),
+            )
+        }
     }
 }
 

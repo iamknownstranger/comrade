@@ -135,6 +135,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
+        with:
+          # Full history, not the default shallow (depth-1) clone: the
+          # version-code step below counts commits with `git rev-list
+          # --count HEAD`, which needs the whole history to be accurate.
+          fetch-depth: 0
 
       - name: Download JNI libs
         uses: actions/download-artifact@v4
@@ -185,6 +190,19 @@ jobs:
       - name: Install build-tools & platform
         run: sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
 
+      - name: Compute version
+        # versionCode must be monotonically increasing across BOTH this
+        # workflow and release.yml — otherwise a sideloaded debug build and
+        # a tagged release can compare as a "downgrade" against each other
+        # and Android refuses the install. Commit count on HEAD is history
+        # shared by both workflows and only ever grows, unlike each
+        # workflow's own `github.run_number`, which is workflow-local and
+        # not comparable to the other file's counter (see release.yml).
+        run: |
+          set -euo pipefail
+          echo "VERSION_CODE=$(git rev-list --count HEAD)" >> "$GITHUB_ENV"
+          echo "SHORT_SHA=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+
       - name: Assemble debug APK
         working-directory: android
         env:
@@ -193,7 +211,11 @@ jobs:
           TURN_URL: ${{ secrets.TURN_URL }}
           TURN_USERNAME: ${{ secrets.TURN_USERNAME }}
           TURN_PASSWORD: ${{ secrets.TURN_PASSWORD }}
-        run: ./gradlew assembleDebug --no-daemon
+        run: |
+          ./gradlew assembleDebug \
+            -PversionCode="$VERSION_CODE" \
+            -PversionName="0.1.0-$SHORT_SHA" \
+            --no-daemon
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
