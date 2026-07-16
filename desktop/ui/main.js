@@ -30,6 +30,19 @@
       }
     : mockBackend();
 
+  // ── Call decision helpers (desktop/ui/call_decisions.mjs) ──────────────────
+  // This file is a plain classic script (index.html loads it as
+  // `<script src="main.js">`, no type="module"), so a static `import`
+  // statement isn't available here. Dynamic `import()` is spec'd to work
+  // from classic scripts too (it isn't restricted to module scripts), so we
+  // kick the load off once, at parse time — long before any call signal can
+  // plausibly arrive — and every call site below awaits this same cached
+  // promise. That's a smaller, safer diff than flipping main.js to
+  // type="module" (which would also change the whole file to always-strict
+  // semantics and defer-by-default execution timing) for a change that only
+  // needs to reuse a couple of pure functions from another file.
+  const callDecisionsReady = import("./call_decisions.mjs");
+
   // ── Tiny DOM helpers ──────────────────────────────────────────────────────
   const $ = (sel) => document.querySelector(sel);
 
@@ -158,6 +171,10 @@
     peerNames: new Map(), // peer pubkey -> published display handle
     replyTo: null, // { id, content, outgoing } while composing a reply
     call: null, // active call session (see newCallState)
+    // Bounded memory of recently-ended call ids (see call_decisions.mjs
+    // rememberEndedCall) — mirrors Android's CallManager.endedCallIds, so a
+    // redelivered Offer for a call we already tore down doesn't ring again.
+    endedCallIds: [],
   };
 
   // Prefer a peer's published handle over the raw npub when we have one.
@@ -991,10 +1008,56 @@
     }
   }
 
-  // Callee: an offer arrived. Ring (Accept/Decline), or auto-reject if busy.
+  // Callee: an offer arrived. Depending on call_decisions.decideOfferDisposition
+  // this either rings fresh (no call yet), renegotiates the existing pc (a
+  // same-call_id re-offer — e.g. the caller's STUN->TURN ICE-restart
+  // fallback), silently no-ops a duplicate/ended call_id, or auto-rejects as
+  // busy (a genuinely different call_id). See call_decisions.mjs for the
+  // pure decision this mirrors from Android's CallManager.
   async function handleIncomingOffer(p, sig) {
-    if (state.call) {
-      // Busy: politely reject the new caller and log the missed attempt.
+    const { decideOfferDisposition, OFFER_DISPOSITION, isEndedCallId } = await callDecisionsReady;
+    const c = state.call;
+    const disposition = decideOfferDisposition({
+      hasCall: !!c,
+      sameCallId: !!c && c.callId === p.call_id,
+      hasPc: !!c && !!c.pc,
+      isEndedCallId: isEndedCallId(state.endedCallIds, p.call_id),
+    });
+
+    if (disposition === OFFER_DISPOSITION.ENDED_NOOP) {
+      // Redelivered offer for a call we already tore down (relay
+      // at-least-once delivery, or a backfill re-scan) — drop silently,
+      // don't ring again.
+      console.log(`call ${p.call_id}: ignoring offer for an already-ended call`);
+      return;
+    }
+
+    if (disposition === OFFER_DISPOSITION.RENEGOTIATE) {
+      // Same call_id re-offer on a live pc (the P0 fix: this used to be
+      // answered `busy`, which broke an Android caller's STUN->TURN
+      // ICE-restart fallback). Answer on the existing pc — do NOT touch
+      // getUserMedia, do NOT recreate the pc, do NOT reset the duration
+      // timer or any UI state.
+      try {
+        await c.pc.setRemoteDescription({ type: "offer", sdp: sig.sdp });
+        const answer = await c.pc.createAnswer();
+        await c.pc.setLocalDescription(answer);
+        await sendSignal({ kind: "answer", sdp: answer.sdp });
+      } catch (e) {
+        showToast(`Could not renegotiate the call — ${errText(e)}`, "error");
+      }
+      return;
+    }
+
+    if (disposition === OFFER_DISPOSITION.DUPLICATE_NOOP) {
+      // Same call_id redelivered while still ringing, pre-accept (no pc
+      // yet) — drop silently; re-ringing would only restart the ring state.
+      return;
+    }
+
+    if (disposition === OFFER_DISPOSITION.BUSY) {
+      // Genuinely busy on a different call: politely reject the new caller
+      // and log the missed attempt.
       try {
         await safeInvoke(
           "send_call_signal",
@@ -1012,6 +1075,8 @@
       logCall(p.peer, p.call_id, p.media, true, "busy", nowSecs(), 0);
       return;
     }
+
+    // NEW_INCOMING: no live call — ring as usual (happy path, unchanged).
     if (!callSupported()) {
       try {
         await safeInvoke(
@@ -1192,6 +1257,12 @@
     const c = state.call;
     if (!c || c.ended) return;
     c.ended = true;
+    // Remember this call_id as ended so a redelivered terminal Offer
+    // (relay at-least-once delivery, or a backfill re-scan) doesn't ring
+    // again — see call_decisions.mjs rememberEndedCall, mirroring Android's
+    // CallManager.endedCallIds/rememberEnded.
+    const { rememberEndedCall } = await callDecisionsReady;
+    state.endedCallIds = rememberEndedCall(state.endedCallIds, c.callId);
     stopDurationTimer();
     const duration = c.startedAt ? Math.max(0, nowSecs() - c.startedAt) : 0;
     if (sendHangup) {

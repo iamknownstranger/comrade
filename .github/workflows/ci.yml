@@ -105,6 +105,25 @@ jobs:
         working-directory: desktop/src-tauri
         run: cargo clippy --all-targets --locked -- -D warnings
 
+  # Pure desktop call-decision logic (desktop/ui/call_decisions.mjs) — the
+  # ADR-3/WP1 testability lane. Node's built-in test runner needs no
+  # package.json and no npm deps, so this job is just checkout + setup-node.
+  # See docs/COMMS_ARCHITECTURE.md §ADR-3/§6.
+  desktop-js:
+    name: Desktop — JS unit tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: node --test
+        run: node --test desktop/ui/*.test.mjs
+
   # JVM unit tests only (voice grammar + dispatcher). No emulator, no APK —
   # compile + test gives most of the signal at a fraction of the cost.
   # APK assembly + on-device (emulator) smoke tests live in android-apk.yml.
