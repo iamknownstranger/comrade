@@ -23,7 +23,8 @@ import org.junit.runner.RunWith
  * On-device journey test for the Telegram-like flow: the onboarding door
  * renders without blocking on the native core, creating an identity (username
  * + passcode) unlocks the vault through real Rust crypto, and the main shell
- * (Chats / Feed / Settings) comes up with working bottom navigation.
+ * (Chats / Journal / Feed, with Settings reached from the navigation drawer)
+ * comes up with working bottom navigation.
  *
  * The test adapts to residual state: on a fresh emulator it walks the create
  * path; if a previous run on the same device already created the vault (or the
@@ -98,13 +99,26 @@ class MainActivityUiTest {
         // reach the bottom navigation.
         Espresso.closeSoftKeyboard()
 
-        // Bottom navigation reaches every section.
+        // Bottom navigation reaches the Feed section.
         composeRule.onNodeWithText("Feed").performClick()
         composeRule
             .onNodeWithText("Public — anyone on the network can read this.")
             .assertIsDisplayed()
 
-        composeRule.onNodeWithText("Settings").performClick()
+        // Settings is a pushed screen now, reached from the navigation drawer
+        // (Telegram-style) rather than a bottom-nav tab. The hamburger only
+        // lives on the chat list, so return there before opening the drawer.
+        composeRule.onNodeWithText("Chats").performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("nav-drawer-button").performClick()
+        composeRule.waitForIdle()
+
+        // The drawer's profile header shows our @handle…
+        composeRule.onNodeWithText("@$USERNAME").assertIsDisplayed()
+
+        // …and its Settings item pushes the full-screen Settings destination.
+        composeRule.onNodeWithTag("drawer-settings").performClick()
+        composeRule.waitForIdle()
         composeRule.onNodeWithText("Your identity key").assertIsDisplayed()
         composeRule.onNodeWithText("@$USERNAME").assertIsDisplayed()
     }
