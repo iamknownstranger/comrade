@@ -48,6 +48,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import mullu.comrade.ComradeCore
 import mullu.comrade.voice.OneShotRecognizer
+import mullu.comrade.voice.VoiceModelMissingException
+import mullu.comrade.voice.VoskModel
 
 /** Self-reported mood markers, low → high. Stored as the emoji itself. */
 private val Moods = listOf("😞", "😕", "😐", "🙂", "😄")
@@ -68,6 +70,8 @@ fun JournalScreen(modifier: Modifier = Modifier) {
     var listening by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     var confirmDelete by remember { mutableStateOf<ComradeCore.JournalEntryInfo?>(null) }
+    // True while the mic tap is parked on the speech-model download dialog.
+    var awaitingModel by remember { mutableStateOf(false) }
 
     suspend fun reload() {
         entries = withContext(Dispatchers.IO) {
@@ -107,7 +111,13 @@ fun JournalScreen(modifier: Modifier = Modifier) {
             },
             onError = {
                 listening = false
-                error = "Voice unavailable: ${it.message}"
+                // Backstop: the model vanished between the gate below and
+                // listening — offer the download rather than a dead end.
+                if (it is VoiceModelMissingException) {
+                    awaitingModel = true
+                } else {
+                    error = "Voice unavailable: ${it.message}"
+                }
             },
         )
     }
@@ -119,11 +129,27 @@ fun JournalScreen(modifier: Modifier = Modifier) {
     }
 
     fun dictateWithPermission() {
+        // Dictation needs the offline model first — offer the one-time
+        // download (no permission needed for that), then the mic permission.
+        if (!VoskModel.isAvailable(context)) {
+            awaitingModel = true
+            return
+        }
         val granted = ContextCompat.checkSelfPermission(
             context,
             Manifest.permission.RECORD_AUDIO,
         ) == PackageManager.PERMISSION_GRANTED
         if (granted) dictate() else micPermission.launch(Manifest.permission.RECORD_AUDIO)
+    }
+
+    if (awaitingModel) {
+        VoiceModelDownloadDialog(
+            onReady = {
+                awaitingModel = false
+                dictateWithPermission()
+            },
+            onDismiss = { awaitingModel = false },
+        )
     }
 
     val list = entries

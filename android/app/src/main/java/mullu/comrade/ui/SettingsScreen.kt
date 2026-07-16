@@ -58,6 +58,8 @@ import mullu.comrade.voice.ComradeCoreBackend
 import mullu.comrade.voice.ComradeTts
 import mullu.comrade.voice.OneShotRecognizer
 import mullu.comrade.voice.VoiceCommand
+import mullu.comrade.voice.VoiceModelMissingException
+import mullu.comrade.voice.VoskModel
 import mullu.comrade.voice.WakeWordService
 
 @Composable
@@ -532,6 +534,9 @@ fun VoiceSection() {
     var wakeEnabled by remember { mutableStateOf(WakeWordService.isRunning) }
     var lastReply by remember { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
+    // The voice action waiting on the speech-model download; non-null keeps
+    // the download dialog up, and the action runs once the model lands.
+    var awaitingModel by remember { mutableStateOf<(() -> Unit)?>(null) }
 
     val tts = remember { ComradeTts(context) }
     val dispatcher = remember { CommandDispatcher(ComradeCoreBackend()) }
@@ -563,7 +568,17 @@ fun VoiceSection() {
                     }
                 }
             },
-            onError = { lastReply = "Voice unavailable: ${it.message}"; busy = false },
+            onError = {
+                busy = false
+                // Backstop for a model that vanished between the isAvailable
+                // gate and listening (or an assets/uuid-less legacy build):
+                // offer the download rather than a dead-end error.
+                if (it is VoiceModelMissingException) {
+                    awaitingModel = { runTapToTalk() }
+                } else {
+                    lastReply = "Voice unavailable: ${it.message}"
+                }
+            },
         )
     }
 
@@ -581,6 +596,28 @@ fun VoiceSection() {
 
     fun ensurePermissionThen(action: () -> Unit) {
         if (hasMic(context)) action() else permissionLauncher.launch(voicePermissions())
+    }
+
+    // Voice needs the offline model AND the mic. Offer the model download
+    // first (no permission needed to fetch it), then the permission prompt —
+    // the Google-style on-device speech model flow.
+    fun ensureVoiceReadyThen(action: () -> Unit) {
+        if (VoskModel.isAvailable(context)) ensurePermissionThen(action) else awaitingModel = action
+    }
+
+    awaitingModel?.let { pending ->
+        VoiceModelDownloadDialog(
+            onReady = {
+                awaitingModel = null
+                ensurePermissionThen(pending)
+            },
+            onDismiss = {
+                awaitingModel = null
+                // An enable-wake tap that never started the service must not
+                // leave the toggle looking on.
+                wakeEnabled = WakeWordService.isRunning
+            },
+        )
     }
 
     OutlinedCard(Modifier.fillMaxWidth()) {
@@ -604,7 +641,7 @@ fun VoiceSection() {
                         wakeEnabled = false
                     } else {
                         wakeEnabled = true
-                        ensurePermissionThen { WakeWordService.start(context) }
+                        ensureVoiceReadyThen { WakeWordService.start(context) }
                     }
                 },
                 modifier = Modifier.fillMaxWidth(),
@@ -617,7 +654,7 @@ fun VoiceSection() {
             }
 
             OutlinedButton(
-                onClick = { ensurePermissionThen { runTapToTalk() } },
+                onClick = { ensureVoiceReadyThen { runTapToTalk() } },
                 enabled = !busy,
                 modifier = Modifier.fillMaxWidth(),
             ) { Text(stringResource(R.string.voice_tap_to_talk)) }

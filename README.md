@@ -26,7 +26,7 @@ entirely in Rust, with a shared view-model layer driving an Android
 | **Media** | NIP-94 / NIP-96 | Encrypted file staging + pluggable decentralized upload | ⚠️ Send + download-and-decrypt over Blossom (`media-http` feature) — desktop **and Android** (attach button); rich in-thread rendering of received media is Android follow-up; not on CLI |
 | **Calls** | WebRTC + signaling over the Vault DM channel (NIP-100 direction) | 1:1 **voice & video** — SDP/ICE ride encrypted DMs; STUN-only first attempt, automatic fallback to a configurable TURN relay if STUN can't connect (e.g. strict CGNAT); call log | ⚠️ 1:1 voice & video wired on BOTH desktop (webview WebRTC) and Android native (`org.webrtc` via `io.github.webrtc-sdk`): ringing/lock-screen call UI, foreground service, Bluetooth/wired audio routing, mid-call camera toggle + tap-to-swap self-view, encryption-emoji (SAS) verification, call history + missed-call notifications, connection-quality indicator. STUN-only first attempt with caller-driven TURN fallback (ICE restart) — wired on Android; desktop does not yet ICE-restart on failure — see [`AUDIT.md` §8.1](AUDIT.md). Calls need the app process alive (no push wakeup, by design) |
 | **Storage** | redb + Argon2id + AES-256-GCM | Encrypted-at-rest persistence (identity, ChitthiCache, VaultCache, LedgerState) unlocked by a passphrase | ✅ Wired (identity, own posts, full DM history — incoming + outgoing — with offline backfill watermark, media refs, call log) |
-| **Voice** | Vosk (offline) + Android TTS | "Hey Comrade" wake word, tap-to-talk, and assist-app role — all on-device, no cloud | ⚠️ Recognition/dispatch work; `post`/`read timeline` need a vault-unlock screen the Android UI doesn't have yet |
+| **Voice** | Vosk (offline) + Android TTS | "Hey Comrade" wake word, tap-to-talk, and assist-app role — all on-device, no cloud; the speech model ships in the APK or is offered as a one-time sha256-verified in-app download on first use | ⚠️ Recognition/dispatch work; `post`/`read timeline` need a vault-unlock screen the Android UI doesn't have yet |
 
 > **Status honesty.** 🧪 rows are working, unit-tested library code that no
 > frontend invokes yet — they describe the architecture's direction, not
@@ -300,16 +300,26 @@ unit-tested (`VoiceCommandTest`, `CommandDispatcherTest`).
 
 ### Voice setup
 
-The Vosk model (~40 MB) is **not** committed. Fetch it before building an APK
-with voice support:
+The Vosk model (~40 MB) is **not** committed, and voice works either way:
 
-```sh
-./scripts/fetch-vosk-model.sh   # → android/app/src/main/assets/model-en-us/
-```
+- **Model absent from the APK** (the default; CI doesn't bake it): the first
+  tap on a voice feature — tap-to-talk, *Enable "Hey Comrade"*, journal
+  dictation — offers a one-time in-app download (Google-style on-device
+  speech-model prompt), with progress, cancel, and retry. The download is
+  verified against a pinned sha256 before install; a mismatch is refused
+  and deleted.
+- **Model baked into the APK** (no first-use download): stage it before
+  building —
 
-Without the model the app still builds and runs; voice features report
-"Voice model missing" and stay inert. On first use the app requests the
-`RECORD_AUDIO` (and, on Android 13+, `POST_NOTIFICATIONS`) runtime permissions.
+  ```sh
+  ./scripts/fetch-vosk-model.sh   # → android/app/src/main/assets/model-en-us/
+  ```
+
+  The script verifies the same pinned sha256 and writes the `uuid` marker
+  `StorageService` needs at runtime.
+
+On first use the app requests the `RECORD_AUDIO` (and, on Android 13+,
+`POST_NOTIFICATIONS`) runtime permissions.
 
 ## Architecture notes
 
