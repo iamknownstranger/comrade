@@ -58,10 +58,23 @@ class CallService : Service() {
      * the old [onStartCommand] comment accepted in order to avoid a "blank"
      * notification.
      *
-     * Mic-only type: the placeholder never carries video, so it needs only
-     * [ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE] — a subset of the
-     * manifest's `camera|microphone`. The camera type is only ever added later,
-     * by [startForegroundNotified], when the real call is video.
+     * Placeholder type — [ServiceInfo.FOREGROUND_SERVICE_TYPE_SHORT_SERVICE]
+     * on API 34+, mic-typed below. The first placeholder shipped mic-typed on
+     * every API level, and CI's API-35 emulator lanes disproved that: a
+     * microphone-typed `startForeground` is subject to the while-in-use check,
+     * so a process with no visible activity (exactly an instrumentation run —
+     * and the refused attempt does NOT cancel the pending
+     * did-not-start-in-time kill; both device lanes died ~10s after the
+     * catch). `SHORT_SERVICE` is the platform's answer for precisely this
+     * situation: no type permission, no while-in-use gate, exempt from the
+     * manifest type declaration, made for "satisfy the contract now, decide
+     * what you really are next" — with a ~3-min timeout delivered to
+     * [onTimeout], where we stop cleanly. The real call path then *transitions*
+     * the type to mic (or mic|camera) via [startForegroundNotified], which in
+     * production always runs foregrounded with the permissions already granted
+     * (withCallPermissions gates every call), so the upgrade succeeds there.
+     * Below API 34 the mic-typed placeholder stays: startForeground has no
+     * type-permission/while-in-use throw before 34, so it cannot be refused.
      */
     override fun onCreate() {
         super.onCreate()
@@ -73,7 +86,13 @@ class CallService : Service() {
             .setCategory(NotificationCompat.CATEGORY_CALL)
             .build()
         runCatching {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    placeholder,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SHORT_SERVICE,
+                )
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 startForeground(
                     NOTIFICATION_ID,
                     placeholder,
@@ -85,17 +104,30 @@ class CallService : Service() {
         }.onSuccess {
             foregroundStarted = true
         }.onFailure { e ->
-            // API 31+ can throw ForegroundServiceStartNotAllowedException (the
-            // platform disallowing a background start); API 34+ can throw on a
-            // type-permission failure (SecurityException). When the platform
-            // itself refuses the start, this can never become a valid
-            // foreground service, so stop cleanly. Note this refusal is NOT the
-            // did-not-start-in-time kill — that fires only when startForeground
-            // is never CALLED; here it was called and rejected, leaving nothing
-            // armed.
+            // Should be unreachable on 34+ (shortService has no gate to refuse)
+            // and on <34 (no startForeground-time throw existed). Kept as a
+            // last-resort belt: log and stop. IMPORTANT lesson encoded here: a
+            // refused startForeground does NOT cancel the pending
+            // did-not-start-in-time kill (CI proved it), so if this branch is
+            // ever reached on some future API, the process may still die ~10s
+            // later — the fix is always "make the promotion succeed", never
+            // "catch the refusal".
             Log.w(TAG, "startForeground (placeholder) refused by platform; stopping", e)
             stopSelf()
         }
+    }
+
+    /**
+     * API 34+ shortService timeout (~3 min): fires only if this service is
+     * still running as the [onCreate] placeholder — i.e. the mic/camera
+     * upgrade in [startForegroundNotified] never happened or was refused
+     * (possible only for a backgrounded, permission-less process; production
+     * call setup is always foregrounded). Stop cleanly rather than let the
+     * platform ANR the service.
+     */
+    override fun onTimeout(startId: Int) {
+        stopForeground(Service.STOP_FOREGROUND_REMOVE)
+        stopSelf()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -131,15 +163,28 @@ class CallService : Service() {
     private fun startForegroundNotified(peer: String, peerLabel: String, video: Boolean) {
         Notifier.ensureChannels(this)
         val notification = buildNotification(peer, peerLabel)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            val type = if (video) {
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
+        // On API 34+ this call *transitions* the service from onCreate's
+        // shortService placeholder to its real type. The mic (and camera)
+        // types are while-in-use gated at this moment: guaranteed satisfied on
+        // the production path (withCallPermissions + a visible call surface
+        // precede every CallService.start), but an instrumentation process
+        // with no visible activity gets refused — in that case keep running
+        // as the placeholder (the contract stays satisfied; the shortService
+        // timeout or the normal teardown stops us) instead of letting the
+        // refusal crash the service.
+        runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val type = if (video) {
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
+                } else {
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                }
+                startForeground(NOTIFICATION_ID, notification, type)
             } else {
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                startForeground(NOTIFICATION_ID, notification)
             }
-            startForeground(NOTIFICATION_ID, notification, type)
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
+        }.onFailure { e ->
+            Log.w(TAG, "mic/camera foreground promotion refused; staying on placeholder type", e)
         }
     }
 
