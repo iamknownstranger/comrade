@@ -8,6 +8,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.Person
 import mullu.comrade.CallActionReceiver
@@ -29,14 +30,93 @@ import mullu.comrade.Notifier
  */
 class CallService : Service() {
 
+    /**
+     * Whether [startForeground] actually promoted this service (set in
+     * [onCreate]). If the platform refused that promotion — an API 31+
+     * background-start disallowal or an API 34+ foreground-service-type
+     * permission failure — there is no valid foreground service and can never
+     * be one for this instance, so [onStartCommand] must not try again.
+     */
+    private var foregroundStarted = false
+
+    /**
+     * Satisfy the foreground-service contract the instant this service exists —
+     * before [onStartCommand] can bail on a blank intent (below) and before a
+     * stop-before-start race ([stop]'s `stopService` dispatched right after
+     * [start]'s `startForegroundService`, i.e. place-then-instant-cancel) can
+     * destroy this instance without it ever having gone foreground.
+     *
+     * After `Context.startForegroundService()` the platform REQUIRES a
+     * `startForeground()` within ~10s even if the service then stops itself
+     * immediately; skipping it makes the platform throw
+     * `ForegroundServiceDidNotStartInTimeException` and kill the whole process
+     * ~10s later, asynchronously — which no `try`/`catch` at the call site can
+     * intercept. A minimal placeholder that the valid-peer path immediately
+     * replaces (same [NOTIFICATION_ID]) or that the blank-peer path / an
+     * incoming stop immediately removes is the platform-sanctioned pattern; that
+     * momentary neutral notification is strictly better than the process kill
+     * the old [onStartCommand] comment accepted in order to avoid a "blank"
+     * notification.
+     *
+     * Mic-only type: the placeholder never carries video, so it needs only
+     * [ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE] — a subset of the
+     * manifest's `camera|microphone`. The camera type is only ever added later,
+     * by [startForegroundNotified], when the real call is video.
+     */
+    override fun onCreate() {
+        super.onCreate()
+        Notifier.ensureChannels(this)
+        val placeholder = NotificationCompat.Builder(this, Notifier.CHANNEL_CALLS)
+            .setSmallIcon(android.R.drawable.sym_action_call)
+            .setContentTitle("Call")
+            .setOngoing(true)
+            .setCategory(NotificationCompat.CATEGORY_CALL)
+            .build()
+        runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    placeholder,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE,
+                )
+            } else {
+                startForeground(NOTIFICATION_ID, placeholder)
+            }
+        }.onSuccess {
+            foregroundStarted = true
+        }.onFailure { e ->
+            // API 31+ can throw ForegroundServiceStartNotAllowedException (the
+            // platform disallowing a background start); API 34+ can throw on a
+            // type-permission failure (SecurityException). When the platform
+            // itself refuses the start, this can never become a valid
+            // foreground service, so stop cleanly. Note this refusal is NOT the
+            // did-not-start-in-time kill — that fires only when startForeground
+            // is never CALLED; here it was called and rejected, leaving nothing
+            // armed.
+            Log.w(TAG, "startForeground (placeholder) refused by platform; stopping", e)
+            stopSelf()
+        }
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (!foregroundStarted) {
+            // onCreate's placeholder startForeground was refused (already
+            // logged) and this service is stopping. Retrying startForeground
+            // would throw the same way, uncaught — and the contract no longer
+            // applies once the platform has refused the start.
+            return START_NOT_STICKY
+        }
         val peer = intent?.getStringExtra(EXTRA_PEER)
         if (peer.isNullOrEmpty()) {
             // A system-triggered restart (e.g. the process was killed under
             // memory pressure) can redeliver a blank/null intent with no
-            // guarantee the original extras survived. Starting a foreground
-            // service with a blank ongoing-call notification is worse than
-            // not starting one — bail before startForegroundNotified.
+            // guarantee the original extras survived, and there is no call to
+            // represent. The foreground-service contract is already satisfied
+            // (onCreate posted the placeholder), so — unlike before — bailing
+            // here is safe: remove the placeholder and stop. Skipping
+            // startForeground is now impossible, so this path can no longer arm
+            // the delayed did-not-start-in-time process kill.
+            stopForeground(Service.STOP_FOREGROUND_REMOVE)
             stopSelf()
             return START_NOT_STICKY
         }
@@ -96,6 +176,7 @@ class CallService : Service() {
     }
 
     companion object {
+        private const val TAG = "CallService"
         private const val NOTIFICATION_ID = 0xCA11
         private const val EXTRA_PEER = "peer"
         private const val EXTRA_PEER_LABEL = "peerLabel"
