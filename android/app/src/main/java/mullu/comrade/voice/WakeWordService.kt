@@ -81,6 +81,16 @@ class WakeWordService : Service(), RecognitionListener {
     private var tts: ComradeTts? = null
     private lateinit var dispatcher: CommandDispatcher
 
+    // All flipped on the main thread (VoskModel's callbacks, onStartCommand,
+    // onDestroy): whether a model request is already in flight (a repeated
+    // onStartCommand while loading must not acquire a second reference),
+    // whether this service still owes VoskModel a release, and whether a
+    // model that finishes loading after onDestroy should be handed straight
+    // back instead of started.
+    private var modelRequested = false
+    private var holdsModel = false
+    private var destroyed = false
+
     @Volatile private var state = State.IDLE
     private val revertToIdle = Runnable {
         if (state == State.LISTENING) {
@@ -112,14 +122,30 @@ class WakeWordService : Service(), RecognitionListener {
     // ── Model + recogniser bootstrap ─────────────────────────────────────────
 
     private fun initRecogniser() {
-        // The shared process-wide model: bundled in the APK or downloaded on
-        // demand — the UI gates starting this service on VoskModel.isAvailable,
-        // so the error path here is a should-not-happen backstop (e.g. the
-        // downloaded model was deleted from under us).
-        VoskModel.withModel(
+        if (modelRequested) return
+        modelRequested = true
+        // The shared model: bundled in the APK or downloaded on demand — the
+        // UI gates starting this service on VoskModel.isAvailable, so the
+        // error path here is a should-not-happen backstop (e.g. the
+        // downloaded model was deleted from under us). The reference taken
+        // here is held for the service's whole lifetime and returned in
+        // onDestroy — disabling the wake word lets the model close and its
+        // RAM be reclaimed.
+        VoskModel.acquire(
             this,
-            onReady = { model -> startRecognition(model) },
+            onReady = { model ->
+                if (destroyed) {
+                    // Stopped before the model finished loading — hand the
+                    // reference straight back.
+                    VoskModel.release()
+                    return@acquire
+                }
+                holdsModel = true
+                startRecognition(model)
+            },
             onError = { exception ->
+                // No reference held on this path; allow a later start to retry.
+                modelRequested = false
                 Log.e(TAG, "Vosk model unavailable", exception)
                 updateNotification(getString(R.string.voice_model_missing))
             },
@@ -254,15 +280,20 @@ class WakeWordService : Service(), RecognitionListener {
     }
 
     override fun onDestroy() {
+        destroyed = true
         isRunning = false
         instance = null
         mainHandler.removeCallbacks(revertToIdle)
         speechService?.stop()
         speechService?.shutdown()
         speechService = null
-        // Deliberately NOT closing the model: it's VoskModel's process-wide
-        // instance, shared with tap-to-talk/assist recognisers that may
-        // outlive this service.
+        // Not closed here — the model is VoskModel's shared instance; giving
+        // back this service's reference lets VoskModel close it once every
+        // other recogniser is done too.
+        if (holdsModel) {
+            holdsModel = false
+            VoskModel.release()
+        }
         tts?.shutdown()
         tts = null
         worker.shutdownNow()

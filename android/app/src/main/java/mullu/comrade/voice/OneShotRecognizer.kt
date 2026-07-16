@@ -16,14 +16,18 @@ import org.vosk.android.SpeechService
  * [WakeWordService].
  *
  * The recogniser stops itself after the first final result or after
- * [timeoutMs]. [RECORD_AUDIO][android.Manifest.permission.RECORD_AUDIO] must
- * already be granted by the caller.
+ * [timeoutMs], releasing its [VoskModel] reference as it finishes (the model's
+ * RAM is reclaimed shortly after the last user lets go). One instance handles
+ * one utterance — create a fresh one per capture.
+ * [RECORD_AUDIO][android.Manifest.permission.RECORD_AUDIO] must already be
+ * granted by the caller.
  */
 class OneShotRecognizer(private val context: Context) {
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var speechService: SpeechService? = null
     private var finished = false
+    private var holdsModel = false
 
     /**
      * @param onText recognised text (possibly empty if nothing was heard)
@@ -34,9 +38,10 @@ class OneShotRecognizer(private val context: Context) {
         onText: (String) -> Unit,
         onError: (Throwable) -> Unit,
     ) {
-        VoskModel.withModel(
+        VoskModel.acquire(
             context,
             onReady = { model ->
+                holdsModel = true
                 runCatching {
                     val recognizer = Recognizer(model, SAMPLE_RATE)
                     val service = SpeechService(recognizer, SAMPLE_RATE)
@@ -55,13 +60,18 @@ class OneShotRecognizer(private val context: Context) {
                         override fun onError(exception: Exception?) {
                             mainHandler.removeCallbacksAndMessages(null)
                             teardown()
+                            releaseModel()
                             onError(exception ?: RuntimeException("recogniser error"))
                         }
                         override fun onTimeout() = complete("", onText)
                     }
                     service.startListening(listener)
                     mainHandler.postDelayed(timeout, timeoutMs)
-                }.onFailure { teardown(); onError(it) }
+                }.onFailure {
+                    teardown()
+                    releaseModel()
+                    onError(it)
+                }
             },
             onError = onError,
         )
@@ -75,7 +85,15 @@ class OneShotRecognizer(private val context: Context) {
         if (finished) return
         finished = true
         teardown()
+        releaseModel()
         onText(text)
+    }
+
+    /** Give back the shared-model reference exactly once (every finish path funnels here or through the error branches). */
+    private fun releaseModel() {
+        if (!holdsModel) return
+        holdsModel = false
+        VoskModel.release()
     }
 
     private fun teardown() {
