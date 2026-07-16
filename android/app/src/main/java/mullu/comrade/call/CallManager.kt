@@ -512,11 +512,23 @@ object CallManager {
         }
     }
 
-    /** Reject the ringing incoming call (callee declines before answering). */
-    @Synchronized
+    /**
+     * Reject the ringing incoming call (callee declines before answering).
+     *
+     * Dispatched to [io] instead of taking the monitor on the caller's
+     * (main/UI) thread: `setupPeer`/`ensureFactory` hold the monitor across
+     * blocking native work, and a control tapped on the main thread while that
+     * runs would block the UI thread for its whole duration — the "Comrade
+     * isn't responding" ANR. Running the transition on [io] means the main
+     * thread only ever *launches* it and returns immediately.
+     */
     fun reject() {
-        if (session == null) return
-        endWith(HangupReason.DECLINED, "declined", sendHangup = true)
+        io.launch {
+            synchronized(this@CallManager) {
+                if (session == null) return@launch
+                endWith(HangupReason.DECLINED, "declined", sendHangup = true)
+            }
+        }
     }
 
     /**
@@ -528,34 +540,43 @@ object CallManager {
      * a [CallSignal.Hangup] to reach, so this ends the call locally only and
      * cancels the in-flight [Session.placingJob] instead, which is what
      * actually stops a late offer from being sent (see [endWith]).
+     *
+     * Dispatched to [io] (see [reject] for why) so the main thread never
+     * blocks on the monitor a running `setupPeer` may be holding.
      */
-    @Synchronized
     fun hangup() {
-        val s = session ?: return
-        val connected = s.connectedAtMs > 0
-        val stillPlacing = !s.incoming && s.pc == null
-        val reason = when {
-            connected -> HangupReason.NORMAL
-            s.incoming -> HangupReason.DECLINED
-            else -> HangupReason.CANCELLED
+        io.launch {
+            synchronized(this@CallManager) {
+                val s = session ?: return@launch
+                val connected = s.connectedAtMs > 0
+                val stillPlacing = !s.incoming && s.pc == null
+                val reason = when {
+                    connected -> HangupReason.NORMAL
+                    s.incoming -> HangupReason.DECLINED
+                    else -> HangupReason.CANCELLED
+                }
+                val outcome = when {
+                    connected -> "connected"
+                    s.incoming -> "declined"
+                    else -> "cancelled"
+                }
+                endWith(reason, outcome, sendHangup = !stillPlacing)
+            }
         }
-        val outcome = when {
-            connected -> "connected"
-            s.incoming -> "declined"
-            else -> "cancelled"
-        }
-        endWith(reason, outcome, sendHangup = !stillPlacing)
     }
 
     // ── Toggles ──────────────────────────────────────────────────────────────
 
-    /** Flip local mic enablement (no renegotiation — just [AudioTrack.setEnabled]). */
-    @Synchronized
+    /** Flip local mic enablement (no renegotiation — just [AudioTrack.setEnabled]). Dispatched to [io], see [reject]. */
     fun toggleMute() {
-        val s = session ?: return
-        val next = !_muted.value
-        s.audioTrack?.setEnabled(!next)
-        _muted.value = next
+        io.launch {
+            synchronized(this@CallManager) {
+                val s = session ?: return@launch
+                val next = !_muted.value
+                s.audioTrack?.setEnabled(!next)
+                _muted.value = next
+            }
+        }
     }
 
     /**
@@ -565,20 +586,25 @@ object CallManager {
      * and stops the capturer (releasing the physical camera, not just muting
      * it); turning back on resumes both. A no-op for audio calls.
      */
-    @Synchronized
     fun toggleCamera() {
-        val s = session ?: return
-        if (!s.isVideo) return
-        val next = !_cameraOn.value
-        if (next) {
-            runCatching { s.capturer?.startCapture(CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS) }
-                .onFailure { Log.w(TAG, "startCapture failed", it) }
-            s.videoTrack?.setEnabled(true)
-        } else {
-            s.videoTrack?.setEnabled(false)
-            runCatching { s.capturer?.stopCapture() }.onFailure { Log.w(TAG, "stopCapture failed", it) }
+        // Dispatched to [io] (see [reject]); startCapture/stopCapture are
+        // blocking native calls that must not run on the main thread either.
+        io.launch {
+            synchronized(this@CallManager) {
+                val s = session ?: return@launch
+                if (!s.isVideo) return@launch
+                val next = !_cameraOn.value
+                if (next) {
+                    runCatching { s.capturer?.startCapture(CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS) }
+                        .onFailure { Log.w(TAG, "startCapture failed", it) }
+                    s.videoTrack?.setEnabled(true)
+                } else {
+                    s.videoTrack?.setEnabled(false)
+                    runCatching { s.capturer?.stopCapture() }.onFailure { Log.w(TAG, "stopCapture failed", it) }
+                }
+                _cameraOn.value = next
+            }
         }
-        _cameraOn.value = next
     }
 
     /** Cycle to the next available [AudioRoute] (earpiece → speaker → Bluetooth/wired → …). */
@@ -643,10 +669,13 @@ object CallManager {
         }
     }
 
-    /** Flip between the front and back cameras (video calls only). */
-    @Synchronized
+    /** Flip between the front and back cameras (video calls only). Dispatched to [io], see [reject]. */
     fun switchCamera() {
-        (session?.capturer as? CameraVideoCapturer)?.switchCamera(null)
+        io.launch {
+            synchronized(this@CallManager) {
+                (session?.capturer as? CameraVideoCapturer)?.switchCamera(null)
+            }
+        }
     }
 
     // ── TURN connectivity diagnostic (AUDIT.md COMMS-02) ─────────────────────
@@ -1347,15 +1376,30 @@ object CallManager {
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build(),
             )
-            .setOnAudioFocusChangeListener { change -> onAudioFocusChange(change) }
+            // Delivered on the MAIN thread. onAudioFocusChange is @Synchronized,
+            // and beginAudioRouting (running under the CallManager monitor on io)
+            // holds that monitor across slow native audio calls — so doing the
+            // work inline here would block the UI thread on the lock. Hop to io
+            // so the main thread never waits on the monitor from an audio callback.
+            .setOnAudioFocusChangeListener { change -> io.launch { onAudioFocusChange(change) } }
             .build()
         audioFocus = focus
         am.requestAudioFocus(focus)
         am.mode = AudioManager.MODE_IN_COMMUNICATION
 
         val callback = object : AudioDeviceCallback() {
-            override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) = refreshAndMaybeSwitchRoute(am)
-            override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) = refreshAndMaybeSwitchRoute(am)
+            // registerAudioDeviceCallback(…, null) delivers these on the MAIN
+            // thread; refreshAndMaybeSwitchRoute is @Synchronized and the monitor
+            // is held throughout beginAudioRouting's slow native audio calls, so
+            // running it inline blocked the UI thread on the lock long enough to
+            // starve CallService.startForeground() → the "did not call
+            // startForeground()" ANR. Hop to io so the main thread never blocks.
+            override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
+                io.launch { refreshAndMaybeSwitchRoute(am) }
+            }
+            override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) {
+                io.launch { refreshAndMaybeSwitchRoute(am) }
+            }
         }
         audioDeviceCallback = callback
         am.registerAudioDeviceCallback(callback, null)

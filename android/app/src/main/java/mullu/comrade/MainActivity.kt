@@ -191,6 +191,9 @@ fun ComradeApp() {
             // without the background-delivery guarantee. Matches
             // CallService.start's own guard in CallManager.setupPeer.
             withContext(Dispatchers.IO) {
+                // Apply the baked-in default TURN relay (if the build has one and
+                // the user hasn't set their own) now that the vault/store is open.
+                CallRelayDefaults.seedIfNeeded(context)
                 runCatching { RelayConnectionService.start(context) }
                     .onFailure { Log.w("ComradeApp", "Failed to start RelayConnectionService", it) }
             }

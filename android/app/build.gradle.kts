@@ -84,6 +84,26 @@ android {
         project.findProperty("deviceHarnessRole")?.toString()?.takeIf { it.isNotBlank() }?.let { role ->
             applicationIdSuffix = ".$role"
         }
+
+        // ── Default TURN relay, baked in from CI secrets ──────────────────────
+        // Read from the TURN_URL / TURN_USERNAME / TURN_PASSWORD environment
+        // variables (set as GitHub Actions secrets in the release/apk workflows;
+        // export them locally to bake a relay into a local build too). Empty
+        // string when unset — local dev and fork PRs still compile, and the app
+        // treats empty as "no baked-in default" and falls back to whatever the
+        // user configured in Settings.
+        //
+        // SECURITY NOTE: these values end up inside the APK and are extractable.
+        // They are a convenience *default* relay only; a user-set relay in
+        // Settings always overrides them. Do not put anything here whose misuse
+        // you can't absorb — see the TURN setup notes for the abuse/quota
+        // tradeoff of a baked-in credential.
+        val turnField: (String?) -> String = { v ->
+            "\"" + (v ?: "").replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+        }
+        buildConfigField("String", "DEFAULT_TURN_URL", turnField(System.getenv("TURN_URL")))
+        buildConfigField("String", "DEFAULT_TURN_USERNAME", turnField(System.getenv("TURN_USERNAME")))
+        buildConfigField("String", "DEFAULT_TURN_PASSWORD", turnField(System.getenv("TURN_PASSWORD")))
     }
 
     signingConfigs {
@@ -115,6 +135,8 @@ android {
 
     buildFeatures {
         compose = true
+        // Needed for the DEFAULT_TURN_* fields below.
+        buildConfig = true
     }
 
     composeOptions {

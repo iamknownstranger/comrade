@@ -187,6 +187,12 @@ jobs:
 
       - name: Assemble debug APK
         working-directory: android
+        env:
+          # Baked-in default TURN relay (see app/build.gradle.kts). Empty if the
+          # secrets aren't set → no default relay compiled in.
+          TURN_URL: ${{ secrets.TURN_URL }}
+          TURN_USERNAME: ${{ secrets.TURN_USERNAME }}
+          TURN_PASSWORD: ${{ secrets.TURN_PASSWORD }}
         run: ./gradlew assembleDebug --no-daemon
 
       - name: Upload APK artifact
@@ -300,6 +306,11 @@ jobs:
 
       - name: Run on-device smoke tests
         uses: reactivecircus/android-emulator-runner@v2
+        env:
+          # Baked-in default TURN relay for the assembled test APK (empty if unset).
+          TURN_URL: ${{ secrets.TURN_URL }}
+          TURN_USERNAME: ${{ secrets.TURN_USERNAME }}
+          TURN_PASSWORD: ${{ secrets.TURN_PASSWORD }}
         with:
           api-level: ${{ matrix.api-level }}
           arch: x86_64
