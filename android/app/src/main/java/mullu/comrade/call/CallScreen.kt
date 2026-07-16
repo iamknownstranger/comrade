@@ -41,6 +41,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
@@ -56,10 +57,12 @@ import kotlinx.coroutines.delay
 import mullu.comrade.R
 import mullu.comrade.ui.CallEndIcon
 import mullu.comrade.ui.CallIcon
+import mullu.comrade.ui.FlipCameraIcon
 import mullu.comrade.ui.MicIcon
 import mullu.comrade.ui.PeerAvatar
 import mullu.comrade.ui.SpeakerIcon
 import mullu.comrade.ui.VideocamIcon
+import mullu.comrade.ui.VideocamOffIcon
 import org.webrtc.RendererCommon
 import org.webrtc.SurfaceViewRenderer
 import org.webrtc.VideoTrack
@@ -90,21 +93,20 @@ fun CallScreen(onAccept: () -> Unit, modifier: Modifier = Modifier) {
     when (val s = state) {
         is CallUiState.Idle -> Unit
         is CallUiState.Ringing -> CallOverlay(modifier) { RingingContent(s, onAccept) }
-        is CallUiState.Connecting -> CallOverlay(modifier) {
+        // One branch — one composition subtree — for both in-call phases: if
+        // Connecting and Active were separate branches, the transition between
+        // them would dispose and recreate the whole video subtree (each
+        // SurfaceViewRenderer re-inits and the remote sink detaches) right as
+        // the first video frames arrive.
+        is CallUiState.Connecting, is CallUiState.Active -> CallOverlay(modifier) {
+            val active = s as? CallUiState.Active
+            val connecting = s as? CallUiState.Connecting
             InCallContent(
-                peer = s.peer,
-                peerLabel = s.peerLabel,
-                video = s.video,
-                status = stringOf(R.string.call_connecting),
-            )
-        }
-        is CallUiState.Active -> CallOverlay(modifier) {
-            InCallContent(
-                peer = s.peer,
-                peerLabel = s.peerLabel,
-                video = s.video,
-                status = null,
-                connectedAtMs = s.connectedAtMs,
+                peer = active?.peer ?: connecting!!.peer,
+                peerLabel = active?.peerLabel ?: connecting!!.peerLabel,
+                video = active?.video ?: connecting!!.video,
+                status = if (active == null) stringOf(R.string.call_connecting) else null,
+                connectedAtMs = active?.connectedAtMs ?: 0L,
             )
         }
         is CallUiState.Ended -> CallOverlay(modifier) { EndedContent(s) }
@@ -131,23 +133,38 @@ private fun RingingContent(s: CallUiState.Ringing, onAccept: () -> Unit) {
         else -> stringOf(R.string.call_calling)
     }
     Column(Modifier.fillMaxSize()) {
-        PeerHeader(s.peer, s.peerLabel, status, Modifier.weight(1f))
+        PeerHeader(s.peer, s.peerLabel, status, Modifier.weight(1f).padding(top = 72.dp))
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 32.dp, vertical = 48.dp),
+                .padding(horizontal = 44.dp, vertical = 44.dp),
             horizontalArrangement = if (s.incoming) Arrangement.SpaceBetween else Arrangement.Center,
+            verticalAlignment = Alignment.Top,
         ) {
             if (s.incoming) {
-                CallActionButton(CallEndIcon, stringOf(R.string.call_decline), HangupRed) { CallManager.reject() }
+                CallActionButton(
+                    icon = CallEndIcon,
+                    desc = stringOf(R.string.call_decline),
+                    bg = HangupRed,
+                    size = 68.dp,
+                    label = stringOf(R.string.call_decline),
+                ) { CallManager.reject() }
                 CallActionButton(
                     icon = if (s.video) VideocamIcon else CallIcon,
                     desc = stringOf(R.string.call_accept),
                     bg = AcceptGreen,
+                    size = 68.dp,
+                    label = stringOf(R.string.call_accept),
                     onClick = onAccept,
                 )
             } else {
-                CallActionButton(CallEndIcon, stringOf(R.string.call_cancel), HangupRed) { CallManager.hangup() }
+                CallActionButton(
+                    icon = CallEndIcon,
+                    desc = stringOf(R.string.call_cancel),
+                    bg = HangupRed,
+                    size = 68.dp,
+                    label = stringOf(R.string.call_cancel),
+                ) { CallManager.hangup() }
             }
         }
     }
@@ -194,31 +211,97 @@ private fun InCallContent(
             var swapped by remember { mutableStateOf(false) }
             val mainTrack = if (swapped) localVideo else remoteVideo
             val pipTrack = if (swapped) remoteVideo else localVideo
-            // The local track is the front camera preview, so it mirrors
-            // wherever it renders; the remote track never mirrors.
-            VideoRenderer(mainTrack, mirror = swapped, modifier = Modifier.fillMaxSize())
-            VideoRenderer(
-                track = pipTrack,
-                mirror = !swapped,
+            val pipIsLocal = !swapped
+
+            if (mainTrack != null) {
+                // The local track is the front camera preview, so it mirrors
+                // wherever it renders; the remote track never mirrors.
+                VideoRenderer(mainTrack, mirror = swapped, modifier = Modifier.fillMaxSize())
+            } else {
+                // No frames for the big view yet (the peer's video hasn't
+                // arrived, typically while still Connecting) — show who the
+                // call is with instead of a raw black screen.
+                PeerHeader(peer, peerLabel, status = null, modifier = Modifier.align(Alignment.Center))
+            }
+
+            // Self-preview tile: swaps on tap; hosts the camera-flip control so
+            // the bottom bar keeps exactly one camera button.
+            Box(
                 modifier = Modifier
                     .align(Alignment.TopEnd)
                     .padding(16.dp)
-                    .size(width = 108.dp, height = 152.dp)
-                    .clip(RoundedCornerShape(12.dp))
+                    .size(width = 110.dp, height = 156.dp)
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(Color(0xFF17212B))
                     .clickable(onClickLabel = stringOf(R.string.call_swap_video)) { swapped = !swapped },
-            )
+            ) {
+                if (pipTrack != null && (cameraOn || !pipIsLocal)) {
+                    VideoRenderer(
+                        track = pipTrack,
+                        mirror = pipIsLocal,
+                        modifier = Modifier.fillMaxSize(),
+                        // Two overlapping SurfaceViews have no defined z-order
+                        // between their surfaces unless the small one is
+                        // explicitly marked as a media overlay — without this
+                        // the tile can composite under the full-screen surface
+                        // and simply never show.
+                        zOrderMediaOverlay = true,
+                    )
+                } else {
+                    Icon(
+                        VideocamOffIcon,
+                        contentDescription = null,
+                        tint = Color(0x66FFFFFF),
+                        modifier = Modifier
+                            .size(30.dp)
+                            .align(Alignment.Center),
+                    )
+                }
+                if (pipIsLocal && cameraOn) {
+                    CallActionButton(
+                        icon = FlipCameraIcon,
+                        desc = stringOf(R.string.call_switch_camera),
+                        bg = Color(0x66000000),
+                        size = 34.dp,
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .padding(bottom = 6.dp),
+                    ) { CallManager.switchCamera() }
+                }
+            }
+
+            // Name + duration/status pill, kept clear of the self-preview tile.
             Column(
                 modifier = Modifier
                     .align(Alignment.TopStart)
-                    .padding(20.dp),
+                    .padding(start = 16.dp, top = 20.dp, end = 142.dp),
             ) {
-                Text(text = label, color = Color.White, fontFamily = FontFamily.Monospace)
+                Column(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(Color(0x66000000))
+                        .padding(horizontal = 14.dp, vertical = 8.dp),
+                ) {
+                    Text(
+                        peerLabel,
+                        color = Color.White,
+                        fontSize = 15.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        text = label,
+                        color = Color(0xFFB0BEC5),
+                        fontSize = 13.sp,
+                        fontFamily = FontFamily.Monospace,
+                    )
+                }
                 if (showWeakConnection) {
-                    Spacer(Modifier.height(4.dp))
+                    Spacer(Modifier.height(6.dp))
                     ConnectionQualityBadge(connectionQuality)
                 }
                 if (sas != null) {
-                    Spacer(Modifier.height(4.dp))
+                    Spacer(Modifier.height(6.dp))
                     SasRow(emojis = sas)
                 }
             }
@@ -235,43 +318,57 @@ private fun InCallContent(
             }
         }
 
-        // Controls: mute, speaker, (switch camera), hang up.
-        Row(
+        // Controls: mute, audio route, (camera on/off), hang up — uniform
+        // sizes with labels beneath; over video they sit on a scrim so they
+        // stay legible on top of bright frames.
+        Column(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .fillMaxWidth()
-                .padding(horizontal = 24.dp, vertical = 40.dp),
-            horizontalArrangement = Arrangement.spacedBy(20.dp, Alignment.CenterHorizontally),
-            verticalAlignment = Alignment.CenterVertically,
+                .then(
+                    if (video) {
+                        Modifier.background(
+                            Brush.verticalGradient(listOf(Color.Transparent, Color(0xB3000000))),
+                        )
+                    } else {
+                        Modifier
+                    },
+                ),
         ) {
-            CallActionButton(
-                icon = MicIcon,
-                desc = stringOf(if (muted) R.string.call_unmute else R.string.call_mute),
-                bg = if (muted) ControlActive else ControlIdle,
-                tint = if (muted) CallBackground else Color.White,
-                size = 56.dp,
-            ) { CallManager.toggleMute() }
-            AudioRouteButton(audioRoute, availableRoutes)
-            if (video) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 24.dp)
+                    .padding(top = 28.dp, bottom = 36.dp),
+                horizontalArrangement = Arrangement.spacedBy(26.dp, Alignment.CenterHorizontally),
+                verticalAlignment = Alignment.Top,
+            ) {
                 CallActionButton(
-                    icon = VideocamIcon,
-                    desc = stringOf(if (cameraOn) R.string.call_camera_off else R.string.call_camera_on),
-                    bg = if (!cameraOn) ControlActive else ControlIdle,
-                    tint = if (!cameraOn) CallBackground else Color.White,
-                    size = 56.dp,
-                ) { CallManager.toggleCamera() }
-                // Nothing to flip while the camera itself is off.
-                if (cameraOn) {
+                    icon = MicIcon,
+                    desc = stringOf(if (muted) R.string.call_unmute else R.string.call_mute),
+                    bg = if (muted) ControlActive else ControlIdle,
+                    tint = if (muted) CallBackground else Color.White,
+                    size = 60.dp,
+                    label = stringOf(if (muted) R.string.call_unmute else R.string.call_mute),
+                ) { CallManager.toggleMute() }
+                AudioRouteButton(audioRoute, availableRoutes)
+                if (video) {
                     CallActionButton(
-                        icon = VideocamIcon,
-                        desc = stringOf(R.string.call_switch_camera),
-                        bg = ControlIdle,
-                        size = 56.dp,
-                    ) { CallManager.switchCamera() }
+                        icon = if (cameraOn) VideocamIcon else VideocamOffIcon,
+                        desc = stringOf(if (cameraOn) R.string.call_camera_off else R.string.call_camera_on),
+                        bg = if (!cameraOn) ControlActive else ControlIdle,
+                        tint = if (!cameraOn) CallBackground else Color.White,
+                        size = 60.dp,
+                        label = stringOf(R.string.call_camera),
+                    ) { CallManager.toggleCamera() }
                 }
-            }
-            CallActionButton(CallEndIcon, stringOf(R.string.call_hang_up), HangupRed, size = 64.dp) {
-                CallManager.hangup()
+                CallActionButton(
+                    icon = CallEndIcon,
+                    desc = stringOf(R.string.call_hang_up),
+                    bg = HangupRed,
+                    size = 60.dp,
+                    label = stringOf(R.string.call_end_label),
+                ) { CallManager.hangup() }
             }
         }
     }
@@ -294,6 +391,8 @@ private fun EndedContent(s: CallUiState.Ended) {
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
     ) {
+        PeerAvatar(s.peerLabel, seed = s.peer, size = 96.dp)
+        Spacer(Modifier.height(20.dp))
         Text(s.peerLabel, color = Color.White, fontSize = 22.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
         Spacer(Modifier.height(8.dp))
         Text(stringOf(labelRes), color = Color(0xFFB0BEC5), fontSize = 15.sp)
@@ -306,14 +405,12 @@ private fun EndedContent(s: CallUiState.Ended) {
 private fun PeerHeader(
     peer: String,
     peerLabel: String,
-    status: String,
+    status: String?,
     modifier: Modifier,
     extra: @Composable () -> Unit = {},
 ) {
     Column(
-        modifier = modifier
-            .fillMaxWidth()
-            .padding(top = 72.dp),
+        modifier = modifier.fillMaxWidth(),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
     ) {
@@ -327,8 +424,10 @@ private fun PeerHeader(
             overflow = TextOverflow.Ellipsis,
             textAlign = TextAlign.Center,
         )
-        Spacer(Modifier.height(10.dp))
-        Text(status, color = Color(0xFFB0BEC5), fontSize = 16.sp, textAlign = TextAlign.Center)
+        if (status != null) {
+            Spacer(Modifier.height(10.dp))
+            Text(status, color = Color(0xFFB0BEC5), fontSize = 16.sp, textAlign = TextAlign.Center)
+        }
         extra()
     }
 }
@@ -397,17 +496,25 @@ private fun CallActionButton(
     bg: Color,
     tint: Color = Color.White,
     size: Dp = 64.dp,
+    label: String? = null,
+    modifier: Modifier = Modifier,
     onClick: () -> Unit,
 ) {
-    Box(
-        modifier = Modifier
-            .size(size)
-            .clip(CircleShape)
-            .background(bg)
-            .clickable(onClick = onClick),
-        contentAlignment = Alignment.Center,
-    ) {
-        Icon(icon, contentDescription = desc, tint = tint, modifier = Modifier.size(size * 0.44f))
+    Column(modifier = modifier, horizontalAlignment = Alignment.CenterHorizontally) {
+        Box(
+            modifier = Modifier
+                .size(size)
+                .clip(CircleShape)
+                .background(bg)
+                .clickable(onClick = onClick),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(icon, contentDescription = desc, tint = tint, modifier = Modifier.size(size * 0.44f))
+        }
+        if (label != null) {
+            Spacer(Modifier.height(6.dp))
+            Text(label, color = Color(0xB3FFFFFF), fontSize = 12.sp, maxLines = 1)
+        }
     }
 }
 
@@ -454,7 +561,8 @@ private fun AudioRouteButton(current: AudioRoute, availableRoutes: List<AudioRou
             desc = stringOf(R.string.call_speaker) + ": " + audioRouteLabel(current),
             bg = if (active) ControlActive else ControlIdle,
             tint = if (active) CallBackground else Color.White,
-            size = 56.dp,
+            size = 60.dp,
+            label = audioRouteLabel(current),
         ) { expanded = true }
         DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
             availableRoutes.forEach { route ->
@@ -484,7 +592,12 @@ private fun audioRouteLabel(route: AudioRoute): String = when (route) {
  * the renderer on disposal — the GPU/native cleanup the webview got for free.
  */
 @Composable
-private fun VideoRenderer(track: VideoTrack?, mirror: Boolean, modifier: Modifier) {
+private fun VideoRenderer(
+    track: VideoTrack?,
+    mirror: Boolean,
+    modifier: Modifier,
+    zOrderMediaOverlay: Boolean = false,
+) {
     val egl = CallManager.eglBaseContext
     if (egl == null) {
         Box(modifier.background(Color.Black))
@@ -496,7 +609,10 @@ private fun VideoRenderer(track: VideoTrack?, mirror: Boolean, modifier: Modifie
             init(egl, null)
             setEnableHardwareScaler(true)
             setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FILL)
-            setMirror(mirror)
+            // Must be set before the view attaches: the picture-in-picture
+            // tile's surface has to be explicitly stacked above the
+            // full-screen renderer's surface, or their z-order is undefined.
+            setZOrderMediaOverlay(zOrderMediaOverlay)
         }
     }
     DisposableEffect(renderer) {
@@ -506,7 +622,9 @@ private fun VideoRenderer(track: VideoTrack?, mirror: Boolean, modifier: Modifie
         track?.addSink(renderer)
         onDispose { track?.removeSink(renderer) }
     }
-    AndroidView(factory = { renderer }, modifier = modifier)
+    // Mirror is applied in update (not just at creation): it flips whenever the
+    // user swaps which tile shows the front-camera preview.
+    AndroidView(factory = { renderer }, update = { it.setMirror(mirror) }, modifier = modifier)
 }
 
 /**
@@ -546,7 +664,12 @@ private fun durationLabel(connectedAtMs: Long): String {
         }
     }
     val secs = ((now - connectedAtMs) / 1000).coerceAtLeast(0)
-    return "%d:%02d".format(secs / 60, secs % 60)
+    val hours = secs / 3600
+    return if (hours > 0) {
+        "%d:%02d:%02d".format(hours, (secs % 3600) / 60, secs % 60)
+    } else {
+        "%d:%02d".format(secs / 60, secs % 60)
+    }
 }
 
 @Composable
