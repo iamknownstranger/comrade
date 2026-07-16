@@ -7,7 +7,7 @@
     <string name="voice_channel_name">Voice assistant</string>
     <string name="voice_listening">Listening for \"Hey Comrade\"</string>
     <string name="voice_go_ahead">Go ahead…</string>
-    <string name="voice_model_missing">Voice model missing — see setup</string>
+    <string name="voice_model_missing">Voice model not downloaded — open Comrade and tap a voice button to set it up</string>
     <string name="voice_mic_error">Microphone unavailable</string>
     <string name="voice_stop">Stop</string>
     <string name="voice_section_title">Voice Assistant</string>
@@ -16,6 +16,18 @@
     <string name="voice_tap_to_talk">Tap to talk</string>
     <string name="voice_set_default_assistant">Set Comrade as assist app</string>
     <string name="voice_permission_needed">Microphone permission is required for voice.</string>
+
+    <!-- On-demand speech-model download (VoiceModelDownloadDialog) -->
+    <string name="voice_model_prompt_title">Download voice model?</string>
+    <string name="voice_model_prompt_body">Comrade\'s voice features run fully offline — speech never leaves this phone. That needs a one-time download of the English recognition model (%1$s). On a metered connection you may want to wait for Wi-Fi.</string>
+    <string name="voice_model_download">Download</string>
+    <string name="voice_model_not_now">Not now</string>
+    <string name="voice_model_downloading">Downloading voice model…</string>
+    <string name="voice_model_progress">%1$s of %2$s</string>
+    <string name="voice_model_verifying">Verifying and installing…</string>
+    <string name="voice_model_cancel_download">Cancel download</string>
+    <string name="voice_model_failed">Download failed: %1$s</string>
+    <string name="voice_model_retry">Retry</string>
 
     <!-- Voice/video calls -->
     <string name="call_voice">Voice call</string>

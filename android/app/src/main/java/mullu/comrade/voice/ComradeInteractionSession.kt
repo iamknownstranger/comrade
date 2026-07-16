@@ -37,7 +37,15 @@ class ComradeInteractionSession(context: Context) :
             },
             onError = { error ->
                 Log.e(TAG, "assist recognition failed", error)
-                tts.speak("Voice isn't available right now.")
+                // No UI of its own to host the download dialog — point the
+                // user at the app, where any voice button offers the download.
+                tts.speak(
+                    if (error is VoiceModelMissingException) {
+                        "The voice model isn't downloaded yet. Open Comrade and tap a voice button to set it up."
+                    } else {
+                        "Voice isn't available right now."
+                    },
+                )
                 hide()
             },
         )

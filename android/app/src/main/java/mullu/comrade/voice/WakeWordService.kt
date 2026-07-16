@@ -20,7 +20,6 @@ import org.vosk.Model
 import org.vosk.Recognizer
 import org.vosk.android.RecognitionListener
 import org.vosk.android.SpeechService
-import org.vosk.android.StorageService
 import java.util.concurrent.Executors
 
 /**
@@ -78,7 +77,6 @@ class WakeWordService : Service(), RecognitionListener {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val worker = Executors.newSingleThreadExecutor()
 
-    private var model: Model? = null
     private var speechService: SpeechService? = null
     private var tts: ComradeTts? = null
     private lateinit var dispatcher: CommandDispatcher
@@ -114,16 +112,14 @@ class WakeWordService : Service(), RecognitionListener {
     // ── Model + recogniser bootstrap ─────────────────────────────────────────
 
     private fun initRecogniser() {
-        // Unpack the Vosk model shipped under assets/model-en-us into filesDir.
-        StorageService.unpack(
+        // The shared process-wide model: bundled in the APK or downloaded on
+        // demand — the UI gates starting this service on VoskModel.isAvailable,
+        // so the error path here is a should-not-happen backstop (e.g. the
+        // downloaded model was deleted from under us).
+        VoskModel.withModel(
             this,
-            MODEL_ASSET,
-            MODEL_TARGET,
-            { unpacked ->
-                model = unpacked
-                startRecognition(unpacked)
-            },
-            { exception ->
+            onReady = { model -> startRecognition(model) },
+            onError = { exception ->
                 Log.e(TAG, "Vosk model unavailable", exception)
                 updateNotification(getString(R.string.voice_model_missing))
             },
@@ -264,8 +260,9 @@ class WakeWordService : Service(), RecognitionListener {
         speechService?.stop()
         speechService?.shutdown()
         speechService = null
-        model?.close()
-        model = null
+        // Deliberately NOT closing the model: it's VoskModel's process-wide
+        // instance, shared with tap-to-talk/assist recognisers that may
+        // outlive this service.
         tts?.shutdown()
         tts = null
         worker.shutdownNow()
@@ -325,10 +322,6 @@ class WakeWordService : Service(), RecognitionListener {
         private const val NOTIFICATION_ID = 0x0C0DE
         private const val SAMPLE_RATE = 16_000.0f
         private const val COMMAND_WINDOW_MS = 6_000L
-
-        /** Assets subfolder holding the unpacked Vosk model (see README). */
-        private const val MODEL_ASSET = "model-en-us"
-        private const val MODEL_TARGET = "model"
 
         fun start(context: Context) {
             val intent = Intent(context, WakeWordService::class.java)
