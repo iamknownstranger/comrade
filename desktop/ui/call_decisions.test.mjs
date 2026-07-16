@@ -18,6 +18,7 @@ import {
   ANSWER_DECISION,
   decideAnswer,
   shouldConnectTimeoutFire,
+  formatSas,
 } from "./call_decisions.mjs";
 
 // ── decideOfferDisposition ───────────────────────────────────────────────────
@@ -374,4 +375,40 @@ test("shouldConnectTimeoutFire does not fire for a superseded call (zombie-timer
     shouldConnectTimeoutFire({ isCurrentCall: false, ended: false, connected: false }),
     false,
   );
+});
+
+// ── formatSas ─────────────────────────────────────────────────────────────
+// The WP4 SAS UI: formatSas mirrors the honest-none contract of
+// comrade_ui::ComradeRuntime::call_sas (runtime.rs:1258-1270) / the Tauri
+// call_sas command — None/null means one side's SDP had no
+// `a=fingerprint:` line, an honest "can't verify", not an error.
+
+test("formatSas joins a real 4-emoji SAS with spaces (happy path)", () => {
+  assert.equal(formatSas(["🐶", "🦊", "🐝", "🐳"]), "🐶 🦊 🐝 🐳");
+});
+
+test("formatSas returns null for a null SAS — no fingerprint on one side, honest can't-verify (required)", () => {
+  // The required "no fingerprint -> no SAS" branch (docs/COMMS_ARCHITECTURE.md
+  // WP4 acceptance criteria): call_sas resolves to None/null when either SDP
+  // lacks an a=fingerprint: line, and that must format to null, never a
+  // fabricated or partial code.
+  assert.equal(formatSas(null), null);
+});
+
+test("formatSas returns null for undefined (not yet derived / older backend)", () => {
+  assert.equal(formatSas(undefined), null);
+});
+
+test("formatSas returns null for an empty array", () => {
+  assert.equal(formatSas([]), null);
+});
+
+test("formatSas returns null for anything other than exactly 4 emoji (never trust a partial code)", () => {
+  assert.equal(formatSas(["🐶", "🦊"]), null);
+  assert.equal(formatSas(["🐶", "🦊", "🐝", "🐳", "🐧"]), null);
+});
+
+test("formatSas returns null for a non-array input", () => {
+  assert.equal(formatSas("🐶 🦊 🐝 🐳"), null);
+  assert.equal(formatSas(42), null);
 });

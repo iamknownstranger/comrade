@@ -264,3 +264,30 @@ export function decideAnswer(signalingState) {
 export function shouldConnectTimeoutFire({ isCurrentCall, ended, connected }) {
   return !!isCurrentCall && !ended && !connected;
 }
+
+/**
+ * Format a derived short-authentication-string (SAS) emoji list for display
+ * on the connected call panel (§ADR-3/WP4). This is a pure formatting
+ * helper, not a decision — it doesn't call anything, it just turns whatever
+ * `call_sas` produced into either a display string or `null`.
+ *
+ * Mirrors the honest-none contract of `comrade_ui::ComradeRuntime::call_sas`
+ * (`crates/comrade_ui/src/runtime.rs:1258-1270`) and the Tauri `call_sas`
+ * command it fronts (`desktop/src-tauri/src/commands.rs`): both return
+ * `None` — which arrives here as `null`/`undefined` over the JS bridge —
+ * when either side's SDP has no `a=fingerprint:` line to derive a code
+ * from. That is an honest "can't verify", not an error, and this function
+ * mirrors it by also returning `null` for anything that isn't exactly the
+ * 4-emoji list a real derivation produces (nullish, empty, or any length
+ * other than 4) rather than rendering a misleading partial code. Deriving
+ * *and* fetching the SAS (the `call_sas` invoke, liveness checks, and
+ * turning a `null` result into the visible "can't verify" panel state) is
+ * `main.js`'s job — this function only formats an already-resolved value.
+ *
+ * @param {string[]|null|undefined} sasList - The value `call_sas` resolved to.
+ * @returns {string|null} The emoji joined with spaces (e.g. `"🐶 🦊 🐝 🐳"`), or `null` if `sasList` isn't a real 4-emoji SAS.
+ */
+export function formatSas(sasList) {
+  if (!Array.isArray(sasList) || sasList.length !== 4) return null;
+  return sasList.join(" ");
+}

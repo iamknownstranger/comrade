@@ -1362,13 +1362,85 @@
 
   function onCallConnected() {
     const c = state.call;
-    if (!c || c.connected) return;
-    c.connected = true;
-    c.phase = "connected";
-    c.startedAt = nowSecs();
-    // Connected — the connect timeout no longer applies (mirrors CallManager.kt:1103).
-    clearConnectTimeout(c);
-    startDurationTimer();
+    if (!c) return;
+    if (!c.connected) {
+      c.connected = true;
+      c.phase = "connected";
+      c.startedAt = nowSecs();
+      // Connected — the connect timeout no longer applies (mirrors CallManager.kt:1103).
+      clearConnectTimeout(c);
+      startDurationTimer();
+    }
+    // Re-derive the SAS on every connected transition, not just the first —
+    // mirrors Android's onConnected calling maybeDeriveSas unconditionally on
+    // every CONNECTED observation (CallManager.kt:1101-1108), so a mid-call
+    // ICE-restart reconnect (WP3's TURN fallback) recomputes against the
+    // fresh post-restart SDPs instead of leaving a stale pre-restart code on
+    // screen. Fire-and-forget: a DOM update, nothing here needs to block on it.
+    updateCallSas(c);
+  }
+
+  // ── SAS (short authentication string) — encryption verification (WP4) ────
+  //
+  // Once a call is connected, both sides' negotiated SDPs carry a DTLS-SRTP
+  // certificate fingerprint (`a=fingerprint:` line); `call_sas` derives a
+  // 4-emoji code from the pair that must match on both ends to rule out a
+  // man-in-the-middle on the call's media path — mirrors Android's
+  // maybeDeriveSas (CallManager.kt:1207-1230), fired from the same
+  // connected-transition site (onConnected there, onCallConnected here).
+  // `call_sas` returns None/null when either side's SDP has no fingerprint
+  // line at all — an honest "can't verify", never a fabricated code (see
+  // crates/comrade_ui/src/runtime.rs:1258-1270) — which this renders as
+  // visible text on the call panel (see renderSasResult below).
+
+  /** Hide/clear the SAS row. Called whenever the call panel (re)opens for a
+   * call that hasn't been verified yet (ringing/connecting) and when the
+   * call ends, so a new or absent call never shows a stale SAS. */
+  function resetSasRow() {
+    const row = $("#call-sas");
+    if (!row) return;
+    row.hidden = true;
+    row.classList.remove("no-sas");
+    $("#call-sas-value").textContent = "";
+  }
+
+  /** Fetch both SDPs off the live pc and ask the backend to derive the SAS,
+   * then paint the result. Guards against the call having ended or been
+   * replaced by the time the (async) invoke returns, both before and after
+   * the network round-trip, per WP4. */
+  async function updateCallSas(c) {
+    if (!c || !c.pc) return;
+    const localSdp = c.pc.localDescription && c.pc.localDescription.sdp;
+    const remoteSdp = c.pc.remoteDescription && c.pc.remoteDescription.sdp;
+    let sas = null;
+    if (localSdp && remoteSdp) {
+      try {
+        sas = await safeInvoke(
+          "call_sas",
+          { localSdp, remoteSdp },
+          { silent: true }, // honest "can't verify" is not an error toast
+        );
+      } catch {
+        sas = null; // treat a transport error the same as an honest can't-verify
+      }
+    }
+    // Re-check liveness after the await: the call may have ended, or been
+    // replaced by a newer one, while the invoke was in flight.
+    if (!c || c.ended || state.call !== c) return;
+    const { formatSas } = await callDecisionsReady;
+    renderSasResult(formatSas(sas));
+  }
+
+  /** Paint the call panel's SAS row from an already-formatted string (or
+   * `null` for the honest can't-verify state). Always updates the same fixed
+   * DOM nodes — never appends — so re-deriving after an ICE restart repaints
+   * in place instead of duplicating anything. */
+  function renderSasResult(formatted) {
+    const row = $("#call-sas");
+    if (!row) return;
+    row.hidden = false;
+    row.classList.toggle("no-sas", !formatted);
+    $("#call-sas-value").textContent = formatted || "Can't verify — no encryption fingerprint";
   }
 
   // Best-effort call-log write (never surfaces its own error).
@@ -1466,6 +1538,7 @@
     $("#call-peer").textContent = displayName(c.peer);
     $("#call-media-label").textContent = c.media === "video" ? "Video call" : "Voice call";
     $("#call-timer").hidden = true;
+    resetSasRow(); // this call hasn't reached connected yet — no SAS to show
     attachLocalMedia();
     attachRemoteMedia();
     $("#call-active").hidden = false;
@@ -1473,6 +1546,7 @@
 
   function hideCallOverlay() {
     $("#call-active").hidden = true;
+    resetSasRow();
     const mb = $("#call-mute");
     mb.classList.remove("is-muted");
     mb.textContent = "🎙";
@@ -2211,6 +2285,10 @@
           // set (the widened list equals the STUN-only one). Keeps WP3's caller
           // TURN-fallback path from throwing "unknown command" in preview.
           return ICE_DEMO.slice();
+        case "call_sas":
+          // Fixed 4-emoji demo code so the SAS row is visible in browser
+          // preview without a real WebRTC connection or backend (WP4).
+          return ["🐶", "🦊", "🐝", "🐳"];
         case "set_turn_server":
           return null;
         case "place_call":
