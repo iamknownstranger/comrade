@@ -825,6 +825,23 @@ object CallManager {
     var forceRelayOnly: Boolean = false
 
     /**
+     * Test-only: instrumented state-machine tests (`CallManagerLifecycleTest`)
+     * place real provisional calls and cancel them immediately; depending on
+     * scheduling the placing continuation can still win the race, reach
+     * [setupPeer], and start [CallService] — a real foreground service those
+     * tests neither exercise nor can safely host. On a loaded emulator the
+     * queued `startForegroundService` → `stopService` pair can trip Android's
+     * "did not call startForeground" process kill even though the service
+     * goes foreground first thing in its `onCreate`: the *creation itself* is
+     * what never gets scheduled inside the contract window. Setting this
+     * skips only the CallService start/stop; every other part of call
+     * setup/teardown runs unchanged. Never touched by any production code
+     * path.
+     */
+    @Volatile
+    var disableCallServiceForTest: Boolean = false
+
+    /**
      * Test-only: a [PeerConnection.Observer] wired to a throwaway, never-current
      * [Session] — lets an instrumented test deliver observer callbacks from its
      * own stand-in "signaling thread" and assert they return promptly even
@@ -907,9 +924,11 @@ object CallManager {
         beginAudioRouting(s.isVideo)
         // Keep the process alive & visible for the rest of the call even if
         // the app is backgrounded — see CallService's doc comment.
-        appContext?.let { ctx ->
-            runCatching { CallService.start(ctx, s.peer, s.peerLabel, s.isVideo) }
-                .onFailure { Log.w(TAG, "Failed to start CallService (foreground restrictions)", it) }
+        if (!disableCallServiceForTest) {
+            appContext?.let { ctx ->
+                runCatching { CallService.start(ctx, s.peer, s.peerLabel, s.isVideo) }
+                    .onFailure { Log.w(TAG, "Failed to start CallService (foreground restrictions)", it) }
+            }
         }
         return true
     }
@@ -1400,7 +1419,7 @@ object CallManager {
         s.audioSource = null
 
         endAudioRouting()
-        appContext?.let { CallService.stop(it) }
+        if (!disableCallServiceForTest) appContext?.let { CallService.stop(it) }
         _muted.value = false
         _cameraOn.value = true
         _connectionQuality.value = CallQuality.UNKNOWN
