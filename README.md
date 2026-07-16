@@ -229,6 +229,19 @@ includes). **iOS is out of scope**: an APK is an Android package and cannot
 run on an iPhone, and Comrade currently has no iOS frontend — the non-Android
 frontends are the Tauri desktop shell and the CLI.
 
+Debug artifacts are signed with the keystore committed at
+`android/debug.keystore` (the standard, deliberately-public Android debug
+credentials), so every CI run and every local `assembleDebug` share one
+signature — a newer sideloaded artifact installs directly over an older one
+and keeps app data instead of tripping Android's "App not installed"
+signature-conflict error. **One-time caveat**: any APK you installed *before*
+this change carries an old, throwaway per-runner signature and must be
+uninstalled once to make room for a debug-keystore-signed build; today that
+uninstall discards its local app data, since there is no identity
+export/import yet. This committed debug key is public by design and cannot
+be used to sign anything for Play — see [`RELEASING.md`](RELEASING.md) for
+production signing.
+
 ### Creating a release from the GitHub UI
 
 1. Go to **Actions** → **Release APK**

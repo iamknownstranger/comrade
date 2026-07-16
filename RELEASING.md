@@ -29,6 +29,15 @@ Actions**):
 | `SIGNING_KEY_PASSWORD` | the key password |
 | `SIGNING_STORE_PASSWORD` | the store password |
 
+> **Not to be confused with `android/debug.keystore`** (committed in this
+> repo): that keystore is a separate, deliberately-public keystore used only
+> for debug builds, so sideloaded/CI debug APKs share one signature and a
+> newer build installs over an older one instead of forcing a reinstall.
+> It exists for sideload/testing continuity only. Production signing always
+> requires the four `SIGNING_*` secrets above — when they're set, they take
+> precedence over the debug keystore for every release build (see the
+> `signingConfigs` block in `android/app/build.gradle.kts`).
+
 The **Release APK** workflow picks them up automatically (all four or none —
 a partial set fails fast). It produces:
 
