@@ -8,7 +8,17 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { OFFER_DISPOSITION, decideOfferDisposition, isEndedCallId, rememberEndedCall } from "./call_decisions.mjs";
+import {
+  OFFER_DISPOSITION,
+  decideOfferDisposition,
+  isEndedCallId,
+  rememberEndedCall,
+  CONNECTION_ACTION,
+  decideConnectionStateAction,
+  ANSWER_DECISION,
+  decideAnswer,
+  shouldConnectTimeoutFire,
+} from "./call_decisions.mjs";
 
 // ── decideOfferDisposition ───────────────────────────────────────────────────
 // Vectors ported from android/app/src/test/java/mullu/comrade/call/
@@ -158,4 +168,210 @@ test("rememberEndedCall never mutates its input", () => {
 test("rememberEndedCall accepts any iterable, not just arrays (mirrors Collection<String>)", () => {
   const ended = rememberEndedCall(new Set(["call-1", "call-2"]), "call-3");
   assert.deepEqual(ended, ["call-1", "call-2", "call-3"]);
+});
+
+// ── decideConnectionStateAction ───────────────────────────────────────────────
+// Vectors ported from CallManagerTest.kt's decideConnectionStateAction cases
+// (:157-219), extended with the caller/callee + already-tried splits Android
+// reaches one layer down in tryTurnFallbackOrFail (CallManager.kt:1063-1097) —
+// desktop folds both into this one pure function (WP3). These are part of the
+// ADR-2 conformance suite (docs/COMMS_ARCHITECTURE.md §ADR-2); keep them in
+// lockstep with the Kotlin vectors.
+
+test("pre-connect failed as the caller, TURN not yet tried, restarts with TURN (RESTART_WITH_TURN)", () => {
+  // The WP3 P0 fix: main.js used to treat any "failed" as terminal (finishCall)
+  // with no TURN fallback and no ICE restart, so a desktop caller behind CGNAT
+  // could never relay. Android: decideConnectionStateAction(FAILED,
+  // hasConnectedBefore=false) -> TRY_TURN_FALLBACK, then tryTurnFallbackOrFail
+  // (caller, !triedTurn) widens to STUN+TURN and re-offers with an ICE restart.
+  assert.equal(
+    decideConnectionStateAction({
+      connectionState: "failed",
+      hasConnectedBefore: false,
+      isCaller: true,
+      triedTurn: false,
+    }),
+    CONNECTION_ACTION.RESTART_WITH_TURN,
+  );
+});
+
+test("pre-connect failed as the caller with TURN already tried is terminal (FAIL), never a second restart", () => {
+  // Regression vector for "already-tried fallback must not loop"
+  // (docs/COMMS_ARCHITECTURE.md §6). Android: tryTurnFallbackOrFail with
+  // s.triedTurn -> endWith(FAILED) (CallManager.kt:1069-1072).
+  assert.equal(
+    decideConnectionStateAction({
+      connectionState: "failed",
+      hasConnectedBefore: false,
+      isCaller: true,
+      triedTurn: true,
+    }),
+    CONNECTION_ACTION.FAIL,
+  );
+});
+
+test("pre-connect failed as the callee WAITs for the caller's re-offer — no callee-side TURN retry", () => {
+  // Android deliberately has no callee TURN retry: tryTurnFallbackOrFail returns
+  // early when s.incoming (CallManager.kt:1065-1068), waiting for the caller's
+  // rescue re-offer (backstopped by the connect timeout; see the comment at
+  // :1051-1057 on why the callee must not Hangup on its own FAILED). triedTurn
+  // is irrelevant on the callee.
+  assert.equal(
+    decideConnectionStateAction({
+      connectionState: "failed",
+      hasConnectedBefore: false,
+      isCaller: false,
+      triedTurn: false,
+    }),
+    CONNECTION_ACTION.WAIT,
+  );
+  assert.equal(
+    decideConnectionStateAction({
+      connectionState: "failed",
+      hasConnectedBefore: false,
+      isCaller: false,
+      triedTurn: true,
+    }),
+    CONNECTION_ACTION.WAIT,
+  );
+});
+
+test("a previously-connected FAILED arms immediate recovery (RECOVER_NOW), caller and callee alike (ported)", () => {
+  // Ported from CallManagerTest.kt:157 — hasConnectedBefore short-circuits
+  // before isCaller/triedTurn are ever consulted, so a post-connect failure is
+  // RECOVER_NOW no matter who placed the call or whether TURN was tried.
+  for (const isCaller of [true, false]) {
+    for (const triedTurn of [true, false]) {
+      assert.equal(
+        decideConnectionStateAction({
+          connectionState: "failed",
+          hasConnectedBefore: true,
+          isCaller,
+          triedTurn,
+        }),
+        CONNECTION_ACTION.RECOVER_NOW,
+      );
+    }
+  }
+});
+
+test("a previously-connected DISCONNECTED starts the disconnect grace (RECOVER_AFTER_GRACE) (ported)", () => {
+  // Ported from CallManagerTest.kt:176.
+  assert.equal(
+    decideConnectionStateAction({
+      connectionState: "disconnected",
+      hasConnectedBefore: true,
+      isCaller: true,
+      triedTurn: false,
+    }),
+    CONNECTION_ACTION.RECOVER_AFTER_GRACE,
+  );
+});
+
+test("a pre-connect DISCONNECTED is not a failure worth acting on (NONE) (ported)", () => {
+  // Ported from CallManagerTest.kt:184.
+  assert.equal(
+    decideConnectionStateAction({
+      connectionState: "disconnected",
+      hasConnectedBefore: false,
+      isCaller: true,
+      triedTurn: false,
+    }),
+    CONNECTION_ACTION.NONE,
+  );
+});
+
+test("decideConnectionStateAction is a no-op for every other connection state (ported)", () => {
+  // Ported from CallManagerTest.kt:204. The browser's
+  // RTCPeerConnection.connectionState values are new/connecting/connected/
+  // disconnected/failed/closed; "connected" is handled by onCallConnected in
+  // main.js, not the decider (as Android handles CONNECTED in peerObserver).
+  for (const connectionState of ["new", "connecting", "connected", "closed"]) {
+    for (const hasConnectedBefore of [true, false]) {
+      assert.equal(
+        decideConnectionStateAction({
+          connectionState,
+          hasConnectedBefore,
+          isCaller: true,
+          triedTurn: false,
+        }),
+        CONNECTION_ACTION.NONE,
+      );
+    }
+  }
+});
+
+// ── decideAnswer ──────────────────────────────────────────────────────────────
+// Vectors ported from CallManagerTest.kt's decideAnswer cases (:75-97), with the
+// browser's lowercase-hyphenated RTCSignalingState strings standing in for
+// Android's PeerConnection.SignalingState enum.
+
+test("decideAnswer applies only in have-local-offer — a fresh answer rings through (ported)", () => {
+  assert.equal(decideAnswer("have-local-offer"), ANSWER_DECISION.APPLY);
+});
+
+test("decideAnswer ignores a duplicate answer once the pc has settled to stable (ported)", () => {
+  // STABLE is exactly the state a pc settles into right after the first Answer
+  // applies — a redelivered second Answer must not re-apply and tear the live
+  // call down (CallManagerTest.kt:84).
+  assert.equal(decideAnswer("stable"), ANSWER_DECISION.IGNORE);
+});
+
+test("decideAnswer ignores a null/undefined signaling state — no pc yet (ported)", () => {
+  assert.equal(decideAnswer(null), ANSWER_DECISION.IGNORE);
+  assert.equal(decideAnswer(undefined), ANSWER_DECISION.IGNORE);
+});
+
+test("second answer after a STUN->TURN ICE-restart re-offer is APPLYed, not dropped (fallback regression)", () => {
+  // Regression vector for the fallback's second answer: after the ICE-restart
+  // re-offer's setLocalDescription the caller's pc is back in "have-local-offer",
+  // so the peer's SECOND answer must apply. main.js keys applyRemoteAnswer off
+  // signalingState (decideAnswer), never a one-shot latch like c.remoteSet — a
+  // latch would silently drop this answer and the TURN fallback would hang.
+  assert.equal(decideAnswer("have-local-offer"), ANSWER_DECISION.APPLY);
+  // ...while every non-offer state stays IGNORE, so a redelivered duplicate
+  // answer can't throw in setRemoteDescription and terminate a live call.
+  assert.equal(decideAnswer("have-remote-offer"), ANSWER_DECISION.IGNORE);
+  assert.equal(decideAnswer("closed"), ANSWER_DECISION.IGNORE);
+});
+
+// ── shouldConnectTimeoutFire ──────────────────────────────────────────────────
+// Mirrors the guard inside Android's armTimeout coroutine body
+// (CallManager.kt:1586, `session === s && !s.ended && s.connectedAtMs == 0L`).
+// This backs desktop's connect-phase timeout (WP3, the CONNECT_TIMEOUT_MS
+// mirror) and pins the zombie-timer + double-finish guards the lead review
+// asked to close: the callee's WAIT-on-failed is only safe with this backstop.
+
+test("shouldConnectTimeoutFire fires only for the current, un-ended, never-connected call", () => {
+  assert.equal(
+    shouldConnectTimeoutFire({ isCurrentCall: true, ended: false, connected: false }),
+    true,
+  );
+});
+
+test("shouldConnectTimeoutFire does not fire once the call has connected (would kill a live call)", () => {
+  // onCallConnected clears the timer, but a timer that already fired must still
+  // no-op — mirrors Android's `s.connectedAtMs == 0L` guard.
+  assert.equal(
+    shouldConnectTimeoutFire({ isCurrentCall: true, ended: false, connected: true }),
+    false,
+  );
+});
+
+test("shouldConnectTimeoutFire does not fire after the call ended (double-finish / timeout-vs-hangup race)", () => {
+  // A Hangup that won the race already ran finishCall (which sets c.ended and
+  // clears the timer); a timeout that fires anyway must not double-finish.
+  assert.equal(
+    shouldConnectTimeoutFire({ isCurrentCall: true, ended: true, connected: false }),
+    false,
+  );
+});
+
+test("shouldConnectTimeoutFire does not fire for a superseded call (zombie-timer guard)", () => {
+  // A stray timer armed for an earlier call must never act on the call that
+  // replaced it — mirrors Android's `session === s`.
+  assert.equal(
+    shouldConnectTimeoutFire({ isCurrentCall: false, ended: false, connected: false }),
+    false,
+  );
 });
