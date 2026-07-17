@@ -153,6 +153,61 @@ val VideocamIcon: ImageVector = materialIcon(name = "Filled.Videocam") {
     }
 }
 
+/** Material "videocam_off" (filled) — camera currently disabled (mid-call toggle state). */
+val VideocamOffIcon: ImageVector = materialIcon(name = "Filled.VideocamOff") {
+    materialPath {
+        moveTo(21.0f, 6.5f)
+        lineToRelative(-4.0f, 4.0f)
+        verticalLineTo(7.0f)
+        curveToRelative(0.0f, -0.55f, -0.45f, -1.0f, -1.0f, -1.0f)
+        horizontalLineTo(9.82f)
+        lineTo(21.0f, 17.18f)
+        verticalLineTo(6.5f)
+        close()
+        moveTo(3.27f, 2.0f)
+        lineTo(2.0f, 3.27f)
+        lineTo(4.73f, 6.0f)
+        horizontalLineTo(4.0f)
+        curveToRelative(-0.55f, 0.0f, -1.0f, 0.45f, -1.0f, 1.0f)
+        verticalLineToRelative(10.0f)
+        curveToRelative(0.0f, 0.55f, 0.45f, 1.0f, 1.0f, 1.0f)
+        horizontalLineToRelative(12.0f)
+        curveToRelative(0.21f, 0.0f, 0.39f, -0.08f, 0.54f, -0.18f)
+        lineTo(19.73f, 21.0f)
+        lineTo(21.0f, 19.73f)
+        lineTo(3.27f, 2.0f)
+        close()
+    }
+}
+
+/** Material "autorenew" (filled) — the flip-front/back-camera control on the self-preview tile. */
+val FlipCameraIcon: ImageVector = materialIcon(name = "Filled.FlipCamera") {
+    materialPath {
+        moveTo(12.0f, 6.0f)
+        verticalLineToRelative(3.0f)
+        lineToRelative(4.0f, -4.0f)
+        lineToRelative(-4.0f, -4.0f)
+        verticalLineToRelative(3.0f)
+        curveToRelative(-4.42f, 0.0f, -8.0f, 3.58f, -8.0f, 8.0f)
+        curveToRelative(0.0f, 1.57f, 0.46f, 3.03f, 1.24f, 4.26f)
+        lineTo(6.7f, 14.8f)
+        curveToRelative(-0.45f, -0.83f, -0.7f, -1.79f, -0.7f, -2.8f)
+        curveToRelative(0.0f, -3.31f, 2.69f, -6.0f, 6.0f, -6.0f)
+        close()
+        moveTo(18.76f, 7.74f)
+        lineTo(17.3f, 9.2f)
+        curveToRelative(0.44f, 0.84f, 0.7f, 1.79f, 0.7f, 2.8f)
+        curveToRelative(0.0f, 3.31f, -2.69f, 6.0f, -6.0f, 6.0f)
+        verticalLineToRelative(-3.0f)
+        lineToRelative(-4.0f, 4.0f)
+        lineToRelative(4.0f, 4.0f)
+        verticalLineToRelative(-3.0f)
+        curveToRelative(4.42f, 0.0f, 8.0f, -3.58f, 8.0f, -8.0f)
+        curveToRelative(0.0f, -1.57f, -0.46f, -3.03f, -1.24f, -4.26f)
+        close()
+    }
+}
+
 /** Material "volume_up" (filled) — speakerphone toggle. */
 val SpeakerIcon: ImageVector = materialIcon(name = "Filled.VolumeUp") {
     materialPath {
