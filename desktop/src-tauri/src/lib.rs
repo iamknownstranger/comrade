@@ -136,6 +136,12 @@ pub fn run() {
             commands::add_journal_entry,
             commands::journal_entries,
             commands::delete_journal_entry,
+            // Tara (reflective companion — strictly local, not therapy)
+            commands::tara_send,
+            commands::tara_thread,
+            commands::clear_tara_thread,
+            commands::tara_opener,
+            commands::tara_crisis_resources,
             // View-model commands (existing frontend)
             commands::workspaces,
             commands::current_workspace,

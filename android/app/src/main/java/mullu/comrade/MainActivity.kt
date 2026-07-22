@@ -79,12 +79,14 @@ import mullu.comrade.ui.ChatBubbleIcon
 import mullu.comrade.ui.ChatsScreen
 import mullu.comrade.ui.ConversationScreen
 import mullu.comrade.ui.FeedScreen
+import mullu.comrade.ui.HeartIcon
 import mullu.comrade.ui.JournalScreen
 import mullu.comrade.ui.NewChatScreen
 import mullu.comrade.ui.OnboardingScreen
 import mullu.comrade.ui.PeerAvatar
 import mullu.comrade.ui.RequestsScreen
 import mullu.comrade.ui.SettingsScreen
+import mullu.comrade.ui.TaraScreen
 import mullu.comrade.ui.peerTitle
 import mullu.comrade.ui.purgeDecryptedMedia
 import mullu.comrade.ui.shortNpub
@@ -232,11 +234,12 @@ fun ComradeApp() {
     }
 }
 
-// ── Main shell: Chats · Journal · Feed (Settings & Call history via the drawer) ─
+// ── Main shell: Chats · Journal · Tara · Feed (Settings & Call history via the drawer) ─
 
 private enum class MainTab(val label: String, val icon: ImageVector) {
     Chats("Chats", ChatBubbleIcon),
     Journal("Journal", BookIcon),
+    Tara("Tara", HeartIcon),
     Feed("Feed", ArticleIcon),
 }
 
@@ -514,6 +517,7 @@ private fun MainShell(
                                         when (tab) {
                                             MainTab.Chats -> "Comrade"
                                             MainTab.Journal -> "Journal"
+                                            MainTab.Tara -> "Tara"
                                             MainTab.Feed -> "Feed"
                                         },
                                     )
@@ -590,6 +594,7 @@ private fun MainShell(
                             )
                         }
                         MainTab.Journal -> JournalScreen(modifier = content)
+                        MainTab.Tara -> TaraScreen(modifier = content)
                         MainTab.Feed -> FeedScreen(
                             feedItems = feedItems,
                             onPosted = { ChatEventRouter.addChitthi(it, front = true) },

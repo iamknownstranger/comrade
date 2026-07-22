@@ -45,6 +45,7 @@ use comrade_core::sabha::{
     display_name_of, ChitthiCallback, FeedFilterSpec, FeedScope, SabhaEngine, DEFAULT_RELAYS,
 };
 use comrade_core::sakha::{LedgerEntry, SakhaEngine, SakhaSyncCallback};
+use comrade_core::tara::{CompanionEngine, JournalSignal, ReflectiveCompanion};
 use comrade_core::vault::{VaultCallback, VaultEngine, VaultMessage};
 use nostr_sdk::{EventId, Metadata, PublicKey, ToBech32};
 use serde::{Deserialize, Serialize};
@@ -482,6 +483,41 @@ impl From<comrade_storage::JournalEntry> for JournalEntryDto {
             created_at: e.created_at,
         }
     }
+}
+
+/// One turn of the Tara reflective-companion thread as the frontend sees it.
+/// Like the journal, the thread is **strictly local**: no relay, no network —
+/// the only copy lives sealed inside the encrypted store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct TaraMessageDto {
+    pub id: String,
+    pub text: String,
+    /// `true` for Tara's replies, `false` for the user's messages.
+    pub from_tara: bool,
+    /// Whether this turn tripped the distress detector — the frontend must
+    /// surface the crisis resources alongside it (AUDIT §8 honesty gate).
+    pub crisis: bool,
+    pub created_at: u64,
+}
+
+impl From<comrade_storage::TaraMessage> for TaraMessageDto {
+    fn from(m: comrade_storage::TaraMessage) -> Self {
+        Self {
+            id: m.id,
+            text: m.text,
+            from_tara: m.from_tara,
+            crisis: m.crisis,
+            created_at: m.created_at,
+        }
+    }
+}
+
+/// A crisis helpline surfaced when a Tara message carries distress cues.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct CrisisResourceDto {
+    pub name: String,
+    pub contact: String,
+    pub note: String,
 }
 
 /// A single direct message in a conversation, from the offline history.
@@ -1609,7 +1645,7 @@ impl ComradeRuntime {
         }
         let created_at = now_secs();
         let entry = comrade_storage::JournalEntry {
-            id: journal_entry_id(created_at),
+            id: timestamped_store_id(created_at),
             text: text.to_string(),
             mood: mood
                 .map(str::trim)
@@ -1643,6 +1679,105 @@ impl ComradeRuntime {
             .map_err(|e| UiError::Storage(e.to_string()))?;
         store.flush().map_err(|e| UiError::Storage(e.to_string()))?;
         Ok(removed)
+    }
+
+    // ── Tara (wellbeing pillar #4 — reflective companion, strictly local) ────
+    //
+    // Same locality guarantee as the journal: no relay, no network. The reply
+    // engine is `comrade_core::tara::ReflectiveCompanion` — deterministic,
+    // on-device templates (AUDIT §8 / OQ9: the LLM slot stays empty until the
+    // owner picks an on-device runtime; a cloud backend is out of the question).
+
+    /// Send a message to Tara: persist the user's turn, compute the companion
+    /// reply, persist it too, and return it. `crisis` on the returned DTO
+    /// means the frontend must show [`Self::tara_crisis_resources`].
+    pub fn tara_send(&self, text: &str) -> Result<TaraMessageDto, UiError> {
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(UiError::Engine("tara message is empty".into()));
+        }
+        let existing = store
+            .tara_messages()
+            .map_err(|e| UiError::Storage(e.to_string()))?;
+        let prior_user_turns = existing.iter().filter(|m| !m.from_tara).count() as u64;
+
+        let reply = ReflectiveCompanion.reply(text, prior_user_turns);
+        let created_at = now_secs();
+        // Sequence-numbered ids, not random ones: turns sent within the same
+        // second must keep their exact send order (user, reply, user, reply…)
+        // under the (created_at, id) sort — random tails would interleave.
+        let seq = existing.len() as u64;
+        let user_turn = comrade_storage::TaraMessage {
+            id: format!("{created_at:020}-{seq:010}"),
+            text: text.to_string(),
+            from_tara: false,
+            crisis: reply.crisis,
+            created_at,
+        };
+        let tara_turn = comrade_storage::TaraMessage {
+            id: format!("{created_at:020}-{:010}", seq + 1),
+            text: reply.text,
+            from_tara: true,
+            crisis: reply.crisis,
+            created_at,
+        };
+        store
+            .save_tara_message(&user_turn)
+            .and_then(|()| store.save_tara_message(&tara_turn))
+            .and_then(|()| store.flush())
+            .map_err(|e| UiError::Storage(e.to_string()))?;
+        Ok(tara_turn.into())
+    }
+
+    /// The whole Tara thread, oldest-first (chat order).
+    pub fn tara_thread(&self) -> Result<Vec<TaraMessageDto>, UiError> {
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        Ok(store
+            .tara_messages()
+            .map_err(|e| UiError::Storage(e.to_string()))?
+            .into_iter()
+            .map(TaraMessageDto::from)
+            .collect())
+    }
+
+    /// Delete the entire Tara thread; returns how many turns were removed.
+    pub fn clear_tara_thread(&self) -> Result<u64, UiError> {
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        let removed = store
+            .clear_tara_messages()
+            .map_err(|e| UiError::Storage(e.to_string()))?;
+        store.flush().map_err(|e| UiError::Storage(e.to_string()))?;
+        Ok(removed)
+    }
+
+    /// The opener shown when the Tara thread is empty — shaped by recent
+    /// journal *mood markers* only (never entry text; data minimisation).
+    pub fn tara_opener(&self) -> Result<String, UiError> {
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        let now = now_secs();
+        let signals: Vec<JournalSignal> = store
+            .journal_entries()
+            .map_err(|e| UiError::Storage(e.to_string()))?
+            .into_iter()
+            .map(|e| JournalSignal {
+                mood: e.mood,
+                age_days: now.saturating_sub(e.created_at) / 86_400,
+            })
+            .collect();
+        Ok(ReflectiveCompanion.opener(&signals))
+    }
+
+    /// The crisis helplines Tara hands off to, for any frontend to render.
+    pub fn tara_crisis_resources(&self) -> Vec<CrisisResourceDto> {
+        comrade_core::tara::CRISIS_RESOURCES
+            .iter()
+            .map(|r| CrisisResourceDto {
+                name: r.name.to_string(),
+                contact: r.contact.to_string(),
+                note: r.note.to_string(),
+            })
+            .collect()
     }
 
     // ── Encrypted media pipeline (NIP-94/96 · Blossom) ───────────────────────
@@ -2441,11 +2576,12 @@ async fn persist_ledger_snapshot(store: &comrade_storage::EncryptedStore, sakha:
     }
 }
 
-/// Store key for a journal entry: a zero-padded timestamp prefix (so ids sort
-/// chronologically) plus a random tail (so two entries in the same second
-/// never collide). The randomness comes from a throwaway secp256k1 key — no
-/// extra dependency, and cryptographically unpredictable.
-fn journal_entry_id(created_at: u64) -> String {
+/// Store key for a local-only record (journal entry, Tara turn): a zero-padded
+/// timestamp prefix (so ids sort chronologically) plus a random tail (so two
+/// records in the same second never collide). The randomness comes from a
+/// throwaway secp256k1 key — no extra dependency, and cryptographically
+/// unpredictable.
+fn timestamped_store_id(created_at: u64) -> String {
     let tail = nostr_sdk::Keys::generate().public_key().to_hex();
     format!("{created_at:020}-{}", &tail[..12])
 }
@@ -3751,11 +3887,71 @@ mod tests {
         assert_eq!(entries[0].text, "grateful today");
     }
 
+    #[tokio::test]
+    async fn tara_lifecycle_send_thread_clear() {
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+
+        // Locked → typed errors, no panics.
+        assert!(matches!(rt.tara_send("hi"), Err(UiError::VaultLocked)));
+        assert!(matches!(rt.tara_thread(), Err(UiError::VaultLocked)));
+        assert!(matches!(rt.tara_opener(), Err(UiError::VaultLocked)));
+        assert!(matches!(rt.clear_tara_thread(), Err(UiError::VaultLocked)));
+
+        rt.unlock_vault(dir.path(), "pin").await.unwrap();
+
+        // Fresh thread → honest opener; empty sends rejected.
+        assert!(rt.tara_opener().unwrap().contains("not a therapist"));
+        assert!(matches!(rt.tara_send("   "), Err(UiError::Engine(_))));
+
+        let reply = rt.tara_send("  I've been anxious all week  ").unwrap();
+        assert!(reply.from_tara);
+        assert!(!reply.crisis);
+        assert!(reply.text.contains("anxious"));
+
+        // Thread is chat-ordered: trimmed user turn first, reply after it.
+        let thread = rt.tara_thread().unwrap();
+        assert_eq!(thread.len(), 2);
+        assert_eq!(thread[0].text, "I've been anxious all week");
+        assert!(!thread[0].from_tara);
+        assert_eq!(thread[1].text, reply.text);
+
+        // Distress → crisis flag on both turns, and resources to render.
+        let crisis = rt.tara_send("I want to end it all").unwrap();
+        assert!(crisis.crisis);
+        assert!(!rt.tara_crisis_resources().is_empty());
+        let thread = rt.tara_thread().unwrap();
+        assert_eq!(thread.len(), 4);
+        assert!(thread[2].crisis && thread[3].crisis);
+
+        // The thread survives a restart (encrypted at rest)…
+        drop(rt);
+        let mut rt2 = ComradeRuntime::new();
+        rt2.unlock_vault(dir.path(), "pin").await.unwrap();
+        assert_eq!(rt2.tara_thread().unwrap().len(), 4);
+
+        // …and clears on request.
+        assert_eq!(rt2.clear_tara_thread().unwrap(), 4);
+        assert!(rt2.tara_thread().unwrap().is_empty());
+        assert_eq!(rt2.clear_tara_thread().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn tara_opener_reflects_recent_low_journal_moods() {
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+        rt.unlock_vault(dir.path(), "pin").await.unwrap();
+
+        rt.add_journal_entry("rough monday", Some("😞")).unwrap();
+        rt.add_journal_entry("rough tuesday", Some("😕")).unwrap();
+        assert!(rt.tara_opener().unwrap().contains("felt low"));
+    }
+
     #[test]
     fn journal_ids_sort_chronologically_and_never_collide() {
-        let a = journal_entry_id(5);
-        let b = journal_entry_id(5);
-        let later = journal_entry_id(1_700_000_000);
+        let a = timestamped_store_id(5);
+        let b = timestamped_store_id(5);
+        let later = timestamped_store_id(1_700_000_000);
         assert_ne!(a, b, "same-second ids must differ");
         assert!(a < later && b < later, "timestamp prefix sorts");
     }

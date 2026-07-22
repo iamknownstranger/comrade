@@ -53,9 +53,9 @@ use comrade_core::crypto::KeyProfile;
 use comrade_state::AppWorkspace;
 use comrade_ui::{
     BridgeEvent, CallRecordDto, CallSessionDto, ChitthiDto, ComradeRuntime, ContactDto,
-    ConversationDto, FoundProfileDto, IceServerDto, IdentityDto, JournalEntryDto, MediaBytesDto,
-    MediaMessageDto, MeshStatusDto, MessageDto, MessageRequestDto, ProfileDto, TurnServerStatusDto,
-    UiError, UpiIntentDto, WorkspaceDto,
+    ConversationDto, CrisisResourceDto, FoundProfileDto, IceServerDto, IdentityDto,
+    JournalEntryDto, MediaBytesDto, MediaMessageDto, MeshStatusDto, MessageDto, MessageRequestDto,
+    ProfileDto, TaraMessageDto, TurnServerStatusDto, UiError, UpiIntentDto, WorkspaceDto,
 };
 use tokio::sync::RwLock;
 use tracing::warn;
@@ -528,6 +528,36 @@ impl Comrade {
 
     pub fn delete_journal_entry(&self, id: String) -> Result<bool, UiError> {
         self.inner.blocking_read().delete_journal_entry(&id)
+    }
+
+    // ── Tara (reflective companion — strictly local, not therapy) ───────────
+
+    /// Persist the user's message, compute Tara's on-device reply, persist and
+    /// return it. `crisis == true` on the reply means the UI must surface
+    /// [`Comrade::tara_crisis_resources`] with it.
+    pub fn tara_send(&self, text: String) -> Result<TaraMessageDto, UiError> {
+        self.inner.blocking_read().tara_send(&text)
+    }
+
+    /// The whole Tara thread, oldest-first (chat order).
+    pub fn tara_thread(&self) -> Result<Vec<TaraMessageDto>, UiError> {
+        self.inner.blocking_read().tara_thread()
+    }
+
+    /// Delete the entire Tara thread; returns how many turns were removed.
+    pub fn clear_tara_thread(&self) -> Result<u64, UiError> {
+        self.inner.blocking_read().clear_tara_thread()
+    }
+
+    /// The opener shown while the thread is empty — shaped by recent journal
+    /// mood markers only, never entry text.
+    pub fn tara_opener(&self) -> Result<String, UiError> {
+        self.inner.blocking_read().tara_opener()
+    }
+
+    /// The crisis helplines Tara hands off to.
+    pub fn tara_crisis_resources(&self) -> Vec<CrisisResourceDto> {
+        self.inner.blocking_read().tara_crisis_resources()
     }
 
     // ── Calls (voice/video signaling) ───────────────────────────────────────
