@@ -16,9 +16,9 @@ use std::sync::Arc;
 
 use comrade_ui::{
     CallRecordDto, CallSessionDto, ChitthiDto, ComradeRuntime, ContactDto, ConversationDto,
-    FoundProfileDto, IceServerDto, IdentityDto, JournalEntryDto, MediaBytesDto, MediaMessageDto,
-    MessageDto, MessageRequestDto, ProfileDto, SakhaStatusDto, TurnServerStatusDto, UpiIntentDto,
-    WorkspaceDto,
+    CrisisResourceDto, FoundProfileDto, IceServerDto, IdentityDto, JournalEntryDto, MediaBytesDto,
+    MediaMessageDto, MessageDto, MessageRequestDto, ProfileDto, SakhaStatusDto, TaraMessageDto,
+    TurnServerStatusDto, UpiIntentDto, WorkspaceDto,
 };
 use tokio::sync::RwLock;
 
@@ -531,6 +531,46 @@ pub async fn delete_journal_entry(
         .await
         .delete_journal_entry(&id)
         .map_err(|e| e.to_string())
+}
+
+// ── Tara (reflective companion — strictly local, not therapy) ──────────────────
+
+/// Send a message to Tara and get her on-device reply. A `crisis == true`
+/// reply obliges the frontend to render [`tara_crisis_resources`] with it.
+#[tauri::command]
+pub async fn tara_send(
+    state: tauri::State<'_, Runtime>,
+    text: String,
+) -> Result<TaraMessageDto, String> {
+    state.read().await.tara_send(&text).map_err(|e| e.to_string())
+}
+
+/// The whole Tara thread, oldest-first (chat order).
+#[tauri::command]
+pub async fn tara_thread(
+    state: tauri::State<'_, Runtime>,
+) -> Result<Vec<TaraMessageDto>, String> {
+    state.read().await.tara_thread().map_err(|e| e.to_string())
+}
+
+/// Delete the entire Tara thread; returns how many turns were removed.
+#[tauri::command]
+pub async fn clear_tara_thread(state: tauri::State<'_, Runtime>) -> Result<u64, String> {
+    state.read().await.clear_tara_thread().map_err(|e| e.to_string())
+}
+
+/// The opener shown while the thread is empty — journal mood markers only.
+#[tauri::command]
+pub async fn tara_opener(state: tauri::State<'_, Runtime>) -> Result<String, String> {
+    state.read().await.tara_opener().map_err(|e| e.to_string())
+}
+
+/// The crisis helplines Tara hands off to.
+#[tauri::command]
+pub async fn tara_crisis_resources(
+    state: tauri::State<'_, Runtime>,
+) -> Result<Vec<CrisisResourceDto>, String> {
+    Ok(state.read().await.tara_crisis_resources())
 }
 
 // ── Milestone 3: progressive-disclosure workspace controller ──────────────────

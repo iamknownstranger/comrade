@@ -9,6 +9,7 @@
  *   call    — voice/video call signaling (WebRTC over the Vault DM channel)
  *   saathi  — Off-grid libp2p mesh (mDNS + Gossipsub)
  *   sakha   — Yrs CRDT shared ledger + DH-encrypted Nostr sync
+ *   tara    — reflective-companion engine (deterministic, on-device, not therapy)
  *   relay   — NIP-65 relay-list metadata + outbox-model routing
  *   media   — NIP-94/96 encrypted media staging + pluggable uploaders
  */
@@ -29,6 +30,7 @@ pub mod relay;
 pub mod saathi;
 pub mod sabha;
 pub mod sakha;
+pub mod tara;
 pub mod vault;
 
 pub use error::CoreError;
