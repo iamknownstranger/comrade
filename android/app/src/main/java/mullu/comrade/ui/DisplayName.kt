@@ -44,6 +44,18 @@ fun relativeTime(epochSecs: Long): String {
     }
 }
 
+/**
+ * Wall-clock send time for a message bubble: "14:05". Bubbles sit under a
+ * day separator, so the clock alone is unambiguous — unlike a relative
+ * "3d" that drifts while the screen is open. [zone] is injectable so the
+ * rule is unit-testable.
+ */
+fun clockTime(
+    epochSecs: Long,
+    zone: java.time.ZoneId = java.time.ZoneId.systemDefault(),
+): String = java.time.Instant.ofEpochSecond(epochSecs).atZone(zone).toLocalTime()
+    .format(java.time.format.DateTimeFormatter.ofPattern("HH:mm"))
+
 /** `mm:ss` duration for a connected call (e.g. a call-history row). */
 fun formatCallDuration(totalSecs: Long): String {
     val secs = totalSecs.coerceAtLeast(0)

@@ -21,11 +21,13 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilledIconButton
@@ -35,12 +37,14 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.SmallFloatingActionButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -443,6 +447,9 @@ fun ConversationScreen(
     // Push-to-talk voice notes: hold the mic to record, release to send.
     var recording by remember { mutableStateOf(false) }
     var voiceSending by remember { mutableStateOf(false) }
+    // Keyed on `peer` so switching conversations resets the scroll bookkeeping.
+    var loadedOnce by remember(peer) { mutableStateOf(false) }
+    var newMessagesBelow by remember(peer) { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val listState = rememberLazyListState()
     val context = LocalContext.current
@@ -464,16 +471,40 @@ fun ConversationScreen(
             .sortedBy { it.createdAt }
     }
 
+    // `chatTick` is a GLOBAL event tick — it fires for activity in any
+    // conversation, and repeatedly while this one is open. So a reload must
+    // not yank a reader who scrolled up in history back to the bottom:
+    // auto-scroll only on first load or when they were already near it,
+    // otherwise light up the jump-to-latest button instead.
     LaunchedEffect(peer, chatTick) {
         val (msgs, media) = withContext(Dispatchers.IO) {
             val msgs = runCatching { ComradeCore.messages(peer) }.getOrDefault(emptyList())
             val media = runCatching { ComradeCore.media(peer) }.getOrDefault(emptyList())
             msgs to media
         }
+        val grew = msgs.size + media.size > messages.size + mediaItems.size
+        val wasNearBottom = isNearBottom(
+            lastVisibleIndex = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1,
+            totalCount = listState.layoutInfo.totalItemsCount,
+        )
         messages = msgs
         mediaItems = media
-        if (msgs.isNotEmpty() || media.isNotEmpty()) {
-            listState.scrollToItem(msgs.size + media.size - 1)
+        val last = msgs.size + media.size - 1
+        when {
+            last < 0 -> {}
+            !loadedOnce -> {
+                listState.scrollToItem(last)
+                loadedOnce = true
+            }
+            grew && wasNearBottom -> listState.scrollToItem(last)
+            grew -> newMessagesBelow = true
+        }
+        if (grew) {
+            // Receipts for messages that arrive while the thread is on
+            // screen — the mark-read on open below only covers backlog.
+            withContext(Dispatchers.IO) {
+                runCatching { ComradeCore.markConversationReadTyped(peer) }
+            }
         }
     }
 
@@ -572,102 +603,161 @@ fun ConversationScreen(
         }
     }
 
+    // Whether the newest message is (nearly) on screen right now — drives
+    // both the jump-to-latest button and clearing its "new" highlight.
+    val atBottom by remember {
+        derivedStateOf {
+            isNearBottom(
+                lastVisibleIndex = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1,
+                totalCount = listState.layoutInfo.totalItemsCount,
+            )
+        }
+    }
+    LaunchedEffect(atBottom) { if (atBottom) newMessagesBelow = false }
+    // Day headers compare against "now" once per data change; good enough —
+    // a stale "Today" flips on the next message either way.
+    val nowSecs = remember(chatItems) { System.currentTimeMillis() / 1000 }
+
     Column(modifier = modifier.fillMaxSize().imePadding()) {
-        LazyColumn(
-            state = listState,
-            modifier = Modifier
+        Box(
+            Modifier
                 .weight(1f)
                 .fillMaxWidth(),
-            contentPadding = PaddingValues(12.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            if (chatItems.isEmpty()) {
-                item {
-                    Text(
-                        "Messages are end-to-end encrypted with your keys. Say hi!",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.fillMaxWidth().padding(top = 24.dp),
-                        textAlign = TextAlign.Center,
-                    )
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(12.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                if (chatItems.isEmpty()) {
+                    item {
+                        Text(
+                            "Messages are end-to-end encrypted with your keys. Say hi!",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.fillMaxWidth().padding(top = 24.dp),
+                            textAlign = TextAlign.Center,
+                        )
+                    }
                 }
-            }
-            items(
-                chatItems,
-                key = { item ->
-                    when (item) {
-                        is ChatItem.TextItem -> item.msg.id
-                        is ChatItem.MediaItem -> "media:${item.info.eventId}"
-                    }
-                },
-            ) { item ->
-                when (item) {
-                    is ChatItem.MediaItem -> Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = if (item.info.outgoing) Arrangement.End else Arrangement.Start,
-                    ) {
-                        MediaAttachmentBubble(item.info)
-                    }
-                    is ChatItem.TextItem -> {
-                        val msg = item.msg
-                        val quoted = msg.replyTo?.let { byId[it] }
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .combinedClickable(
-                                    onClick = {},
-                                    onLongClick = { replyingTo = msg },
-                                ),
-                            horizontalArrangement = if (msg.outgoing) Arrangement.End else Arrangement.Start,
-                        ) {
-                            Surface(
-                                shape = RoundedCornerShape(
-                                    topStart = 18.dp,
-                                    topEnd = 18.dp,
-                                    bottomStart = if (msg.outgoing) 18.dp else 6.dp,
-                                    bottomEnd = if (msg.outgoing) 6.dp else 18.dp,
-                                ),
-                                color = if (msg.outgoing) {
-                                    MaterialTheme.colorScheme.primaryContainer
-                                } else {
-                                    MaterialTheme.colorScheme.surfaceVariant
-                                },
-                                tonalElevation = 1.dp,
-                                modifier = Modifier.widthIn(max = 300.dp),
+                itemsIndexed(
+                    chatItems,
+                    key = { _, item ->
+                        when (item) {
+                            is ChatItem.TextItem -> item.msg.id
+                            is ChatItem.MediaItem -> "media:${item.info.eventId}"
+                        }
+                    },
+                ) { index, item ->
+                    // The separator lives inside the message item (not as its own
+                    // list item), so item indices keep matching `chatItems` and the
+                    // scroll-to-latest arithmetic above stays honest.
+                    val prevAt = chatItems.getOrNull(index - 1)?.createdAt
+                    Column(Modifier.fillMaxWidth()) {
+                        if (startsNewDay(prevAt, item.createdAt)) {
+                            DaySeparator(dayLabel(item.createdAt, nowSecs))
+                        }
+                        when (item) {
+                            is ChatItem.MediaItem -> Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = if (item.info.outgoing) Arrangement.End else Arrangement.Start,
                             ) {
-                                Column(Modifier.padding(horizontal = 14.dp, vertical = 9.dp)) {
-                                    if (quoted != null) {
-                                        QuotedPreview(quoted.content)
-                                    }
-                                    Text(msg.content, style = MaterialTheme.typography.bodyLarge)
-                                    Row(
-                                        modifier = Modifier
-                                            .align(Alignment.End)
-                                            .padding(top = 2.dp),
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                MediaAttachmentBubble(item.info)
+                            }
+                            is ChatItem.TextItem -> {
+                                val msg = item.msg
+                                val quoted = msg.replyTo?.let { byId[it] }
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .combinedClickable(
+                                            onClick = {},
+                                            onLongClick = { replyingTo = msg },
+                                        ),
+                                    horizontalArrangement = if (msg.outgoing) Arrangement.End else Arrangement.Start,
+                                ) {
+                                    Surface(
+                                        shape = RoundedCornerShape(
+                                            topStart = 18.dp,
+                                            topEnd = 18.dp,
+                                            bottomStart = if (msg.outgoing) 18.dp else 6.dp,
+                                            bottomEnd = if (msg.outgoing) 6.dp else 18.dp,
+                                        ),
+                                        color = if (msg.outgoing) {
+                                            MaterialTheme.colorScheme.primaryContainer
+                                        } else {
+                                            MaterialTheme.colorScheme.surfaceVariant
+                                        },
+                                        tonalElevation = 1.dp,
+                                        modifier = Modifier.widthIn(max = 300.dp),
                                     ) {
-                                        Text(
-                                            relativeTime(msg.createdAt),
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = MaterialTheme.colorScheme.outline,
-                                        )
-                                        if (msg.outgoing) {
-                                            Text(
-                                                statusGlyph(msg.status),
-                                                style = MaterialTheme.typography.labelSmall,
-                                                color = if (msg.status == "read") {
-                                                    MaterialTheme.colorScheme.primary
-                                                } else {
-                                                    MaterialTheme.colorScheme.outline
-                                                },
-                                            )
+                                        Column(Modifier.padding(horizontal = 14.dp, vertical = 9.dp)) {
+                                            if (quoted != null) {
+                                                QuotedPreview(quoted.content)
+                                            }
+                                            Text(msg.content, style = MaterialTheme.typography.bodyLarge)
+                                            Row(
+                                                modifier = Modifier
+                                                    .align(Alignment.End)
+                                                    .padding(top = 2.dp),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                            ) {
+                                                Text(
+                                                    clockTime(msg.createdAt),
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = MaterialTheme.colorScheme.outline,
+                                                )
+                                                if (msg.outgoing) {
+                                                    Text(
+                                                        statusGlyph(msg.status),
+                                                        style = MaterialTheme.typography.labelSmall,
+                                                        color = if (msg.status == "read") {
+                                                            MaterialTheme.colorScheme.primary
+                                                        } else {
+                                                            MaterialTheme.colorScheme.outline
+                                                        },
+                                                    )
+                                                }
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
                     }
+                }
+            }
+            if (!atBottom && chatItems.isNotEmpty()) {
+                SmallFloatingActionButton(
+                    onClick = {
+                        newMessagesBelow = false
+                        scope.launch { listState.scrollToItem(chatItems.size - 1) }
+                    },
+                    containerColor = if (newMessagesBelow) {
+                        MaterialTheme.colorScheme.primary
+                    } else {
+                        MaterialTheme.colorScheme.surfaceVariant
+                    },
+                    contentColor = if (newMessagesBelow) {
+                        MaterialTheme.colorScheme.onPrimary
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                    modifier = Modifier
+                        .align(Alignment.BottomEnd)
+                        .padding(12.dp)
+                        .testTag("dm-jump-latest"),
+                ) {
+                    Icon(
+                        Icons.Filled.KeyboardArrowDown,
+                        contentDescription = if (newMessagesBelow) {
+                            "New messages — jump to latest"
+                        } else {
+                            "Jump to latest"
+                        },
+                    )
                 }
             }
         }
@@ -853,6 +943,29 @@ private fun VoiceRecordButton(
                 MicIcon,
                 contentDescription = "Hold to record a voice note",
                 tint = MaterialTheme.colorScheme.onPrimary,
+            )
+        }
+    }
+}
+
+/** Centred "Today" / "Yesterday" / "12 Jul 2026" pill between days. */
+@Composable
+private fun DaySeparator(label: String) {
+    Box(
+        Modifier
+            .fillMaxWidth()
+            .padding(vertical = 6.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Surface(
+            shape = RoundedCornerShape(12.dp),
+            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f),
+        ) {
+            Text(
+                label,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 10.dp, vertical = 3.dp),
             )
         }
     }
