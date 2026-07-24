@@ -388,6 +388,22 @@ phones) vs. none (template-based reflective prompts only) vs. cloud
 (fastest, but breaks the privacy promise for the most sensitive data a
 user has)? Owner call required before any companion code.
 
+> **Status (2026-07-22, Tara v1 landed).** The companion surface shipped as
+> **Tara** with OQ9's *"none"* option as the shipped brain: a deterministic,
+> on-device template engine (`comrade_core::tara::ReflectiveCompanion`) behind
+> a `CompanionEngine` trait — the seam an **on-device** quantised LLM slots
+> into once OQ9's model/runtime half is decided (a cloud backend stays ruled
+> out). Both honesty gates are implemented and regression-tested: the
+> first-open explainer + persistent footer say "not a therapist", and
+> distress cues flip the reply into a crisis hand-off (Tele-MANAS / KIRAN /
+> AASRA / findahelpline.com). The thread lives in the encrypted store's
+> `tara_companion` tree (plaintext-leak test, same as the journal), opener
+> nudges read journal *mood markers only* — never entry text. Wired: Android
+> **Tara** tab end-to-end; desktop Tauri commands (`tara_send`/`tara_thread`/
+> `clear_tara_thread`/`tara_opener`/`tara_crisis_resources`) registered, web
+> UI still pending like the journal's. Voice-dispatcher (`tara <text>`) and a
+> desktop web surface are the open follow-ups. Design note: `docs/TARA.md`.
+
 ### 8.1 Calls — voice & video (owner request, 2026-07-12)
 
 > **Status (landed).** The **signaling layer is built and tested**: a

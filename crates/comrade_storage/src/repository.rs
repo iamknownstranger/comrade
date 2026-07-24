@@ -48,6 +48,8 @@ const CHITTHI_TREE: &str = "chitthi_cache";
 const MESSAGES_TREE: &str = "vault_cache";
 const LEDGER_TREE: &str = "ledger";
 const JOURNAL_TREE: &str = "journal";
+/// The Tara reflective-companion conversation (strictly local, like the journal).
+const TARA_TREE: &str = "tara_companion";
 /// Per-peer conversation gate: request / accepted / blocked (message requests).
 const CONVERSATIONS_TREE: &str = "conversation_meta";
 /// Voice/video call log, keyed by call id.
@@ -140,6 +142,23 @@ pub struct JournalEntry {
     /// Optional self-reported mood marker (an emoji or short tag).
     #[serde(default)]
     pub mood: Option<String>,
+    pub created_at: u64,
+}
+
+/// One turn of the Tara reflective-companion conversation — the user's message
+/// or Tara's reply. Strictly local, exactly like [`JournalEntry`]: never
+/// published, never networked; the only copy lives sealed in this store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaraMessage {
+    /// Store key. Zero-padded-timestamp-prefixed so ids sort chronologically.
+    pub id: String,
+    pub text: String,
+    /// `true` for Tara's replies, `false` for the user's messages.
+    pub from_tara: bool,
+    /// Whether this turn tripped the distress detector (drives the crisis
+    /// card the next time the thread renders). Defaulted so old rows read.
+    #[serde(default)]
+    pub crisis: bool,
     pub created_at: u64,
 }
 
@@ -377,6 +396,35 @@ impl EncryptedStore {
         self.delete(JOURNAL_TREE, id)
     }
 
+    // Tara companion thread (local-only, never networked) ----------------------
+
+    /// Persist one Tara conversation turn, keyed by its id.
+    pub fn save_tara_message(&self, message: &TaraMessage) -> Result<(), StorageError> {
+        self.put(TARA_TREE, &message.id, message)
+    }
+
+    /// The whole Tara thread, oldest-first (chat order).
+    pub fn tara_messages(&self) -> Result<Vec<TaraMessage>, StorageError> {
+        let mut messages: Vec<TaraMessage> = self.values(TARA_TREE)?;
+        messages.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(messages)
+    }
+
+    /// Delete the entire Tara thread. Returns how many turns were removed.
+    pub fn clear_tara_messages(&self) -> Result<u64, StorageError> {
+        let mut removed = 0u64;
+        for key in self.keys(TARA_TREE)? {
+            if self.delete(TARA_TREE, &key)? {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
     // Ledger ------------------------------------------------------------------
 
     /// Persist a binary CRDT (Yrs) ledger snapshot (raw bytes).
@@ -559,6 +607,88 @@ mod tests {
 
         let s = EncryptedStore::open(dir.path(), "passphrase").unwrap();
         assert_eq!(s.journal_entries().unwrap()[0].text, secret_thought);
+    }
+
+    #[test]
+    fn tara_thread_crud_ordering_and_clear() {
+        let (_d, s) = store();
+        assert!(s.tara_messages().unwrap().is_empty());
+        for (id, text, from_tara, crisis, at) in [
+            (
+                "00000000000000000020-bbbb",
+                "that sounds heavy",
+                true,
+                false,
+                20u64,
+            ),
+            ("00000000000000000010-aaaa", "rough day", false, false, 10),
+            (
+                "00000000000000000030-cccc",
+                "I want to end it all",
+                false,
+                true,
+                30,
+            ),
+        ] {
+            s.save_tara_message(&TaraMessage {
+                id: id.into(),
+                text: text.into(),
+                from_tara,
+                crisis,
+                created_at: at,
+            })
+            .unwrap();
+        }
+        let thread = s.tara_messages().unwrap();
+        assert_eq!(
+            thread.iter().map(|m| m.created_at).collect::<Vec<_>>(),
+            [10, 20, 30],
+            "chat order: oldest first"
+        );
+        assert!(thread[2].crisis);
+        assert!(thread[1].from_tara);
+
+        assert_eq!(s.clear_tara_messages().unwrap(), 3);
+        assert!(s.tara_messages().unwrap().is_empty());
+        assert_eq!(s.clear_tara_messages().unwrap(), 0);
+    }
+
+    #[test]
+    fn tara_text_never_plaintext_at_rest() {
+        // Tara receives the same class of disclosure as the journal — hold it
+        // to the same ciphertext-on-disk guarantee.
+        let dir = TempDir::new().unwrap();
+        let secret_confession = "my-very-private-tara-confession-0123456789";
+        {
+            let s = EncryptedStore::open(dir.path(), "passphrase").unwrap();
+            s.save_tara_message(&TaraMessage {
+                id: "00000000000000000001-test".into(),
+                text: secret_confession.into(),
+                from_tara: false,
+                crisis: false,
+                created_at: 1,
+            })
+            .unwrap();
+            s.flush().unwrap();
+        }
+        let mut leaked = false;
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_file() {
+                if let Ok(bytes) = std::fs::read(&path) {
+                    if bytes
+                        .windows(secret_confession.len())
+                        .any(|w| w == secret_confession.as_bytes())
+                    {
+                        leaked = true;
+                    }
+                }
+            }
+        }
+        assert!(!leaked, "tara messages must never be written in plaintext");
+
+        let s = EncryptedStore::open(dir.path(), "passphrase").unwrap();
+        assert_eq!(s.tara_messages().unwrap()[0].text, secret_confession);
     }
 
     #[test]

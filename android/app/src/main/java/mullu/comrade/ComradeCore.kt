@@ -379,6 +379,44 @@ object ComradeCore {
     fun deleteJournalEntryTyped(id: String): Boolean =
         rethrowing("Journal delete") { ffi.deleteJournalEntry(id) }
 
+    // ── Tara (reflective companion — strictly local, not therapy) ─────────────
+
+    data class TaraMessageInfo(
+        val id: String,
+        val text: String,
+        /** True for Tara's replies, false for the user's messages. */
+        val fromTara: Boolean,
+        /** True when the turn tripped the distress detector — the UI must show the crisis card. */
+        val crisis: Boolean,
+        val createdAt: Long,
+    )
+
+    data class CrisisResourceInfo(val name: String, val contact: String, val note: String)
+
+    private fun uniffi.comrade_ui.TaraMessageDto.toInfo() = TaraMessageInfo(
+        id = id,
+        text = text,
+        fromTara = fromTara,
+        crisis = crisis,
+        createdAt = createdAt.toLong(),
+    )
+
+    fun taraSendTyped(text: String): TaraMessageInfo =
+        rethrowing("Tara") { ffi.taraSend(text).toInfo() }
+
+    fun taraThread(): List<TaraMessageInfo> =
+        rethrowing("Tara") { ffi.taraThread().map { it.toInfo() } }
+
+    fun clearTaraThreadTyped(): Long = rethrowing("Tara clear") { ffi.clearTaraThread().toLong() }
+
+    fun taraOpener(): String = rethrowing("Tara") { ffi.taraOpener() }
+
+    fun taraCrisisResources(): List<CrisisResourceInfo> = rethrowing("Tara") {
+        ffi.taraCrisisResources().map {
+            CrisisResourceInfo(name = it.name, contact = it.contact, note = it.note)
+        }
+    }
+
     // ── Encrypted media (NIP-94/96 · Blossom) ─────────────────────────────────
 
     /** An encrypted-media message (send result, incoming reference, or history entry). */

@@ -1,6 +1,8 @@
 package mullu.comrade.call
 
+import android.Manifest
 import android.content.Context
+import android.content.pm.PackageManager
 import android.media.AudioAttributes
 import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
@@ -8,6 +10,7 @@ import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.os.Build
 import android.util.Log
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -653,44 +656,94 @@ object CallManager {
         setAudioRoute(avail[(idx + 1) % avail.size])
     }
 
-    /** Explicitly route in-call audio to [route], if it's currently in [availableRoutes]. */
+    /**
+     * Explicitly route in-call audio to [route], if it's currently in
+     * [availableRoutes]. [_audioRoute] is only updated when the platform
+     * actually accepted the switch — a route that failed to apply (device
+     * vanished mid-tap, or Bluetooth without `BLUETOOTH_CONNECT`) must not
+     * leave the UI claiming audio is somewhere it isn't.
+     */
     @Synchronized
     fun setAudioRoute(route: AudioRoute) {
         if (route !in _availableRoutes.value) return
         val am = appContext?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
-        applyAudioRoute(am, route)
-        _audioRoute.value = route
+        if (applyAudioRoute(am, route)) {
+            _audioRoute.value = route
+        }
     }
 
     /**
-     * Apply [route] to the platform. API 31+ has a purpose-built API for
-     * exactly this (`setCommunicationDevice`); below that, routing is the
-     * older speakerphone flag plus manual Bluetooth SCO start/stop.
+     * Every [AudioDeviceInfo] type that counts as [route] — shared by
+     * availability scanning ([refreshAvailableRoutes]) and actual routing
+     * ([applyAudioRoute]) so they can never disagree. Notably WIRED includes
+     * the USB types (a USB-C headset is what "wired earphones" *is* on a
+     * jack-less phone) and BLUETOOTH includes the API 31+ LE Audio types —
+     * before this, a plugged USB-C headset was never offered and call setup
+     * actively routed audio away from it to the earpiece.
      */
-    private fun applyAudioRoute(am: AudioManager, route: AudioRoute) {
+    private fun routeDeviceTypes(route: AudioRoute): Set<Int> = when (route) {
+        AudioRoute.EARPIECE -> setOf(AudioDeviceInfo.TYPE_BUILTIN_EARPIECE)
+        AudioRoute.SPEAKER -> setOf(AudioDeviceInfo.TYPE_BUILTIN_SPEAKER)
+        AudioRoute.BLUETOOTH -> buildSet {
+            add(AudioDeviceInfo.TYPE_BLUETOOTH_SCO)
+            add(AudioDeviceInfo.TYPE_BLUETOOTH_A2DP)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                add(AudioDeviceInfo.TYPE_BLE_HEADSET)
+                add(AudioDeviceInfo.TYPE_BLE_SPEAKER)
+            }
+        }
+        AudioRoute.WIRED -> setOf(
+            AudioDeviceInfo.TYPE_WIRED_HEADSET,
+            AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
+            AudioDeviceInfo.TYPE_USB_HEADSET,
+            AudioDeviceInfo.TYPE_USB_DEVICE,
+        )
+    }
+
+    /**
+     * Routing a call to Bluetooth needs `BLUETOOTH_CONNECT` on API 31+. The
+     * in-call UI requests it when the user *taps* the Bluetooth route; the
+     * automatic picks (call start, headset-connected callback) must instead
+     * check first — silently failing `setCommunicationDevice` used to leave
+     * the state claiming Bluetooth while audio played nowhere the user could
+     * hear it.
+     */
+    private fun canRouteBluetooth(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return true
+        val ctx = appContext ?: return false
+        return ContextCompat.checkSelfPermission(ctx, Manifest.permission.BLUETOOTH_CONNECT) ==
+            PackageManager.PERMISSION_GRANTED
+    }
+
+    /**
+     * Apply [route] to the platform; returns whether it actually took. API
+     * 31+ has a purpose-built API for exactly this (`setCommunicationDevice`);
+     * below that, routing is the older speakerphone flag plus manual
+     * Bluetooth SCO start/stop.
+     */
+    private fun applyAudioRoute(am: AudioManager, route: AudioRoute): Boolean {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            val wantedType = when (route) {
-                AudioRoute.EARPIECE -> AudioDeviceInfo.TYPE_BUILTIN_EARPIECE
-                AudioRoute.SPEAKER -> AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
-                AudioRoute.BLUETOOTH -> AudioDeviceInfo.TYPE_BLUETOOTH_SCO
-                AudioRoute.WIRED -> AudioDeviceInfo.TYPE_WIRED_HEADSET
+            val wantedTypes = routeDeviceTypes(route)
+            val device = am.availableCommunicationDevices.firstOrNull { it.type in wantedTypes }
+            if (device == null) {
+                // No matching communication device: only the earpiece request
+                // legitimately maps to "the platform default".
+                am.clearCommunicationDevice()
+                return route == AudioRoute.EARPIECE
             }
-            val device = am.availableCommunicationDevices.firstOrNull {
-                it.type == wantedType ||
-                    (route == AudioRoute.WIRED && it.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES)
-            }
-            try {
-                if (device != null) am.setCommunicationDevice(device) else am.clearCommunicationDevice()
+            return try {
+                am.setCommunicationDevice(device)
             } catch (e: SecurityException) {
-                // Routing to a TYPE_BLUETOOTH_SCO device needs BLUETOOTH_CONNECT
-                // on API 31+; without it, fall back to the default route
+                // Routing to a Bluetooth device needs BLUETOOTH_CONNECT on
+                // API 31+; without it, fall back to the default route
                 // instead of crashing the call.
                 Log.w(TAG, "missing BLUETOOTH_CONNECT for setCommunicationDevice; clearing route", e)
                 am.clearCommunicationDevice()
+                false
             }
-        } else {
-            applyAudioRouteLegacy(am, route)
         }
+        applyAudioRouteLegacy(am, route)
+        return true
     }
 
     @Suppress("DEPRECATION") // isSpeakerphoneOn/isBluetoothScoOn/*BluetoothSco: the API 31+ path above covers modern devices
@@ -1496,7 +1549,10 @@ object CallManager {
         refreshAvailableRoutes(am)
         val avail = _availableRoutes.value
         val initial = when {
-            AudioRoute.BLUETOOTH in avail -> AudioRoute.BLUETOOTH
+            // Bluetooth is only auto-picked when it can actually be applied
+            // (see canRouteBluetooth) — otherwise it stays selectable in the
+            // route menu, where tapping it runs the permission prompt.
+            AudioRoute.BLUETOOTH in avail && canRouteBluetooth() -> AudioRoute.BLUETOOTH
             AudioRoute.WIRED in avail -> AudioRoute.WIRED
             video -> AudioRoute.SPEAKER
             else -> AudioRoute.EARPIECE
@@ -1536,12 +1592,12 @@ object CallManager {
         if (_audioRoute.value !in avail) {
             // The route we were on just disconnected — fall back sensibly.
             val fallback = when {
-                AudioRoute.BLUETOOTH in avail -> AudioRoute.BLUETOOTH
+                AudioRoute.BLUETOOTH in avail && canRouteBluetooth() -> AudioRoute.BLUETOOTH
                 AudioRoute.WIRED in avail -> AudioRoute.WIRED
                 else -> AudioRoute.EARPIECE
             }
             setAudioRoute(fallback)
-        } else if (AudioRoute.BLUETOOTH in avail && !hadBluetooth) {
+        } else if (AudioRoute.BLUETOOTH in avail && !hadBluetooth && canRouteBluetooth()) {
             setAudioRoute(AudioRoute.BLUETOOTH) // a headset just connected — prefer it
         } else if (AudioRoute.WIRED in avail && !hadWired && AudioRoute.BLUETOOTH !in avail) {
             setAudioRoute(AudioRoute.WIRED)
@@ -1576,11 +1632,12 @@ object CallManager {
         } else {
             legacyOutputDeviceTypes(am)
         }
+        val bluetoothTypes = routeDeviceTypes(AudioRoute.BLUETOOTH)
+        val wiredTypes = routeDeviceTypes(AudioRoute.WIRED)
         for (type in types) {
             when (type) {
-                AudioDeviceInfo.TYPE_BLUETOOTH_SCO, AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ->
-                    if (!bluetoothPermissionDenied) routes.add(AudioRoute.BLUETOOTH)
-                AudioDeviceInfo.TYPE_WIRED_HEADSET, AudioDeviceInfo.TYPE_WIRED_HEADPHONES -> routes.add(AudioRoute.WIRED)
+                in bluetoothTypes -> if (!bluetoothPermissionDenied) routes.add(AudioRoute.BLUETOOTH)
+                in wiredTypes -> routes.add(AudioRoute.WIRED)
             }
         }
         _availableRoutes.value = routes.toList()

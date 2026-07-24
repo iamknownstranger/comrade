@@ -34,9 +34,10 @@ pub mod runtime;
 
 pub use runtime::{
     BridgeEvent, CallRecordDto, CallSessionDto, CallSignalDto, ChitthiDto, ComradeRuntime,
-    ContactDto, ConversationDto, DirectMessageDto, FoundProfileDto, IceServerDto, JournalEntryDto,
-    MediaBytesDto, MediaMessageDto, MeshStatusDto, MessageDto, MessageRequestDto, ProfileDto,
-    RuntimeHandles, SakhaStatusDto, TurnServerStatusDto,
+    ContactDto, ConversationDto, CrisisResourceDto, DirectMessageDto, FoundProfileDto,
+    IceServerDto, JournalEntryDto, MediaBytesDto, MediaMessageDto, MeshStatusDto, MessageDto,
+    MessageRequestDto, ProfileDto, RuntimeHandles, SakhaStatusDto, TaraMessageDto,
+    TurnServerStatusDto,
 };
 
 // ── Errors ──────────────────────────────────────────────────────────────────────
