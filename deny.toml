@@ -22,11 +22,16 @@ ignore = [
     "RUSTSEC-2026-0118",
     "RUSTSEC-2026-0119",
     # Unmaintained transitive deps of accepted frameworks (sled / libp2p /
-    # proc-macro ecosystem). Exit: upstream framework releases drop them, or
-    # the sled migration reader itself is removed.
+    # yrs / proc-macro ecosystem). Exit: upstream framework releases drop
+    # them, or the sled migration reader itself is removed.
     "RUSTSEC-2025-0057", # fxhash (via sled)
     "RUSTSEC-2024-0384", # instant (via sled's parking_lot)
     "RUSTSEC-2024-0436", # paste (proc-macro, compile-time only)
+    # smallstr (via yrs 0.21). Advisory published 2026-07-23 and turned every
+    # CI run red from that day (first failing merge: PR #43) — no code change
+    # involved. Same accepted-framework rationale as above; yrs's own tracker
+    # covers replacing it. Exit: bump yrs once a release drops smallstr.
+    "RUSTSEC-2026-0215",
 ]
 
 [licenses]
