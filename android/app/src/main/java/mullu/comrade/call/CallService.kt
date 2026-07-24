@@ -31,11 +31,12 @@ import mullu.comrade.Notifier
 class CallService : Service() {
 
     /**
-     * Whether [startForeground] actually promoted this service (set in
-     * [onCreate]). If the platform refused that promotion — an API 31+
-     * background-start disallowal or an API 34+ foreground-service-type
-     * permission failure — there is no valid foreground service and can never
-     * be one for this instance, so [onStartCommand] must not try again.
+     * Whether the most recent placeholder promotion succeeded (set by
+     * [onCreate] and refreshed at the top of every [onStartCommand] — the
+     * obligation it satisfies is armed per `startForegroundService()` call,
+     * not per instance; see [promotePlaceholder]). When false the platform
+     * refused even the unrefusable placeholder (unreachable on known API
+     * levels) and the service is stopping.
      */
     private var foregroundStarted = false
 
@@ -78,6 +79,31 @@ class CallService : Service() {
      */
     override fun onCreate() {
         super.onCreate()
+        foregroundStarted = promotePlaceholder()
+        if (!foregroundStarted) stopSelf()
+    }
+
+    /**
+     * Promote (or re-promote) this service with the unrefusable placeholder
+     * type. Returns whether the promotion succeeded.
+     *
+     * Called from BOTH [onCreate] and the top of EVERY [onStartCommand] —
+     * the second half is the load-bearing part, learned from CI run
+     * 29535796960: the did-not-start-in-time obligation is armed **per
+     * `Context.startForegroundService()` call, not per service instance**. A
+     * second `CallService.start` delivered to an already-running instance
+     * (place → cancel → place again, before the async stop lands) re-arms the
+     * obligation, and [onCreate] never runs again to satisfy it — if the only
+     * promotion attempt on that delivery is the refusable mic upgrade (which
+     * an activity-less instrumentation process always gets refused), the
+     * process is killed ~10s later. Re-promoting the placeholder at the top
+     * of every command satisfies each delivery unconditionally; the
+     * production path then immediately transitions to mic/camera via
+     * [startForegroundNotified]. Repeated shortService promotions do not
+     * reset its ~3-min timeout — fine, [onTimeout] stops us cleanly and
+     * production upgrades within milliseconds anyway.
+     */
+    private fun promotePlaceholder(): Boolean {
         Notifier.ensureChannels(this)
         val placeholder = NotificationCompat.Builder(this, Notifier.CHANNEL_CALLS)
             .setSmallIcon(android.R.drawable.sym_action_call)
@@ -85,7 +111,7 @@ class CallService : Service() {
             .setOngoing(true)
             .setCategory(NotificationCompat.CATEGORY_CALL)
             .build()
-        runCatching {
+        return runCatching {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                 startForeground(
                     NOTIFICATION_ID,
@@ -101,20 +127,15 @@ class CallService : Service() {
             } else {
                 startForeground(NOTIFICATION_ID, placeholder)
             }
-        }.onSuccess {
-            foregroundStarted = true
         }.onFailure { e ->
-            // Should be unreachable on 34+ (shortService has no gate to refuse)
-            // and on <34 (no startForeground-time throw existed). Kept as a
-            // last-resort belt: log and stop. IMPORTANT lesson encoded here: a
-            // refused startForeground does NOT cancel the pending
-            // did-not-start-in-time kill (CI proved it), so if this branch is
-            // ever reached on some future API, the process may still die ~10s
-            // later — the fix is always "make the promotion succeed", never
-            // "catch the refusal".
-            Log.w(TAG, "startForeground (placeholder) refused by platform; stopping", e)
-            stopSelf()
-        }
+            // Should be unreachable on 34+ (shortService has no gate to
+            // refuse) and on <34 (no startForeground-time throw existed).
+            // Last-resort belt: log; callers stop the service. Lesson encoded
+            // twice over by CI: a refused startForeground does NOT cancel a
+            // pending did-not-start-in-time kill — the fix is always "make
+            // the promotion succeed", never "catch the refusal".
+            Log.w(TAG, "placeholder foreground promotion refused by platform", e)
+        }.isSuccess
     }
 
     /**
@@ -131,11 +152,16 @@ class CallService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // EVERY startForegroundService() delivery (re)arms the ~10s
+        // startForeground obligation — including a second start delivered to
+        // this already-running instance (see promotePlaceholder). Satisfy it
+        // first, unconditionally, before any branch can bail.
+        foregroundStarted = promotePlaceholder()
         if (!foregroundStarted) {
-            // onCreate's placeholder startForeground was refused (already
-            // logged) and this service is stopping. Retrying startForeground
-            // would throw the same way, uncaught — and the contract no longer
-            // applies once the platform has refused the start.
+            // Placeholder promotion refused (already logged) — nothing else
+            // can succeed either; stop and hope the platform honors the clean
+            // stop (see promotePlaceholder's lesson comment).
+            stopSelf()
             return START_NOT_STICKY
         }
         val peer = intent?.getStringExtra(EXTRA_PEER)
@@ -143,17 +169,15 @@ class CallService : Service() {
             // A system-triggered restart (e.g. the process was killed under
             // memory pressure) can redeliver a blank/null intent with no
             // guarantee the original extras survived, and there is no call to
-            // represent. The foreground-service contract is already satisfied
-            // (onCreate posted the placeholder), so — unlike before — bailing
-            // here is safe: remove the placeholder and stop. Skipping
-            // startForeground is now impossible, so this path can no longer arm
-            // the delayed did-not-start-in-time process kill.
+            // represent. The foreground-service contract for THIS delivery is
+            // already satisfied (placeholder above), so bailing is safe:
+            // remove the placeholder and stop.
             stopForeground(Service.STOP_FOREGROUND_REMOVE)
             stopSelf()
             return START_NOT_STICKY
         }
-        val peerLabel = intent?.getStringExtra(EXTRA_PEER_LABEL)?.ifBlank { null } ?: peer
-        val video = intent?.getBooleanExtra(EXTRA_VIDEO, false) ?: false
+        val peerLabel = intent.getStringExtra(EXTRA_PEER_LABEL)?.ifBlank { null } ?: peer
+        val video = intent.getBooleanExtra(EXTRA_VIDEO, false)
         startForegroundNotified(peer, peerLabel, video)
         return START_NOT_STICKY
     }
