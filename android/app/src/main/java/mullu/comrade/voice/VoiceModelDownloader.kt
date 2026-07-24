@@ -47,7 +47,7 @@ object VoiceModelDownloader {
 
         data class Failed(val message: String) : State()
 
-        /** Model installed where [VoskModel.withModel] looks for downloaded models. */
+        /** Model installed where [VoskModel.acquire] looks for downloaded models. */
         object Ready : State()
     }
 
