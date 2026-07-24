@@ -1283,7 +1283,8 @@ code {
   transform: translateY(1px);
 }
 
-.call-btn.is-muted {
+.call-btn.is-muted,
+.call-btn.is-camera-off {
   background: var(--warn);
   color: #1a1206;
   border-color: transparent;

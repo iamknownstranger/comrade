@@ -43,6 +43,13 @@
   // needs to reuse a couple of pure functions from another file.
   const callDecisionsReady = import("./call_decisions.mjs");
 
+  // ── Media-parameter helpers (desktop/ui/media_params.mjs) ───────────────────
+  // Same lazy dynamic-import pattern as callDecisionsReady above, and for the
+  // same reason (classic script, no static `import` available) — kicked off
+  // once at parse time and awaited from every call site below (WP17: bounded
+  // capture constraints + sender bitrate cap, docs/COMMS_ARCHITECTURE.md).
+  const mediaParamsReady = import("./media_params.mjs");
+
   // ── Tiny DOM helpers ──────────────────────────────────────────────────────
   const $ = (sel) => document.querySelector(sel);
 
@@ -859,6 +866,14 @@
   // timeout (a separate, deferred WP): this covers the connect phase only.
   const CONNECT_TIMEOUT_MS = 30_000;
 
+  // Outgoing video bitrate cap (WP17: docs/COMMS_ARCHITECTURE.md), applied to
+  // the video RTCRtpSender on both the caller and callee paths (see
+  // capVideoSenderBitrate below). ~1.5 Mbps: comparable to a mobile-friendly
+  // 720p30 encode. Android's Camera2 capture is bounded to 1280x720@30
+  // (CallManager.kt:91-93) but its encoder has no explicit bitrate cap today,
+  // so this is a new desktop-only policy value, not a mirrored constant.
+  const VIDEO_SENDER_MAX_BITRATE_BPS = 1_500_000;
+
   function newCallState(base) {
     return Object.assign(
       {
@@ -884,6 +899,10 @@
         timerId: null,
         connectTimeoutId: null, // connect-phase timeout handle (see armConnectTimeout)
         muted: false,
+        // Mid-call camera on/off (WP17: docs/COMMS_ARCHITECTURE.md), mirroring
+        // Android's CallManager.cameraOn (video calls only). Reset fresh on
+        // every new call, same as `muted` above.
+        cameraOff: false,
         ended: false,
       },
       base,
@@ -924,12 +943,10 @@
   // Shared peer-connection setup for both the caller and the accepting callee.
   async function setupPeer(iceServers) {
     const c = state.call;
+    const { buildCaptureConstraints } = await mediaParamsReady;
     let stream;
     try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: true,
-        video: c.media === "video",
-      });
+      stream = await navigator.mediaDevices.getUserMedia(buildCaptureConstraints(c.media));
     } catch (e) {
       showToast(`Microphone/camera unavailable — ${errText(e)}`, "error");
       await finishCall({
@@ -952,6 +969,16 @@
     c.pc = pc;
     c.remoteStream = new MediaStream();
     for (const track of stream.getTracks()) pc.addTrack(track, stream);
+    // Cap the video sender's bitrate now that its track is added — applies on
+    // both the caller path (startCall -> setupPeer) and the callee accept
+    // path (acceptIncoming -> setupPeer), since both funnel through this one
+    // function. A no-op for an audio-only call (capVideoSenderBitrate finds
+    // no video sender). The cap is a property of the sender/track, so it
+    // survives the caller's later STUN->TURN ICE-restart re-offer
+    // (tryTurnFallback) and the callee's renegotiation answer
+    // (handleIncomingOffer's RENEGOTIATE branch) without being reapplied —
+    // both reuse this same pc/sender, they never call setupPeer again.
+    await capVideoSenderBitrate(pc);
 
     pc.onicecandidate = (ev) => {
       if (!ev.candidate) return; // null == end-of-candidates
@@ -986,6 +1013,27 @@
     attachLocalMedia();
     attachRemoteMedia();
     return true;
+  }
+
+  // Find the video RTCRtpSender (if any — a no-op for an audio-only call)
+  // and cap its outgoing bitrate via the pure media_params helper (WP17).
+  // Webview support for RTCRtpSender.setParameters varies, so this is
+  // best-effort: getParameters()/setParameters() can throw or simply not
+  // exist on some webviews, and that must never affect the call itself —
+  // getUserMedia/addTrack/offer-answer already succeeded by the time this
+  // runs, so a failure here is logged and swallowed, not surfaced as a toast.
+  async function capVideoSenderBitrate(pc) {
+    const sender = pc.getSenders().find((s) => s.track && s.track.kind === "video");
+    if (!sender) return; // audio-only call
+    try {
+      const { buildVideoSenderParameters } = await mediaParamsReady;
+      const params = sender.getParameters();
+      await sender.setParameters(
+        buildVideoSenderParameters(params, VIDEO_SENDER_MAX_BITRATE_BPS),
+      );
+    } catch (e) {
+      console.warn("video sender bitrate cap failed; continuing without it", e);
+    }
   }
 
   // React to a non-"connected" peer-connection state change. Replaces the old
@@ -1531,6 +1579,25 @@
     btn.title = c.muted ? "Unmute microphone" : "Mute microphone";
   }
 
+  // Mid-call camera on/off (WP17: docs/COMMS_ARCHITECTURE.md), mirroring
+  // Android's CallManager.toggleCamera *narrowly*: only the track's `enabled`
+  // flag flips. Unlike Android (which also stop/starts the Camera2 capturer,
+  // CallManager.kt:589-608), this does NOT stop the capturer and does NOT
+  // renegotiate — the capturer keeps running and the pc/sender are untouched,
+  // exactly like toggleMute above does for audio. Renegotiating a track
+  // add/remove is WP16's scope, not this one. Video-call-only: guarded here
+  // and the button itself is hidden for audio calls (see showCallOverlay).
+  function toggleCamera() {
+    const c = state.call;
+    if (!c || !c.localStream || c.media !== "video") return;
+    c.cameraOff = !c.cameraOff;
+    for (const t of c.localStream.getVideoTracks()) t.enabled = !c.cameraOff;
+    const btn = $("#call-camera");
+    btn.classList.toggle("is-camera-off", c.cameraOff);
+    btn.textContent = c.cameraOff ? "📷" : "🎥";
+    btn.title = c.cameraOff ? "Turn camera on" : "Turn camera off";
+  }
+
   // ── Call overlay / media-element plumbing ──────────────────────────────────
   function showCallOverlay() {
     const c = state.call;
@@ -1539,6 +1606,9 @@
     $("#call-media-label").textContent = c.media === "video" ? "Video call" : "Voice call";
     $("#call-timer").hidden = true;
     resetSasRow(); // this call hasn't reached connected yet — no SAS to show
+    // Camera toggle only makes sense for a video call (WP17); hidden entirely
+    // for a voice call rather than merely disabled.
+    $("#call-camera").hidden = c.media !== "video";
     attachLocalMedia();
     attachRemoteMedia();
     $("#call-active").hidden = false;
@@ -1551,6 +1621,14 @@
     mb.classList.remove("is-muted");
     mb.textContent = "🎙";
     mb.title = "Mute microphone";
+    // Reset the camera toggle's DOM state too, same as the mute button above
+    // — the call object's own `cameraOff` is already reset fresh per call by
+    // newCallState, so this just keeps the button's visuals in sync for
+    // whenever the next call's showCallOverlay unhides it.
+    const cb = $("#call-camera");
+    cb.classList.remove("is-camera-off");
+    cb.textContent = "🎥";
+    cb.title = "Turn camera off";
   }
 
   function showRingingOverlay() {
@@ -2117,6 +2195,7 @@
     $("#ring-accept").addEventListener("click", acceptIncoming);
     $("#ring-decline").addEventListener("click", declineIncoming);
     $("#call-mute").addEventListener("click", toggleMute);
+    $("#call-camera").addEventListener("click", toggleCamera);
     $("#call-hangup").addEventListener("click", hangupByUser);
 
     $("#modal-partner").addEventListener("click", (e) => {
