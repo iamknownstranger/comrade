@@ -193,3 +193,101 @@ chrome, and the primitives that carry them. Screen layouts, navigation
 structure, and every decision function (`TogetherDecisions.kt`,
 `call_decisions.mjs`, and the rest) are untouched. A screen picks up the new
 look by being made of the primitives, not by being rewritten.
+
+## 7. Layout, rhythm and state — the polish contract
+
+§3 fixed what things are *coloured* with. This section fixes what makes the
+same tokens read as finished rather than assembled: spacing rhythm, type
+hierarchy, and the states a screen shows when it has nothing to show. It was
+written after an owner review that landed on two words — "dated" and
+"unfinished" — and each rule below names the measurement behind it.
+
+### 7.1 Spacing is a 4dp grid, and drift is the bug
+
+Android alone carried **138 off-grid values** (10, 6, 18, 14, 3, 1, 7, 9, 11)
+against 52 uses of 16 and 28 of 8. Nobody sees "14dp"; what they see is edges
+that fail to line up between two screens, which is precisely the "unfinished"
+read.
+
+```
+space-1   4      space-5  20      space-10  40
+space-2   8      space-6  24      space-12  48
+space-3  12      space-8  32      space-16  64
+```
+
+Every padding, gap and inset resolves to one of these. Values that are not
+multiples of 4 are permitted in exactly two places, and both must carry a
+comment saying which: a 1px/1dp hairline, and an optical correction that
+compensates for a glyph or icon's own bearing.
+
+### 7.2 Type: fewer sizes, and size is not the only signal
+
+A hierarchy built only from size needs many sizes. One built from size *and*
+weight *and* colour needs few. Cap the scale at six roles; separate adjacent
+roles by weight or by `mutedForeground`, not by two points of size.
+
+```
+display  32 / 700 / 1.15 / -0.02em    title    20 / 600 / 1.30 / -0.01em
+heading  24 / 700 / 1.20 / -0.02em    body     15 / 400 / 1.50 /  0
+                                      label    13 / 500 / 1.40 /  0.01em
+                                      caption  12 / 400 / 1.35 /  0.02em
+```
+
+Negative tracking on large text and positive on small is what separates a
+current-looking type stack from a default one. Line-height is part of the
+token, not a per-call-site decision.
+
+### 7.3 Lists load as skeletons, not spinners
+
+**All 14 loading states in `android/app/src/main/java/mullu/comrade/ui` are a
+`CircularProgressIndicator`; there is not one skeleton in the tree.** A
+centred spinner over a blank screen is the most dated pattern still shipping,
+and it also *hides* the layout, so arrival is a jump.
+
+- Content whose shape is known before it arrives — chat rows, comrades, feed
+  items, journal entries, tasks, call history — renders **skeleton
+  placeholders in the real row geometry**, 3–6 rows, at `muted` with a slow
+  opacity pulse (never a travelling gradient sweep; it draws the eye to the
+  loader instead of the content).
+- A spinner is correct only for a bounded, blocking, indeterminate action the
+  user just triggered (unlocking the vault, sending). Not for lists.
+- Under reduced motion the pulse stops and the skeleton is static — still a
+  layout preview, just not animated.
+
+### 7.4 Every list has three states, and all three are designed
+
+Empty is a state, not the absence of one. One pattern everywhere: a single
+line saying what belongs here in `mutedForeground`, and — when there is an
+action that would fill it — exactly one button. No illustration, no headline
+plus subhead plus two buttons. First-run empty and filtered-to-nothing empty
+say different things and must not share a string.
+
+Error states say what failed and offer retry. A list that can be empty, load,
+or fail needs all three branches present before the screen is done.
+
+### 7.5 Touch targets and hit area
+
+Minimum **48dp** on every interactive element, expanding the hit area rather
+than the drawn size where the visual is smaller. An icon button drawn at 24dp
+still takes 48dp of touch. This is the accessibility floor, and it is also
+most of why an interface feels confident rather than fiddly.
+
+### 7.6 Motion is short, and it explains
+
+Durations come from §3.5. Enter/exit for the same element must be the same
+gesture reversed. Nothing on a routine path runs longer than `base`; nothing
+at all exceeds 400ms. Motion earns its place by showing where something came
+from — a sheet rising from the edge it will return to — and never as
+decoration on arrival. §4.3's reduced-motion hatch collapses all of it.
+
+### 7.7 The bar carries five
+
+`MainTab` reached six, and the enum's own comment recorded the cost at the
+time: "a NavigationBar is comfortable at five and tight at six — labels shrink
+rather than wrap." Travel moves to the drawer beside Ride: it is a place you
+go deliberately, not a daily surface, which is the same test that put Feed
+there. Five stay: Chats, Journal, Together, Focus, Tara.
+
+This is a navigation change and it is deliberately the *only* one — which of
+the remaining five is least used is a question for usage data, not for a
+polish pass.
