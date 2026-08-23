@@ -27,6 +27,7 @@ import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
@@ -47,6 +48,7 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -55,6 +57,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
+import androidx.compose.material3.Switch
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -83,6 +86,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
@@ -107,6 +111,10 @@ import mullu.comrade.together.MusicLibrary
 import mullu.comrade.together.PlaybackModeDecision
 import mullu.comrade.together.PlaybackOwnership
 import mullu.comrade.together.ShareTransfer
+import mullu.comrade.together.PlayerEffects
+import mullu.comrade.together.PlayerPrefs
+import mullu.comrade.together.StreamingSourcesStore
+import mullu.comrade.together.TogetherPlayer
 import mullu.comrade.together.TogetherDecisions
 import mullu.comrade.together.TogetherManager
 import mullu.comrade.ui.theme.ComradeRadii
@@ -451,6 +459,11 @@ private sealed interface HomeStep {
     data object Browsing : HomeStep
     data object Linking : HomeStep
     data object Searching : HomeStep
+    data object Streaming : HomeStep
+    data object Collections : HomeStep
+    data object Loved : HomeStep
+    data object Recent : HomeStep
+    data object Playlists : HomeStep
 }
 
 /**
@@ -481,6 +494,19 @@ private sealed interface Chosen {
 
     /** A YouTube video or a public media URL, already classified by core. */
     data class Link(val link: TogetherDecisions.Link) : Chosen
+
+    /**
+     * A row from your own streaming server (Subsonic/Navidrome).
+     *
+     * The candidate came from core with its URL **already guarded** —
+     * `subsonic_search` drops rows whose URL would fail
+     * `valid_stream_url` — so this carries the typed value rather than
+     * re-running the paste parser, which a token-authenticated `/rest/stream`
+     * URL could never pass (it names no media extension; that check exists for
+     * pasted text and this never was one). Core still validates on the way
+     * out of `together_start`, so nothing here can smuggle a URL onto the wire.
+     */
+    data class ServerTrack(val candidate: uniffi.comrade_ui.StreamCandidateDto) : Chosen
 
     /**
      * A file to be picked once we know who for.
@@ -562,6 +588,11 @@ private fun PlayerHome(
                 onPickAFile = { chosen = Chosen.AFile },
                 onLink = { step = HomeStep.Linking },
                 onSearch = { step = HomeStep.Searching },
+                onServer = { step = HomeStep.Streaming },
+                onCollections = { step = HomeStep.Collections },
+                onFavourites = { step = HomeStep.Loved },
+                onRecent = { step = HomeStep.Recent },
+                onPlaylists = { step = HomeStep.Playlists },
                 onClose = onClose,
             )
 
@@ -596,6 +627,78 @@ private fun PlayerHome(
                 onBack = { step = HomeStep.Choosing },
                 onPlay = { chosenTrack, shown ->
                     chosen = Chosen.Track(chosenTrack, shown, fromLibrary = false)
+                },
+            )
+
+            is HomeStep.Streaming -> ServerSearch(
+                onBack = { step = HomeStep.Choosing },
+                onPlay = { candidate -> chosen = Chosen.ServerTrack(candidate) },
+            )
+
+            is HomeStep.Collections -> CollectionsScreen(
+                onBack = { step = HomeStep.Choosing },
+                onPlay = { candidate -> chosen = Chosen.ServerTrack(candidate) },
+            )
+
+            is HomeStep.Loved -> RememberedList(
+                onBack = { step = HomeStep.Choosing },
+                kind = RememberedKind.Favourites,
+                onPlayLocal = { track, list ->
+                    chosen = Chosen.Track(track, list, fromLibrary = true)
+                },
+                onPlayStream = { candidate -> chosen = Chosen.ServerTrack(candidate) },
+            )
+
+            is HomeStep.Recent -> RememberedList(
+                onBack = { step = HomeStep.Choosing },
+                kind = RememberedKind.History,
+                onPlayLocal = { track, list ->
+                    chosen = Chosen.Track(track, list, fromLibrary = true)
+                },
+                onPlayStream = { candidate -> chosen = Chosen.ServerTrack(candidate) },
+            )
+
+            is HomeStep.Playlists -> PlaylistsScreen(
+                onBack = { step = HomeStep.Choosing },
+                onPlayTracks = { tracks, index ->
+                    val t = tracks.getOrNull(index) ?: return@PlaylistsScreen
+                    if (t.kind == uniffi.comrade_ui.PlayerTrackKind.LOCAL &&
+                        t.key.startsWith("local:")
+                    ) {
+                        chosen = Chosen.Track(
+                            TogetherDecisions.Track(
+                                uri = t.key.removePrefix("local:"),
+                                title = t.title,
+                                artist = t.artist,
+                                album = t.album,
+                                durationMs = t.durationMs.toLong(),
+                                albumId = null,
+                            ),
+                            tracks.filter { it.kind == uniffi.comrade_ui.PlayerTrackKind.LOCAL }
+                                .map {
+                                    TogetherDecisions.Track(
+                                        uri = it.key.removePrefix("local:"),
+                                        title = it.title,
+                                        artist = it.artist,
+                                        album = it.album,
+                                        durationMs = it.durationMs.toLong(),
+                                        albumId = null,
+                                    )
+                                },
+                            fromLibrary = true,
+                        )
+                    } else if (t.url != null) {
+                        chosen = Chosen.ServerTrack(
+                            uniffi.comrade_ui.StreamCandidateDto(
+                                title = t.title,
+                                artist = t.artist,
+                                album = t.album,
+                                durationMs = t.durationMs,
+                                streamUrl = t.url!!,
+                                artworkUrl = null,
+                            ),
+                        )
+                    }
                 },
             )
         }
@@ -734,6 +837,25 @@ private fun startWith(
     // a list. Everything else here is one thing, and says so by passing none.
     is Chosen.Track -> TogetherManager.playTrack(context, with, what.track, what.queue)
 
+    is Chosen.ServerTrack -> runCatching {
+        // Built typed rather than through the paste parser — see
+        // [Chosen.ServerTrack]. The recording and length come from the same
+        // search that produced the URL, which is more than a pasted link ever
+        // knows; the player still discovers the real length itself.
+        val c = what.candidate
+        val content = uniffi.comrade_core.TogetherContent.Stream(
+            url = c.streamUrl,
+            recording = uniffi.comrade_core.Recording(
+                isrc = null,
+                title = c.title,
+                artist = c.artist,
+                album = c.album,
+            ),
+            durationMs = c.durationMs.toULong().takeIf { it > 0uL },
+        )
+        TogetherManager.startStream(context, with.npub, with.label, content)
+    }.onFailure { Log.w(TAG, "could not start on a server track", it) }.isSuccess
+
     is Chosen.Link -> when (val link = what.link) {
         is TogetherDecisions.Link.Video -> runCatching {
             TogetherManager.startEmbed(context, with.npub, with.label, link.videoId)
@@ -770,7 +892,7 @@ private fun startWith(
 
 private const val TAG = "TogetherScreen"
 
-/** The four ways in. */
+/** The ways in, plus the remembered lists one tap below the cards. */
 @Composable
 private fun ChooseASource(
     libraryGranted: Boolean,
@@ -778,6 +900,11 @@ private fun ChooseASource(
     onPickAFile: () -> Unit,
     onLink: () -> Unit,
     onSearch: () -> Unit,
+    onServer: () -> Unit,
+    onCollections: () -> Unit,
+    onFavourites: () -> Unit,
+    onRecent: () -> Unit,
+    onPlaylists: () -> Unit,
     onClose: (() -> Unit)?,
 ) {
     Column(
@@ -860,8 +987,43 @@ private fun ChooseASource(
                     subtitle = stringResource(R.string.together_source_search_note),
                     onClick = onSearch,
                 )
+
+                is TogetherDecisions.Source.YourServer -> SourceCard(
+                    icon = ComputerIcon,
+                    title = stringResource(R.string.together_source_server),
+                    subtitle = stringResource(R.string.together_source_server_note),
+                    onClick = onServer,
+                )
+
+                is TogetherDecisions.Source.PublicCollections -> SourceCard(
+                    icon = LyricsIcon,
+                    title = stringResource(R.string.together_source_collections),
+                    subtitle = stringResource(R.string.together_source_collections_note),
+                    onClick = onCollections,
+                )
             }
         }
+
+        // The player's own memory, one quiet row beneath the cards — lists of
+        // what was loved and played, not sources. Text buttons rather than
+        // cards so they read as places inside this tab, not more doors.
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            TextButton(onClick = onFavourites) {
+                Text(stringResource(R.string.library_favourites), color = TogetherMuted)
+            }
+            TextButton(onClick = onRecent) {
+                Text(stringResource(R.string.library_recent), color = TogetherMuted)
+            }
+            TextButton(onClick = onPlaylists) {
+                Text(stringResource(R.string.library_playlists), color = TogetherMuted)
+            }
+        }
+
+        ResumeCard()
+        Spacer(Modifier.height(4.dp))
         Spacer(Modifier.height(4.dp))
         Text(
             stringResource(R.string.together_home_note),
@@ -1563,8 +1725,18 @@ private fun SearchByName(
                     // `Dispatchers.IO`, not the main thread: this is a relay-free
                     // but genuinely networked call, and `runBlocking` on it from
                     // a click handler is the ANR of docs/TOGETHER.md §17.
+                    //
+                    // The Jamendo key rides along when one is saved; without
+                    // it the catalogue search simply answers from MusicBrainz
+                    // alone, which is an ordinary answer and not an error. Read
+                    // here rather than remembered, so a key added in Settings
+                    // counts from the next search without reopening this screen.
                     val result = withContext(Dispatchers.IO) {
-                        ComradeCore.catalogueLookup(query)
+                        val jamendo = StreamingSourcesStore.load(context).jamendoClientId
+                        ComradeCore.catalogueLookup(
+                            query,
+                            jamendo.takeIf { it.isNotBlank() },
+                        )
                     }
                     matches = (result as? ComradeCore.CatalogueResult.Found)?.matches.orEmpty()
                     outcome = TogetherDecisions.searchOutcome(
@@ -1713,6 +1885,198 @@ private fun SearchByName(
 }
 
 /**
+ * Search your own streaming server — the fifth source card's screen.
+ *
+ * The shape mirrors [SearchByName] deliberately (field, one button, outcomes
+ * below), because both are "type words, get rows" and the two must not feel
+ * like different apps. Where they differ is the point of each sentence:
+ *
+ * - **No server configured** is a setup step, shown as its own card-sized
+ *   sentence rather than an empty result — "you have no server saved" and
+ *   "nothing matched" are different answers, and collapsing them is exactly
+ *   the wrong-answer shape §20 exists to prevent.
+ * - **A failed search names what failed**, verbatim from core: the server's
+ *   own refusal ("Wrong username or password") or the network's.
+ * - **Rows play without leaving this screen**: tapping asks who with through
+ *   [startWith]'s ordinary path, because a server track is a gesture aimed at
+ *   somebody the same way a catalogue row is — not a library tap.
+ *
+ * Every candidate URL arrived already guarded in core, so a tap can start a
+ * session without a second validation pass — but `together_start` still runs
+ * its own check on the way out, which is where a mid-air config change would
+ * surface as a thrown refusal rather than a silent send.
+ */
+@Composable
+private fun ServerSearch(
+    onBack: () -> Unit,
+    onPlay: (uniffi.comrade_ui.StreamCandidateDto) -> Unit,
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    // Read once per entry into the screen; a change made in Settings lands the
+    // next time this screen opens, not under the current results.
+    var sources by remember {
+        mutableStateOf(StreamingSourcesStore.load(context))
+    }
+    var query by remember { mutableStateOf("") }
+    var outcome by remember { mutableStateOf<ComradeCore.StreamResult?>(null) }
+    var searching by remember { mutableStateOf(false) }
+
+    Column(
+        Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        BrowserHeader(stringResource(R.string.together_source_server), onBack)
+        Text(
+            stringResource(R.string.together_server_explainer),
+            style = MaterialTheme.typography.bodyMedium,
+            color = TogetherMuted,
+        )
+
+        if (!sources.subsonicConfigured) {
+            // Setup gate, drawn as a card so it reads as a place rather than a
+            // dead end. Nothing here links into Settings directly — the tab has
+            // no navigation to it — so the sentence says where to go instead.
+            //
+            // An if/else, not an early return: this Column recomposes when the
+            // search state below changes, and a branch that emits a different
+            // number of groups either side of a state flip is the defect that
+            // killed TaskListScreen (AUDIT 2026-08-04) and RideScreen
+            // (2026-08-15) on their *second* frame. The search UI lives in the
+            // else arm for the same reason.
+            ElevatedCard(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        stringResource(R.string.together_server_none_title),
+                        style = MaterialTheme.typography.titleSmall,
+                        color = TogetherText,
+                    )
+                    Text(
+                        stringResource(R.string.together_server_none_body),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = TogetherMuted,
+                    )
+                }
+            }
+        } else {
+        OutlinedTextField(
+            value = query,
+            onValueChange = {
+                query = it
+                if (it.isBlank()) outcome = null
+            },
+            singleLine = true,
+            leadingIcon = { Icon(Icons.Filled.Search, contentDescription = null) },
+            placeholder = { Text(stringResource(R.string.together_server_search_hint)) },
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Button(
+            enabled = query.isNotBlank() && !searching,
+            onClick = {
+                searching = true
+                scope.launch {
+                    val cfg = uniffi.comrade_core.SubsonicConfig(
+                        server = sources.server.trim(),
+                        username = sources.username.trim(),
+                        password = sources.password,
+                    )
+                    val result = withContext(Dispatchers.IO) {
+                        ComradeCore.subsonicSearch(cfg, query)
+                    }
+                    outcome = result
+                    searching = false
+                }
+            },
+        ) {
+            Text(stringResource(R.string.together_search_go))
+        }
+
+        when (val shown = outcome) {
+            null -> Unit
+
+            // The two non-answers that must not read alike: no setup versus a
+            // build that cannot stream at all. Both are about this device;
+            // neither is about the songs.
+            is ComradeCore.StreamResult.NotConfigured -> Text(
+                stringResource(R.string.together_server_none_body),
+                style = MaterialTheme.typography.bodyMedium,
+                color = TogetherMuted,
+            )
+
+            is ComradeCore.StreamResult.CannotStream -> Text(
+                stringResource(R.string.together_server_cannot_stream),
+                style = MaterialTheme.typography.bodyMedium,
+                color = TogetherMuted,
+            )
+
+            is ComradeCore.StreamResult.Failed -> Text(
+                stringResource(R.string.together_server_failed, shown.reason),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.error,
+            )
+
+            // An empty list here really does mean "the server has no such
+            // song" — the only arm allowed to say that, because it is the only
+            // one that asked.
+            is ComradeCore.StreamResult.Found ->
+                if (shown.candidates.isEmpty()) {
+                    Text(
+                        stringResource(R.string.together_search_nothing_found),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = TogetherMuted,
+                    )
+                } else {
+                    Column {
+                        shown.candidates.forEach { candidate ->
+                            ServerRow(candidate = candidate, onClick = { onPlay(candidate) })
+                        }
+                    }
+                }
+        }
+        }
+    }
+}
+
+/** One streaming-server answer: title over artist, ready to listen with. */
+@Composable
+private fun ServerRow(
+    candidate: uniffi.comrade_ui.StreamCandidateDto,
+    onClick: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        Icon(QueueMusicIcon, contentDescription = null, tint = TogetherMuted)
+        Column(Modifier.weight(1f)) {
+            Text(
+                candidate.title,
+                style = MaterialTheme.typography.bodyLarge,
+                color = TogetherText,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                candidate.artist.ifBlank {
+                    stringResource(R.string.together_search_unknown_artist)
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = TogetherMuted,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        Icon(Icons.Filled.PlayArrow, contentDescription = null, tint = TogetherMuted)
+    }
+}
+
+/**
  * One catalogue answer, with the catalogue that gave it named on the row and a
  * download button only where the licence actually permits one.
  *
@@ -1721,8 +2085,7 @@ private fun SearchByName(
  * then explain a licence, which is worse than not offering it. Where there *is* a
  * reason worth naming ([downloadNote]) it is a line of text, not a disabled
  * control.
- */
-@Composable
+ */@Composable
 private fun CandidateRow(
     candidate: TogetherDecisions.Candidate,
     onClick: () -> Unit,
@@ -1794,20 +2157,13 @@ private fun uniffi.comrade_core.CatalogueMatch.asCandidate() = TogetherDecisions
     artist = recording.artist,
     album = recording.album,
     durationMs = durationMs?.toLong() ?: 0L,
-    catalogue = MUSICBRAINZ,
+    // Named on the row, not once at the top: with more than one catalogue
+    // wired (`docs/TOGETHER.md` §23's Jamendo alongside MusicBrainz) the name
+    // has to travel on the match itself — the exact move §20 predicted when it
+    // called the old constant a lie waiting to happen.
+    catalogue = source,
     durationKnown = durationMs != null,
 )
-
-/**
- * The catalogue behind [ComradeCore.catalogueLookup].
- *
- * Named here rather than plumbed through the FFI because there is exactly one
- * resolver and `CatalogueMatch` carries no source field. **If a second catalogue
- * is ever added, this constant becomes a lie and the field has to move onto the
- * match** — which is the point of stating it as a constant with this comment
- * rather than inlining the string at the call site.
- */
-private const val MUSICBRAINZ = "MusicBrainz"
 
 /**
  * Fetch an openly-licensed track and put it in the phone's music library.
@@ -2866,4 +3222,635 @@ private fun statusLabel(s: TogetherManager.UiState.Live): String = when (s.statu
     TogetherManager.Status.CatchingUp -> stringResource(R.string.together_catching_up)
     TogetherManager.Status.LostTrack -> stringResource(R.string.together_lost_track)
     TogetherManager.Status.TheyPaused -> stringResource(R.string.together_they_paused, s.peerLabel)
+}
+
+// ── The extras row: shuffle, repeat, speed, sleep, EQ, lyrics ────────────────
+
+/**
+ * One quiet row of player conveniences above the transport.
+ *
+ * Every control is conditional on where it is *true*, not where it fits: speed
+ * exists only solo ([TogetherDecisions.speedAllowed] — in a session the
+ * correction ladder owns the rate), the equalizer only where the sound comes
+ * from our own decoder (an embed and a followed external app mix elsewhere),
+ * shuffle and repeat only mean something with a queue behind the session. A
+ * control that appears and silently does nothing is worse than one absent —
+ * the same argument §22 made about greyed-out download buttons.
+ */
+@Composable
+private fun ExtrasRow(s: TogetherManager.UiState.Live) {
+    val context = LocalContext.current
+    val extras by TogetherManager.extras.collectAsState()
+    val queue by TogetherManager.queue.collectAsState()
+    LaunchedEffect(Unit) { TogetherManager.loadExtras(context) }
+
+    var showSpeed by remember { mutableStateOf(false) }
+    var showSleep by remember { mutableStateOf(false) }
+    var showEq by remember { mutableStateOf(false) }
+    var showLyrics by remember { mutableStateOf(false) }
+    val filePlayer = !s.embed && !s.external
+
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.Center,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        if (queue != null) {
+            IconButton(onClick = { TogetherManager.toggleShuffle(context) }) {
+                Icon(
+                    ShuffleIcon,
+                    contentDescription = stringResource(R.string.extras_shuffle),
+                    tint = if (extras.shuffle) MaterialTheme.colorScheme.primary else TogetherMuted,
+                )
+            }
+            IconButton(onClick = { TogetherManager.cycleRepeat(context) }) {
+                Icon(
+                    if (extras.repeat == TogetherDecisions.RepeatMode.ONE) RepeatOneIcon else RepeatIcon,
+                    contentDescription = stringResource(
+                        if (extras.repeat == TogetherDecisions.RepeatMode.ONE) {
+                            R.string.extras_repeat_one
+                        } else {
+                            R.string.extras_repeat
+                        },
+                    ),
+                    tint = if (extras.repeat != TogetherDecisions.RepeatMode.OFF) {
+                        MaterialTheme.colorScheme.primary
+                    } else {
+                        TogetherMuted
+                    },
+                )
+            }
+        }
+        if (TogetherDecisions.speedAllowed(s.solo)) {
+            IconButton(onClick = { showSpeed = true }) {
+                Icon(SpeedIcon, contentDescription = stringResource(R.string.extras_speed), tint = TogetherMuted)
+            }
+        }
+        IconButton(onClick = { showSleep = true }) {
+            Icon(BedtimeIcon, contentDescription = stringResource(R.string.extras_sleep), tint = TogetherMuted)
+        }
+        if (filePlayer && PlayerEffects.bandCount() > 0) {
+            IconButton(onClick = { showEq = true }) {
+                Icon(TuneIcon, contentDescription = stringResource(R.string.extras_equalizer), tint = TogetherMuted)
+            }
+        }
+        if (!queue?.current?.title.isNullOrBlank() || s.title.isNotBlank()) {
+            IconButton(onClick = { showLyrics = true }) {
+                Icon(LyricsIcon, contentDescription = stringResource(R.string.extras_lyrics), tint = TogetherMuted)
+            }
+        }
+    }
+
+    if (showSpeed) {
+        SpeedSheet(current = extras.speed, onDismiss = { showSpeed = false })
+    }
+    if (showSleep) {
+        SleepSheet(endsAtMs = extras.sleepEndsAtMs, onDismiss = { showSleep = false })
+    }
+    if (showEq) {
+        EqualizerSheet(sessionId = (TogetherManager.filePlayer() as? TogetherPlayer)?.audioSessionId, onDismiss = { showEq = false })
+    }
+    if (showLyrics) {
+        LyricsSheet(
+            title = queue?.current?.title ?: s.title,
+            artist = queue?.current?.artist.orEmpty(),
+            durationMs = s.durationMs,
+            positionMs = s.positionMs,
+            onDismiss = { showLyrics = false },
+        )
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun SpeedSheet(current: Float, onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Text(stringResource(R.string.speed_sheet_title), style = MaterialTheme.typography.titleMedium)
+            var value by remember(current) { mutableStateOf(current) }
+            Slider(
+                value = value,
+                onValueChange = { value = TogetherDecisions.clampSpeed(it) },
+                onValueChangeFinished = { TogetherManager.setSpeed(context, value) },
+                valueRange = 0.5f..2f,
+            )
+            Text("×${"%.2f".format(value)}", fontFamily = FontFamily.Monospace)
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun SleepSheet(endsAtMs: Long?, onDismiss: () -> Unit) {
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(stringResource(R.string.sleep_sheet_title), style = MaterialTheme.typography.titleMedium)
+            listOf(15, 30, 45, 60).forEach { minutes ->
+                TextButton(onClick = {
+                    TogetherManager.startSleepTimer(minutes)
+                    onDismiss()
+                }) { Text(stringResource(R.string.sleep_minutes, minutes), color = TogetherText) }
+            }
+            endsAtMs?.let {
+                TextButton(onClick = {
+                    TogetherManager.cancelSleepTimer()
+                    onDismiss()
+                }) { Text(stringResource(R.string.sleep_off), color = MaterialTheme.colorScheme.error) }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun EqualizerSheet(sessionId: Int?, onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    val bands = remember { PlayerEffects.bandCount() }
+    val saved = remember { PlayerPrefs.equalizer(context) }
+    var enabled by remember { mutableStateOf(saved.first) }
+    var levels by remember {
+        mutableStateOf(saved.second.ifEmpty { List(bands) { 0 } })
+    }
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(stringResource(R.string.eq_sheet_title), style = MaterialTheme.typography.titleMedium)
+            if (bands <= 0) {
+                Text(stringResource(R.string.eq_unavailable), color = TogetherMuted)
+            } else {
+                levels.forEachIndexed { i, level ->
+                    Text("${i + 1}", style = MaterialTheme.typography.labelSmall, color = TogetherMuted)
+                    Slider(
+                        value = level.toFloat(),
+                        onValueChange = { newLevel ->
+                            val next = levels.toMutableList().also { it[i] = newLevel.toInt() }
+                            levels = next
+                            PlayerEffects.applyLive(enabled, next, sessionId)
+                            PlayerPrefs.setEqualizer(context, enabled, next)
+                        },
+                        valueRange = -1500f..1500f,
+                    )
+                }
+                Switch(
+                    checked = enabled,
+                    onCheckedChange = { on ->
+                        enabled = on
+                        PlayerEffects.applyLive(on, levels, sessionId)
+                        PlayerPrefs.setEqualizer(context, on, levels)
+                    },
+                )
+            }
+        }
+    }
+}
+
+/** Synced lyrics, highlighted line by line against the live playhead. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun LyricsSheet(title: String, artist: String, durationMs: Long, positionMs: Long, onDismiss: () -> Unit) {
+    val scope = rememberCoroutineScope()
+    var lines by remember { mutableStateOf<List<TogetherDecisions.LyricLine>?>(null) }
+    var note by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(title, artist) {
+        note = stringResource(R.string.lyrics_loading)
+        val result = withContext(Dispatchers.IO) {
+            ComradeCore.lyricsLookup(title, artist, durationMs)
+        }
+        when (result) {
+            is ComradeCore.LyricsResult.Found -> {
+                lines = result.lines.map {
+                    TogetherDecisions.LyricLine(it.atMs.toLong(), it.text)
+                }
+                if (result.lines.isEmpty()) note = stringResource(R.string.lyrics_none) else note = null
+            }
+            is ComradeCore.LyricsResult.CannotSearch -> note = stringResource(R.string.together_server_cannot_stream)
+            is ComradeCore.LyricsResult.Failed -> note = stringResource(R.string.lyrics_failed, result.reason)
+        }
+    }
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(Modifier.padding(20.dp).heightIn(max = 480.dp)) {
+            Text(title, style = MaterialTheme.typography.titleMedium)
+            Spacer(Modifier.height(8.dp))
+            when {
+                lines == null -> Text(note.orEmpty(), color = TogetherMuted)
+                lines!!.isEmpty() -> Text(note.orEmpty(), color = TogetherMuted)
+                else -> {
+                    val active = TogetherDecisions.lyricIndexAt(lines!!, positionMs)
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        lines!!.forEachIndexed { i, line ->
+                            Text(
+                                line.text,
+                                style = MaterialTheme.typography.bodyLarge,
+                                color = if (i == active) MaterialTheme.colorScheme.primary else TogetherMuted,
+                                fontWeight = if (i == active) FontWeight.SemiBold else FontWeight.Normal,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ── Resume card ──────────────────────────────────────────────────────────────
+
+/**
+ * The saved queue, offered once at the top of Choosing.
+ *
+ * Solo only — [TogetherManager.resumeSavedQueue] enforces the same rule — and
+ * hidden entirely when there is nothing saved or nothing resolvable. A card
+ * that says "continue" and then starts over would be the small confident lie
+ * this screen exists to avoid.
+ */
+@Composable
+private fun ResumeCard() {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var saved by remember { mutableStateOf<uniffi.comrade_ui.SavedQueueDto?>(null) }
+    LaunchedEffect(Unit) {
+        saved = withContext(Dispatchers.IO) { runCatching { ComradeCore.queueLoad() }.getOrNull() }
+    }
+    val snapshot = saved ?: return
+    ElevatedCard(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(stringResource(R.string.resume_title), style = MaterialTheme.typography.titleSmall)
+            Text(
+                stringResource(
+                    R.string.resume_body,
+                    snapshot.tracks.size,
+                    java.text.DateFormat.getTimeInstance(java.text.DateFormat.SHORT)
+                        .format(java.util.Date(snapshot.savedAtMs.toLong())),
+                ),
+                style = MaterialTheme.typography.bodySmall,
+                color = TogetherMuted,
+            )
+            Button(onClick = {
+                scope.launch { TogetherManager.resumeSavedQueue(context) }
+            }) { Text(stringResource(R.string.resume_button)) }
+        }
+    }
+}
+
+// ── Favourites / recently played / playlists ─────────────────────────────────
+
+/** Which remembered list a [RememberedList] is drawing. */
+private enum class RememberedKind { Favourites, History }
+
+/**
+ * One of the player's own lists — favourites or recently played.
+ *
+ * Rows resolve to sessions through the same two doors everything else uses: a
+ * local key that still opens plays as a library tap; a stream URL re-fetches.
+ * A row that can no longer do either is skipped silently rather than drawn as
+ * a broken button — the list remembers, but it does not haunt.
+ */
+@Composable
+private fun RememberedList(
+    onBack: () -> Unit,
+    kind: RememberedKind,
+    onPlayLocal: (TogetherDecisions.Track, List<TogetherDecisions.Track>) -> Unit,
+    onPlayStream: (uniffi.comrade_ui.StreamCandidateDto) -> Unit,
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var rows by remember {
+        mutableStateOf<List<Pair<uniffi.comrade_ui.PlayerTrackDto, Boolean>>>(emptyList())
+    }
+    var loaded by remember { mutableStateOf(false) }
+
+    LaunchedEffect(kind) {
+        val entries: List<uniffi.comrade_ui.PlayerTrackDto> = withContext(Dispatchers.IO) {
+            runCatching {
+                when (kind) {
+                    RememberedKind.Favourites -> ComradeCore.favouritesList()
+                    RememberedKind.History ->
+                        ComradeCore.historyList().map { it.track }
+                }
+            }.getOrDefault(emptyList())
+        }
+        rows = entries.map { dto ->
+            val uri = dto.key.removePrefix("local:")
+            val exists = dto.kind == uniffi.comrade_ui.PlayerTrackKind.LOCAL && (
+                uri.startsWith("content://") || java.io.File(android.net.Uri.parse(uri).path ?: "/").exists()
+                )
+            dto to (dto.kind == uniffi.comrade_ui.PlayerTrackKind.STREAM || exists)
+        }
+        loaded = true
+    }
+
+    Column(
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        BrowserHeader(
+            stringResource(
+                if (kind == RememberedKind.Favourites) {
+                    R.string.library_favourites
+                } else {
+                    R.string.library_recent
+                },
+            ),
+            onBack,
+        )
+        if (!loaded) {
+            return@Column
+        }
+        if (rows.isEmpty()) {
+            Text(
+                stringResource(
+                    if (kind == RememberedKind.Favourites) {
+                        R.string.library_empty_favourites
+                    } else {
+                        R.string.library_empty_recent
+                    },
+                ),
+                color = TogetherMuted,
+            )
+            return@Column
+        }
+        rows.forEach { (dto, playable) ->
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .then(if (playable) Modifier.clickable {
+                        if (dto.kind == uniffi.comrade_ui.PlayerTrackKind.STREAM && dto.url != null) {
+                            onPlayStream(
+                                uniffi.comrade_ui.StreamCandidateDto(
+                                    title = dto.title,
+                                    artist = dto.artist,
+                                    album = dto.album,
+                                    durationMs = dto.durationMs,
+                                    streamUrl = dto.url!!,
+                                    artworkUrl = null,
+                                ),
+                            )
+                        } else {
+                            val track = TogetherDecisions.Track(
+                                uri = dto.key.removePrefix("local:"),
+                                title = dto.title,
+                                artist = dto.artist,
+                                album = dto.album,
+                                durationMs = dto.durationMs.toLong(),
+                                albumId = null,
+                            )
+                            // The queue is this list's locals, in list order —
+                            // prev and next mean what this screen shows.
+                            val queueList = rows.filter { (d, ok) ->
+                                ok && d.kind == uniffi.comrade_ui.PlayerTrackKind.LOCAL
+                            }.map { (d, _) ->
+                                TogetherDecisions.Track(
+                                    uri = d.key.removePrefix("local:"),
+                                    title = d.title,
+                                    artist = d.artist,
+                                    album = d.album,
+                                    durationMs = d.durationMs.toLong(),
+                                    albumId = null,
+                                )
+                            }
+                            onPlayLocal(track, queueList)
+                        }
+                    } else Modifier),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(14.dp),
+            ) {
+                Icon(QueueMusicIcon, contentDescription = null, tint = TogetherMuted)
+                Column(Modifier.weight(1f)) {
+                    Text(dto.title, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text(
+                        dto.artist.ifBlank { stringResource(R.string.together_search_unknown_artist) },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = TogetherMuted,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Playlists: create, open (play all), remove tracks. The one list with
+ * editing, because a playlist is the only thing here that is *authored*.
+ */
+@Composable
+private fun PlaylistsScreen(
+    onBack: () -> Unit,
+    onPlayTracks: (List<uniffi.comrade_ui.PlayerTrackDto>, Int) -> Unit,
+) {
+    val scope = rememberCoroutineScope()
+    var lists by remember { mutableStateOf<List<uniffi.comrade_ui.PlaylistDto>>(emptyList()) }
+    var loaded by remember { mutableStateOf(false) }
+    var openId by remember { mutableStateOf<String?>(null) }
+    var newName by remember { mutableStateOf("") }
+
+    fun refresh() {
+        scope.launch {
+            lists = withContext(Dispatchers.IO) { runCatching { ComradeCore.playlistsList() }.getOrDefault(emptyList()) }
+            loaded = true
+        }
+    }
+    LaunchedEffect(Unit) { refresh() }
+
+    Column(
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        BrowserHeader(stringResource(R.string.library_playlists), onBack)
+        if (!loaded) return@Column
+
+        openId?.let { id ->
+            val list = lists.firstOrNull { it.id == id }
+            if (list == null) {
+                openId = null
+                return@Column
+            }
+            BrowserHeader(list.name, onBack = { openId = null })
+            list.tracks.forEachIndexed { i, t ->
+                Row(
+                    Modifier.fillMaxWidth().clickable { onPlayTracks(list.tracks, i) },
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f).padding(vertical = 8.dp)) {
+                        Text(t.title, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                    TextButton(onClick = {
+                        scope.launch {
+                            withContext(Dispatchers.IO) {
+                                runCatching { ComradeCore.playlistRemoveTrack(id, t.key) }
+                            }
+                            refresh()
+                        }
+                    }) { Text(stringResource(R.string.library_remove_from_playlist)) }
+                }
+            }
+            return@Column
+        }
+
+        OutlinedTextField(
+            value = newName,
+            onValueChange = { newName = it },
+            placeholder = { Text(stringResource(R.string.library_new_playlist_hint)) },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Button(enabled = newName.isNotBlank(), onClick = {
+            scope.launch {
+                withContext(Dispatchers.IO) {
+                    runCatching {
+                        ComradeCore.playlistCreate(newName.trim(), System.currentTimeMillis())
+                    }
+                }
+                newName = ""
+                refresh()
+            }
+        }) { Text(stringResource(R.string.library_create)) }
+
+        lists.forEach { list ->
+            SourceCard(icon = QueueMusicIcon, title = list.name, subtitle = "${list.tracks.size}") {
+                openId = list.id
+            }
+        }
+    }
+}
+
+// ── Public collections: Internet Archive + podcast feeds ─────────────────────
+
+/**
+ * The keyless online sources, behind one door.
+ *
+ * Two tabs because the two flows genuinely differ (words-to-recordings versus
+ * a feed address-to-episodes); one screen because both end in the same place:
+ * guarded stream candidates that play exactly like server results. Every URL
+ * here was built and guarded inside core — this screen never sees an
+ * unvalidated one.
+ */
+@Composable
+private fun CollectionsScreen(
+    onBack: () -> Unit,
+    onPlay: (uniffi.comrade_ui.StreamCandidateDto) -> Unit,
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var tab by remember { mutableStateOf(0) }
+    var query by remember { mutableStateOf("") }
+    var items by remember { mutableStateOf<List<uniffi.comrade_ui.ArchiveItemDto>>(emptyList()) }
+    var note by remember { mutableStateOf<String?>(null) }
+    var searching by remember { mutableStateOf(false) }
+    var openItem by remember { mutableStateOf<String?>(null) }
+    var tracks by remember { mutableStateOf<List<uniffi.comrade_ui.StreamCandidateDto>>(emptyList()) }
+
+    Column(
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        BrowserHeader(stringResource(R.string.together_source_collections), onBack)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            TextButton(onClick = { tab = 0; note = null }) {
+                Text(
+                    stringResource(R.string.collections_tab_archive),
+                    color = if (tab == 0) TogetherText else TogetherMuted,
+                    fontWeight = if (tab == 0) FontWeight.SemiBold else FontWeight.Normal,
+                )
+            }
+            TextButton(onClick = { tab = 1; note = null; items = emptyList() }) {
+                Text(
+                    stringResource(R.string.collections_tab_podcasts),
+                    color = if (tab == 1) TogetherText else TogetherMuted,
+                    fontWeight = if (tab == 1) FontWeight.SemiBold else FontWeight.Normal,
+                )
+            }
+        }
+
+        OutlinedTextField(
+            value = query,
+            onValueChange = { query = it },
+            singleLine = true,
+            leadingIcon = { Icon(Icons.Filled.Search, contentDescription = null) },
+            placeholder = {
+                Text(
+                    stringResource(
+                        if (tab == 0) R.string.collections_archive_hint else R.string.collections_feed_hint,
+                    ),
+                )
+            },
+            modifier = Modifier.fillMaxWidth(),
+        )
+
+        when (tab) {
+            0 -> {
+                Button(
+                    enabled = query.isNotBlank() && !searching,
+                    onClick = {
+                        searching = true
+                        scope.launch {
+                            val result = withContext(Dispatchers.IO) { ComradeCore.archiveSearch(query) }
+                            items = (result as? ComradeCore.CollectionResult.Found)?.items.orEmpty()
+                            note = when (result) {
+                                is ComradeCore.CollectionResult.Failed -> result.reason
+                                is ComradeCore.CollectionResult.CannotSearch ->
+                                    context.getString(R.string.together_server_cannot_stream)
+                                else -> null
+                            }
+                            searching = false
+                        }
+                    },
+                ) { Text(stringResource(R.string.together_search_go)) }
+                items.forEach { item ->
+                    SourceCard(
+                        icon = QueueMusicIcon,
+                        title = item.title,
+                        subtitle = item.creator.ifBlank { item.identifier },
+                    ) {
+                        searching = true
+                        scope.launch {
+                            val result = withContext(Dispatchers.IO) { ComradeCore.archiveTracks(item.identifier) }
+                            tracks = (result as? ComradeCore.TrackListResult.Found)?.candidates.orEmpty()
+                            note = (result as? ComradeCore.TrackListResult.Failed)?.reason
+                            searching = false
+                            openItem = item.identifier
+                        }
+                    }
+                }
+            }
+            else -> {
+                Button(
+                    enabled = query.isNotBlank() && !searching,
+                    onClick = {
+                        searching = true
+                        scope.launch {
+                            val result = withContext(Dispatchers.IO) { ComradeCore.podcastEpisodes(query.trim()) }
+                            tracks = (result as? ComradeCore.TrackListResult.Found)?.candidates.orEmpty()
+                            note = when (result) {
+                                is ComradeCore.TrackListResult.Refused -> result.reason
+                                is ComradeCore.TrackListResult.Failed -> result.reason
+                                is ComradeCore.TrackListResult.CannotSearch ->
+                                    context.getString(R.string.together_server_cannot_stream)
+                                else -> null
+                            }
+                            searching = false
+                        }
+                    },
+                ) { Text(stringResource(R.string.collections_open)) }
+                if (openItem == null || tab == 1) {
+                    tracks.forEach { candidate -> ServerRow(candidate = candidate) { onPlay(candidate) } }
+                }
+            }
+        }
+
+        openItem?.let { id ->
+            if (tab == 0) {
+                BrowserHeader(
+                    items.firstOrNull { it.identifier == id }?.title ?: id,
+                    onBack = { openItem = null },
+                )
+                tracks.forEach { candidate -> ServerRow(candidate = candidate) { onPlay(candidate) } }
+            }
+        }
+
+        if (searching) {
+            Text(stringResource(R.string.together_search_running), color = TogetherMuted)
+        }
+        note?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+    }
 }

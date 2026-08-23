@@ -2761,3 +2761,116 @@ device has drawn this grid, no `MediaStore` has answered it, and nothing here ha
 run a `LazyVerticalGrid` or decoded a cover. How it *looks* — tile size, how the
 adaptive column count lands on a real 360 dp phone, whether 144 dp of cover is
 enough — is CI's and then a handset's.
+
+## 23. Streaming from your own server, and the player's own library
+
+_Added 2026-08-24, owner request: the Together tab as a full music player that
+streams online, in the way §20 said it could be filled._
+
+### The source: Subsonic/Navidrome, and why that is the online streaming here
+
+§20 left the pluggable tier pluggable and empty. It is now filled — by the one
+shape of online source this app can carry without touching the line
+`catalogue.rs`'s header draws: a **self-hosted Subsonic-compatible server**
+(Navidrome, Gonic, Airsonic). The user points the app at a server they own;
+`comrade_core::subsonic` searches its `search3`, builds `/rest/stream` URLs,
+and every URL is run through `together::valid_stream_url` **inside core** before
+a candidate exists. What reaches the screen is only what a Together session
+will accept unchanged — the guard runs at construction, not again at the edge,
+because a filter total at one layer must not depend on another layer remembering.
+
+The auth is Subsonic's salted token (`md5(password + salt)`), implemented in
+~90 inline lines pinned to the RFC 1321 suite rather than added as a
+dependency — the same call `urlencode` made. The reason token auth matters more
+here than in an ordinary client: **the stream URL travels to the peer** in a
+Together invitation. A per-request token lets them fetch that file, which is
+what being invited means; the password itself never leaves the phone, and the
+source card says so before anything is shared.
+
+What was *not* written, still: adapters that defeat a protection measure. That
+decision of §20's stands; this module exists because Subsonic serves plain
+progressive HTTPS by design, which is also why such sessions earn the fine
+sync ladder (`TogetherContent::tuning`) — the same player, the same accurate
+positions, the same rate-trimmable corrections as a local file.
+
+### The second catalogue: Jamendo
+
+`parse_jamendo` gives the by-name search a second resolver behind
+[`CatalogueResolver`], and `CatalogueMatch` now carries a `source` field — the
+exact move §20 predicted when it called TogetherScreen's `MUSICBRAINZ`
+constant "a lie waiting to happen". The constant is gone; the row names the
+catalogue that answered.
+
+Jamendo declares a Creative Commons licence per track and serves direct files,
+so for the first time [`choose_audio_plan`]'s OpenLicence tier has something
+true to check: its rows get working download buttons through §21's gate with
+zero new policy. Where an artist switched `audiodownload_allowed` off, the
+match carries the stream URL but fails `is_openly_fetchable` — serving is not
+licensing, now enforced end to end.
+
+### The player library: favourites, history, playlists, queue
+
+Four vault trees (`player_*`) and fifteen FFI methods close what §20 called
+"nothing at all":
+
+- **Favourites** keyed by track key; toggle answers what it now is.
+- **History** is one entry per track, timestamp updated in place, capped at
+  100 — recently played, not a diary of plays.
+- **Playlists** are named ordered lists; removing by key takes out every copy,
+  because the key is the identity and "one of the two" is not a request the
+  API can understand.
+- **Queue snapshots** save on pause and on leave (Android's `saveQueueSnapshot`),
+  so the resume point survives.
+
+All of it is vault-backed and therefore answers `VaultLocked` while locked.
+That is deliberate and worth defending once more than usual: what somebody
+plays and loves is diary data, and the app's existing bar for reading diaries
+is an unlocked vault. An empty library would have been easier and would lie.
+
+### Player extras: shuffle, repeat, sleep, speed, EQ, lyrics
+
+The BlackHole-shaped control set, each landed where it is *true*:
+
+- **Shuffle** keeps the current track first (`TogetherDecisions.shuffledOrder`,
+  Fisher-Yates on an injected Random so tests pin orders); next and previous
+  follow the order, not the files.
+- **Repeat** OFF/ALL/ONE answers only what happens when a track ends by
+  itself — a manual skip under repeat-one still moves, which is
+  `manualNextIndex` and its own test.
+- **Auto-advance is solo-only by definition**: a leader's completion is a
+  playhead fact for the follower to follow, and both devices deciding would
+  race.
+- **Speed is solo-only** for a sharper reason: the correction ladder trims
+  rate continuously to hold two playheads together; a user multiplier under
+  that would fight it. `speedAllowed` gates the control to where nobody is
+  following.
+- **Sleep timer** pauses via `setState`, so both devices stop together.
+- **Equalizer** attaches per audio session, only where our decoder mixes the
+  sound (never an embed or a followed app); levels stored in millibels, the
+  device's own unit, so no layer converts anything.
+- **Lyrics** come from LRCLIB (keyless), parsed twice - Rust and Kotlin -
+  pinned by shared fixtures; the highlight is the last line that started.
+
+### Public collections: Internet Archive and podcast feeds
+
+Two more keyless sources behind one card. Archive search leads to an item's
+guarded file list (`direct_media_url` passes - these name real files); a
+pasted feed URL yields every episode as a candidate. Every URL built here
+passed the peer guard inside core before it was a row. Jellyfin users are
+covered as well, through Jellyfin's official Subsonic-compatibility plugin
+and the existing server adapter.
+
+### What is still missing
+
+- **Playlist editing depth** - create/open/play/remove shipped; reordering
+  within a playlist did not.
+- **Desktop and Flutter reach.** Android-first per the standing directive;
+  desktop's panel can call the same free functions, and Flutter needs the frb
+  mirror regenerated (`flutter_rust_bridge_codegen generate`) - deliberately
+  not done blind, since codegen cannot run where Dart cannot build.
+- **Adapters that defeat protection measures.** Still not written, still on
+  purpose - repeating the request does not change what such code *is*.
+  Spotify means Widevine; JioSaavn's URLs mean their secret DES key; YouTube
+  Music means InnerTube extraction. The sanctioned set stands instead: your
+  server, public collections, podcasts, open licences, embeds, and an
+  external-app follow mode.

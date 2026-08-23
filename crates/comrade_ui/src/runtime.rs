@@ -118,6 +118,9 @@ fn relay_policy_to_prefs(policy: RelayPolicy) -> comrade_storage::SharePrefs {
 use comrade_core::catalogue::OpenLicence;
 use comrade_core::catalogue::{choose_audio_plan, AudioPlan, CatalogueMatch};
 use comrade_core::download::{permit_download, DownloadRefusal};
+// The network half of the streaming source exists only where sockets do; the
+// config type crosses the FFI in every build.
+use comrade_core::subsonic::SubsonicConfig;
 use comrade_core::tara::{
     tara_chat_answer, tara_chat_line, CompanionEngine, JournalSignal, ReflectiveCompanion,
 };
@@ -131,6 +134,8 @@ use comrade_core::together::{
 use comrade_core::vault::{
     build_pay_regex, extract_upi_intents, PayRegex, VaultCallback, VaultEngine, VaultMessage,
 };
+#[cfg(feature = "catalogue-http")]
+use comrade_core::{public_sources, subsonic};
 use nostr_sdk::prelude::{EventId, Metadata, PublicKey, ToBech32};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
@@ -854,28 +859,462 @@ pub fn audio_plan(
 /// A catalogue lookup is public data about a public recording, so this works
 /// before unlock — deliberately. The alternative is asking somebody to unlock a
 /// vault to find out what a song is called.
-pub async fn catalogue_lookup(query: &str) -> Result<Vec<CatalogueMatch>, UiError> {
+pub async fn catalogue_lookup(
+    query: &str,
+    jamendo_client_id: Option<String>,
+) -> Result<Vec<CatalogueMatch>, UiError> {
     let q = query.trim();
     if q.is_empty() {
         return Ok(Vec::new());
     }
     #[cfg(feature = "catalogue-http")]
     {
-        use comrade_core::catalogue::{CatalogueResolver, MusicBrainz};
+        use comrade_core::catalogue::{CatalogueResolver, Jamendo, MusicBrainz};
         // MusicBrainz asks that clients identify themselves, and a generic
         // agent is what gets a project rate-limited. No version: the string
         // would then change with every release for no benefit to them.
-        let resolver = MusicBrainz::new("comrade/1.0 (https://github.com/cmullu/comrade)");
-        resolver
-            .lookup(q)
-            .await
-            .map_err(|e| UiError::Catalogue(e.to_string()))
+        let mb = MusicBrainz::new("comrade/1.0 (https://github.com/cmullu/comrade)");
+        // Both resolvers run together — neither depends on the other, and
+        // serialising them doubles the wait a composer is already absorbing.
+        let jamendo = async {
+            match jamendo_client_id
+                .as_deref()
+                .filter(|id| !id.trim().is_empty())
+            {
+                Some(id) => Jamendo::new(id.trim()).lookup(q).await.ok(),
+                // No key configured is an empty answer, not an error: this
+                // catalogue is optional by design, and its absence must not
+                // read as MusicBrainz having failed.
+                None => None,
+            }
+        };
+        let (mb_res, jam_res) = tokio::join!(mb.lookup(q), jamendo);
+        let mut out = Vec::with_capacity(comrade_core::catalogue::MAX_CANDIDATES * 2);
+        match (&mb_res, &jam_res) {
+            // Both failed: one error, not two half-answers.
+            (Err(e), None) => return Err(UiError::Catalogue(e.to_string())),
+            _ => {}
+        }
+        if let Ok(matches) = mb_res {
+            out.extend(matches);
+        }
+        if let Some(matches) = jam_res {
+            out.extend(matches);
+        }
+        out.truncate(comrade_core::catalogue::MAX_CANDIDATES * 2);
+        Ok(out)
     }
     #[cfg(not(feature = "catalogue-http"))]
     {
+        // Named so the unused-parameter lint cannot eat the signature change:
+        // the lean build refuses identically whether or not a key was passed.
+        let _ = jamendo_client_id;
         Err(UiError::CatalogueUnavailable)
     }
 }
+
+// ── Streaming from a server you own ─────────────────────────────────────────
+
+/// One playable row from a self-hosted streaming source, ready for a player or
+/// a Together invitation.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct StreamCandidateDto {
+    pub title: String,
+    pub artist: String,
+    pub album: Option<String>,
+    pub duration_ms: u64,
+    /// The URL both halves of a stream session will fetch.
+    pub stream_url: String,
+    pub artwork_url: Option<String>,
+}
+
+/// What a streaming search came back with — **flat, not a `Result`**, because
+/// none of these arms is exceptional and each needs its own sentence:
+///
+/// - "you have no server saved yet" ([`Self::NotConfigured`]) is a setup step,
+/// - "this build cannot stream" ([`Self::BuildCannotSearch`]) is a build fact,
+/// - "the server said no / could not be reached" ([`Self::Failed`]) is the
+///   server's or network's answer, carried verbatim,
+/// - and an empty [`Self::Found`] really means "nothing matched".
+///
+/// Collapsing these into one error string is how a missing config ends up
+/// rendered as "no results" — the exact wrong-answer shape §20 exists to
+/// prevent. It is also deliberately not a new `UiError` variant: that enum is
+/// mirrored into the Flutter bridge, where adding a case breaks four CI lanes
+/// for no informational gain over a typed value.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum StreamSearchOutcome {
+    Found {
+        candidates: Vec<StreamCandidateDto>,
+    },
+    /// No server has been saved yet. The UI's job is to point at settings.
+    NotConfigured,
+    /// The build has no network support (`catalogue-http` off) — a different
+    /// sentence from any server-side failure.
+    BuildCannotSearch,
+    /// The server refused, lied, or was unreachable. Its own words, not ours.
+    Failed {
+        reason: String,
+    },
+}
+
+/// Search one Subsonic/Navidrome server — the online-streaming source this app
+/// sanctions: your library, your server, plain progressive HTTPS out.
+///
+/// A free function like [`catalogue_lookup`] and for the same reason: nothing
+/// here reads runtime state, so no caller can hold a lock across the round
+/// trip. `config` arrives per call from the frontend's own settings store; it
+/// is never persisted here, and `None` is the ordinary pre-setup state rather
+/// than an error.
+///
+/// Rows whose URL cannot pass the peer guard are dropped inside core, so every
+/// candidate returned is one a Together session will accept unchanged.
+pub async fn subsonic_search(config: Option<SubsonicConfig>, query: String) -> StreamSearchOutcome {
+    #[cfg(feature = "catalogue-http")]
+    {
+        let Some(cfg) = config else {
+            return StreamSearchOutcome::NotConfigured;
+        };
+        let q = query.trim();
+        if q.is_empty() {
+            return StreamSearchOutcome::Found {
+                candidates: Vec::new(),
+            };
+        }
+        match subsonic::lookup(&cfg, q).await {
+            Ok(rows) => StreamSearchOutcome::Found {
+                candidates: rows
+                    .into_iter()
+                    .filter_map(|row| {
+                        Some(StreamCandidateDto {
+                            title: row.title,
+                            artist: row.artist,
+                            album: row.album,
+                            duration_ms: row.duration_ms,
+                            // Built under the peer guard already; a `None`
+                            // here means the origin failed it, and the filter
+                            // stays total rather than trusting that upstream.
+                            stream_url: row.stream_url?,
+                            artwork_url: row.artwork_url,
+                        })
+                    })
+                    .collect(),
+            },
+            Err(subsonic::SearchError::BadServer(issue)) => StreamSearchOutcome::Failed {
+                reason: issue.to_string(),
+            },
+            Err(subsonic::SearchError::ServerRejected(detail)) => {
+                StreamSearchOutcome::Failed { reason: detail }
+            }
+            Err(subsonic::SearchError::Unreachable(detail)) => {
+                StreamSearchOutcome::Failed { reason: detail }
+            }
+        }
+    }
+    #[cfg(not(feature = "catalogue-http"))]
+    {
+        let _ = (config, query);
+        StreamSearchOutcome::BuildCannotSearch
+    }
+}
+
+// ── Public collections & lyrics ─────────────────────────────────────────────
+
+/// One Internet Archive collection, as a search row.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ArchiveItemDto {
+    pub identifier: String,
+    pub title: String,
+    pub creator: String,
+}
+
+/// One playable track from any public source. Same shape the streaming server
+/// answers with — a URL already guarded in core is a URL any of these screens
+/// can start a session from without a second thought.
+pub type StreamCandidate = StreamCandidateDto;
+
+/// What an archive search came back with — flat, like [`StreamSearchOutcome`].
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum CollectionSearchOutcome {
+    Found { items: Vec<ArchiveItemDto> },
+    BuildCannotSearch,
+    Failed { reason: String },
+}
+
+/// What a track listing (archive item / podcast feed) came back with.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum TrackListOutcome {
+    Found {
+        candidates: Vec<StreamCandidate>,
+    },
+    /// The feed address itself failed the shareable-URL guard.
+    Refused {
+        reason: String,
+    },
+    BuildCannotSearch,
+    Failed {
+        reason: String,
+    },
+}
+
+/// One timed lyric line.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct LyricLineDto {
+    pub at_ms: u64,
+    pub text: String,
+}
+
+/// What a lyrics lookup came back with. `Found` with an empty list means "no
+/// synced lyrics exist for this" — a real answer, distinct from a failure.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum LyricsOutcome {
+    Found { lines: Vec<LyricLineDto> },
+    BuildCannotSearch,
+    Failed { reason: String },
+}
+
+#[cfg(feature = "catalogue-http")]
+fn tracks_outcome(result: Result<Vec<public_sources::PublicTrack>, String>) -> TrackListOutcome {
+    match result {
+        Ok(rows) => TrackListOutcome::Found {
+            candidates: rows
+                .into_iter()
+                .map(|t| StreamCandidate {
+                    title: t.title,
+                    artist: t.artist,
+                    album: t.album,
+                    duration_ms: t.duration_ms,
+                    stream_url: t.url,
+                    artwork_url: t.artwork_url,
+                })
+                .collect(),
+        },
+        Err(e) => TrackListOutcome::Failed { reason: e },
+    }
+}
+
+/// Search the Internet Archive's audio collections.
+pub async fn archive_search(query: String) -> CollectionSearchOutcome {
+    #[cfg(feature = "catalogue-http")]
+    {
+        match public_sources::archive_search(query.trim()).await {
+            Ok(items) => CollectionSearchOutcome::Found {
+                items: items
+                    .into_iter()
+                    .map(|i| ArchiveItemDto {
+                        identifier: i.identifier,
+                        title: i.title,
+                        creator: i.creator,
+                    })
+                    .collect(),
+            },
+            Err(e) => CollectionSearchOutcome::Failed { reason: e },
+        }
+    }
+    #[cfg(not(feature = "catalogue-http"))]
+    {
+        let _ = query;
+        CollectionSearchOutcome::BuildCannotSearch
+    }
+}
+
+/// List one archive item's playable files.
+pub async fn archive_tracks(identifier: String) -> TrackListOutcome {
+    #[cfg(feature = "catalogue-http")]
+    {
+        tracks_outcome(public_sources::archive_tracks(&identifier).await)
+    }
+    #[cfg(not(feature = "catalogue-http"))]
+    {
+        let _ = identifier;
+        TrackListOutcome::BuildCannotSearch
+    }
+}
+
+/// List one podcast feed's episodes.
+///
+/// A refused feed address is its own arm: "that is not a shareable https
+/// address" and "the feed could not be fetched" are different sentences about
+/// different fixes.
+pub async fn podcast_episodes(feed_url: String) -> TrackListOutcome {
+    #[cfg(feature = "catalogue-http")]
+    {
+        if !comrade_core::together::valid_stream_url(feed_url.trim()) {
+            return TrackListOutcome::Refused {
+                reason: "the feed must be an https address at a named host".into(),
+            };
+        }
+        tracks_outcome(public_sources::podcast_episodes(feed_url.trim()).await)
+    }
+    #[cfg(not(feature = "catalogue-http"))]
+    {
+        let _ = feed_url;
+        TrackListOutcome::BuildCannotSearch
+    }
+}
+
+/// Synced lyrics, newest lines first by time. Empty `Found` = none exists.
+pub async fn lyrics_lookup(title: String, artist: String, duration_ms: u64) -> LyricsOutcome {
+    #[cfg(feature = "catalogue-http")]
+    {
+        match public_sources::lrc_lookup(&title, &artist, duration_ms).await {
+            Ok(lines) => LyricsOutcome::Found {
+                lines: lines
+                    .into_iter()
+                    .map(|l| LyricLineDto {
+                        at_ms: l.at_ms,
+                        text: l.text,
+                    })
+                    .collect(),
+            },
+            Err(e) => LyricsOutcome::Failed { reason: e },
+        }
+    }
+    #[cfg(not(feature = "catalogue-http"))]
+    {
+        let _ = (title, artist, duration_ms);
+        LyricsOutcome::BuildCannotSearch
+    }
+}
+
+// ── The player's own library ─────────────────────────────────────────────────
+//
+// Favourites, recently-played, playlists and the persisted queue: the half
+// `docs/TOGETHER.md` §20 called "the half that makes it a music player rather
+// than a session tool", which until now had no storage, no FFI and no screen.
+//
+// Everything here lives in the **encrypted vault**, because this is personal
+// listening data — what somebody plays and loves is a diary — and the vault is
+// where this app keeps diaries. The consequence is stated rather than hidden:
+// every method answers [`UiError::VaultLocked`] while locked. A music player
+// that shows an empty library when the phone is locked is telling the truth.
+//
+// The trees are written through [`EncryptedStore`]'s generic put/get, like the
+// settings tree, rather than through new `comrade_storage` typed helpers: four
+// small collections with one accessor each are not worth a repository layer,
+// and runtime.rs already owns the settings tree the same way.
+
+/// Where a track came from, which decides how it can be played again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum)]
+#[serde(rename_all = "snake_case")]
+pub enum PlayerTrackKind {
+    /// A file on this device (`local:<media store id>`).
+    Local,
+    /// A URL this device streams (`stream:<url>`).
+    Stream,
+    /// A YouTube video (`youtube:<video id>`).
+    Youtube,
+}
+
+/// One track in the player's own library.
+///
+/// `key` is the identity everywhere: favourites are keyed by it, history is
+/// deduplicated on it, playlists order by it. It encodes both kind and id —
+/// `local:4171`, `stream:https://…`, `youtube:dQw4w9WgXcQ` — so a single
+/// string can be asked "do I love you?" without carrying the rest of the row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct PlayerTrackDto {
+    pub key: String,
+    pub title: String,
+    pub artist: String,
+    pub album: Option<String>,
+    /// Zero when nothing reliable is known; [`PlayerTrackKind::Stream`] rows
+    /// carry what their server said, local files what MediaStore did.
+    pub duration_ms: u64,
+    /// The stream URL or YouTube id, when the track is not on this device.
+    pub url: Option<String>,
+    pub kind: PlayerTrackKind,
+}
+
+impl PlayerTrackDto {
+    /// A stream candidate from a server search, as a library track.
+    pub fn from_stream(c: &StreamCandidateDto) -> Self {
+        Self {
+            key: format!("stream:{}", c.stream_url),
+            title: c.title.clone(),
+            artist: c.artist.clone(),
+            album: c.album.clone(),
+            duration_ms: c.duration_ms,
+            url: Some(c.stream_url.clone()),
+            kind: PlayerTrackKind::Stream,
+        }
+    }
+}
+
+/// One recently-played answer: the track and *when* it was last played.
+///
+/// History is one entry per track keyed by its [key][PlayerTrackDto::key] with
+/// the timestamp updated, not an append log — playing the same song twice does
+/// not make it twice as interesting, and a list that shows it once per day
+/// played is what "recently played" means on every player this feature was
+/// modelled on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct HistoryEntryDto {
+    pub track: PlayerTrackDto,
+    /// Milliseconds since the epoch, as the caller recorded it. Core never
+    /// invents timestamps: a caller that says zero gets a zero ordered last.
+    pub at_ms: u64,
+}
+
+/// A named, ordered list of tracks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct PlaylistDto {
+    pub id: String,
+    pub name: String,
+    pub created_at_ms: u64,
+    pub tracks: Vec<PlayerTrackDto>,
+}
+
+/// The queue as it stood when saved, so a killed app resumes mid-queue rather
+/// than at the top of a lost one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct SavedQueueDto {
+    pub tracks: Vec<PlayerTrackDto>,
+    /// Which entry was playing. Out of bounds after edits upstream is handled
+    /// by the loader: it clamps rather than errors, because a queue one past
+    /// its end is still a queue.
+    pub index: u32,
+    pub position_ms: u64,
+    pub saved_at_ms: u64,
+}
+
+/// How many history entries survive. A year of daily listening is a few
+/// hundred; beyond that the oldest falls off, which is the point of "recent".
+pub const HISTORY_MAX_ENTRIES: usize = 100;
+
+/// Order history newest-first and cap it.
+///
+/// Pure so the rule is testable without a vault: sort descending by time,
+/// drop past [`HISTORY_MAX_ENTRIES`]. Stable sort, so two entries recorded at
+/// the same millisecond keep the order the store handed them up in.
+pub fn prune_history(mut entries: Vec<HistoryEntryDto>) -> Vec<HistoryEntryDto> {
+    entries.sort_by_key(|e| std::cmp::Reverse(e.at_ms));
+    entries.truncate(HISTORY_MAX_ENTRIES);
+    entries
+}
+
+/// An id for a new playlist.
+///
+/// Nanoseconds plus a process-lifetime counter: unique enough for keys in one
+/// person's vault, and honest about being no more than that — this is not a
+/// distributed identifier and must not become one.
+fn fresh_playlist_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("pl{nanos:x}{:x}", COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+const PLAYER_FAVOURITES_TREE: &str = "player_favourites";
+const PLAYER_HISTORY_TREE: &str = "player_history";
+const PLAYER_PLAYLISTS_TREE: &str = "player_playlists";
+const PLAYER_QUEUE_TREE: &str = "player_queue";
+/// One queue snapshot per device, under one key — there is exactly one live
+/// queue, and a previous snapshot is overwritten, not archived.
+const PLAYER_QUEUE_KEY: &str = "current";
 
 /// Whether a catalogue answer may be downloaded, and if not, why.
 ///
@@ -3745,6 +4184,232 @@ impl ComradeRuntime {
                 url: None,
             },
         }
+    }
+
+    // ── The player's own library ─────────────────────────────────────────────
+    //
+    // Favourites, history, playlists and the saved queue. Every method here is
+    // a quick local read or write — no await, no network, no third party — so
+    // holding the runtime lock for its duration is the same non-event it is
+    // for the settings tree beside which these trees live. The vault rule is
+    // the one shared gate: [`UiError::VaultLocked`] while locked, because
+    // listening data is diary data.
+
+    /// Every favourited track, unordered (the UI orders).
+    ///
+    /// Unordered on purpose: the store's key order is an implementation detail,
+    /// and pretending it means something invites screens that break when the
+    /// storage engine changes iteration order. A screen that wants recency has
+    /// history for that.
+    pub fn favourites_list(&self) -> Result<Vec<PlayerTrackDto>, UiError> {
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        store
+            .values::<PlayerTrackDto>(PLAYER_FAVOURITES_TREE)
+            .map_err(|e| UiError::Storage(e.to_string()))
+    }
+
+    /// Whether `key` is favourited — asked per row while drawing a list.
+    pub fn favourite_is(&self, key: String) -> Result<bool, UiError> {
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        store
+            .contains(PLAYER_FAVOURITES_TREE, &key)
+            .map_err(|e| UiError::Storage(e.to_string()))
+    }
+
+    /// Toggle a favourite; answers what it now **is**, so a toggle button can
+    /// render from the return value without a second call racing it.
+    pub fn favourite_toggle(&self, track: PlayerTrackDto) -> Result<bool, UiError> {
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        let was = store
+            .contains(PLAYER_FAVOURITES_TREE, &track.key)
+            .map_err(|e| UiError::Storage(e.to_string()))?;
+        let result = if was {
+            store.delete(PLAYER_FAVOURITES_TREE, &track.key).map(|_| ())
+        } else {
+            store.put(PLAYER_FAVOURITES_TREE, &track.key, &track)
+        };
+        result
+            .and_then(|()| store.flush())
+            .map_err(|e| UiError::Storage(e.to_string()))?;
+        Ok(!was)
+    }
+
+    /// Record that `track` was just played.
+    ///
+    /// One entry per track, timestamp updated in place, oldest evicted past
+    /// [`HISTORY_MAX_ENTRIES`] — see [`prune_history`] for the whole rule. A
+    /// failed write is swallowed rather than surfaced: playback must never
+    /// error because its diary could not be written.
+    pub fn history_record(&self, track: PlayerTrackDto, at_ms: u64) -> Result<(), UiError> {
+        let Some(store) = self.ui.store_ref() else {
+            return Ok(());
+        };
+        let key = track.key.clone();
+        let _ = store.put(PLAYER_HISTORY_TREE, &key, &HistoryEntryDto { track, at_ms });
+        if store.flush().is_err() {
+            return Ok(());
+        }
+        self.history_prune_locked();
+        Ok(())
+    }
+
+    /// Recently played, newest first.
+    pub fn history_list(&self) -> Result<Vec<HistoryEntryDto>, UiError> {
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        let entries: Vec<HistoryEntryDto> = store
+            .values(PLAYER_HISTORY_TREE)
+            .map_err(|e| UiError::Storage(e.to_string()))?;
+        Ok(prune_history(entries))
+    }
+
+    /// Forget everything recently played. A privacy action, not housekeeping —
+    /// which is why it is one tap rather than a rolling window nobody controls.
+    pub fn history_clear(&self) -> Result<(), UiError> {
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        for key in store
+            .keys(PLAYER_HISTORY_TREE)
+            .map_err(|e| UiError::Storage(e.to_string()))?
+        {
+            store
+                .delete(PLAYER_HISTORY_TREE, &key)
+                .map_err(|e| UiError::Storage(e.to_string()))?;
+        }
+        store.flush().map_err(|e| UiError::Storage(e.to_string()))
+    }
+
+    /// Evict past the cap. Called after writes; errors are swallowed by the
+    /// same argument as [`Self::history_record`].
+    fn history_prune_locked(&self) {
+        let Some(store) = self.ui.store_ref() else {
+            return;
+        };
+        let Ok(all) = store.values::<HistoryEntryDto>(PLAYER_HISTORY_TREE) else {
+            return;
+        };
+        if all.len() <= HISTORY_MAX_ENTRIES {
+            return;
+        }
+        // The surviving keys, per the shared rule; everything else is deleted.
+        let keep: std::collections::HashSet<String> = prune_history(all)
+            .into_iter()
+            .map(|e| e.track.key)
+            .collect();
+        let Ok(keys) = store.keys(PLAYER_HISTORY_TREE) else {
+            return;
+        };
+        for key in keys {
+            if !keep.contains(&key) {
+                let _ = store.delete(PLAYER_HISTORY_TREE, &key);
+            }
+        }
+        let _ = store.flush();
+    }
+
+    /// Every playlist, each with its tracks in playlist order.
+    pub fn playlists_list(&self) -> Result<Vec<PlaylistDto>, UiError> {
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        let mut lists: Vec<PlaylistDto> = store
+            .values(PLAYER_PLAYLISTS_TREE)
+            .map_err(|e| UiError::Storage(e.to_string()))?;
+        lists.sort_by_key(|l| l.created_at_ms);
+        Ok(lists)
+    }
+
+    /// Create an empty playlist, answering its id.
+    pub fn playlist_create(&self, name: String, created_at_ms: u64) -> Result<String, UiError> {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return Err(UiError::Engine("a playlist needs a name".into()));
+        }
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        let id = fresh_playlist_id();
+        store
+            .put(
+                PLAYER_PLAYLISTS_TREE,
+                &id,
+                &PlaylistDto {
+                    id: id.clone(),
+                    name,
+                    created_at_ms,
+                    tracks: Vec::new(),
+                },
+            )
+            .and_then(|()| store.flush())
+            .map_err(|e| UiError::Storage(e.to_string()))?;
+        Ok(id)
+    }
+
+    /// Delete a playlist. Its tracks are untouched elsewhere: deleting a list
+    /// never deletes music.
+    pub fn playlist_delete(&self, id: String) -> Result<(), UiError> {
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        store
+            .delete(PLAYER_PLAYLISTS_TREE, &id)
+            .and_then(|_| store.flush())
+            .map_err(|e| UiError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Append a track to a playlist. Duplicates are allowed and are the
+    /// caller's business — a mixtape may say the same song twice.
+    pub fn playlist_add_track(&self, id: String, track: PlayerTrackDto) -> Result<(), UiError> {
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        let mut list = store
+            .get::<PlaylistDto>(PLAYER_PLAYLISTS_TREE, &id)
+            .map_err(|e| UiError::Storage(e.to_string()))?
+            .ok_or_else(|| UiError::Engine(format!("no playlist {id}")))?;
+        list.tracks.push(track);
+        store
+            .put(PLAYER_PLAYLISTS_TREE, &id, &list)
+            .and_then(|()| store.flush())
+            .map_err(|e| UiError::Storage(e.to_string()))
+    }
+
+    /// Remove every copy of the track whose [key][PlayerTrackDto::key] is
+    /// `track_key`.
+    ///
+    /// **Every copy, not one** — the key is the identity, so two rows carrying
+    /// it are not distinguishable enough to remove between. Removing an absent
+    /// track succeeds quietly: the requested end state ("this track is not in
+    /// this list") already holds.
+    pub fn playlist_remove_track(&self, id: String, track_key: String) -> Result<(), UiError> {
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        let mut list = store
+            .get::<PlaylistDto>(PLAYER_PLAYLISTS_TREE, &id)
+            .map_err(|e| UiError::Storage(e.to_string()))?
+            .ok_or_else(|| UiError::Engine(format!("no playlist {id}")))?;
+        list.tracks.retain(|t| t.key != track_key);
+        store
+            .put(PLAYER_PLAYLISTS_TREE, &id, &list)
+            .and_then(|()| store.flush())
+            .map_err(|e| UiError::Storage(e.to_string()))
+    }
+
+    /// Save the live queue over any previous snapshot.
+    pub fn queue_save(&self, queue: SavedQueueDto) -> Result<(), UiError> {
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        store
+            .put(PLAYER_QUEUE_TREE, PLAYER_QUEUE_KEY, &queue)
+            .and_then(|()| store.flush())
+            .map_err(|e| UiError::Storage(e.to_string()))
+    }
+
+    /// The saved queue, if any.
+    pub fn queue_load(&self) -> Result<Option<SavedQueueDto>, UiError> {
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        store
+            .get(PLAYER_QUEUE_TREE, PLAYER_QUEUE_KEY)
+            .map_err(|e| UiError::Storage(e.to_string()))
+    }
+
+    /// Forget the saved queue — "start fresh" is a choice worth making.
+    pub fn queue_clear(&self) -> Result<(), UiError> {
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        store
+            .delete(PLAYER_QUEUE_TREE, PLAYER_QUEUE_KEY)
+            .map(|_| ())
+            .and_then(|()| store.flush())
+            .map_err(|e| UiError::Storage(e.to_string()))
     }
 
     /// Begin a call to `peer`: mint a call id and return the session the
@@ -18639,7 +19304,196 @@ mod tests {
     /// a composer calls this as somebody clears the field.
     #[tokio::test]
     async fn an_empty_catalogue_query_is_no_results_rather_than_a_lookup() {
-        assert_eq!(catalogue_lookup("   ").await.unwrap(), Vec::new());
+        assert_eq!(catalogue_lookup("   ", None).await.unwrap(), Vec::new());
+    }
+
+    /// A streaming search with no server saved is a setup step, not a failure
+    /// — and never "no results", which would read as the library being empty.
+    /// Under a lean build the build fact outranks the setup one, mirroring the
+    /// catalogue test below.
+    #[tokio::test]
+    async fn a_streaming_search_without_a_config_asks_for_setup() {
+        let got = subsonic_search(None, "kun faya kun".into()).await;
+        #[cfg(feature = "catalogue-http")]
+        assert_eq!(got, StreamSearchOutcome::NotConfigured);
+        #[cfg(not(feature = "catalogue-http"))]
+        assert_eq!(got, StreamSearchOutcome::BuildCannotSearch);
+    }
+
+    // ── The player's own library ─────────────────────────────────────────────
+
+    fn a_track(key: &str) -> PlayerTrackDto {
+        PlayerTrackDto {
+            key: key.into(),
+            title: format!("track {key}"),
+            artist: "A. R. Rahman".into(),
+            album: Some("Rockstar".into()),
+            duration_ms: 327_000,
+            url: None,
+            kind: PlayerTrackKind::Local,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_favourite_toggles_and_answers_what_it_now_is() {
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+        rt.unlock_vault(dir.path(), "pin").await.unwrap();
+
+        let track = a_track("local:41");
+        assert!(!rt.favourite_is(track.key.clone()).unwrap());
+        assert!(
+            rt.favourite_toggle(track.clone()).unwrap(),
+            "first toggle adds"
+        );
+        assert!(rt.favourite_is(track.key.clone()).unwrap());
+        assert_eq!(rt.favourites_list().unwrap(), vec![track.clone()]);
+        assert!(
+            !rt.favourite_toggle(track.clone()).unwrap(),
+            "second removes"
+        );
+        assert!(rt.favourites_list().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn history_is_one_entry_per_track_newest_first_and_capped() {
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+        rt.unlock_vault(dir.path(), "pin").await.unwrap();
+
+        rt.history_record(a_track("a"), 1_000).unwrap();
+        rt.history_record(a_track("b"), 2_000).unwrap();
+        // Same track again: updated in place, not duplicated.
+        rt.history_record(a_track("a"), 3_000).unwrap();
+        let got = rt.history_list().unwrap();
+        assert_eq!(
+            got.iter().map(|e| e.track.key.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b"],
+            "most recent first, one row per track"
+        );
+
+        for i in 0..(HISTORY_MAX_ENTRIES + 10) {
+            rt.history_record(a_track(&format!("n{i}")), 10_000 + i as u64)
+                .unwrap();
+        }
+        let got = rt.history_list().unwrap();
+        assert_eq!(got.len(), HISTORY_MAX_ENTRIES);
+        assert!(
+            !got.iter().any(|e| e.track.key == "a"),
+            "the oldest entries fall off — that is what recent means"
+        );
+    }
+
+    #[tokio::test]
+    async fn history_clear_forgets_everything() {
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+        rt.unlock_vault(dir.path(), "pin").await.unwrap();
+        rt.history_record(a_track("a"), 1).unwrap();
+        rt.history_clear().unwrap();
+        assert!(rt.history_list().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn playlists_round_trip_in_order_and_delete_leaves_the_music() {
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+        rt.unlock_vault(dir.path(), "pin").await.unwrap();
+
+        assert!(
+            rt.playlist_create("   ".into(), 0).is_err(),
+            "an unnamed playlist is refused rather than invented"
+        );
+        let id = rt.playlist_create("Road trip".into(), 5).unwrap();
+        rt.playlist_add_track(id.clone(), a_track("a")).unwrap();
+        // A duplicate is allowed: a mixtape may say the same song twice.
+        rt.playlist_add_track(id.clone(), a_track("a")).unwrap();
+        rt.playlist_add_track(id.clone(), a_track("b")).unwrap();
+
+        let lists = rt.playlists_list().unwrap();
+        assert_eq!(lists.len(), 1);
+        assert_eq!(lists[0].name, "Road trip");
+        assert_eq!(
+            lists[0]
+                .tracks
+                .iter()
+                .map(|t| t.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "a", "b"],
+            "playlist order is insertion order"
+        );
+
+        // Removing by key takes out every copy — the key is the identity, so
+        // "one of the two" was never a request this API could understand.
+        rt.playlist_remove_track(id.clone(), "a".into()).unwrap();
+        assert_eq!(
+            rt.playlists_list().unwrap()[0]
+                .tracks
+                .iter()
+                .map(|t| t.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b"],
+        );
+
+        rt.playlist_delete(id).unwrap();
+        assert!(rt.playlists_list().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_queue_survives_a_save_load_cycle_and_clamps_nothing_here() {
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+        rt.unlock_vault(dir.path(), "pin").await.unwrap();
+
+        assert!(rt.queue_load().unwrap().is_none());
+        let queue = SavedQueueDto {
+            tracks: vec![a_track("a"), a_track("b")],
+            index: 1,
+            position_ms: 42_000,
+            saved_at_ms: 7,
+        };
+        rt.queue_save(queue.clone()).unwrap();
+        assert_eq!(rt.queue_load().unwrap(), Some(queue));
+        // Saving again overwrites rather than archives.
+        rt.queue_save(SavedQueueDto {
+            tracks: vec![],
+            index: 0,
+            position_ms: 0,
+            saved_at_ms: 9,
+        })
+        .unwrap();
+        assert_eq!(rt.queue_load().unwrap().map(|q| q.saved_at_ms), Some(9));
+        rt.queue_clear().unwrap();
+        assert!(rt.queue_load().unwrap().is_none());
+    }
+
+    /// The whole library answers `VaultLocked` while locked — these are diary
+    /// rows, and an unlocked vault is the app's own bar for reading diaries.
+    #[tokio::test]
+    async fn a_locked_vault_hides_the_player_library_behind_vault_locked() {
+        let rt = ComradeRuntime::new();
+        assert!(matches!(rt.favourites_list(), Err(UiError::VaultLocked)));
+        assert!(matches!(rt.history_list(), Err(UiError::VaultLocked)));
+        assert!(matches!(rt.playlists_list(), Err(UiError::VaultLocked)));
+        assert!(matches!(rt.queue_load(), Err(UiError::VaultLocked)));
+    }
+
+    /// A cleared search field must not reach the server, in every build that
+    /// could reach one at all.
+    #[cfg(feature = "catalogue-http")]
+    #[tokio::test]
+    async fn an_empty_streaming_query_is_an_empty_answer() {
+        let cfg = SubsonicConfig {
+            server: "https://music.example.com".into(),
+            username: "u".into(),
+            password: "p".into(),
+        };
+        assert_eq!(
+            subsonic_search(Some(cfg), "   ".into()).await,
+            StreamSearchOutcome::Found {
+                candidates: Vec::new()
+            }
+        );
     }
 
     /// The distinction [`UiError::CatalogueUnavailable`] exists for: this build
@@ -18651,7 +19505,7 @@ mod tests {
     /// MusicBrainz, which a test must not.
     #[tokio::test]
     async fn a_build_without_the_feature_says_so_instead_of_answering_nothing_found() {
-        let got = catalogue_lookup("kun faya kun").await;
+        let got = catalogue_lookup("kun faya kun", None).await;
         #[cfg(not(feature = "catalogue-http"))]
         assert!(
             matches!(got, Err(UiError::CatalogueUnavailable)),
@@ -18697,6 +19551,7 @@ mod tests {
 
         // Rung 3: nobody has it, and the archive's licence permits a copy.
         let open = CatalogueMatch {
+            source: "Test".into(),
             recording: want.clone(),
             duration_ms: Some(470_000),
             audio_url: Some("https://archive.example/kfk.flac".into()),
@@ -18713,6 +19568,7 @@ mod tests {
         // thereby licensed it. Same URL, undeclared licence, and the plan must
         // fall through to the embed rather than fetch it.
         let unlicensed = CatalogueMatch {
+            source: "Test".into(),
             recording: want.clone(),
             duration_ms: Some(470_000),
             audio_url: Some("https://archive.example/kfk.flac".into()),

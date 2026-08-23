@@ -1216,3 +1216,252 @@ val ExploreIcon: ImageVector = materialIcon(name = "Filled.Explore") {
         close()
     }
 }
+
+/**
+ * Material "computer" (filled) — a streaming server you own.
+ *
+ * Inlined like every other icon here rather than taking
+ * `material-icons-extended` for one glyph. A monitor-with-base reads as "a
+ * machine somewhere else that answers you", which is exactly what a
+ * Subsonic/Navidrome card is offering; a cloud would claim somebody else's
+ * infrastructure, and this feature's whole point is that there isn't any.
+ */
+val ComputerIcon: ImageVector = materialIcon(name = "Filled.Computer") {
+    materialPath {
+        moveTo(20.0f, 18.0f)
+        curveToRelative(1.1f, 0.0f, 2.0f, -0.9f, 2.0f, -2.0f)
+        verticalLineTo(6.0f)
+        curveToRelative(0.0f, -1.1f, -0.9f, -2.0f, -2.0f, -2.0f)
+        horizontalLineTo(4.0f)
+        curveToRelative(-1.1f, 0.0f, -2.0f, 0.9f, -2.0f, 2.0f)
+        verticalLineToRelative(10.0f)
+        curveToRelative(0.0f, 1.1f, 0.9f, 2.0f, 2.0f, 2.0f)
+        horizontalLineTo(0.0f)
+        verticalLineToRelative(2.0f)
+        horizontalLineToRelative(24.0f)
+        verticalLineToRelative(-2.0f)
+        horizontalLineToRelative(-4.0f)
+        close()
+        moveTo(4.0f, 6.0f)
+        horizontalLineToRelative(16.0f)
+        verticalLineToRelative(10.0f)
+        horizontalLineTo(4.0f)
+        verticalLineTo(6.0f)
+        close()
+    }
+}
+
+/** Material "shuffle" (filled) — the player extras row. */
+val ShuffleIcon: ImageVector = materialIcon(name = "Filled.Shuffle") {
+    materialPath {
+        moveTo(10.59f, 9.17f)
+        lineTo(5.41f, 4.0f)
+        lineTo(4.0f, 5.41f)
+        lineToRelative(5.17f, 5.17f)
+        lineToRelative(1.42f, -1.41f)
+        close()
+        moveTo(14.5f, 4.0f)
+        lineToRelative(2.04f, 2.04f)
+        lineTo(4.0f, 18.83f)
+        lineTo(5.41f, 20.0f)
+        lineTo(17.96f, 7.46f)
+        lineTo(20.0f, 9.5f)
+        verticalLineTo(4.0f)
+        horizontalLineToRelative(-5.5f)
+        close()
+        moveToRelative(0.33f, 9.41f)
+        lineToRelative(-1.41f, 1.41f)
+        lineToRelative(3.13f, 3.13f)
+        lineTo(14.5f, 20.0f)
+        horizontalLineTo(20.0f)
+        verticalLineToRelative(-5.5f)
+        lineToRelative(-2.04f, 2.04f)
+        lineToRelative(-3.13f, -3.13f)
+        close()
+    }
+}
+
+/** Material "repeat" (filled). */
+val RepeatIcon: ImageVector = materialIcon(name = "Filled.Repeat") {
+    materialPath {
+        moveTo(7.0f, 7.0f)
+        horizontalLineToRelative(10.0f)
+        verticalLineToRelative(3.0f)
+        lineToRelative(4.0f, -4.0f)
+        lineToRelative(-4.0f, -4.0f)
+        verticalLineToRelative(3.0f)
+        horizontalLineTo(5.0f)
+        verticalLineToRelative(6.0f)
+        horizontalLineToRelative(2.0f)
+        verticalLineTo(7.0f)
+        close()
+        moveTo(17.0f, 17.0f)
+        horizontalLineTo(7.0f)
+        verticalLineToRelative(-3.0f)
+        lineToRelative(-4.0f, 4.0f)
+        lineToRelative(4.0f, 4.0f)
+        verticalLineToRelative(-3.0f)
+        horizontalLineToRelative(12.0f)
+        verticalLineToRelative(-6.0f)
+        horizontalLineToRelative(-2.0f)
+        verticalLineToRelative(4.0f)
+        close()
+    }
+}
+
+/** Material "repeat_one" (filled) — repeat with the one in the middle. */
+val RepeatOneIcon: ImageVector = materialIcon(name = "Filled.RepeatOne") {
+    materialPath {
+        moveTo(7.0f, 7.0f)
+        horizontalLineToRelative(10.0f)
+        verticalLineToRelative(3.0f)
+        lineToRelative(4.0f, -4.0f)
+        lineToRelative(-4.0f, -4.0f)
+        verticalLineToRelative(3.0f)
+        horizontalLineTo(5.0f)
+        verticalLineToRelative(6.0f)
+        horizontalLineToRelative(2.0f)
+        verticalLineTo(7.0f)
+        close()
+        moveTo(17.0f, 17.0f)
+        horizontalLineTo(7.0f)
+        verticalLineToRelative(-3.0f)
+        lineToRelative(-4.0f, 4.0f)
+        lineToRelative(4.0f, 4.0f)
+        verticalLineToRelative(-3.0f)
+        horizontalLineToRelative(12.0f)
+        verticalLineToRelative(-6.0f)
+        horizontalLineToRelative(-2.0f)
+        verticalLineToRelative(4.0f)
+        close()
+        moveTo(13.0f, 15.0f)
+        verticalLineTo(9.0f)
+        horizontalLineToRelative(-1.0f)
+        lineToRelative(-2.0f, 1.0f)
+        verticalLineToRelative(1.0f)
+        horizontalLineToRelative(1.5f)
+        verticalLineToRelative(4.0f)
+        horizontalLineTo(13.0f)
+        close()
+    }
+}
+
+/** Material "speed" (filled) — playback rate. */
+val SpeedIcon: ImageVector = materialIcon(name = "Filled.Speed") {
+    materialPath {
+        moveTo(20.38f, 8.57f)
+        lineToRelative(-1.23f, 1.85f)
+        curveToRelative(0.0f, 0.0f, -0.0f, 0.0f, -0.0f, 0.0f)
+        arcToRelative(8.0f, 8.0f, 0.0f, false, true, -0.22f, 7.58f)
+        horizontalLineTo(5.07f)
+        arcToRelative(8.0f, 8.0f, 0.0f, false, true, 10.51f, -11.15f)
+        lineToRelative(1.85f, -1.23f)
+        arcTo(10.0f, 10.0f, 0.0f, false, false, 3.35f, 19.0f)
+        curveToRelative(-0.36f, 0.62f, -0.31f, 1.39f, 0.12f, 1.98f)
+        horizontalLineToRelative(16.95f)
+        curveToRelative(0.75f, 0.0f, 1.44f, -0.41f, 1.79f, -1.08f)
+        arcTo(10.0f, 10.0f, 0.0f, false, false, 20.38f, 8.57f)
+        close()
+        moveTo(10.59f, 15.41f)
+        curveToRelative(0.78f, 0.78f, 2.05f, 0.78f, 2.83f, 0.0f)
+        lineToRelative(5.66f, -8.49f)
+        lineToRelative(-8.49f, 5.66f)
+        curveToRelative(-0.78f, 0.78f, -0.78f, 2.05f, 0.0f, 2.83f)
+        close()
+    }
+}
+
+/** Material "bedtime" (filled) — the sleep timer. */
+val BedtimeIcon: ImageVector = materialIcon(name = "Filled.Bedtime") {
+    materialPath {
+        moveTo(12.34f, 2.02f)
+        curveTo(6.59f, 1.82f, 2.0f, 6.42f, 2.0f, 12.0f)
+        curveToRelative(0.0f, 5.52f, 4.48f, 10.0f, 10.0f, 10.0f)
+        curveToRelative(3.71f, 0.0f, 6.93f, -2.02f, 8.66f, -5.02f)
+        curveToRelative(-7.51f, -0.25f, -12.09f, -8.43f, -8.32f, -14.96f)
+        close()
+    }
+}
+
+/** Material "tune" (filled) — the equalizer. */
+val TuneIcon: ImageVector = materialIcon(name = "Filled.Tune") {
+    materialPath {
+        moveTo(3.0f, 17.0f)
+        verticalLineToRelative(2.0f)
+        horizontalLineToRelative(6.0f)
+        verticalLineToRelative(-2.0f)
+        horizontalLineTo(3.0f)
+        close()
+        moveTo(3.0f, 5.0f)
+        verticalLineToRelative(2.0f)
+        horizontalLineToRelative(10.0f)
+        verticalLineTo(5.0f)
+        horizontalLineTo(3.0f)
+        close()
+        moveTo(13.0f, 21.0f)
+        verticalLineToRelative(-2.0f)
+        horizontalLineToRelative(8.0f)
+        verticalLineToRelative(-2.0f)
+        horizontalLineToRelative(-8.0f)
+        verticalLineToRelative(-2.0f)
+        horizontalLineToRelative(-2.0f)
+        verticalLineToRelative(6.0f)
+        horizontalLineToRelative(2.0f)
+        close()
+        moveTo(7.0f, 9.0f)
+        verticalLineToRelative(2.0f)
+        horizontalLineTo(3.0f)
+        verticalLineToRelative(2.0f)
+        horizontalLineToRelative(4.0f)
+        verticalLineToRelative(2.0f)
+        horizontalLineToRelative(2.0f)
+        verticalLineTo(9.0f)
+        horizontalLineTo(7.0f)
+        close()
+        moveTo(21.0f, 13.0f)
+        verticalLineToRelative(-2.0f)
+        horizontalLineTo(11.0f)
+        verticalLineToRelative(2.0f)
+        horizontalLineToRelative(10.0f)
+        close()
+        moveTo(15.0f, 9.0f)
+        horizontalLineToRelative(2.0f)
+        verticalLineTo(7.0f)
+        horizontalLineToRelative(4.0f)
+        verticalLineTo(5.0f)
+        horizontalLineToRelative(-4.0f)
+        verticalLineTo(3.0f)
+        horizontalLineToRelative(-2.0f)
+        verticalLineToRelative(6.0f)
+        close()
+    }
+}
+
+/** Material "lyrics"-shaped note-plus-lines — synced lyrics sheet entry. */
+val LyricsIcon: ImageVector = materialIcon(name = "Filled.Lyrics") {
+    materialPath {
+        moveTo(14.0f, 9.0f)
+        horizontalLineTo(3.0f)
+        verticalLineToRelative(2.0f)
+        horizontalLineToRelative(11.0f)
+        verticalLineTo(9.0f)
+        close()
+        moveTo(14.0f, 5.0f)
+        horizontalLineTo(3.0f)
+        verticalLineToRelative(2.0f)
+        horizontalLineToRelative(11.0f)
+        verticalLineTo(5.0f)
+        close()
+        moveTo(18.0f, 13.0f)
+        verticalLineToRelative(6.0f)
+        lineToRelative(-5.0f, -3.0f)
+        lineTo(18.0f, 13.0f)
+        close()
+        moveTo(3.0f, 15.0f)
+        horizontalLineToRelative(7.0f)
+        verticalLineToRelative(-2.0f)
+        horizontalLineTo(3.0f)
+        verticalLineTo(15.0f)
+        close()
+    }
+}

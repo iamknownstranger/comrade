@@ -67,6 +67,17 @@ class TogetherPlayer(private val context: Context) : SessionPlayer {
     private var listener: Listener? = null
 
     /**
+     * The audio session this player outputs through, when a player exists.
+     *
+     * [PlayerEffects] attaches equalization here — one effect instance per
+     * session id, re-attached on every `open`, because `MediaPlayer()` mints a
+     * fresh session each time. Cleared on release like everything else the
+     * decoder owned.
+     */
+    var audioSessionId: Int? = null
+        private set
+
+    /**
      * The window to draw into, held here because it and the player have
      * independent lifetimes: the surface is destroyed and recreated on every
      * rotation and every trip through the background, while the player must
@@ -169,6 +180,7 @@ class TogetherPlayer(private val context: Context) : SessionPlayer {
             }
         }
         player = mp
+        audioSessionId = runCatching { mp.audioSessionId }.getOrNull()
         // Re-attach whatever the view already gave us: `open` is also how a
         // handed-over copy replaces the file mid-session, and the surface from
         // before that swap is still on screen.
@@ -233,6 +245,7 @@ class TogetherPlayer(private val context: Context) : SessionPlayer {
         runCatching { player?.release() }
         player = null
         prepared = false
+        audioSessionId = null
     }
 
     /**
