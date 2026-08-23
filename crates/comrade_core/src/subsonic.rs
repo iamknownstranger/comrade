@@ -271,7 +271,9 @@ fn md5(input: &[u8]) -> [u8; 16] {
         0x1032_5476u32,
     );
 
-    for block in msg.chunks_exact(64) {
+    // CI's clippy prefers `as_chunks` over `chunks_exact` when the size is a
+    // constant — same iteration, the block type carries the length.
+    for block in msg.as_chunks::<64>().0 {
         let m: [u32; 16] = std::array::from_fn(|i| {
             u32::from_le_bytes([
                 block[i * 4],
