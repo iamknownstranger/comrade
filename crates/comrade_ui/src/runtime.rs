@@ -890,10 +890,11 @@ pub async fn catalogue_lookup(
         };
         let (mb_res, jam_res) = tokio::join!(mb.lookup(q), jamendo);
         let mut out = Vec::with_capacity(comrade_core::catalogue::MAX_CANDIDATES * 2);
-        match (&mb_res, &jam_res) {
-            // Both failed: one error, not two half-answers.
-            (Err(e), None) => return Err(UiError::Catalogue(e.to_string())),
-            _ => {}
+        // Both failed: one error, not two half-answers. (`None` covers both
+        // an unconfigured Jamendo and a failed one — the former is ordinary
+        // and the latter is swallowed by design above.)
+        if let (Err(e), None) = (&mb_res, &jam_res) {
+            return Err(UiError::Catalogue(e.to_string()));
         }
         if let Ok(matches) = mb_res {
             out.extend(matches);
