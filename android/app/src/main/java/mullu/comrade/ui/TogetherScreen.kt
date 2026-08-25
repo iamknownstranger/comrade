@@ -3411,8 +3411,15 @@ private fun LyricsSheet(title: String, artist: String, durationMs: Long, positio
     val scope = rememberCoroutineScope()
     var lines by remember { mutableStateOf<List<TogetherDecisions.LyricLine>?>(null) }
     var note by remember { mutableStateOf<String?>(null) }
+    // Resolved here, outside the effect: `stringResource` is composable-only,
+    // and the failure sentences carry an argument, so those go through the
+    // context instead.
+    val loadingNote = stringResource(R.string.lyrics_loading)
+    val noneNote = stringResource(R.string.lyrics_none)
+    val cannotSearchNote = stringResource(R.string.together_server_cannot_stream)
+    val context = LocalContext.current
     LaunchedEffect(title, artist) {
-        note = stringResource(R.string.lyrics_loading)
+        note = loadingNote
         val result = withContext(Dispatchers.IO) {
             ComradeCore.lyricsLookup(title, artist, durationMs)
         }
@@ -3421,10 +3428,11 @@ private fun LyricsSheet(title: String, artist: String, durationMs: Long, positio
                 lines = result.lines.map {
                     TogetherDecisions.LyricLine(it.atMs.toLong(), it.text)
                 }
-                if (result.lines.isEmpty()) note = stringResource(R.string.lyrics_none) else note = null
+                note = if (result.lines.isEmpty()) noneNote else null
             }
-            is ComradeCore.LyricsResult.CannotSearch -> note = stringResource(R.string.together_server_cannot_stream)
-            is ComradeCore.LyricsResult.Failed -> note = stringResource(R.string.lyrics_failed, result.reason)
+            is ComradeCore.LyricsResult.CannotSearch -> note = cannotSearchNote
+            is ComradeCore.LyricsResult.Failed ->
+                note = context.getString(R.string.lyrics_failed, result.reason)
         }
     }
     ModalBottomSheet(onDismissRequest = onDismiss) {

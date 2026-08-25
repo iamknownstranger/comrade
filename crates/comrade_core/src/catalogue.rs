@@ -691,22 +691,31 @@ pub fn parse_jamendo(body: &str) -> Result<Vec<CatalogueMatch>, CatalogueError> 
             if title.is_empty() {
                 return None;
             }
-            let audio_url = if item
+            // Which URL to carry, and under what licence, is one decision:
+            // where the artist left downloads on, the download URL arrives
+            // under its declared CC licence and the OpenLicence tier may take
+            // it. Where they switched downloads off, the stream URL stands in
+            // for identification but the licence reads **Unknown** — the
+            // artist's own switch is the declaration, and "serving is not
+            // licensing" now cuts the way §21 meant it: the row cannot offer
+            // a fetched copy, whatever the platform's blanket terms say.
+            let (url_field, licence) = if item
                 .get("audiodownload_allowed")
                 .and_then(|a| a.as_bool())
                 .unwrap_or(false)
             {
-                item.get("audiodownload").and_then(|u| u.as_str())
+                ("audiodownload", OpenLicence::CreativeCommons)
             } else {
-                item.get("audio").and_then(|u| u.as_str())
-            }?
-            .to_string();
+                ("audio", OpenLicence::Unknown)
+            };
+            let audio_url = item.get(url_field).and_then(|u| u.as_str())?.to_string();
             let duration_ms = item
                 .get("duration")
                 .and_then(|d| d.as_u64())
                 .map(|s| s.saturating_mul(1000));
-            Some(CatalogueMatch::openly_licensed(
-                Recording {
+            Some(CatalogueMatch {
+                source: "Jamendo".to_string(),
+                recording: Recording {
                     isrc: None,
                     title,
                     artist: item
@@ -720,9 +729,9 @@ pub fn parse_jamendo(body: &str) -> Result<Vec<CatalogueMatch>, CatalogueError> 
                         .map(str::to_string),
                 },
                 duration_ms,
-                audio_url,
-                "Jamendo",
-            ))
+                audio_url: Some(audio_url),
+                licence,
+            })
         })
         .collect())
 }
