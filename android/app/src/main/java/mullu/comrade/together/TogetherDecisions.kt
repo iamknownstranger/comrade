@@ -1016,6 +1016,28 @@ object TogetherDecisions {
          * answered. What leaves the phone is the query text and nothing else.
          */
         data object SearchByName : Source
+
+        /**
+         * Search a streaming server you own — Subsonic/Navidrome and kin, the
+         * online-streaming source this app sanctions (`docs/TOGETHER.md` §23).
+         *
+         * It reaches **your** server with your credentials, which makes it a
+         * different sentence from [SearchByName]: the catalogue asks a third
+         * party about a recording, this one asks your own machine for a file
+         * it already serves you. Offered after the catalogue because it needs
+         * setup the others do not — a server, a user, a password — and a card
+         * that leads to settings on first touch must sit below the cards that
+         * just work.
+         */
+        data object YourServer : Source
+
+        /**
+         * Keyless public collections — the Internet Archive's audio and any
+         * podcast feed. The online sources that need no account and no server
+         * of one's own; offered last because two keyboard screens in a row is
+         * already a lot of typing for a tab whose first card needs none.
+         */
+        data object PublicCollections : Source
     }
 
     /**
@@ -1024,13 +1046,18 @@ object TogetherDecisions {
      * On-device first, deliberately: it is the one that needs no typing, no
      * network and no account, and it is what "listen to music together" means
      * most of the time. The keyboard ones come last, and search comes after the
-     * link field because it is the only source that reaches a third party at all.
+     * link field because it is the only source that reaches a third party at
+     * all. Your own server comes after even that: it reaches only where you
+     * already have an account, but it needs setting up first, and the cards
+     * that just work sit above the one that asks for credentials.
      */
     fun sources(libraryGranted: Boolean): List<Source> = listOf(
         Source.OnThisPhone(needsPermission = !libraryGranted),
         Source.PickAFile,
         Source.FromALink,
         Source.SearchByName,
+        Source.YourServer,
+        Source.PublicCollections,
     )
 
     // ── Searching a catalogue by name ────────────────────────────────────────
@@ -1549,6 +1576,167 @@ object TogetherDecisions {
     /** The queue moved to [to], or `null` when that is not a track. */
     fun movedTo(queue: Queue, to: Int): Queue? =
         if (to in queue.tracks.indices) queue.copy(index = to) else null
+
+    // ── Player extras: shuffle, repeat, speed, sleep ─────────────────────────
+
+    /**
+     * Repeat, as three answers to "what happens when this track ends".
+     *
+     * [OFF][RepeatMode.OFF] stops, [ALL][RepeatMode.ALL] wraps the queue,
+     * [ONE][RepeatMode.ONE] restarts the track that just finished.
+     */
+    enum class RepeatMode { OFF, ALL, ONE }
+
+    /**
+     * A play order for shuffle: every index once, current track kept first.
+     *
+     * Kept deterministic on an injected [Random] rather than calling
+     * `Random.Default`, so a test can pin an order and — more importantly — so
+     * the *property* is testable whatever the seed: current first, nothing
+     * dropped, nothing twice. Fisher–Yates, the boring correct way.
+     */
+    fun shuffledOrder(count: Int, keepFirst: Int, random: kotlin.random.Random): List<Int> {
+        if (count <= 0) return emptyList()
+        val start = keepFirst.coerceIn(0, count - 1)
+        val rest = (0 until count).filter { it != start }.toMutableList()
+        for (i in rest.size - 1 downTo 1) {
+            val j = random.nextInt(i + 1)
+            val tmp = rest[i]
+            rest[i] = rest[j]
+            rest[j] = tmp
+        }
+        return listOf(start) + rest
+    }
+
+    /**
+     * Where playback goes when a track ends, or `null` to stop.
+     *
+     * `order` is [shuffledOrder]'s output when shuffle is on, `null` when off;
+     * navigation differs only in which neighbour "next" means. Repeat-one
+     * deliberately wins over the queue: the button someone tapped last is the
+     * intent in force at the moment the track ends. Wrapping under [ALL]
+     * follows the same order shuffle produced, so a shuffled queue repeats
+     * shuffled rather than snapping back to file order mid-listen.
+     */
+    fun nextIndexOnEnd(
+        repeat: RepeatMode,
+        order: List<Int>?,
+        currentIndex: Int,
+        count: Int,
+    ): Int? {
+        if (count <= 0 || currentIndex !in 0 until count) return null
+        if (repeat == RepeatMode.ONE) return currentIndex
+        if (order != null && order.size == count) {
+            val at = order.indexOf(currentIndex)
+            if (at >= 0 && at + 1 < order.size) return order[at + 1]
+            // End of the order: wrap only when repeat says so.
+            return if (repeat == RepeatMode.ALL) order.firstOrNull() else null
+        }
+        if (currentIndex + 1 < count) return currentIndex + 1
+        return if (repeat == RepeatMode.ALL) 0 else null
+    }
+
+    /** The index skip-back lands on, honouring a shuffle order when one is live. */
+    fun previousIndexWith(order: List<Int>?, currentIndex: Int, count: Int): Int? {
+        if (count <= 0 || currentIndex !in 0 until count) return null
+        if (order != null && order.size == count) {
+            val at = order.indexOf(currentIndex)
+            if (at > 0) return order[at - 1]
+            return null
+        }
+        return if (currentIndex - 1 >= 0) currentIndex - 1 else null
+    }
+
+    /**
+     * Where a *manual* skip-forward lands, or `null` at the end.
+     *
+     * Deliberately not [nextIndexOnEnd]: a person pressing next while repeat
+     * is ONE means "play something else", not "restart this one" — repeat-one
+     * answers only what happens when a track ends by itself. Shuffle still
+     * governs which "something else", for the same reason it governs the end
+     * of a track: under shuffle, file order is not the listen's order.
+     */
+    fun manualNextIndex(order: List<Int>?, currentIndex: Int, count: Int): Int? {
+        if (count <= 0 || currentIndex !in 0 until count) return null
+        if (order != null && order.size == count) {
+            val at = order.indexOf(currentIndex)
+            return order.getOrNull(at + 1)
+        }
+        return (currentIndex + 1).takeIf { it < count }
+    }
+
+    /**
+     * Whether a playback-speed control makes sense right now.
+     *
+     * **Only solo.** In a together session the rate is not yours to set — the
+     * correction ladder trims it continuously to hold two playheads in step,
+     * and a user multiplier underneath that would fight the very mechanism
+     * keeping the two devices together. Listening alone has nobody to stay
+     * in step with, so there the control is honest.
+     */
+    fun speedAllowed(solo: Boolean): Boolean = solo
+
+    /** Speed snapped to the slider's steps and clamped to sane bounds. */
+    fun clampSpeed(value: Float): Float {
+        val stepped = (value * 20).toInt() / 20f // 0.05 steps
+        return stepped.coerceIn(0.5f, 2.0f)
+    }
+
+    /** Milliseconds left on a sleep timer, or `null` when none is running. */
+    fun sleepRemainingMs(startedAtMs: Long?, durationMs: Long, nowMs: Long): Long? {
+        val started = startedAtMs ?: return null
+        val remaining = durationMs - (nowMs - started)
+        return remaining.takeIf { it > 0 }
+    }
+
+    // ── Lyrics ───────────────────────────────────────────────────────────────
+
+    /** One lyric line: when it is sung, and what is sung. */
+    data class LyricLine(val atMs: Long, val text: String)
+
+    /**
+     * Parse an LRC document into timed lines.
+     *
+     * Handles the shapes feeds actually contain: several timestamps on one
+     * line (`[00:12.00][01:40.50]chorus`), metadata tags (`[ar:]`, `[ti:]`,
+     * `[by:]`) which are dropped rather than sung, fractional parts of two or
+     * three digits, and lines out of order — sorted here so the consumer can
+     * binary-search. Untimed text (plain lyrics) parses to an empty list,
+     * which the caller must render as "no synced lyrics" rather than nothing.
+     */
+    fun parseLrc(text: String): List<LyricLine> {
+        val tag = Regex("""\[(\d{1,2}):(\d{1,2})(?:[.:](\d{1,3}))?]""")
+        val out = mutableListOf<LyricLine>()
+        text.lineSequence().forEach { raw ->
+            val stamps = tag.findAll(raw).toList()
+            if (stamps.isEmpty()) return@forEach
+            val body = raw.substring(stamps.last().range.last + 1).trim()
+            if (body.isEmpty()) return@forEach
+            stamps.forEach { m ->
+                val (mm, ss) = m.groupValues[0].let { _ ->
+                    m.groupValues[1].toLong() to m.groupValues[2].toLong()
+                }
+                val fracRaw = m.groupValues[3]
+                val frac = when (fracRaw.length) {
+                    0 -> 0L
+                    1 -> fracRaw.toLong() * 100
+                    2 -> fracRaw.toLong() * 10
+                    else -> fracRaw.take(3).toLong()
+                }
+                out.add(LyricLine(mm * 60_000 + ss * 1_000 + frac, body))
+            }
+        }
+        return out.sortedBy { it.atMs }
+    }
+
+    /** Which line is being sung at `posMs`: the last one that started, or `-1`. */
+    fun lyricIndexAt(lines: List<LyricLine>, posMs: Long): Int {
+        var best = -1
+        for (i in lines.indices) {
+            if (lines[i].atMs <= posMs) best = i else break
+        }
+        return best
+    }
 
     // ── Answering an invitation ─────────────────────────────────────────────
 

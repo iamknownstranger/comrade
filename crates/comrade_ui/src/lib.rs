@@ -68,6 +68,19 @@ pub use runtime::play_route;
 // The catalogue rung: one network call and one pure decision, both free
 // functions so no caller can hold a lock across the lookup (see their docs).
 pub use runtime::{audio_plan, catalogue_lookup, download_track, download_verdict};
+// The streaming-source search: one network call, a free function for the same
+// reason the catalogue one is — no caller can hold the runtime lock across it.
+pub use runtime::{subsonic_search, StreamCandidateDto, StreamSearchOutcome};
+// The public sources: Internet Archive, podcast feeds, synced lyrics.
+pub use runtime::{
+    archive_search, archive_tracks, lyrics_lookup, podcast_episodes, ArchiveItemDto,
+    CollectionSearchOutcome, LyricsOutcome, TrackListOutcome,
+};
+// The player's own library — favourites, history, playlists, saved queue.
+pub use runtime::{
+    prune_history, HistoryEntryDto, PlayerTrackDto, PlayerTrackKind, PlaylistDto, SavedQueueDto,
+    HISTORY_MAX_ENTRIES,
+};
 // The travel guide: one network call, deliberately a free function so no caller
 // can hold the runtime lock across three round trips (see its doc).
 pub use runtime::{travel_guide, TravelCache, TRAVEL_NO_KEY_NOTICE};

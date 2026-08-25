@@ -694,6 +694,72 @@
     <string name="together_search_failed">Couldn\'t search: %1$s</string>
     <string name="together_search_result_subtitle">%1$s · from %2$s</string>
     <string name="together_search_unknown_artist">Unknown artist</string>
+
+    <!-- Your own streaming server (Subsonic/Navidrome). Deliberately different
+         sentences from the catalogue search above: "no server saved" is about
+         setup, "this build cannot stream" is about the build, and only an
+         answered-but-empty search may say nothing matched. -->
+    <string name="together_source_server">Your server</string>
+    <string name="together_source_server_note">Stream from your own Subsonic or Navidrome — alone or together</string>
+    <string name="together_server_explainer">Searches the music library on your own server. What plays here streams straight from it — and if you listen together, the link to each track is shared with the person you\'re listening with.</string>
+    <string name="together_server_none_title">No server saved yet</string>
+    <string name="together_server_none_body">Add your server in Settings → Music sources — its address, your username and password. It streams your own library, so this app never sees a copy of anything on it.</string>
+    <string name="together_server_search_hint">Songs on your server</string>
+    <string name="together_server_cannot_stream">This build can\'t reach a music server. Your own music and links still work.</string>
+    <string name="together_server_failed">Your server said no: %1$s</string>
+
+    <!-- Settings → Music sources. -->
+    <string name="settings_music_sources_title">Music sources</string>
+    <string name="settings_music_sources_explainer">Where the Together tab streams music from. Your credentials stay on this phone; a stream URL shared during a session carries only a per-request token, never your password.</string>
+    <string name="settings_music_sources_server">Server address</string>
+    <string name="settings_music_sources_username">Username</string>
+    <string name="settings_music_sources_password">Password</string>
+    <string name="settings_music_sources_jamendo">Jamendo client id (optional)</string>
+    <string name="settings_music_sources_jamendo_hint">from developer.jamendo.com</string>
+    <string name="settings_music_sources_jamendo_note">A Jamendo key adds openly-licensed tracks you can download to the by-name search. Leave blank to search MusicBrainz alone.</string>
+    <string name="settings_music_sources_save">Save</string>
+    <string name="settings_music_sources_clear">Clear</string>
+    <string name="settings_music_sources_saved">Saved ✓</string>
+
+    <!-- Public collections: Internet Archive + podcast feeds. -->
+    <string name="together_source_collections">Public collections</string>
+    <string name="together_source_collections_note">Free music from the Internet Archive, and any podcast feed</string>
+    <string name="collections_tab_archive">Internet Archive</string>
+    <string name="collections_tab_podcasts">Podcasts</string>
+    <string name="collections_archive_hint">Search free recordings</string>
+    <string name="collections_feed_hint">https://example.com/feed.xml</string>
+    <string name="collections_open">Open</string>
+
+    <!-- Player extras row accessibility labels. -->
+    <string name="extras_shuffle">Shuffle</string>
+    <string name="extras_repeat">Repeat</string>
+    <string name="extras_repeat_one">Repeat this one</string>
+    <string name="extras_speed">Playback speed</string>
+    <string name="extras_sleep">Sleep timer</string>
+    <string name="extras_equalizer">Equalizer</string>
+    <string name="extras_lyrics">Lyrics</string>
+    <string name="speed_sheet_title">Playback speed</string>
+    <string name="sleep_sheet_title">Sleep timer</string>
+    <string name="sleep_off">Off</string>
+    <string name="sleep_minutes">%1$d min</string>
+    <string name="eq_sheet_title">Equalizer</string>
+    <string name="eq_unavailable">This device offers no equalizer.</string>
+    <string name="lyrics_loading">Looking for synced lyrics…</string>
+    <string name="lyrics_none">No synced lyrics found for this track.</string>
+    <string name="lyrics_failed">Couldn\'t fetch lyrics: %1$s</string>
+
+    <!-- Resume + the player\'s remembered lists. -->
+    <string name="resume_title">Continue where you left off</string>
+    <string name="resume_body">%1$d tracks · saved %2$s</string>
+    <string name="resume_button">Resume</string>
+    <string name="library_favourites">Favourites</string>
+    <string name="library_recent">Recently played</string>
+    <string name="library_playlists">Playlists</string>
+    <string name="library_empty_favourites">Nothing loved yet. Tap the heart on a row in your library.</string>
+    <string name="library_empty_recent">Play something and it will show up here.</string>
+    <string name="library_new_playlist_hint">New playlist name</string>
+    <string name="library_create">Create</string>
+    <string name="library_remove_from_playlist">Remove</string>
     <string name="together_search_not_on_phone">No copy of \u201C%1$s\u201D on this phone. Try another result, pick a file, or ask the other person to send theirs.</string>
     <!-- Downloading an openly-licensed track into the phone's music library. -->
     <string name="together_buffering">buffering\u2026</string>

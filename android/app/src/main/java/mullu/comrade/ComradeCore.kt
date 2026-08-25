@@ -3,10 +3,12 @@ package mullu.comrade
 import android.util.Log
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.runBlocking
 import mullu.comrade.travel.TravelDecisions
 import uniffi.comrade.BridgeEventListener
@@ -866,9 +868,9 @@ object ComradeCore {
      *
      * Only the query text leaves the device.
      */
-    suspend fun catalogueLookup(query: String): CatalogueResult =
+    suspend fun catalogueLookup(query: String, jamendoClientId: String?): CatalogueResult =
         try {
-            CatalogueResult.Found(ffi.catalogueLookup(query))
+            CatalogueResult.Found(ffi.catalogueLookup(query, jamendoClientId))
         } catch (_: UiException.CatalogueUnavailable) {
             // Caught by *type*, not by matching on a message: the sentence is
             // free to be reworded, and a string match would silently start
@@ -877,6 +879,183 @@ object ComradeCore {
         } catch (e: UiException) {
             CatalogueResult.Failed(e.humanMessage())
         }
+
+    /** What a streaming-server search came back with — see
+     * `comrade_ui::StreamSearchOutcome`; this mirrors it as a sealed interface
+     * because Kotlin pattern-matches those better than an enum with payloads,
+     * and because a thrown FFI panic has to become a [Failed] rather than
+     * crash the screen. */
+    sealed interface StreamResult {
+        data class Found(val candidates: List<uniffi.comrade_ui.StreamCandidateDto>) : StreamResult
+
+        /** No server saved yet — a setup step, not a failure. */
+        data object NotConfigured : StreamResult
+
+        /** This build cannot stream (`catalogue-http` off). */
+        data object CannotStream : StreamResult
+
+        /** The server refused, lied, or was unreachable; its words. */
+        data class Failed(val reason: String) : StreamResult
+    }
+
+    /**
+     * Search one self-hosted streaming server (Subsonic/Navidrome).
+     *
+     * **Suspends, and must be called off the main thread** — same rule and
+     * same ANR history as [catalogueLookup]. The config arrives per call from
+     * [mullu.comrade.together.StreamingSourcesStore]; nothing here persists or
+     * logs it. Every candidate's URL already passed the peer guard in core,
+     * so any row is startable as a Together session unchanged.
+     */
+    suspend fun subsonicSearch(
+        config: uniffi.comrade_core.SubsonicConfig?,
+        query: String,
+    ): StreamResult =
+        runCatching { ffi.subsonicSearch(config, query) }.fold(
+            onSuccess = { outcome ->
+                when (outcome) {
+                    is uniffi.comrade_ui.StreamSearchOutcome.Found ->
+                        StreamResult.Found(outcome.candidates)
+                    uniffi.comrade_ui.StreamSearchOutcome.NotConfigured ->
+                        StreamResult.NotConfigured
+                    uniffi.comrade_ui.StreamSearchOutcome.BuildCannotSearch ->
+                        StreamResult.CannotStream
+                    is uniffi.comrade_ui.StreamSearchOutcome.Failed ->
+                        StreamResult.Failed(outcome.reason)
+                }
+            },
+            onFailure = { StreamResult.Failed(it.message ?: "the search failed") },
+        )
+
+    // ── The player's own library ─────────────────────────────────────────────
+    //
+    // Favourites, recently-played, playlists, saved queue. Straight
+    // pass-throughs that **throw** rather than flatten: a locked vault must not
+    // render as an empty library — "you have nothing saved" and "unlock to see
+    // it" are different sentences, the same argument that split
+    // [CatalogueResult.Unavailable] from an empty result list. Callers wrap in
+    // their own `runCatching` where a screen has somewhere else to be.
+
+    suspend fun favouritesList(): List<uniffi.comrade_ui.PlayerTrackDto> =
+        withContext(Dispatchers.IO) { ffi.favouritesList() }
+
+    suspend fun favouriteIs(key: String): Boolean =
+        withContext(Dispatchers.IO) { ffi.favouriteIs(key) }
+
+    /** Answers what the track now **is**, so the button renders from this. */
+    suspend fun favouriteToggle(track: uniffi.comrade_ui.PlayerTrackDto): Boolean =
+        withContext(Dispatchers.IO) { ffi.favouriteToggle(track) }
+
+    /** Fire-and-forget by contract: a failed diary write never fails playback. */
+    suspend fun historyRecord(track: uniffi.comrade_ui.PlayerTrackDto, atMs: Long) {
+        withContext(Dispatchers.IO) {
+            runCatching { ffi.historyRecord(track, atMs.toULong()) }
+        }
+    }
+
+    suspend fun historyList(): List<uniffi.comrade_ui.HistoryEntryDto> =
+        withContext(Dispatchers.IO) { ffi.historyList() }
+
+    suspend fun historyClear() = withContext(Dispatchers.IO) { ffi.historyClear() }
+
+    suspend fun playlistsList(): List<uniffi.comrade_ui.PlaylistDto> =
+        withContext(Dispatchers.IO) { ffi.playlistsList() }
+
+    suspend fun playlistCreate(name: String, createdAtMs: Long): String =
+        withContext(Dispatchers.IO) { ffi.playlistCreate(name, createdAtMs.toULong()) }
+
+    suspend fun playlistDelete(id: String) =
+        withContext(Dispatchers.IO) { ffi.playlistDelete(id) }
+
+    suspend fun playlistAddTrack(id: String, track: uniffi.comrade_ui.PlayerTrackDto) =
+        withContext(Dispatchers.IO) { ffi.playlistAddTrack(id, track) }
+
+    suspend fun playlistRemoveTrack(id: String, trackKey: String) =
+        withContext(Dispatchers.IO) { ffi.playlistRemoveTrack(id, trackKey) }
+
+    suspend fun queueSave(queue: uniffi.comrade_ui.SavedQueueDto) =
+        withContext(Dispatchers.IO) { ffi.queueSave(queue) }
+
+    suspend fun queueLoad(): uniffi.comrade_ui.SavedQueueDto? =
+        withContext(Dispatchers.IO) { ffi.queueLoad() }
+
+    suspend fun queueClear() = withContext(Dispatchers.IO) { ffi.queueClear() }
+
+    // ── Public collections & lyrics ──────────────────────────────────────────
+
+    /** Same flat-outcome reasoning as [StreamResult]; see core's §23 docs. */
+    sealed interface CollectionResult {
+        data class Found(val items: List<uniffi.comrade_ui.ArchiveItemDto>) : CollectionResult
+        data object CannotSearch : CollectionResult
+        data class Failed(val reason: String) : CollectionResult
+    }
+
+    sealed interface TrackListResult {
+        data class Found(val candidates: List<uniffi.comrade_ui.StreamCandidateDto>) :
+            TrackListResult
+
+        /** The address itself failed the shareable-URL guard — a setup sentence. */
+        data class Refused(val reason: String) : TrackListResult
+        data object CannotSearch : TrackListResult
+        data class Failed(val reason: String) : TrackListResult
+    }
+
+    sealed interface LyricsResult {
+        /** Empty list = no synced lyrics exist — a real answer, not a failure. */
+        data class Found(val lines: List<uniffi.comrade_ui.LyricLineDto>) : LyricsResult
+        data object CannotSearch : LyricsResult
+        data class Failed(val reason: String) : LyricsResult
+    }
+
+    suspend fun archiveSearch(query: String): CollectionResult =
+        runCatching { ffi.archiveSearch(query) }.fold(
+            onSuccess = { outcome ->
+                when (outcome) {
+                    is uniffi.comrade_ui.CollectionSearchOutcome.Found ->
+                        CollectionResult.Found(outcome.items)
+                    uniffi.comrade_ui.CollectionSearchOutcome.BuildCannotSearch ->
+                        CollectionResult.CannotSearch
+                    is uniffi.comrade_ui.CollectionSearchOutcome.Failed ->
+                        CollectionResult.Failed(outcome.reason)
+                }
+            },
+            onFailure = { CollectionResult.Failed(it.message ?: "the search failed") },
+        )
+
+    private fun TrackListOutcomeToResult(
+        outcome: uniffi.comrade_ui.TrackListOutcome,
+    ): TrackListResult =
+        when (outcome) {
+            is uniffi.comrade_ui.TrackListOutcome.Found -> TrackListResult.Found(outcome.candidates)
+            is uniffi.comrade_ui.TrackListOutcome.Refused -> TrackListResult.Refused(outcome.reason)
+            uniffi.comrade_ui.TrackListOutcome.BuildCannotSearch -> TrackListResult.CannotSearch
+            is uniffi.comrade_ui.TrackListOutcome.Failed -> TrackListResult.Failed(outcome.reason)
+        }
+
+    suspend fun archiveTracks(identifier: String): TrackListResult =
+        runCatching { ffi.archiveTracks(identifier) }.fold(
+            onSuccess = ::TrackListOutcomeToResult,
+            onFailure = { TrackListResult.Failed(it.message ?: "the listing failed") },
+        )
+
+    suspend fun podcastEpisodes(feedUrl: String): TrackListResult =
+        runCatching { ffi.podcastEpisodes(feedUrl) }.fold(
+            onSuccess = ::TrackListOutcomeToResult,
+            onFailure = { TrackListResult.Failed(it.message ?: "the feed failed") },
+        )
+
+    suspend fun lyricsLookup(title: String, artist: String, durationMs: Long): LyricsResult =
+        runCatching { ffi.lyricsLookup(title, artist, durationMs.toULong()) }.fold(
+            onSuccess = { outcome ->
+                when (outcome) {
+                    is uniffi.comrade_ui.LyricsOutcome.Found -> LyricsResult.Found(outcome.lines)
+                    uniffi.comrade_ui.LyricsOutcome.BuildCannotSearch -> LyricsResult.CannotSearch
+                    is uniffi.comrade_ui.LyricsOutcome.Failed ->
+                        LyricsResult.Failed(outcome.reason)
+                }
+            },
+            onFailure = { LyricsResult.Failed(it.message ?: "the lookup failed") },
+        )
 
     /**
      * Which tier will supply a recording, once the catalogue has answered.
