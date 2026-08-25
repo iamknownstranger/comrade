@@ -534,6 +534,78 @@ pub fn parse_lrc_document(text: &str) -> Vec<LyricLine> {
 // The timestamp scanning lives inline in [`parse_lrc_document`] — a tiny hand
 // loop beat importing a regex dependency for four fixed-width digit groups.
 
+// ── The network half ─────────────────────────────────────────────────────────
+
+/// Search the Archive for audio collections matching `query`.
+#[cfg(feature = "catalogue-http")]
+pub async fn archive_search(query: &str) -> Result<Vec<ArchiveItem>, String> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Ok(Vec::new());
+    }
+    let body = fetch_bounded(&archive_search_url(q)).await?;
+    parse_archive_search(&body)
+}
+
+/// One item's playable files, guarded and named.
+#[cfg(feature = "catalogue-http")]
+pub async fn archive_tracks(identifier: &str) -> Result<Vec<PublicTrack>, String> {
+    if identifier.trim().is_empty()
+        || !identifier
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+    {
+        return Err("not an archive identifier".into());
+    }
+    let url = format!(
+        "https://archive.org/metadata/{}",
+        urlencode(identifier.trim())
+    );
+    let body = fetch_bounded(&url).await?;
+    parse_archive_item(identifier.trim(), &body)
+}
+
+/// Every playable episode of one podcast feed.
+///
+/// The feed URL itself must pass the peer guard — a feed is a URL this device
+/// will fetch on its own behalf, so the same bar applies as to anything a peer
+/// might have sent.
+#[cfg(feature = "catalogue-http")]
+pub async fn podcast_episodes(feed_url: &str) -> Result<Vec<PublicTrack>, String> {
+    let url = feed_url.trim();
+    if !valid_stream_url(url) {
+        return Err("that is not a shareable https feed address".into());
+    }
+    let body = fetch_bounded(url).await?;
+    let text = String::from_utf8(body).map_err(|_| "the feed is not text".to_string())?;
+    Ok(parse_rss_episodes(&text))
+}
+
+/// Synced lyrics for a recording, or an empty answer when nothing matched.
+#[cfg(feature = "catalogue-http")]
+pub async fn lrc_lookup(
+    title: &str,
+    artist: &str,
+    want_duration_ms: u64,
+) -> Result<Vec<LyricLine>, String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Ok(Vec::new());
+    }
+    // The API takes either structured params or one q=; q= tolerates a missing
+    // artist, which is the common case here — a session knows its title first.
+    let q = if artist.trim().is_empty() {
+        title.to_string()
+    } else {
+        format!("{title} {artist}")
+    };
+    let url = format!("https://lrclib.net/api/search?q={}", urlencode(&q));
+    let body = fetch_bounded(&url).await?;
+    // No synced answer within tolerance is an empty success — "none exists",
+    // not a failure.
+    pick_lrc(&body, want_duration_ms).map(|opt| opt.unwrap_or_default())
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -635,76 +707,4 @@ mod tests {
         );
         assert_eq!(lines[0].text, "chorus");
     }
-}
-
-// ── The network half ─────────────────────────────────────────────────────────
-
-/// Search the Archive for audio collections matching `query`.
-#[cfg(feature = "catalogue-http")]
-pub async fn archive_search(query: &str) -> Result<Vec<ArchiveItem>, String> {
-    let q = query.trim();
-    if q.is_empty() {
-        return Ok(Vec::new());
-    }
-    let body = fetch_bounded(&archive_search_url(q)).await?;
-    parse_archive_search(&body)
-}
-
-/// One item's playable files, guarded and named.
-#[cfg(feature = "catalogue-http")]
-pub async fn archive_tracks(identifier: &str) -> Result<Vec<PublicTrack>, String> {
-    if identifier.trim().is_empty()
-        || !identifier
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
-    {
-        return Err("not an archive identifier".into());
-    }
-    let url = format!(
-        "https://archive.org/metadata/{}",
-        urlencode(identifier.trim())
-    );
-    let body = fetch_bounded(&url).await?;
-    parse_archive_item(identifier.trim(), &body)
-}
-
-/// Every playable episode of one podcast feed.
-///
-/// The feed URL itself must pass the peer guard — a feed is a URL this device
-/// will fetch on its own behalf, so the same bar applies as to anything a peer
-/// might have sent.
-#[cfg(feature = "catalogue-http")]
-pub async fn podcast_episodes(feed_url: &str) -> Result<Vec<PublicTrack>, String> {
-    let url = feed_url.trim();
-    if !valid_stream_url(url) {
-        return Err("that is not a shareable https feed address".into());
-    }
-    let body = fetch_bounded(url).await?;
-    let text = String::from_utf8(body).map_err(|_| "the feed is not text".to_string())?;
-    Ok(parse_rss_episodes(&text))
-}
-
-/// Synced lyrics for a recording, or an empty answer when nothing matched.
-#[cfg(feature = "catalogue-http")]
-pub async fn lrc_lookup(
-    title: &str,
-    artist: &str,
-    want_duration_ms: u64,
-) -> Result<Vec<LyricLine>, String> {
-    let title = title.trim();
-    if title.is_empty() {
-        return Ok(Vec::new());
-    }
-    // The API takes either structured params or one q=; q= tolerates a missing
-    // artist, which is the common case here — a session knows its title first.
-    let q = if artist.trim().is_empty() {
-        title.to_string()
-    } else {
-        format!("{title} {artist}")
-    };
-    let url = format!("https://lrclib.net/api/search?q={}", urlencode(&q));
-    let body = fetch_bounded(&url).await?;
-    // No synced answer within tolerance is an empty success — "none exists",
-    // not a failure.
-    pick_lrc(&body, want_duration_ms).map(|opt| opt.unwrap_or_default())
 }

@@ -569,7 +569,7 @@ pub async fn lookup(
     let cfg = cfg.clone().normalised().map_err(SearchError::BadServer)?;
     let salt = SubsonicConfig::fresh_salt();
     let url = search_url(&cfg.server, &cfg.username, &cfg.password, &salt, query)
-        .ok_or_else(|| SearchError::BadServer(ServerIssue::NotHttps))?;
+        .ok_or(SearchError::BadServer(ServerIssue::NotHttps))?;
     let body = fetch_json(&url).await.map_err(SearchError::Unreachable)?;
     let songs = parse_search3(&body).map_err(SearchError::ServerRejected)?;
     Ok(to_candidates(
