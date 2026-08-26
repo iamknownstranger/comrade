@@ -385,6 +385,76 @@ abstract final class ComradeRadii {
   static const double bubbleTail = 6;
 }
 
+/// Spacing is a 4dp grid (§7.1): every padding, gap and inset in new layout
+/// code resolves to one of these rather than a hand-picked number. Android
+/// alone had drifted to 138 off-grid values before this existed; the read
+/// that produces is edges that fail to line up between two screens.
+///
+/// Values that are not a multiple of 4 are permitted in exactly two places —
+/// a 1px/1dp hairline, or an optical correction for a glyph or icon's own
+/// bearing — and each such call site must say in a comment which of the two
+/// it is (§7.1).
+abstract final class ComradeSpacing {
+  static const double space1 = 4;
+  static const double space2 = 8;
+  static const double space3 = 12;
+  static const double space4 = 16;
+  static const double space5 = 20;
+  static const double space6 = 24;
+  static const double space8 = 32;
+  static const double space10 = 40;
+  static const double space12 = 48;
+  static const double space16 = 64;
+}
+
+/// Six type roles (§7.2), each separated from its neighbour by weight or by
+/// `mutedForeground` rather than by two points of size — a hierarchy built
+/// from size alone needs many sizes, and this app's existing `TextTheme` had
+/// drifted toward exactly that.
+///
+/// Negative tracking on the large roles and positive tracking on the small
+/// ones is deliberate (§7.2): it is what separates a current-looking type
+/// stack from Material's own defaults. Flutter's `letterSpacing` is in
+/// logical pixels, not em, so each value below is `em * fontSize`.
+abstract final class ComradeTypeScale {
+  static const TextStyle display = TextStyle(
+    fontSize: 32,
+    fontWeight: FontWeight.w700,
+    height: 1.15,
+    letterSpacing: -0.64, // -0.02em
+  );
+  static const TextStyle heading = TextStyle(
+    fontSize: 24,
+    fontWeight: FontWeight.w700,
+    height: 1.20,
+    letterSpacing: -0.48, // -0.02em
+  );
+  static const TextStyle title = TextStyle(
+    fontSize: 20,
+    fontWeight: FontWeight.w600,
+    height: 1.30,
+    letterSpacing: -0.20, // -0.01em
+  );
+  static const TextStyle body = TextStyle(
+    fontSize: 15,
+    fontWeight: FontWeight.w400,
+    height: 1.50,
+    letterSpacing: 0,
+  );
+  static const TextStyle label = TextStyle(
+    fontSize: 13,
+    fontWeight: FontWeight.w500,
+    height: 1.40,
+    letterSpacing: 0.13, // 0.01em
+  );
+  static const TextStyle caption = TextStyle(
+    fontSize: 12,
+    fontWeight: FontWeight.w400,
+    height: 1.35,
+    letterSpacing: 0.24, // 0.02em
+  );
+}
+
 /// State-layer opacities (§3.3, Material 3, fixed): an overlay of the
 /// *foreground* colour over a surface, at a strength that names the
 /// interaction rather than the component. A component that wants a
@@ -578,7 +648,8 @@ abstract final class ComradeTheme {
       ),
       filledButtonTheme: FilledButtonThemeData(
         style: FilledButton.styleFrom(
-          minimumSize: const Size(0, 44),
+          // §7.5: 48dp is the touch-target floor, not a suggestion — was 44.
+          minimumSize: const Size(0, ComradeSpacing.space12),
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(ComradeRadii.large),
           ),
@@ -586,7 +657,7 @@ abstract final class ComradeTheme {
       ),
       outlinedButtonTheme: OutlinedButtonThemeData(
         style: OutlinedButton.styleFrom(
-          minimumSize: const Size(0, 44),
+          minimumSize: const Size(0, ComradeSpacing.space12),
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(ComradeRadii.large),
           ),
@@ -637,17 +708,30 @@ abstract final class ComradeTheme {
 
   /// Default M3 type with a firmer title hierarchy: names and headings sit
   /// semi-bold so lists scan by name first, metadata second (`Theme.kt`'s
-  /// `ComradeTypography`).
+  /// `ComradeTypography`), layered with §7.2's six roles.
+  ///
+  /// Each of the six [ComradeTypeScale] roles replaces the Material default
+  /// on the one `TextTheme` slot that already plays that role at every call
+  /// site in this app, rather than sitting beside the stock 15-style scale as
+  /// a seventh vocabulary — `titleMedium` is the row-title/header style
+  /// throughout `app/lib/src/screens`, so it *is* §7.2's `title`, not merely
+  /// similar to it. `.merge` keeps the colour already resolved above
+  /// (`bodyColor`/`displayColor`), since [ComradeTypeScale] carries none.
+  /// `bodySmall`, `titleSmall`, `labelLarge` and the `display*` roles are
+  /// left on Material's own numbers: they are not one of the six, and this
+  /// pass does not chase every remaining call site into line (§7.1's own
+  /// "the sandbox cannot see how this looks" applies here too).
   static TextTheme _typography(TextTheme base) => base.copyWith(
-        headlineMedium:
-            base.headlineMedium?.copyWith(fontWeight: FontWeight.bold),
-        titleLarge: base.titleLarge?.copyWith(fontWeight: FontWeight.w600),
-        titleMedium: base.titleMedium?.copyWith(fontWeight: FontWeight.w600),
+        headlineMedium: base.headlineMedium?.merge(ComradeTypeScale.display),
+        titleLarge: base.titleLarge?.merge(ComradeTypeScale.heading),
+        titleMedium: base.titleMedium?.merge(ComradeTypeScale.title),
         titleSmall: base.titleSmall?.copyWith(
           fontWeight: FontWeight.w600,
           letterSpacing: 0.1,
         ),
-        labelSmall: base.labelSmall?.copyWith(letterSpacing: 0.2),
+        bodyMedium: base.bodyMedium?.merge(ComradeTypeScale.body),
+        labelMedium: base.labelMedium?.merge(ComradeTypeScale.label),
+        labelSmall: base.labelSmall?.merge(ComradeTypeScale.caption),
       );
 }
 

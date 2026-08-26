@@ -16,6 +16,7 @@ import '../../state/content_providers.dart';
 import '../../state/providers.dart';
 import '../../util/display_name.dart';
 import '../../widgets/app_chrome.dart';
+import '../../widgets/list_skeleton.dart';
 import '../../widgets/peer_avatar.dart';
 
 /// Outcomes a row renders with the "problem" (error) tint.

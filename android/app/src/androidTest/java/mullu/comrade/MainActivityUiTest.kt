@@ -315,6 +315,20 @@ class MainActivityUiTest {
 
         composeRule.onNodeWithTag("nav-drawer-button").performClick()
         composeRule.waitForIdle()
+
+        // Travel moved off the bottom bar into the drawer beside Ride
+        // (`docs/DESIGN_SYSTEM.md` §7.7) — asserted the same way Feed is
+        // above: "off the nav, not removed" only holds if there is still a
+        // route to it. The title is asserted rather than a loaded-guide tag
+        // because the guide itself needs a location fix the emulator may not
+        // have; the app bar renders regardless of that state.
+        composeRule.onNodeWithTag("drawer-travel").performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("Travel").assertIsDisplayed()
+        Espresso.pressBack()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("nav-drawer-button").performClick()
+        composeRule.waitForIdle()
         composeRule.onNodeWithTag("drawer-settings").performClick()
         composeRule.waitForIdle()
         composeRule.onNodeWithText("Your identity key").assertIsDisplayed()

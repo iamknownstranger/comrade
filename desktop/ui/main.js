@@ -305,7 +305,10 @@
     const ttl = type === "error" ? 6500 : 3500;
     setTimeout(() => {
       toast.classList.add("leaving");
-      setTimeout(() => toast.remove(), 250);
+      // Matches the `toast-out` animation length in styles.css (§7.6: enter
+      // and exit are the same gesture reversed) — 250ms here left the DOM
+      // node hanging around 50ms after its own exit animation finished.
+      setTimeout(() => toast.remove(), 200);
     }, ttl);
   }
 
