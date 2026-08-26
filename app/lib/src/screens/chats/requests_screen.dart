@@ -18,6 +18,7 @@ import '../../data/models.dart';
 import '../../state/chat_providers.dart';
 import '../../util/display_name.dart';
 import '../../widgets/app_chrome.dart';
+import '../../widgets/list_skeleton.dart';
 import '../../widgets/peer_avatar.dart';
 
 class RequestsScreen extends ConsumerWidget {
@@ -31,12 +32,16 @@ class RequestsScreen extends ConsumerWidget {
         ref.watch(messageRequestsProvider);
 
     return requests.when(
-      loading: () => const Center(
-        child:
-            SizedBox(width: 28, height: 28, child: CircularProgressIndicator()),
+      // §7.3: the row shape is known before the list loads.
+      loading: () => ListSkeleton.peerRows(key: const Key('requests-skeleton')),
+      error: (Object e, StackTrace s) => EmptyState(
+        title: 'Could not load requests',
+        body: '$e',
+        action: FilledButton(
+          onPressed: () => ref.invalidate(messageRequestsProvider),
+          child: const Text('Try again'),
+        ),
       ),
-      error: (Object e, StackTrace s) =>
-          EmptyState(title: 'Could not load requests', body: '$e'),
       data: (List<MessageRequestInfo> list) {
         if (list.isEmpty) {
           return const EmptyState(title: 'No message requests.');

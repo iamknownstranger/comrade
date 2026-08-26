@@ -7,14 +7,17 @@ import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
@@ -76,7 +79,10 @@ import mullu.comrade.voice.OneShotRecognizer
 import mullu.comrade.voice.VoiceModelMissingException
 import mullu.comrade.voice.VoskModel
 import mullu.comrade.ui.theme.ComradeRadii
+import mullu.comrade.ui.theme.ComradeSkeletonRowCount
 import mullu.comrade.ui.theme.GlassElevation
+import mullu.comrade.ui.theme.Spacing
+import mullu.comrade.ui.theme.comradeSkeleton
 import mullu.comrade.ui.theme.glassSurface
 
 /** Self-reported mood markers, low → high. Stored as the emoji itself. */
@@ -571,12 +577,12 @@ fun JournalScreen(modifier: Modifier = Modifier) {
     LazyColumn(
         modifier = modifier
             .fillMaxSize()
-            .padding(horizontal = 16.dp, vertical = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
+            .padding(horizontal = Spacing.space4, vertical = Spacing.space3),
+        verticalArrangement = Arrangement.spacedBy(Spacing.space3),
     ) {
         item {
             ElevatedCard(Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Column(Modifier.padding(Spacing.space4), verticalArrangement = Arrangement.spacedBy(Spacing.space3)) {
                     OutlinedTextField(
                         value = draft,
                         onValueChange = { draft = it },
@@ -586,7 +592,7 @@ fun JournalScreen(modifier: Modifier = Modifier) {
                             .fillMaxWidth()
                             .testTag("journal-input"),
                     )
-                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(Spacing.space2)) {
                         Moods.forEach { m ->
                             FilterChip(
                                 selected = mood == m,
@@ -743,12 +749,13 @@ fun JournalScreen(modifier: Modifier = Modifier) {
         }
 
         when {
-            list == null -> item {
-                CircularProgressIndicator(
-                    Modifier
-                        .padding(top = 24.dp)
-                        .size(28.dp),
-                )
+            // §7.3: the real row geometry, pulsing, rather than a spinner —
+            // an entry's shape (a card with a header and text lines) is known
+            // before it loads. This list already lives inside the composer's
+            // `LazyColumn`, so each row is its own `item` rather than a
+            // wrapping `Column`.
+            list == null -> items(ComradeSkeletonRowCount, key = { "entry-skeleton-$it" }) {
+                JournalEntryCardSkeleton()
             }
             list.isEmpty() -> item {
                 Text(
@@ -759,7 +766,7 @@ fun JournalScreen(modifier: Modifier = Modifier) {
                     textAlign = TextAlign.Center,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(top = 24.dp),
+                        .padding(top = Spacing.space6),
                 )
             }
             else -> {
@@ -770,7 +777,7 @@ fun JournalScreen(modifier: Modifier = Modifier) {
                             day,
                             style = MaterialTheme.typography.titleSmall,
                             color = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.padding(top = 6.dp),
+                            modifier = Modifier.padding(top = Spacing.space2),
                         )
                     }
                     items(dayEntries, key = { it.id }) { entry ->
@@ -972,6 +979,26 @@ fun JournalScreen(modifier: Modifier = Modifier) {
     }
 }
 
+/**
+ * §7.3's row geometry for a journal entry: an `OutlinedCard` with a short
+ * header line (mood + timestamp) and two body lines — the same silhouette as
+ * [JournalEntryCard] with real content swapped for [comradeSkeleton] fills.
+ */
+@Composable
+private fun JournalEntryCardSkeleton() {
+    OutlinedCard(Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier.padding(Spacing.space4),
+            verticalArrangement = Arrangement.spacedBy(Spacing.space1),
+        ) {
+            Box(Modifier.width(72.dp).height(12.dp).comradeSkeleton(RoundedCornerShape(ComradeRadii.sm)))
+            Box(Modifier.fillMaxWidth(0.5f).height(16.dp).comradeSkeleton(RoundedCornerShape(ComradeRadii.sm)))
+            Box(Modifier.fillMaxWidth().height(16.dp).comradeSkeleton(RoundedCornerShape(ComradeRadii.sm)))
+            Box(Modifier.fillMaxWidth(0.7f).height(16.dp).comradeSkeleton(RoundedCornerShape(ComradeRadii.sm)))
+        }
+    }
+}
+
 @Composable
 private fun JournalEntryCard(
     entry: ComradeCore.JournalEntryInfo,
@@ -985,13 +1012,18 @@ private fun JournalEntryCard(
     val recording = entry.recording
     OutlinedCard(Modifier.fillMaxWidth()) {
         Row(
-            modifier = Modifier.padding(start = 14.dp, top = 10.dp, bottom = 10.dp, end = 4.dp),
+            modifier = Modifier.padding(
+                start = Spacing.space4,
+                top = Spacing.space3,
+                bottom = Spacing.space3,
+                end = Spacing.space1,
+            ),
             verticalAlignment = Alignment.Top,
         ) {
-            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(Spacing.space1)) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    horizontalArrangement = Arrangement.spacedBy(Spacing.space2),
                 ) {
                     entry.mood?.let { Text(it, style = MaterialTheme.typography.titleMedium) }
                     Text(
@@ -1022,7 +1054,11 @@ private fun JournalEntryCard(
                         recording = recording,
                         available = recordingPlayable,
                         onPlayVideo = onPlayVideo,
-                        modifier = Modifier.padding(top = 2.dp, end = 6.dp),
+                        // top = 2.dp: §7.1 optical correction — the strip's
+                        // leading icon sits slightly high in its own bounds,
+                        // and 2dp closes the gap that leaves under the title
+                        // line above it.
+                        modifier = Modifier.padding(top = 2.dp, end = Spacing.space2),
                     )
                 }
                 // A recording entry with no words has nothing to draw here, and
@@ -1090,7 +1126,7 @@ private fun JournalShareSheet(
         containerColor = Color.Transparent,
         title = { Text(stringResource(R.string.journal_share_title)) },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Column(verticalArrangement = Arrangement.spacedBy(Spacing.space3)) {
                 Text(
                     stringResource(R.string.journal_share_body),
                     style = MaterialTheme.typography.bodySmall,
@@ -1110,7 +1146,7 @@ private fun JournalShareSheet(
                             .heightIn(max = 280.dp)
                             .verticalScroll(rememberScrollState())
                             .testTag("journal-share-targets"),
-                        verticalArrangement = Arrangement.spacedBy(2.dp),
+                        verticalArrangement = Arrangement.spacedBy(Spacing.space1),
                     ) {
                         targets.forEach { target ->
                             TextButton(

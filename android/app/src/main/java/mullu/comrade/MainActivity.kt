@@ -471,14 +471,14 @@ private enum class MainTab(val label: String, val icon: ImageVector) {
     // and this feature is about the person more than the music.
     Together("Together", PeopleHugIcon),
     Focus("Focus", TimerIcon),
-    // Sixth slot, added 2026-08-16 with the Travel guide. A NavigationBar is
-    // comfortable at five and tight at six — labels shrink rather than wrap —
-    // and this took the sixth rather than pushing an existing tab into the
-    // drawer, because deciding which of the five is least used is not a call
-    // this change is entitled to make. If a seventh is ever wanted, that
-    // decision has to be made first.
-    Travel("Travel", ExploreIcon),
     Tara("Tara", HeartIcon),
+    // Travel briefly held a sixth slot (added 2026-08-16) on the reasoning
+    // that a NavigationBar is comfortable at five and tight at six — labels
+    // shrink rather than wrap. `docs/DESIGN_SYSTEM.md` §7.7 revisited that:
+    // Travel is a place you go deliberately, not a daily surface, the same
+    // test that already put Feed in the drawer rather than on this bar. It
+    // moved there (`drawer-travel`, beside `drawer-ride`) and the bar is back
+    // to five.
 }
 
 /** Sub-navigation inside the Focus tab. */
@@ -524,6 +524,9 @@ private fun MainShell(
     /// Feed is a pushed screen now, reached from the drawer — see [MainTab].
     var feedOpen by rememberSaveable { mutableStateOf(false) }
     var rideOpen by rememberSaveable { mutableStateOf(false) }
+    // §7.7: Travel moved off the bottom bar into the drawer, beside Ride —
+    // same pushed-screen shape as Feed/Ride above it.
+    var travelOpen by rememberSaveable { mutableStateOf(false) }
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     val scope = rememberCoroutineScope()
     // Owned by RelayConnectionService/ChatEventRouter now — the single
@@ -754,7 +757,7 @@ private fun MainShell(
     // Settings screen closes, then a Chats sub-screen returns to the list.
     BackHandler(
         enabled = drawerState.isOpen ||
-            settingsOpen || feedOpen || rideOpen ||
+            settingsOpen || feedOpen || rideOpen || travelOpen ||
             (tab == MainTab.Chats && chatNav != ChatNav.List) ||
             (tab == MainTab.Focus && focusNav != FocusNav.Sessions),
     ) {
@@ -763,6 +766,7 @@ private fun MainShell(
             settingsOpen -> settingsOpen = false
             feedOpen -> feedOpen = false
             rideOpen -> rideOpen = false
+            travelOpen -> travelOpen = false
             tab == MainTab.Focus -> focusNav = FocusNav.Sessions
             else -> chatNav = ChatNav.List
         }
@@ -789,6 +793,9 @@ private fun MainShell(
         } else if (rideOpen) {
             // Pushed, with its own back arrow, like Feed — see the drawer item.
             RidePushedScreen(onBack = { rideOpen = false })
+        } else if (travelOpen) {
+            // Pushed, with its own back arrow, like Ride beside it in the drawer.
+            TravelPushedScreen(onBack = { travelOpen = false })
         } else if (settingsOpen) {
             SettingsPushedScreen(
                 profile = profile,
@@ -828,6 +835,10 @@ private fun MainShell(
                         onOpenRide = {
                             scope.launch { drawerState.close() }
                             rideOpen = true
+                        },
+                        onOpenTravel = {
+                            scope.launch { drawerState.close() }
+                            travelOpen = true
                         },
                     )
                 },
@@ -1113,7 +1124,6 @@ private fun MainShell(
                                             MainTab.Tara -> "Tara"
                                             MainTab.Together -> "Together"
                                             MainTab.Focus -> stringResource(R.string.attention_tab)
-                                            MainTab.Travel -> stringResource(R.string.travel_tab)
                                         },
                                     )
                                 },
@@ -1216,7 +1226,6 @@ private fun MainShell(
                             )
                         }
                         MainTab.Journal -> JournalScreen(modifier = content)
-                        MainTab.Travel -> mullu.comrade.ui.TravelScreen(modifier = content)
                         MainTab.Tara -> TaraScreen(modifier = content)
                         MainTab.Focus -> when (focusNav) {
                             FocusNav.Sessions -> FocusScreen(
@@ -1523,6 +1532,7 @@ private fun ComradeDrawerSheet(
     onOpenTasks: () -> Unit,
     onOpenFeed: () -> Unit,
     onOpenRide: () -> Unit,
+    onOpenTravel: () -> Unit,
 ) {
     ModalDrawerSheet {
         Row(
@@ -1585,6 +1595,16 @@ private fun ComradeDrawerSheet(
             onClick = onOpenRide,
             modifier = Modifier.testTag("drawer-ride"),
         )
+        // §7.7: Travel is a place you go deliberately, not a daily surface —
+        // the same test that put Ride and Feed here rather than on the bottom
+        // bar. It held a sixth tab slot briefly; this is where it settled.
+        NavigationDrawerItem(
+            label = { Text(stringResource(R.string.travel_tab)) },
+            icon = { Icon(ExploreIcon, contentDescription = null) },
+            selected = false,
+            onClick = onOpenTravel,
+            modifier = Modifier.testTag("drawer-travel"),
+        )
         NavigationDrawerItem(
             label = { Text(stringResource(R.string.call_history_title)) },
             icon = { Icon(CallIcon, contentDescription = null) },
@@ -1638,6 +1658,35 @@ private fun RidePushedScreen(onBack: () -> Unit) {
             peers = comrades,
             modifier = Modifier.padding(padding),
         )
+    }
+}
+
+/**
+ * Travel, as a pushed screen (`docs/TRAVEL.md`) — §7.7 moved it here from the
+ * bottom bar, beside Ride, on the same "somewhere you go deliberately" test.
+ * `TravelScreen` itself is unchanged; only its entry point moved.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun TravelPushedScreen(onBack: () -> Unit) {
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                modifier = Modifier.glassSurface(GlassElevation.Chrome),
+                colors = glassTopAppBarColors(),
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(
+                            Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = "Back",
+                        )
+                    }
+                },
+                title = { Text(stringResource(R.string.travel_tab)) },
+            )
+        },
+    ) { padding ->
+        mullu.comrade.ui.TravelScreen(modifier = Modifier.padding(padding))
     }
 }
 

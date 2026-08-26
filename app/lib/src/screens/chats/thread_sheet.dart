@@ -25,8 +25,10 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../data/comrade_repository.dart';
 import '../../data/models.dart';
 import '../../state/topic_providers.dart';
+import '../../theme/comrade_theme.dart';
 import '../../util/topic_view.dart';
 import '../../widgets/glass_surface.dart';
+import '../../widgets/list_skeleton.dart';
 
 /// Open the topic sheet.
 ///
@@ -232,13 +234,29 @@ class _TopicSheetState extends ConsumerState<_TopicSheet> {
             ),
           Flexible(
             child: async.when(
-              loading: () => const Padding(
-                padding: EdgeInsets.all(24),
-                child: Center(child: CircularProgressIndicator()),
+              // §7.3: the row shape is known before the list loads.
+              loading: () => Padding(
+                padding: const EdgeInsets.all(ComradeSpacing.space4),
+                child: ListSkeleton.peerRows(
+                  key: const Key('topics-skeleton'),
+                  rowCount: 3,
+                ),
               ),
               error: (Object e, _) => Padding(
                 padding: const EdgeInsets.all(20),
-                child: Text(e is ComradeException ? e.message : '$e'),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                    Text(e is ComradeException ? e.message : '$e'),
+                    const SizedBox(height: ComradeSpacing.space2),
+                    TextButton(
+                      onPressed: () =>
+                          ref.invalidate(topicsProvider(widget.peer)),
+                      child: const Text('Try again'),
+                    ),
+                  ],
+                ),
               ),
               data: (TopicsState state) => _body(context, state),
             ),

@@ -10,6 +10,7 @@ import '../../data/models.dart';
 import '../../state/chat_providers.dart';
 import '../../util/display_name.dart';
 import '../../widgets/app_chrome.dart';
+import '../../widgets/list_skeleton.dart';
 import '../../widgets/peer_avatar.dart';
 
 class ChatsListScreen extends ConsumerWidget {
@@ -36,10 +37,9 @@ class ChatsListScreen extends ConsumerWidget {
     final int requestCount = ref.watch(messageRequestCountProvider);
 
     return conversations.when(
-      loading: () => const Center(
-        child:
-            SizedBox(width: 28, height: 28, child: CircularProgressIndicator()),
-      ),
+      // §7.3: the row shape is known before the list loads, so the loading
+      // state shows it rather than hiding it behind a spinner.
+      loading: () => ListSkeleton.peerRows(key: const Key('chats-skeleton')),
       error: (Object e, StackTrace s) => EmptyState(
         title: 'Could not load your chats',
         body: '$e',

@@ -84,6 +84,14 @@ class ErrorText extends StatelessWidget {
 }
 
 /// Centred empty state with an optional call to action.
+///
+/// §7.4: no illustration, no headline-plus-subhead, at most one action — and
+/// the copy reads as "what belongs here", in `mutedForeground` (the doc's own
+/// words), not as a heading in the page's ordinary text colour. `title` and
+/// `body` still exist as two params for source compatibility with call sites
+/// written before §7.4, but both render at the same muted weight now, so a
+/// caller passing only `title` already gets the one-line pattern the doc
+/// asks for.
 class EmptyState extends StatelessWidget {
   const EmptyState({
     required this.title,
@@ -103,7 +111,13 @@ class EmptyState extends StatelessWidget {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: <Widget>[
-              Text(title, style: Theme.of(context).textTheme.titleMedium),
+              Text(
+                title,
+                textAlign: TextAlign.center,
+                style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                      color: Theme.of(context).colorScheme.onSurfaceVariant,
+                    ),
+              ),
               if (body != null)
                 Padding(
                   padding: const EdgeInsets.only(top: 4, bottom: 16),

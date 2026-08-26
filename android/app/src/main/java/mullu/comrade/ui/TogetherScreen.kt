@@ -119,6 +119,7 @@ import mullu.comrade.together.TogetherDecisions
 import mullu.comrade.together.TogetherManager
 import mullu.comrade.ui.theme.ComradeRadii
 import mullu.comrade.ui.theme.GlassElevation
+import mullu.comrade.ui.theme.Spacing
 import mullu.comrade.ui.theme.glassSurface
 import java.util.Locale
 
@@ -1407,7 +1408,7 @@ private fun AlbumTile(
         modifier = Modifier
             .clip(RoundedCornerShape(12.dp))
             .clickable(onClick = onClick),
-        verticalArrangement = Arrangement.spacedBy(6.dp),
+        verticalArrangement = Arrangement.spacedBy(Spacing.space2),
     ) {
         Cover(
             uri = album.cover.uri,
@@ -1475,7 +1476,7 @@ private fun TrackRow(track: TogetherDecisions.Track, onClick: () -> Unit) {
             .clickable(onClick = onClick)
             .padding(vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(14.dp),
+        horizontalArrangement = Arrangement.spacedBy(Spacing.space4),
     ) {
         Cover(
             uri = track.uri,
@@ -2049,9 +2050,9 @@ private fun ServerRow(
         modifier = Modifier
             .fillMaxWidth()
             .clickable(onClick = onClick)
-            .padding(vertical = 10.dp),
+            .padding(vertical = Spacing.space3),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(14.dp),
+        horizontalArrangement = Arrangement.spacedBy(Spacing.space4),
     ) {
         Icon(QueueMusicIcon, contentDescription = null, tint = TogetherMuted)
         Column(Modifier.weight(1f)) {
@@ -2097,9 +2098,9 @@ private fun CandidateRow(
         modifier = Modifier
             .fillMaxWidth()
             .clickable(onClick = onClick)
-            .padding(vertical = 10.dp),
+            .padding(vertical = Spacing.space3),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(14.dp),
+        horizontalArrangement = Arrangement.spacedBy(Spacing.space4),
     ) {
         Icon(QueueMusicIcon, contentDescription = null, tint = TogetherMuted)
         Column(Modifier.weight(1f)) {
@@ -2725,7 +2726,7 @@ private fun LiveSession(
     if (!s.solo) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            horizontalArrangement = Arrangement.spacedBy(Spacing.space2),
         ) {
             Text(
                 stringResource(R.string.together_with, s.peerLabel),
@@ -3444,7 +3445,7 @@ private fun LyricsSheet(title: String, artist: String, durationMs: Long, positio
                 lines!!.isEmpty() -> Text(note.orEmpty(), color = TogetherMuted)
                 else -> {
                     val active = TogetherDecisions.lyricIndexAt(lines!!, positionMs)
-                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Column(verticalArrangement = Arrangement.spacedBy(Spacing.space3)) {
                         lines!!.forEachIndexed { i, line ->
                             Text(
                                 line.text,
@@ -3619,7 +3620,7 @@ private fun RememberedList(
                         }
                     } else Modifier),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(14.dp),
+                horizontalArrangement = Arrangement.spacedBy(Spacing.space4),
             ) {
                 Icon(QueueMusicIcon, contentDescription = null, tint = TogetherMuted)
                 Column(Modifier.weight(1f)) {

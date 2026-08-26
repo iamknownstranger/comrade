@@ -6,10 +6,12 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -30,6 +32,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import mullu.comrade.ComradeCore
+import mullu.comrade.ui.theme.ComradeRadii
+import mullu.comrade.ui.theme.ComradeSkeletonRowCount
+import mullu.comrade.ui.theme.Spacing
+import mullu.comrade.ui.theme.comradeSkeleton
 import uniffi.comrade_core.TaskState
 
 /**
@@ -118,14 +124,18 @@ fun TaskListScreen(modifier: Modifier = Modifier) {
         }
 
         when {
-            !loaded -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                CircularProgressIndicator()
+            // §7.3: the real row geometry, pulsing, rather than a spinner over
+            // a blank screen — a task's shape (checkbox, one line) is known
+            // before it loads.
+            !loaded -> Column(Modifier.fillMaxSize()) {
+                repeat(ComradeSkeletonRowCount) { TaskRowSkeleton() }
             }
 
             tasks.isEmpty() -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Text(
                     text = TaskList.EMPTY_COPY,
                     style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier
                         .padding(32.dp)
                         .testTag("tasks-empty"),
@@ -158,6 +168,27 @@ fun TaskListScreen(modifier: Modifier = Modifier) {
     }
 }
 
+/**
+ * §7.3's row geometry for a task: a checkbox-shaped mark and one line of text,
+ * painted with [comradeSkeleton] instead of a real [TaskRow].
+ */
+@Composable
+private fun TaskRowSkeleton() {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = Spacing.space4, vertical = Spacing.space3),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(Spacing.space3),
+    ) {
+        Box(Modifier.size(Spacing.space5).comradeSkeleton(RoundedCornerShape(ComradeRadii.sm)))
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(Spacing.space1)) {
+            Box(Modifier.fillMaxWidth(0.65f).height(16.dp).comradeSkeleton(RoundedCornerShape(ComradeRadii.sm)))
+            Box(Modifier.fillMaxWidth(0.35f).height(12.dp).comradeSkeleton(RoundedCornerShape(ComradeRadii.sm)))
+        }
+    }
+}
+
 @Composable
 private fun TaskRow(
     task: ComradeCore.TaskInfo,
@@ -165,7 +196,7 @@ private fun TaskRow(
     onAction: (ComradeCore.TaskInfo, TaskAction) -> Unit,
 ) {
     val resolved = task.state != TaskState.OPEN
-    Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp)) {
+    Column(modifier = Modifier.fillMaxWidth().padding(horizontal = Spacing.space4, vertical = Spacing.space3)) {
         Text(
             text = task.text,
             style = MaterialTheme.typography.bodyLarge,

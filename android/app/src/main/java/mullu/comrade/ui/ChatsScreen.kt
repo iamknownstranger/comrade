@@ -109,7 +109,10 @@ import mullu.comrade.together.MediaLibraryAccess
 import mullu.comrade.together.TogetherManager
 import mullu.comrade.ui.theme.AvatarPalette
 import mullu.comrade.ui.theme.ComradeRadii
+import mullu.comrade.ui.theme.ComradeSkeletonRowCount
 import mullu.comrade.ui.theme.GlassElevation
+import mullu.comrade.ui.theme.Spacing
+import mullu.comrade.ui.theme.comradeSkeleton
 import mullu.comrade.ui.theme.glassSurface
 import uniffi.comrade_ui.PlayRoute
 
@@ -190,8 +193,10 @@ fun ChatsScreen(
 
     val list = conversations
     when {
-        list == null -> Box(modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            CircularProgressIndicator(Modifier.size(28.dp))
+        list == null -> Column(modifier.fillMaxSize()) {
+            // §7.3: the real row geometry, pulsing, rather than a spinner over
+            // a blank screen — the list's shape is known before it arrives.
+            repeat(ComradeSkeletonRowCount) { ChatRowSkeleton() }
         }
         list.isEmpty() -> Column(
             modifier = modifier.fillMaxSize(),
@@ -210,9 +215,9 @@ fun ChatsScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .clickable { onOpen(convo.peer, convo.alias, convo.peerName) }
-                        .padding(horizontal = 16.dp, vertical = 11.dp),
+                        .padding(horizontal = Spacing.space4, vertical = Spacing.space3),
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(14.dp),
+                    horizontalArrangement = Arrangement.spacedBy(Spacing.space4),
                 ) {
                     Box(contentAlignment = Alignment.BottomEnd) {
                         PeerAvatar(title, seed = convo.peer)
@@ -248,24 +253,69 @@ fun ChatsScreen(
     }
 }
 
-/** Empty-state prompt for the chat list. */
+/**
+ * Empty-state prompt for the chat list — §7.4: one muted line, one button.
+ * This is first-run-empty specifically ("nothing here yet"), not a filtered-
+ * to-nothing state — the chat list has no filter to distinguish it from.
+ */
 @Composable
 private fun EmptyChats(onNewChat: () -> Unit) {
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(32.dp),
+            .padding(Spacing.space8),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
     ) {
-        Text("No chats yet", style = MaterialTheme.typography.titleMedium)
         Text(
-            "Find someone by username, or share your key so they can find you.",
-            style = MaterialTheme.typography.bodySmall,
+            "No chats yet — find someone by username, or share your key so they can find you.",
+            style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(top = 4.dp, bottom = 16.dp),
+            textAlign = TextAlign.Center,
+            modifier = Modifier.padding(bottom = Spacing.space4),
         )
         Button(onClick = onNewChat) { Text("Start a chat") }
+    }
+}
+
+/** §7.3's row geometry for a chat-list entry, painted with [comradeSkeleton] instead of real content. */
+@Composable
+private fun ChatRowSkeleton() {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = Spacing.space4, vertical = Spacing.space3),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(Spacing.space4),
+    ) {
+        Box(
+            Modifier
+                .size(46.dp)
+                .comradeSkeleton(CircleShape),
+        )
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(Spacing.space1)) {
+            Box(Modifier.fillMaxWidth(0.45f).height(16.dp).comradeSkeleton(RoundedCornerShape(ComradeRadii.sm)))
+            Box(Modifier.fillMaxWidth(0.7f).height(12.dp).comradeSkeleton(RoundedCornerShape(ComradeRadii.sm)))
+        }
+        Box(Modifier.width(32.dp).height(12.dp).comradeSkeleton(RoundedCornerShape(ComradeRadii.sm)))
+    }
+}
+
+/** §7.3's row geometry for a message-request row: avatar, two text lines, no trailing time. */
+@Composable
+private fun RequestRowSkeleton() {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = Spacing.space4, vertical = Spacing.space3),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(Spacing.space4),
+    ) {
+        Box(Modifier.size(46.dp).comradeSkeleton(CircleShape))
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(Spacing.space1)) {
+            Box(Modifier.fillMaxWidth(0.4f).height(16.dp).comradeSkeleton(RoundedCornerShape(ComradeRadii.sm)))
+            Box(Modifier.fillMaxWidth(0.8f).height(12.dp).comradeSkeleton(RoundedCornerShape(ComradeRadii.sm)))
+        }
     }
 }
 
@@ -330,7 +380,7 @@ fun NewChatScreen(
         modifier = modifier
             .fillMaxSize()
             .padding(horizontal = 16.dp, vertical = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
+        verticalArrangement = Arrangement.spacedBy(Spacing.space3),
     ) {
         item {
             OutlinedTextField(
@@ -386,7 +436,7 @@ fun NewChatScreen(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clickable { startChat(found.npub, found.name) }
-                    .padding(vertical = 6.dp),
+                    .padding(vertical = Spacing.space2),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
             ) {
@@ -421,7 +471,7 @@ fun NewChatScreen(
                         .clickable {
                             onOpen(contact.npub, contact.alias.ifBlank { null }, contact.name)
                         }
-                        .padding(vertical = 6.dp),
+                        .padding(vertical = Spacing.space2),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
@@ -1650,9 +1700,9 @@ fun ConversationScreen(
                     .testTag("threads-bar"),
             ) {
                 Row(
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                    modifier = Modifier.padding(horizontal = Spacing.space4, vertical = Spacing.space2),
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    horizontalArrangement = Arrangement.spacedBy(Spacing.space3),
                 ) {
                     Icon(
                         TagIcon,
@@ -1674,7 +1724,7 @@ fun ConversationScreen(
                                 unreadThreads.toString(),
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onPrimary,
-                                modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp),
+                                modifier = Modifier.padding(horizontal = Spacing.space2, vertical = Spacing.space1),
                             )
                         }
                     }
@@ -1689,8 +1739,8 @@ fun ConversationScreen(
             LazyColumn(
                 state = listState,
                 modifier = Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(12.dp),
-                verticalArrangement = Arrangement.spacedBy(6.dp),
+                contentPadding = PaddingValues(Spacing.space3),
+                verticalArrangement = Arrangement.spacedBy(Spacing.space2),
             ) {
                 if (chatItems.isEmpty()) {
                     item {
@@ -1825,7 +1875,7 @@ fun ConversationScreen(
                                                 tonalElevation = 1.dp,
                                                 modifier = Modifier.widthIn(max = 300.dp),
                                             ) {
-                                                Column(Modifier.padding(horizontal = 14.dp, vertical = 9.dp)) {
+                                                Column(Modifier.padding(horizontal = Spacing.space3, vertical = Spacing.space2)) {
                                                     if (hers) {
                                                         Text(
                                                             stringResource(R.string.tara_author_label),
@@ -1853,7 +1903,7 @@ fun ConversationScreen(
                                                     Row(
                                                         modifier = Modifier
                                                             .align(Alignment.End)
-                                                            .padding(top = 2.dp),
+                                                            .padding(top = Spacing.space1),
                                                         verticalAlignment = Alignment.CenterVertically,
                                                         horizontalArrangement = Arrangement.spacedBy(4.dp),
                                                     ) {
@@ -1949,7 +1999,7 @@ fun ConversationScreen(
                         style = MaterialTheme.typography.bodySmall,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                        modifier = Modifier.padding(horizontal = Spacing.space3, vertical = Spacing.space2),
                     )
                 }
                 TextButton(onClick = { replyingTo = null }) { Text("✕") }
@@ -2024,7 +2074,7 @@ fun ConversationScreen(
                                     },
                                 )
                             }
-                            .padding(vertical = 6.dp, horizontal = 4.dp),
+                            .padding(vertical = Spacing.space2, horizontal = Spacing.space1),
                     )
                 }
             }
@@ -2438,7 +2488,7 @@ private fun DaySeparator(label: String) {
     Box(
         Modifier
             .fillMaxWidth()
-            .padding(vertical = 6.dp),
+            .padding(vertical = Spacing.space2),
         contentAlignment = Alignment.Center,
     ) {
         Surface(
@@ -2449,7 +2499,7 @@ private fun DaySeparator(label: String) {
                 label,
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(horizontal = 10.dp, vertical = 3.dp),
+                modifier = Modifier.padding(horizontal = Spacing.space2, vertical = Spacing.space1),
             )
         }
     }
@@ -2467,7 +2517,7 @@ private fun UnreadSeparator(label: String) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(vertical = 6.dp),
+            .padding(vertical = Spacing.space2),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
@@ -2550,7 +2600,7 @@ private fun QuotedPreview(text: String, onTap: (() -> Unit)? = null) {
 private fun ReactionChips(chips: List<ReactionChip>, onToggle: (String) -> Unit) {
     if (chips.isEmpty()) return
     Row(
-        modifier = Modifier.padding(top = 3.dp).testTag("dm-reactions"),
+        modifier = Modifier.padding(top = Spacing.space1).testTag("dm-reactions"),
         horizontalArrangement = Arrangement.spacedBy(4.dp),
     ) {
         for (chip in chips) {
@@ -2564,9 +2614,9 @@ private fun ReactionChips(chips: List<ReactionChip>, onToggle: (String) -> Unit)
                 modifier = Modifier.clickable { onToggle(chip.emoji) },
             ) {
                 Row(
-                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp),
+                    modifier = Modifier.padding(horizontal = Spacing.space2, vertical = Spacing.space1),
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(3.dp),
+                    horizontalArrangement = Arrangement.spacedBy(Spacing.space1),
                 ) {
                     Text(chip.emoji, style = MaterialTheme.typography.labelLarge)
                     // The count is only informative once more than one person is
@@ -2793,11 +2843,12 @@ fun RequestsScreen(
 
     val list = requests
     when {
-        list == null -> Box(modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            CircularProgressIndicator(Modifier.size(28.dp))
+        list == null -> Column(modifier.fillMaxSize()) {
+            // §7.3: skeletons, not a spinner — same reasoning as the chat list above.
+            repeat(ComradeSkeletonRowCount) { RequestRowSkeleton() }
         }
         list.isEmpty() -> Box(
-            modifier.fillMaxSize().padding(32.dp),
+            modifier.fillMaxSize().padding(Spacing.space8),
             contentAlignment = Alignment.Center,
         ) {
             Text(
@@ -2811,11 +2862,11 @@ fun RequestsScreen(
                 Column(
                     Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 10.dp),
+                        .padding(horizontal = Spacing.space4, vertical = Spacing.space3),
                 ) {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(14.dp),
+                        horizontalArrangement = Arrangement.spacedBy(Spacing.space4),
                     ) {
                         PeerAvatar(shortNpub(req.peer), seed = req.peer)
                         Column(Modifier.weight(1f)) {
@@ -2834,7 +2885,7 @@ fun RequestsScreen(
                         }
                     }
                     Row(
-                        Modifier.fillMaxWidth().padding(top = 6.dp),
+                        Modifier.fillMaxWidth().padding(top = Spacing.space2),
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
                         OutlinedButton(

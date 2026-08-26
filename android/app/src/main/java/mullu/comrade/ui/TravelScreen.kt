@@ -132,7 +132,12 @@ fun TravelScreen(modifier: Modifier = Modifier) {
     )
 
     Column(
-        modifier = modifier.fillMaxSize(),
+        // The screen root, tagged because the device test needs something that
+        // identifies *this screen* whatever the location state: `travel_guide`
+        // below only exists once a guide loads, and the word "Travel" is also
+        // the drawer item's label, so a text finder matches the drawer entry
+        // still composed behind this screen as well as the bar above it.
+        modifier = modifier.fillMaxSize().testTag("travel-screen"),
         verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
         // A thin bar rather than a full-screen spinner once there is something

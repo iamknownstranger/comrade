@@ -7,13 +7,26 @@
 /// chat bubble on either side), and that naming a topic twice is one topic.
 library;
 
+import 'dart:async';
+
 import 'package:comrade/src/data/fake_comrade_repository.dart';
 import 'package:comrade/src/data/models.dart';
 import 'package:comrade/src/screens/chats/conversation_screen.dart';
+import 'package:comrade/src/screens/chats/thread_sheet.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'helpers.dart';
+
+/// Never resolves `topics()`, so the sheet's own loading branch can be
+/// pinned rather than raced past.
+class _StuckTopicsRepo extends FakeComradeRepository {
+  _StuckTopicsRepo() : super(latency: Duration.zero, seed: false);
+
+  @override
+  Future<List<TopicInfo>> topics(String peer) =>
+      Completer<List<TopicInfo>>().future;
+}
 
 /// A conversation of `root` plus two replies into it, and one unrelated
 /// message — the smallest history in which "thread" means anything. Mirrors
@@ -295,6 +308,41 @@ void main() {
 
       expect(find.textContaining('two or more letters'), findsOneWidget);
       expect(await repo.topics(FakePeers.alice), isEmpty);
+    });
+
+    testWidgets('the row shape shows while topics load, not a bare spinner',
+        (WidgetTester tester) async {
+      // `showTopicSheet` directly, rather than through `ConversationScreen`'s
+      // threads-bar: that bar only renders once `topicsProvider` already has
+      // data, which a repo whose `topics()` never resolves would never reach.
+      setWindowSize(tester, const Size(420, 900));
+      final _StuckTopicsRepo repo = _StuckTopicsRepo();
+      await repo.unlockVault(path: 't', passphrase: 'p');
+
+      await tester.pumpWidget(harness(
+        Builder(
+          builder: (BuildContext context) => ElevatedButton(
+            onPressed: () => showTopicSheet(
+              context,
+              peer: FakePeers.alice,
+              onOpenThread: (String _) {},
+            ),
+            child: const Text('open'),
+          ),
+        ),
+        repo: repo,
+      ));
+      await tester.tap(find.text('open'));
+      // Explicit pumps rather than `pumpAndSettle`, and not because of the
+      // stuck repo: the skeleton's pulse is an *infinite* repeating
+      // animation, so settling never returns while one is on screen (§7.3).
+      // The two pumps start the sheet's entrance transition and then run it
+      // past its end, which is all this needs before asserting.
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 400));
+
+      expect(find.byKey(const Key('topics-skeleton')), findsOneWidget);
+      expect(find.byType(CircularProgressIndicator), findsNothing);
     });
   });
 }

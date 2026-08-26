@@ -9,12 +9,14 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Switch
@@ -42,7 +44,11 @@ import kotlinx.coroutines.withContext
 import mullu.comrade.ComradeCore
 import mullu.comrade.PresenceMonitor
 import mullu.comrade.R
+import mullu.comrade.ui.theme.ComradeRadii
+import mullu.comrade.ui.theme.ComradeSkeletonRowCount
 import mullu.comrade.ui.theme.OnlineGreen
+import mullu.comrade.ui.theme.Spacing
+import mullu.comrade.ui.theme.comradeSkeleton
 
 /**
  * A presence dot: green while the peer is online, a muted grey otherwise.
@@ -111,96 +117,118 @@ fun ComradesScreen(
         }
     }
 
+    // One `when`, not an early `return` — `.claude/rules/android.md`: a bare
+    // `return` here would make this composable emit a different number of
+    // groups before and after `comrades` first loads, which throws on the
+    // recomposition that follows, not on the first frame.
     val chosen = comrades
-    if (chosen == null) {
-        Box(modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            CircularProgressIndicator(Modifier.size(28.dp))
+    when {
+        chosen == null -> Column(modifier.fillMaxSize()) {
+            // §7.3: the real row geometry, pulsing, rather than a spinner over
+            // a blank screen — the list's shape is known before it arrives.
+            repeat(ComradeSkeletonRowCount) { ComradeRowSkeleton() }
         }
-        return
-    }
-    val chosenKeys = chosen.map { it.npub }.toSet()
-    val others = contacts.filterNot { it.npub in chosenKeys }
+        else -> {
+            val chosenKeys = chosen.map { it.npub }.toSet()
+            val others = contacts.filterNot { it.npub in chosenKeys }
 
-    LazyColumn(modifier = modifier.fillMaxSize()) {
-        item {
-            Text(
-                stringResource(R.string.comrades_explainer),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
-            )
-        }
-        error?.let { msg ->
-            item {
-                Text(
-                    msg,
-                    color = MaterialTheme.colorScheme.error,
-                    style = MaterialTheme.typography.bodySmall,
-                    modifier = Modifier.padding(horizontal = 16.dp),
-                )
-            }
-        }
-        if (chosen.isEmpty()) {
-            item {
-                Text(
-                    stringResource(
-                        if (contacts.isEmpty()) R.string.comrades_no_contacts else R.string.comrades_empty,
-                    ),
-                    style = MaterialTheme.typography.bodyMedium,
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-                )
-            }
-        }
-        items(chosen, key = { "comrade:" + it.npub }) { comrade ->
-            // Prefer the live flow over the snapshot this screen loaded, so a
-            // beacon arriving while it is open moves the dot immediately.
-            val live = presenceNow[comrade.npub]
-            val online = live?.online ?: comrade.online
-            ComradeRow(
-                title = peerTitle(comrade.npub, comrade.alias, comrade.name),
-                seed = comrade.npub,
-                online = online,
-                subtitle = presenceText(
-                    online = online,
-                    // The store's timestamp is authoritative (it also records
-                    // an explicit goodbye); the flow only ever fills in a
-                    // sighting the store hasn't been re-read for yet.
-                    lastSeenAt = maxOf(comrade.lastSeenAt, live?.lastSeenAt ?: 0L),
-                    peerMarkedUs = comrade.peerMarkedUs || live?.peerMarkedUs == true,
-                ),
-                checked = true,
-                onCheckedChange = { toggle(comrade.npub, it) },
-                onClick = { onOpen(comrade.npub, comrade.alias.ifBlank { null }, comrade.name) },
-            )
-            HorizontalDivider(
-                modifier = Modifier.padding(start = 76.dp),
-                color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f),
-            )
-        }
-        if (others.isNotEmpty()) {
-            item {
-                Text(
-                    "Contacts",
-                    style = MaterialTheme.typography.titleSmall,
-                    color = MaterialTheme.colorScheme.primary,
-                    modifier = Modifier.padding(start = 16.dp, top = 16.dp, bottom = 4.dp),
-                )
-            }
-            items(others, key = { "contact:" + it.npub }) { contact ->
-                ComradeRow(
-                    title = peerTitle(contact.npub, contact.alias, contact.name),
-                    seed = contact.npub,
-                    online = false,
-                    subtitle = shortNpub(contact.npub),
-                    showDot = false,
-                    checked = false,
-                    onCheckedChange = { toggle(contact.npub, it) },
-                    onClick = { onOpen(contact.npub, contact.alias.ifBlank { null }, contact.name) },
-                )
-                HorizontalDivider(
-                    modifier = Modifier.padding(start = 76.dp),
-                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f),
-                )
+            LazyColumn(modifier = modifier.fillMaxSize()) {
+                item {
+                    Text(
+                        stringResource(R.string.comrades_explainer),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(horizontal = Spacing.space4, vertical = Spacing.space3),
+                    )
+                }
+                error?.let { msg ->
+                    item {
+                        Text(
+                            msg,
+                            color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.padding(horizontal = Spacing.space4),
+                        )
+                    }
+                }
+                if (chosen.isEmpty()) {
+                    item {
+                        // §7.4: first-run-empty ("no comrades yet") and
+                        // filtered-to-nothing ("no contacts to choose from")
+                        // are different states and use different strings —
+                        // `comrades_empty` vs `comrades_no_contacts`.
+                        Text(
+                            stringResource(
+                                if (contacts.isEmpty()) {
+                                    R.string.comrades_no_contacts
+                                } else {
+                                    R.string.comrades_empty
+                                },
+                            ),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(horizontal = Spacing.space4, vertical = Spacing.space2),
+                        )
+                    }
+                }
+                items(chosen, key = { "comrade:" + it.npub }) { comrade ->
+                    // Prefer the live flow over the snapshot this screen loaded,
+                    // so a beacon arriving while it is open moves the dot
+                    // immediately.
+                    val live = presenceNow[comrade.npub]
+                    val online = live?.online ?: comrade.online
+                    ComradeRow(
+                        title = peerTitle(comrade.npub, comrade.alias, comrade.name),
+                        seed = comrade.npub,
+                        online = online,
+                        subtitle = presenceText(
+                            online = online,
+                            // The store's timestamp is authoritative (it also
+                            // records an explicit goodbye); the flow only ever
+                            // fills in a sighting the store hasn't been re-read
+                            // for yet.
+                            lastSeenAt = maxOf(comrade.lastSeenAt, live?.lastSeenAt ?: 0L),
+                            peerMarkedUs = comrade.peerMarkedUs || live?.peerMarkedUs == true,
+                        ),
+                        checked = true,
+                        onCheckedChange = { toggle(comrade.npub, it) },
+                        onClick = { onOpen(comrade.npub, comrade.alias.ifBlank { null }, comrade.name) },
+                    )
+                    HorizontalDivider(
+                        modifier = Modifier.padding(start = 76.dp),
+                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f),
+                    )
+                }
+                if (others.isNotEmpty()) {
+                    item {
+                        Text(
+                            "Contacts",
+                            style = MaterialTheme.typography.titleSmall,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.padding(
+                                start = Spacing.space4,
+                                top = Spacing.space4,
+                                bottom = Spacing.space1,
+                            ),
+                        )
+                    }
+                    items(others, key = { "contact:" + it.npub }) { contact ->
+                        ComradeRow(
+                            title = peerTitle(contact.npub, contact.alias, contact.name),
+                            seed = contact.npub,
+                            online = false,
+                            subtitle = shortNpub(contact.npub),
+                            showDot = false,
+                            checked = false,
+                            onCheckedChange = { toggle(contact.npub, it) },
+                            onClick = { onOpen(contact.npub, contact.alias.ifBlank { null }, contact.name) },
+                        )
+                        HorizontalDivider(
+                            modifier = Modifier.padding(start = 76.dp),
+                            color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f),
+                        )
+                    }
+                }
             }
         }
     }
@@ -261,13 +289,21 @@ private fun ComradeRow(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 8.dp),
+            .padding(horizontal = Spacing.space4, vertical = Spacing.space2),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(14.dp),
+        horizontalArrangement = Arrangement.spacedBy(Spacing.space4),
     ) {
-        Box(contentAlignment = Alignment.BottomEnd) {
-            PeerAvatar(title, seed = seed, modifier = Modifier.clickable { onClick() })
-            if (showDot) PresenceDot(online, size = 12.dp)
+        // §7.5: the avatar draws at 46dp, short of the 48dp touch floor — the
+        // hit area grows to Spacing.space12 around it rather than the avatar
+        // itself growing, so the dot and the ripple both stay the drawn size.
+        Box(
+            modifier = Modifier
+                .size(Spacing.space12)
+                .clickable { onClick() },
+            contentAlignment = Alignment.Center,
+        ) {
+            PeerAvatar(title, seed = seed)
+            if (showDot) PresenceDot(online, size = 12.dp, modifier = Modifier.align(Alignment.BottomEnd))
         }
         Column(
             Modifier
@@ -293,5 +329,28 @@ private fun ComradeRow(
             onCheckedChange = onCheckedChange,
             modifier = Modifier.testTag("comrade-toggle:$seed"),
         )
+    }
+}
+
+/**
+ * §7.3's row geometry for a comrade: an avatar circle, a name line, a
+ * presence line, and a trailing toggle-shaped block — the same silhouette as
+ * [ComradeRow] with real content swapped for [comradeSkeleton] fills.
+ */
+@Composable
+private fun ComradeRowSkeleton() {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = Spacing.space4, vertical = Spacing.space2),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(Spacing.space4),
+    ) {
+        Box(Modifier.size(46.dp).comradeSkeleton(CircleShape))
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(Spacing.space1)) {
+            Box(Modifier.fillMaxWidth(0.4f).height(16.dp).comradeSkeleton(RoundedCornerShape(ComradeRadii.sm)))
+            Box(Modifier.fillMaxWidth(0.6f).height(12.dp).comradeSkeleton(RoundedCornerShape(ComradeRadii.sm)))
+        }
+        Box(Modifier.width(36.dp).height(20.dp).comradeSkeleton(RoundedCornerShape(ComradeRadii.sm)))
     }
 }

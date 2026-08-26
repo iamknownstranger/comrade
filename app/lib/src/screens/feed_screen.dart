@@ -18,6 +18,7 @@ import '../state/content_providers.dart';
 import '../state/providers.dart';
 import '../util/display_name.dart';
 import '../widgets/app_chrome.dart';
+import '../widgets/list_skeleton.dart';
 import '../widgets/peer_avatar.dart';
 
 const int kChitthiMaxChars = 2000;
@@ -90,14 +91,19 @@ class _FeedScreenState extends ConsumerState<FeedScreen> {
           _composer(context),
           const SizedBox(height: 14),
           ...feed.when(
-            loading: () => const <Widget>[
-              Padding(
-                padding: EdgeInsets.only(top: 24),
-                child: Center(child: CircularProgressIndicator()),
-              ),
+            // §7.3: the row shape is known before the list loads.
+            loading: () => <Widget>[
+              ListSkeleton.cardRows(key: const Key('feed-skeleton')),
             ],
             error: (Object e, StackTrace s) => <Widget>[
-              EmptyState(title: 'Could not load the timeline', body: '$e'),
+              EmptyState(
+                title: 'Could not load the timeline',
+                body: '$e',
+                action: FilledButton(
+                  onPressed: () => ref.invalidate(feedProvider),
+                  child: const Text('Try again'),
+                ),
+              ),
             ],
             data: (List<ChitthiInfo> items) {
               if (items.isEmpty) {
