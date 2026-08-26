@@ -109,7 +109,10 @@ import mullu.comrade.together.MediaLibraryAccess
 import mullu.comrade.together.TogetherManager
 import mullu.comrade.ui.theme.AvatarPalette
 import mullu.comrade.ui.theme.ComradeRadii
+import mullu.comrade.ui.theme.ComradeSkeletonRowCount
 import mullu.comrade.ui.theme.GlassElevation
+import mullu.comrade.ui.theme.Spacing
+import mullu.comrade.ui.theme.comradeSkeleton
 import mullu.comrade.ui.theme.glassSurface
 import uniffi.comrade_ui.PlayRoute
 

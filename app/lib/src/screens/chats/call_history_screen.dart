@@ -49,9 +49,11 @@ class CallHistoryScreen extends ConsumerWidget {
     final Map<String, ContactInfo> contacts = ref.watch(contactsByNpubProvider);
 
     return history.when(
-      loading: () => const Center(
-        child:
-            SizedBox(width: 28, height: 28, child: CircularProgressIndicator()),
+      // §7.3: a call row is an avatar, a name and a time — a shape known
+      // before the list arrives, so the loading state shows it rather than
+      // hiding it behind a spinner.
+      loading: () => ListSkeleton.peerRows(
+        key: const Key('call-history-skeleton'),
       ),
       error: (Object e, StackTrace s) =>
           EmptyState(title: 'Could not load call history', body: '$e'),

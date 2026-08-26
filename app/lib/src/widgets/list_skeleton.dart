@@ -220,7 +220,8 @@ class _SkeletonCardRow extends StatelessWidget {
         children: <Widget>[
           Row(
             children: <Widget>[
-              const SkeletonBlock(width: 28, height: 28, shape: BoxShape.circle),
+              const SkeletonBlock(
+                  width: 28, height: 28, shape: BoxShape.circle),
               const SizedBox(width: ComradeSpacing.space2),
               const SkeletonBlock(width: 80, height: 12),
             ],
