@@ -287,16 +287,30 @@ class MainActivityUiTest {
         Espresso.pressBack()
         composeRule.waitForIdle()
 
-        // Travel (added 2026-08-16, a bottom-nav tab rather than a drawer
-        // item) had never been opened on a device either — the same gap
-        // docs/TRAVEL.md's TRAVEL-1 names, and the same bug class Tasks and
-        // Ride shipped: an early return@Column would pass every lane that
-        // runs here and only fail on a device mid-recomposition. Coarse
-        // location is pre-granted above so the screen actually walks
-        // Locating → Loading → a terminal state instead of parking on the
-        // permission prompt.
-        composeRule.onNodeWithText("Travel").performClick()
+        composeRule.onNodeWithTag("nav-drawer-button").performClick()
         composeRule.waitForIdle()
+
+        // Travel, reached from the drawer rather than the bottom bar: it moved
+        // there when the bar went back to five (`docs/DESIGN_SYSTEM.md` §7.7).
+        // This leg is one thing, not two — it proves the route still exists
+        // (the Feed assertion's purpose: "off the nav, not removed" only holds
+        // if something still reaches it) *and* that the screen survives its own
+        // load, which is why it was written in the first place. Travel had
+        // never been opened on a device — the gap docs/TRAVEL.md's TRAVEL-1
+        // names, and the bug class Tasks and Ride both shipped: an early
+        // return@Column passes every lane that runs before CI and only fails on
+        // a device mid-recomposition. Coarse location is pre-granted above, so
+        // the screen really walks Locating → Loading → a terminal state instead
+        // of parking on the permission prompt.
+        composeRule.onNodeWithTag("drawer-travel").performClick()
+        composeRule.waitForIdle()
+        // The screen root, not the word "Travel": `travel_tab` labels the
+        // drawer item too, and a closed `ModalNavigationDrawer` keeps its
+        // content composed, so a text finder matches two nodes and
+        // `assertIsDisplayed` throws on the ambiguity rather than on anything
+        // to do with Travel. Feed escapes this only because its string happens
+        // to be unique to the screen.
+        composeRule.onNodeWithTag("travel-screen").assertIsDisplayed()
         composeRule.waitUntil(timeoutMillis = 60_000) {
             hasTag("travel_guide") || hasText("Try again")
         }
@@ -310,28 +324,8 @@ class MainActivityUiTest {
             composeRule.onNodeWithText("Try again").performClick()
             composeRule.waitForIdle()
         }
-        composeRule.onNodeWithText("Chats").performClick()
-        composeRule.waitForIdle()
-
-        composeRule.onNodeWithTag("nav-drawer-button").performClick()
-        composeRule.waitForIdle()
-
-        // Travel moved off the bottom bar into the drawer beside Ride
-        // (`docs/DESIGN_SYSTEM.md` §7.7) — asserted for the same reason Feed
-        // is above: "off the nav, not removed" only holds if there is still a
-        // route to it.
-        //
-        // The screen's own tag, not the word "Travel": the drawer item carries
-        // that same `travel_tab` string, and a closed `ModalNavigationDrawer`
-        // keeps its content composed — so a text finder matches two nodes and
-        // `assertIsDisplayed` throws on the ambiguity rather than failing for
-        // any reason to do with Travel. Feed dodges this only because its
-        // assertion happens to use a string unique to the screen. Not the
-        // loaded-guide tag either: that needs a location fix the emulator may
-        // not have, whereas the screen root renders in every state.
-        composeRule.onNodeWithTag("drawer-travel").performClick()
-        composeRule.waitForIdle()
-        composeRule.onNodeWithTag("travel-screen").assertIsDisplayed()
+        // Back out the way Tasks and Ride do: Travel is a pushed destination
+        // now, not a tab, so there is no bottom-bar entry to return through.
         Espresso.pressBack()
         composeRule.waitForIdle()
         composeRule.onNodeWithTag("nav-drawer-button").performClick()
