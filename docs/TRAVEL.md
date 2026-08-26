@@ -207,11 +207,11 @@ run. Only the socket is behind `travel-http`.
 
 **Not checked anywhere before CI:**
 
-- Anything about how the screen *looks*, and whether `TravelScreen` survives a
-  recomposition. `.claude/rules/android.md`'s early-return rule was followed
-  (every branch is an `if`/`when`), but the lane that would prove it is the
-  emulator, and this change does not add an emulator test — a gap recorded
-  rather than hidden.
+- How the screen *looks*. `.claude/rules/android.md`'s early-return rule was
+  followed (every branch is an `if`/`when`), and §10's TRAVEL-1 closed the
+  emulator-cover gap this line used to name — but that test is itself unrun
+  here (no Android SDK), so CI's emulator lane is still the first place either
+  claim is actually checked.
 - Every real network response. Every parser test is a fixture; nothing here has
   ever spoken to Overpass, Wikipedia or Google.
 - `app/` (Flutter). The Travel tab is **Android-only** for now — see §9.
@@ -233,10 +233,13 @@ Both are parity debt, not a closed decision.
 
 ## 10. Follow-ups worth naming
 
-- **TRAVEL-1 — no emulator cover.** `MainActivityUiTest` does not open the tab.
-  The two Compose crashes this app has shipped (`TaskListScreen`, `RideScreen`)
-  were both invisible to every lane that runs here. Exit: a test that opens
-  Travel and waits past a state change.
+- ~~**TRAVEL-1 — no emulator cover.**~~ **— done 2026-08-21.**
+  `MainActivityUiTest` now opens the Travel tab (coarse location pre-granted so
+  it actually walks Locating → Loading → a terminal state) and waits until
+  either the guide (`travel_guide` tag) or a terminal error/no-fix state
+  ("Try again") appears, then takes one more action to prove the screen
+  survived the recomposition — the same proof the Tasks and Ride legs already
+  give. Still unrun on a device or in CI; this sandbox has no Android SDK.
 - **TRAVEL-2 — the guide is not reachable offline.** The cache is per-session and
   in memory, so a guide fetched on hotel WiFi is gone by the time it is useful on
   the street. Persisting it would mean writing where somebody has been into the

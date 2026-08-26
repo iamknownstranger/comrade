@@ -48,12 +48,19 @@ class MainActivityUiTest {
     // the grant, tapping record pops the runtime permission dialog over the
     // app, which pauses the Activity and empties the Compose hierarchy the
     // assertions read.
+    // ACCESS_COARSE_LOCATION joins it for the Travel leg below: granting it
+    // before launch means that leg actually walks Locating → Loading → a
+    // terminal state instead of parking on the permission prompt
+    // (`TravelDecisions.State.NeedsPermission`), which is the one branch a
+    // real device run needs to get past to prove the state-machine
+    // transitions are safe.
     @get:Rule
     val rules: RuleChain = RuleChain
         .outerRule(
             GrantPermissionRule.grant(
                 Manifest.permission.POST_NOTIFICATIONS,
                 Manifest.permission.RECORD_AUDIO,
+                Manifest.permission.ACCESS_COARSE_LOCATION,
             ),
         )
         .around(composeRule)
@@ -279,6 +286,33 @@ class MainActivityUiTest {
 
         Espresso.pressBack()
         composeRule.waitForIdle()
+
+        // Travel (added 2026-08-16, a bottom-nav tab rather than a drawer
+        // item) had never been opened on a device either — the same gap
+        // docs/TRAVEL.md's TRAVEL-1 names, and the same bug class Tasks and
+        // Ride shipped: an early return@Column would pass every lane that
+        // runs here and only fail on a device mid-recomposition. Coarse
+        // location is pre-granted above so the screen actually walks
+        // Locating → Loading → a terminal state instead of parking on the
+        // permission prompt.
+        composeRule.onNodeWithText("Travel").performClick()
+        composeRule.waitForIdle()
+        composeRule.waitUntil(timeoutMillis = 60_000) {
+            hasTag("travel_guide") || hasText("Try again")
+        }
+        // Whichever terminal state this emulator's fix and network produced —
+        // a guide, or "no fix"/"failed" with a retry — the screen is still
+        // alive and takes a follow-up tap: the same "survived the
+        // recomposition" proof the Ride leg above relies on.
+        if (hasTag("travel_guide")) {
+            composeRule.onNodeWithTag("travel_guide").assertIsDisplayed()
+        } else {
+            composeRule.onNodeWithText("Try again").performClick()
+            composeRule.waitForIdle()
+        }
+        composeRule.onNodeWithText("Chats").performClick()
+        composeRule.waitForIdle()
+
         composeRule.onNodeWithTag("nav-drawer-button").performClick()
         composeRule.waitForIdle()
         composeRule.onNodeWithTag("drawer-settings").performClick()
