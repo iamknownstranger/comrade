@@ -465,6 +465,7 @@ mod tests {
 
     fn openly(url: Option<&str>, licence: OpenLicence) -> CatalogueMatch {
         CatalogueMatch {
+            source: "Test".into(),
             recording: Recording {
                 isrc: None,
                 title: "Kun Faya Kun".into(),

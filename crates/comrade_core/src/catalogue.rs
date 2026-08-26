@@ -212,6 +212,13 @@ pub fn licence_permits_sharing(licence: OpenLicence) -> bool {
 /// redistributed.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct CatalogueMatch {
+    /// Which catalogue answered. A row names its source on screen
+    /// (`CatalogueResolver::name`'s contract: a guess presented without its
+    /// source is worse than no guess), and with more than one resolver wired,
+    /// that name has to travel **on the match** rather than live as a constant
+    /// beside a single call site — the exact drift §20 predicted for
+    /// TogetherScreen's now-removed `MUSICBRAINZ` constant.
+    pub source: String,
     pub recording: Recording,
     /// Duration when the catalogue knows it — the tiebreak
     /// [`crate::together::match_score`] uses against a local file.
@@ -226,12 +233,36 @@ pub struct CatalogueMatch {
 
 impl CatalogueMatch {
     /// Metadata only — the MusicBrainz shape.
+    ///
+    /// Named for the one catalogue that produces it: every metadata-only
+    /// resolver today *is* MusicBrainz. The day a second metadata-only
+    /// catalogue exists, this constructor grows a source parameter and stops
+    /// guessing — same reasoning as [`Self::openly_licensed`] taking one.
     pub fn metadata(recording: Recording, duration_ms: Option<u64>) -> Self {
         Self {
+            source: "MusicBrainz".to_string(),
             recording,
             duration_ms,
             audio_url: None,
             licence: OpenLicence::Unknown,
+        }
+    }
+
+    /// An answer carrying audio the catalogue itself serves under a declared
+    /// licence. The source is taken, not assumed: two audio catalogues in the
+    /// plan means two names on the rows.
+    pub fn openly_licensed(
+        recording: Recording,
+        duration_ms: Option<u64>,
+        audio_url: String,
+        source: &'static str,
+    ) -> Self {
+        Self {
+            source: source.to_string(),
+            recording,
+            duration_ms,
+            audio_url: Some(audio_url),
+            licence: OpenLicence::CreativeCommons,
         }
     }
 
@@ -565,6 +596,146 @@ async fn fetch_json(url: &str, user_agent: &str) -> Result<String, CatalogueErro
     String::from_utf8(buf).map_err(|e| CatalogueError::Malformed(e.to_string()))
 }
 
+// ── The Jamendo adapter ──────────────────────────────────────────────────────
+
+/// Jamendo — an openly-licensed catalogue that *serves audio*.
+///
+/// Where MusicBrainz answers "what is this recording" and stops, Jamendo
+/// answers it and hands over the file: every track on the platform is
+/// published under a Creative Commons licence the API declares per track, with
+/// direct download and streaming URLs. That makes it the first real
+/// [`SourceTier::OpenLicence`] resident — [`choose_audio_plan`] can pick it,
+/// and `download.rs`'s gate opens for it, without any new policy: the licence
+/// check that already existed simply has something true to check.
+///
+/// It needs a client id (free, per-app, from developer.jamendo.com) because
+/// that is how the provider rate-limits; there is no key to ship in the binary
+/// because the caller supplies theirs per call, exactly like Subsonic's
+/// credentials. No config, no search.
+#[cfg(feature = "catalogue-http")]
+#[derive(Debug, Clone)]
+pub struct Jamendo {
+    base: String,
+    client_id: String,
+}
+
+#[cfg(feature = "catalogue-http")]
+impl Jamendo {
+    /// The public API with this app's registered id.
+    pub fn new(client_id: impl Into<String>) -> Self {
+        Self {
+            base: "https://api.jamendo.com".to_string(),
+            client_id: client_id.into(),
+        }
+    }
+
+    /// Point at another instance — a test server.
+    #[cfg(test)]
+    pub fn with_base(base: impl Into<String>, client_id: impl Into<String>) -> Self {
+        Self {
+            base: base.into(),
+            client_id: client_id.into(),
+        }
+    }
+}
+
+#[cfg(feature = "catalogue-http")]
+impl CatalogueResolver for Jamendo {
+    fn name(&self) -> &'static str {
+        "Jamendo"
+    }
+
+    async fn lookup(&self, query: &str) -> Result<Vec<CatalogueMatch>, CatalogueError> {
+        let url = format!(
+            "{}/v3.0/tracks/?client_id={}&format=json&search={}&limit={MAX_CANDIDATES}",
+            self.base,
+            urlencode(&self.client_id),
+            urlencode(query),
+        );
+        let body = fetch_json(&url, "comrade/1.0 (https://github.com/cmullu/comrade)").await?;
+        parse_jamendo(&body)
+    }
+}
+
+/// Parse a Jamendo track-search response.
+///
+/// Split from the request so the shape is pinned by a fixture, like
+/// [`parse_musicbrainz`]. Two fields carry policy weight and are read
+/// accordingly:
+///
+/// - `audiodownload_allowed` — the artist's own switch for whether the track
+///   may be fetched as a file. When they said no, we take the stream URL or
+///   nothing, never the download URL: **serving the bytes is not licensing
+///   them**, the same line `download_verdict` draws.
+/// - `duration` — seconds here (MusicBrainz reports milliseconds), converted
+///   once so `match_score` sees one unit everywhere.
+#[cfg(feature = "catalogue-http")]
+pub fn parse_jamendo(body: &str) -> Result<Vec<CatalogueMatch>, CatalogueError> {
+    let doc: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| CatalogueError::Malformed(e.to_string()))?;
+    let Some(items) = doc.get("results").and_then(|r| r.as_array()) else {
+        // An error envelope from the API carries `headers.error_message` and
+        // no results key; an empty answer carries results=[] and parses to [].
+        if doc.get("headers").is_some() {
+            return Ok(Vec::new());
+        }
+        return Err(CatalogueError::Malformed(
+            "no results array and no headers envelope".into(),
+        ));
+    };
+    Ok(items
+        .iter()
+        .take(MAX_CANDIDATES)
+        .filter_map(|item| {
+            let title = item.get("name")?.as_str()?.to_string();
+            if title.is_empty() {
+                return None;
+            }
+            // Which URL to carry, and under what licence, is one decision:
+            // where the artist left downloads on, the download URL arrives
+            // under its declared CC licence and the OpenLicence tier may take
+            // it. Where they switched downloads off, the stream URL stands in
+            // for identification but the licence reads **Unknown** — the
+            // artist's own switch is the declaration, and "serving is not
+            // licensing" now cuts the way §21 meant it: the row cannot offer
+            // a fetched copy, whatever the platform's blanket terms say.
+            let (url_field, licence) = if item
+                .get("audiodownload_allowed")
+                .and_then(|a| a.as_bool())
+                .unwrap_or(false)
+            {
+                ("audiodownload", OpenLicence::CreativeCommons)
+            } else {
+                ("audio", OpenLicence::Unknown)
+            };
+            let audio_url = item.get(url_field).and_then(|u| u.as_str())?.to_string();
+            let duration_ms = item
+                .get("duration")
+                .and_then(|d| d.as_u64())
+                .map(|s| s.saturating_mul(1000));
+            Some(CatalogueMatch {
+                source: "Jamendo".to_string(),
+                recording: Recording {
+                    isrc: None,
+                    title,
+                    artist: item
+                        .get("artist_name")
+                        .and_then(|a| a.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    album: item
+                        .get("album_name")
+                        .and_then(|a| a.as_str())
+                        .map(str::to_string),
+                },
+                duration_ms,
+                audio_url: Some(audio_url),
+                licence,
+            })
+        })
+        .collect())
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -657,6 +828,7 @@ mod tests {
     fn an_audio_url_without_a_licence_is_not_fetchable() {
         // An archive serving audio is not thereby permitting redistribution.
         let m = CatalogueMatch {
+            source: "Test".into(),
             recording: rec("Kun Faya Kun", "A.R. Rahman"),
             duration_ms: Some(480_000),
             audio_url: Some("https://example.org/track.mp3".into()),
@@ -685,6 +857,7 @@ mod tests {
         let want = rec("Kun Faya Kun", "A.R. Rahman");
         let library = vec![(rec("Kun Faya Kun", "A.R. Rahman"), 481_000u64)];
         let open = vec![CatalogueMatch {
+            source: "Test".into(),
             recording: want.clone(),
             duration_ms: None,
             audio_url: Some("https://archive.example/x.mp3".into()),
@@ -712,6 +885,7 @@ mod tests {
     fn the_peer_is_asked_before_any_archive() {
         let want = rec("Kun Faya Kun", "A.R. Rahman");
         let open = vec![CatalogueMatch {
+            source: "Test".into(),
             recording: want.clone(),
             duration_ms: None,
             audio_url: Some("https://archive.example/x.mp3".into()),
@@ -727,6 +901,7 @@ mod tests {
     fn an_open_archive_is_used_only_when_nobody_in_the_conversation_has_it() {
         let want = rec("Kun Faya Kun", "A.R. Rahman");
         let open = vec![CatalogueMatch {
+            source: "Test".into(),
             recording: want.clone(),
             duration_ms: None,
             audio_url: Some("https://archive.example/x.mp3".into()),
@@ -760,6 +935,7 @@ mod tests {
         // resolver returning an all-rights-reserved URL changes nothing.
         let want = rec("Kun Faya Kun", "A.R. Rahman");
         let sneaky = vec![CatalogueMatch {
+            source: "Test".into(),
             recording: want.clone(),
             duration_ms: None,
             audio_url: Some("https://drm.example/protected.m4a".into()),
@@ -858,6 +1034,72 @@ mod tests {
             r#"{"recordings":[{"title":"T","isrcs":["nope"],"artist-credit":[{"name":"A"}]}]}"#;
         let out = parse_musicbrainz(body).unwrap();
         assert!(out[0].recording.isrc.is_none());
+    }
+
+    #[cfg(feature = "catalogue-http")]
+    #[test]
+    fn a_jamendo_answer_carries_its_audio_and_its_name() {
+        let body = r#"{
+          "headers": {"status": "success", "results_count": 2},
+          "results": [
+            {"id": "1432101", "name": "Sundown", "duration": 214,
+             "artist_name": "Chasing Kites", "album_name": "Aerology",
+             "audio": "https://prod-1.storage.jamendo.com/?trackid=1432101&format=mp31",
+             "audiodownload": "https://prod-1.storage.jamendo.com/download/1432101/sundown.mp3",
+             "audiodownload_allowed": true},
+            {"id": "1432102", "name": "White Dawn", "duration": 187,
+             "artist_name": "Chasing Kites",
+             "audio": "https://prod-1.storage.jamendo.com/?trackid=1432102&format=mp31",
+             "audiodownload": "https://prod-1.storage.jamendo.com/download/1432102/x.mp3",
+             "audiodownload_allowed": false}
+          ]
+        }"#;
+        let out = parse_jamendo(body).expect("ok");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].source, "Jamendo");
+        assert_eq!(out[0].recording.title, "Sundown");
+        assert_eq!(out[0].recording.artist, "Chasing Kites");
+        assert_eq!(out[0].recording.album.as_deref(), Some("Aerology"));
+        // Seconds on the wire, milliseconds everywhere in this app.
+        assert_eq!(out[0].duration_ms, Some(214_000));
+        // The artist allowed downloads, so the fetchable URL is the download
+        // one — and the licence gate agrees.
+        assert_eq!(
+            out[0].audio_url.as_deref(),
+            Some("https://prod-1.storage.jamendo.com/download/1432101/sundown.mp3")
+        );
+        assert!(out[0].is_openly_fetchable());
+        // …but serving is not licensing: where the artist switched downloads
+        // off, the stream URL stands in and the *fetch* gate stays shut.
+        assert_eq!(
+            out[1].audio_url.as_deref(),
+            Some("https://prod-1.storage.jamendo.com/?trackid=1432102&format=mp31")
+        );
+        assert!(!out[1].is_openly_fetchable());
+    }
+
+    #[cfg(feature = "catalogue-http")]
+    #[test]
+    fn jamendo_rows_without_a_title_or_any_url_are_dropped() {
+        let body = r#"{
+          "headers": {"status": "success"},
+          "results": [
+            {"id": "1"},
+            {"id": "2", "name": "No URLs Anywhere", "artist_name": "X"},
+            {"id": "3", "name": "", "audio": "https://a.example/t.mp3"}
+          ]
+        }"#;
+        let out = parse_jamendo(body).expect("ok");
+        assert!(out.is_empty());
+    }
+
+    #[cfg(feature = "catalogue-http")]
+    #[test]
+    fn an_api_error_envelope_is_no_results_and_garbage_is_an_error() {
+        let err_body = r#"{"headers":{"status":"failed","error_message":"bad key","code":200}}"#;
+        assert!(parse_jamendo(err_body).unwrap().is_empty());
+        assert!(parse_jamendo("not json").is_err());
+        assert!(parse_jamendo(r#"{"unexpected":true}"#).is_err());
     }
 
     #[cfg(feature = "catalogue-http")]

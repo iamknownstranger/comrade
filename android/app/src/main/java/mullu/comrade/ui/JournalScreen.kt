@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Delete
@@ -45,6 +46,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.platform.testTag
@@ -73,6 +75,9 @@ import mullu.comrade.media.VoiceRecorder
 import mullu.comrade.voice.OneShotRecognizer
 import mullu.comrade.voice.VoiceModelMissingException
 import mullu.comrade.voice.VoskModel
+import mullu.comrade.ui.theme.ComradeRadii
+import mullu.comrade.ui.theme.GlassElevation
+import mullu.comrade.ui.theme.glassSurface
 
 /** Self-reported mood markers, low → high. Stored as the emoji itself. */
 private val Moods = listOf("😞", "😕", "😐", "🙂", "😄")
@@ -846,8 +851,12 @@ fun JournalScreen(modifier: Modifier = Modifier) {
     }
 
     shareResult?.let { message ->
+        val dialogShape = RoundedCornerShape(ComradeRadii.xl)
         AlertDialog(
             onDismissRequest = { shareResult = null },
+            modifier = Modifier.glassSurface(GlassElevation.Sheet, shape = dialogShape),
+            shape = dialogShape,
+            containerColor = Color.Transparent,
             text = { Text(message) },
             confirmButton = {
                 TextButton(onClick = { shareResult = null }) { Text("OK") }
@@ -914,8 +923,12 @@ fun JournalScreen(modifier: Modifier = Modifier) {
     }
 
     confirmDelete?.let { entry ->
+        val dialogShape = RoundedCornerShape(ComradeRadii.xl)
         AlertDialog(
             onDismissRequest = { confirmDelete = null },
+            modifier = Modifier.glassSurface(GlassElevation.Sheet, shape = dialogShape),
+            shape = dialogShape,
+            containerColor = Color.Transparent,
             title = { Text("Delete this entry?") },
             text = {
                 Text(
@@ -1069,8 +1082,12 @@ private fun JournalShareSheet(
     onPick: (ShareTarget) -> Unit,
     onDismiss: () -> Unit,
 ) {
+    val dialogShape = RoundedCornerShape(ComradeRadii.xl)
     AlertDialog(
         onDismissRequest = onDismiss,
+        modifier = Modifier.glassSurface(GlassElevation.Sheet, shape = dialogShape),
+        shape = dialogShape,
+        containerColor = Color.Transparent,
         title = { Text(stringResource(R.string.journal_share_title)) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {

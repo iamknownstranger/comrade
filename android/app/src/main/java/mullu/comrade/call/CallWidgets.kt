@@ -30,6 +30,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import mullu.comrade.R
+import mullu.comrade.ui.theme.CallPalette
 
 /**
  * The Compose twins of the Flutter `signal_bars.dart` / `slashed_icon.dart`
@@ -44,9 +45,6 @@ import mullu.comrade.R
  * neighbours don't have to reach across into `ui/`.
  */
 
-private val WeakSignalAmber = Color(0xFFFFA000)
-private val PoorSignalRed = Color(0xFFC62828)
-
 /** How many of the four bars a quality reading fills. Mirrors `signalBarsFor`. */
 fun signalBarsFor(quality: CallQuality): Int = when (quality) {
     CallQuality.GOOD -> 4
@@ -57,8 +55,8 @@ fun signalBarsFor(quality: CallQuality): Int = when (quality) {
 
 /** The colour the filled bars take — white when healthy, warning tones when not. */
 fun signalColorFor(quality: CallQuality): Color = when (quality) {
-    CallQuality.POOR -> PoorSignalRed
-    CallQuality.MEDIUM -> WeakSignalAmber
+    CallQuality.POOR -> CallPalette.poorSignal
+    CallQuality.MEDIUM -> CallPalette.weakSignal
     CallQuality.GOOD, CallQuality.UNKNOWN -> Color.White
 }
 

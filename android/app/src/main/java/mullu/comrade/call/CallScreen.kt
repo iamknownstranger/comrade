@@ -80,6 +80,8 @@ import mullu.comrade.ui.MoreVertIcon
 import mullu.comrade.ui.PeerAvatar
 import mullu.comrade.ui.SpeakerIcon
 import mullu.comrade.ui.VideocamIcon
+import mullu.comrade.ui.theme.CallPalette
+import mullu.comrade.ui.theme.comradeFocusRing
 import org.webrtc.RendererCommon
 import org.webrtc.SurfaceViewRenderer
 import kotlin.math.roundToInt
@@ -115,11 +117,13 @@ import org.webrtc.VideoTrack
  *    just runs off the right edge, taking End call with it.
  */
 
-private val CallBackground = Color(0xFF0E1621)
-private val AcceptGreen = Color(0xFF2E7D32)
-private val HangupRed = Color(0xFFC62828)
-private val ControlIdle = Color(0x33FFFFFF)
-private val ControlActive = Color(0xFFFFFFFF)
+// Full-bleed dark on every theme, deliberately outside ComradeTheme's
+// ColorScheme — docs/DESIGN_SYSTEM.md §5, mullu.comrade.ui.theme.CallPalette.
+private val CallBackground = CallPalette.background
+private val AcceptGreen = CallPalette.accept
+private val HangupRed = CallPalette.hangup
+private val ControlIdle = CallPalette.controlIdle
+private val ControlActive = CallPalette.controlActive
 
 /**
  * How long a video call's controls stay up before fading — long enough to hit
@@ -333,7 +337,7 @@ private fun CallOptionsDock(
         modifier = modifier
             .widthIn(min = 216.dp)
             .clip(RoundedCornerShape(16.dp))
-            .background(Color(0xF217212B))
+            .background(CallPalette.dockBackground)
             .padding(vertical = 6.dp),
     ) {
         items.forEach { item ->
@@ -377,6 +381,7 @@ private fun DockItem(
     Row(
         modifier = Modifier
             .fillMaxWidth()
+            .comradeFocusRing()
             .clickable(onClick = onClick)
             .padding(horizontal = 16.dp, vertical = 14.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -446,7 +451,7 @@ private fun MinimizedCallTile(
                 .offset { IntOffset(animatedX.roundToInt(), animatedY.roundToInt()) }
                 .size(width = tileWidth, height = tileHeight)
                 .clip(RoundedCornerShape(14.dp))
-                .background(Color(0xFF17212B))
+                .background(CallPalette.tileBackground)
                 .pointerInput(maxX, maxY) {
                     detectDragGestures(
                         onDragStart = { dragging = true },
@@ -497,7 +502,7 @@ private fun MinimizedCallTile(
                 CallActionButton(
                     icon = MicIcon,
                     desc = stringOf(if (muted) R.string.call_unmute else R.string.call_mute),
-                    bg = if (muted) ControlActive else Color(0x66000000),
+                    bg = if (muted) ControlActive else CallPalette.scrim,
                     tint = if (muted) CallBackground else Color.White,
                     size = 34.dp,
                     slashed = muted,
@@ -686,7 +691,7 @@ private fun InCallContent(
                     .padding(16.dp)
                     .size(width = 110.dp, height = 156.dp)
                     .clip(RoundedCornerShape(14.dp))
-                    .background(Color(0xFF17212B))
+                    .background(CallPalette.tileBackground)
                     .clickable(onClickLabel = stringOf(R.string.call_swap_video)) { swapped = !swapped },
             ) {
                 CallVideoSurface(
@@ -708,7 +713,7 @@ private fun InCallContent(
                     CallActionButton(
                         icon = FlipCameraIcon,
                         desc = stringOf(R.string.call_switch_camera),
-                        bg = Color(0x66000000),
+                        bg = CallPalette.scrim,
                         size = 34.dp,
                         modifier = Modifier
                             .align(Alignment.BottomCenter)
@@ -731,7 +736,7 @@ private fun InCallContent(
                     Column(
                         modifier = Modifier
                             .clip(RoundedCornerShape(14.dp))
-                            .background(Color(0x66000000))
+                            .background(CallPalette.scrim)
                             .padding(horizontal = 14.dp, vertical = 8.dp),
                     ) {
                         Text(
@@ -743,7 +748,7 @@ private fun InCallContent(
                         )
                         Text(
                             text = label,
-                            color = Color(0xFFB0BEC5),
+                            color = CallPalette.secondaryText,
                             fontSize = 13.sp,
                             fontFamily = FontFamily.Monospace,
                         )
@@ -754,7 +759,7 @@ private fun InCallContent(
                             connectionQuality,
                             modifier = Modifier
                                 .clip(RoundedCornerShape(14.dp))
-                                .background(Color(0x66000000))
+                                .background(CallPalette.scrim)
                                 .padding(horizontal = 10.dp, vertical = 6.dp),
                         )
                     }
@@ -789,7 +794,7 @@ private fun InCallContent(
                     .then(
                         if (video) {
                             Modifier.background(
-                                Brush.verticalGradient(listOf(Color.Transparent, Color(0xB3000000))),
+                                Brush.verticalGradient(listOf(Color.Transparent, CallPalette.captionOverlay)),
                             )
                         } else {
                             Modifier
@@ -905,7 +910,7 @@ private fun EndedContent(s: CallUiState.Ended) {
         Spacer(Modifier.height(20.dp))
         Text(s.peerLabel, color = Color.White, fontSize = 22.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
         Spacer(Modifier.height(8.dp))
-        Text(stringOf(labelRes), color = Color(0xFFB0BEC5), fontSize = 15.sp)
+        Text(stringOf(labelRes), color = CallPalette.secondaryText, fontSize = 15.sp)
     }
 }
 
@@ -936,7 +941,7 @@ private fun PeerHeader(
         )
         if (status != null) {
             Spacer(Modifier.height(10.dp))
-            Text(status, color = Color(0xFFB0BEC5), fontSize = 16.sp, textAlign = TextAlign.Center)
+            Text(status, color = CallPalette.secondaryText, fontSize = 16.sp, textAlign = TextAlign.Center)
         }
         extra()
     }
@@ -964,6 +969,7 @@ private fun CallActionButton(
                 .size(size)
                 .clip(CircleShape)
                 .background(bg)
+                .comradeFocusRing(CircleShape)
                 .clickable(onClick = onClick),
             contentAlignment = Alignment.Center,
         ) {
@@ -985,7 +991,7 @@ private fun CallActionButton(
             // of a phone.
             Text(
                 label,
-                color = Color(0xB3FFFFFF),
+                color = CallPalette.labelDim,
                 fontSize = 12.sp,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,

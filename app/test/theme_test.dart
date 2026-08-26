@@ -378,6 +378,41 @@ void main() {
             ),
           );
 
+      // A glass surface paints its tint with a DecoratedBox, which is not a
+      // Material — so without an explicit ink surface every ListTile and
+      // InkWell inside a glass sheet or dialog silently loses its ripple.
+      // Flutter asserts on it in debug ("ListTile background color or ink
+      // splashes may be invisible"), which took down five thread_sheet tests
+      // once the sheets went glass. The tint must stay *above* nothing: an
+      // opaque Material here would hide it, so the ink surface is
+      // deliberately transparent.
+      testWidgets('gives ink somewhere to paint without hiding the tint', (
+        WidgetTester tester,
+      ) async {
+        await tester.pumpWidget(
+          MaterialApp(
+            theme: ComradeTheme.dark(),
+            home: const Scaffold(
+              body: GlassSurface(
+                child: ListTile(key: Key('inky'), title: Text('tap me')),
+              ),
+            ),
+          ),
+        );
+        // The assert above fires during pump, so reaching here at all is most
+        // of the check; pin the mechanism too so a refactor cannot drop it.
+        expect(tester.takeException(), isNull);
+        final Material ink = tester.widget<Material>(
+          find
+              .ancestor(
+                of: find.byKey(const Key('inky')),
+                matching: find.byType(Material),
+              )
+              .first,
+        );
+        expect(ink.type, MaterialType.transparency);
+      });
+
       testWidgets('blurs the backdrop by default', (
         WidgetTester tester,
       ) async {

@@ -620,8 +620,7 @@ abstract final class ComradeTheme {
       popupMenuTheme: PopupMenuThemeData(
         color: surfaces.popover,
         surfaceTintColor: Colors.transparent,
-        textStyle:
-            text.bodyMedium?.copyWith(color: surfaces.popoverForeground),
+        textStyle: text.bodyMedium?.copyWith(color: surfaces.popoverForeground),
         elevation: 8,
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(ComradeRadii.md),

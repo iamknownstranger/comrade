@@ -34,6 +34,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalConfiguration
@@ -43,6 +44,9 @@ import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import mullu.comrade.handoff.HandoffDecisions
+import mullu.comrade.ui.theme.ComradeRadii
+import mullu.comrade.ui.theme.GlassElevation
+import mullu.comrade.ui.theme.glassSurface
 
 /**
  * One attachment that has been obtained but not yet sent, waiting on the
@@ -109,10 +113,13 @@ fun AttachmentPreviewSheet(
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     var caption by remember(pending) { mutableStateOf(TextFieldValue(pending.seedCaption)) }
 
+    val sheetShape = RoundedCornerShape(topStart = ComradeRadii.xl, topEnd = ComradeRadii.xl)
     ModalBottomSheet(
         onDismissRequest = onDismiss,
         sheetState = sheetState,
-        modifier = Modifier.testTag("attachment-preview"),
+        modifier = Modifier.testTag("attachment-preview").glassSurface(GlassElevation.Sheet, shape = sheetShape),
+        shape = sheetShape,
+        containerColor = Color.Transparent,
     ) {
         // Scrollable: header + a 280 dp photo + the caption box + the buttons is
         // taller than a phone in landscape, and the two controls the sheet exists

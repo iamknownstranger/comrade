@@ -107,22 +107,11 @@ import mullu.comrade.media.VoiceRecorder
 import mullu.comrade.together.LibraryResolver
 import mullu.comrade.together.MediaLibraryAccess
 import mullu.comrade.together.TogetherManager
+import mullu.comrade.ui.theme.AvatarPalette
+import mullu.comrade.ui.theme.ComradeRadii
+import mullu.comrade.ui.theme.GlassElevation
+import mullu.comrade.ui.theme.glassSurface
 import uniffi.comrade_ui.PlayRoute
-
-/**
- * Identity-stable avatar hues: the same key renders the same colour on every
- * device (Telegram-style), so people become recognisable at a glance.
- */
-private val AvatarPalette = listOf(
-    Color(0xFF6366F1), // indigo
-    Color(0xFF0EA5E9), // sky
-    Color(0xFF10B981), // emerald
-    Color(0xFFF59E0B), // amber
-    Color(0xFFEF4444), // coral
-    Color(0xFF8B5CF6), // violet
-    Color(0xFFEC4899), // rose
-    Color(0xFF14B8A6), // teal
-)
 
 @Composable
 fun PeerAvatar(
@@ -2624,10 +2613,13 @@ private fun MessageActionSheet(
     onDismiss: () -> Unit,
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    val sheetShape = RoundedCornerShape(topStart = ComradeRadii.xl, topEnd = ComradeRadii.xl)
     ModalBottomSheet(
         onDismissRequest = onDismiss,
         sheetState = sheetState,
-        modifier = Modifier.testTag("message-actions"),
+        modifier = Modifier.testTag("message-actions").glassSurface(GlassElevation.Sheet, shape = sheetShape),
+        shape = sheetShape,
+        containerColor = Color.Transparent,
     ) {
         Column(Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
             Row(

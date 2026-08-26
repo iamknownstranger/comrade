@@ -39,6 +39,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
@@ -53,6 +54,9 @@ import mullu.comrade.topic.ThreadFilter
 import mullu.comrade.topic.ThreadRow
 import mullu.comrade.topic.TopicDecisions
 import mullu.comrade.topic.TopicRow
+import mullu.comrade.ui.theme.ComradeRadii
+import mullu.comrade.ui.theme.GlassElevation
+import mullu.comrade.ui.theme.glassSurface
 
 /*
  * The thread sheet and the topic sheet — Telegram's forum topics and Slack's
@@ -131,7 +135,14 @@ fun ThreadSheet(
         if (entries.isNotEmpty()) listState.scrollToItem(entries.size - 1)
     }
 
-    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheetState, modifier = modifier) {
+    val sheetShape = RoundedCornerShape(topStart = ComradeRadii.xl, topEnd = ComradeRadii.xl)
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState,
+        modifier = modifier.glassSurface(GlassElevation.Sheet, shape = sheetShape),
+        shape = sheetShape,
+        containerColor = Color.Transparent,
+    ) {
         Column(Modifier.imePadding().testTag("thread-sheet")) {
             Row(
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp),
@@ -375,7 +386,14 @@ fun TopicSheet(
         }
     }
 
-    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheetState, modifier = modifier) {
+    val sheetShape = RoundedCornerShape(topStart = ComradeRadii.xl, topEnd = ComradeRadii.xl)
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState,
+        modifier = modifier.glassSurface(GlassElevation.Sheet, shape = sheetShape),
+        shape = sheetShape,
+        containerColor = Color.Transparent,
+    ) {
         Column(Modifier.imePadding().testTag("topic-sheet")) {
             Row(
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp),

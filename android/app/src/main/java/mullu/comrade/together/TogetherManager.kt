@@ -972,6 +972,14 @@ object TogetherManager {
     fun currentPositionMs(): Long = player?.positionMs ?: 0
 
     /**
+     * The live file player, when the session's sound comes from our own
+     * decoder — the only case an equalizer can reach ([PlayerEffects]).
+     * Returns the [SessionPlayer] so callers narrow with `as?` rather than
+     * this growing a second accessor per implementation.
+     */
+    fun filePlayer(): SessionPlayer? = player
+
+    /**
      * "I don't have this — send me yours."
      *
      * Joining first is deliberate and not just ordering: the handover rides the
@@ -1121,10 +1129,12 @@ object TogetherManager {
         uri: Uri,
         recording: uniffi.comrade_core.Recording?,
         queue: TogetherDecisions.Queue? = null,
+        resumeAtMs: Long = 0L,
     ) {
         beginSession(context, peer, peerLabel)
         _queue.value = queue
         val title = recording?.title.orEmpty()
+        rememberPlayedLocal(uri, recording)
         openPlayer(uri) { durationMs ->
             // Queued, not awaited. The player is already open by this point and
             // there is no reason for it to wait on a relay — offline, that wait
@@ -1136,6 +1146,7 @@ object TogetherManager {
                     uniffi.comrade_core.TogetherContent.LocalFile(durationMs.toULong(), recording),
                 )
             }
+            val startingAt = resumeAtMs.coerceIn(0L, durationMs)
             _state.value = UiState.Live(
                 peer = peer,
                 peerLabel = peerLabel,
@@ -1144,12 +1155,21 @@ object TogetherManager {
                 joined = false,
                 ready = true,
                 playing = false,
-                positionMs = 0,
+                // Resuming a saved queue starts where it was left, not at 0 —
+                // the whole point of having saved it.
+                positionMs = startingAt,
                 durationMs = durationMs,
                 status = Status.WaitingForThem,
                 sourceUri = openedUri,
                 solo = alone,
             )
+            if (startingAt > 0L) {
+                (player as? TogetherPlayer)?.let { p ->
+                    runCatching { p.seekTo(startingAt) }
+                        .onFailure { Log.w(TAG, "resume seek failed", it) }
+                }
+            }
+            applySpeedIfAlone()
             startService()
         }
     }
@@ -1249,6 +1269,7 @@ object TogetherManager {
             solo = alone,
         )
         startService()
+        rememberPlayedStream(content.url, content.recording)
         openStreamPlayer(content.url)
     }
 
@@ -1475,7 +1496,10 @@ object TogetherManager {
             }
             if (playing != p.isPlaying) {
                 suppressor.expect(if (playing) "play" else "pause", null, now)
-                if (playing) p.play() else p.pause()
+                if (playing) p.play() else {
+                    p.pause()
+                    saveQueueSnapshot()
+                }
             }
             refreshLive(playing = playing)
         }
@@ -1495,6 +1519,7 @@ object TogetherManager {
         // must be acted on rather than swallowed as a replacement's.
         pendingSelfEnds = 0
         sendOut("leave") { ComradeCore.togetherEndTyped() }
+        saveQueueSnapshot()
         stopPlayback()
         forgetPairing()
         _state.value = UiState.Idle
@@ -1506,6 +1531,9 @@ object TogetherManager {
         _pairing.value = null
         pairingEndedAtMs = 0
         _queue.value = null
+        cancelSleepTimer()
+        extrasLoaded = false
+        _extras.value = PlayerExtras(speed = _extras.value.speed, sleepEndsAtMs = null)
     }
 
     // ── The queue ───────────────────────────────────────────────────────────
@@ -1532,11 +1560,16 @@ object TogetherManager {
         )
     }.onFailure { Log.w(TAG, "could not play that track", it) }.isSuccess
 
-    /** The next track in the queue, to the same person. A no-op at the end of it. */
+    /** The next track in the queue, to the same person. A no-op at the end of it.
+     *
+     * Under shuffle "next" is the order's neighbour — [extras]'s `order` — not
+     * the file's; repeat-one deliberately does NOT trap a manual skip
+     * ([TogetherDecisions.manualNextIndex]). */
     fun skipForward(context: Context) {
         val pairing = _pairing.value ?: return
         val at = _queue.value ?: return
-        val moved = TogetherDecisions.movedTo(at, at.index + 1) ?: return
+        val to = TogetherDecisions.manualNextIndex(extras.value.order, at.index, at.tracks.size) ?: return
+        val moved = TogetherDecisions.movedTo(at, to) ?: return
         val track = moved.current ?: return
         playTrack(context, pairing, track, moved.tracks)
     }
@@ -1556,11 +1589,219 @@ object TogetherManager {
             is TogetherDecisions.Back.Previous -> {
                 val pairing = _pairing.value ?: return
                 val at = _queue.value ?: return
-                val moved = TogetherDecisions.movedTo(at, step.index) ?: return
+                // Under shuffle the previous track is the order's previous;
+                // the restart-within-seconds rule above still wins first.
+                val to = if (extras.value.order != null && extras.value.order!!.size == at.tracks.size) {
+                    TogetherDecisions.previousIndexWith(extras.value.order, at.index, at.tracks.size)
+                } else {
+                    step.index
+                } ?: return
+                val moved = TogetherDecisions.movedTo(at, to) ?: return
                 val track = moved.current ?: return
                 playTrack(context, pairing, track, moved.tracks)
             }
         }
+    }
+
+    // ── Player extras: shuffle, repeat, speed, sleep timer ──────────────────
+
+    /**
+     * The remembered-and-live shape of the player's own conveniences.
+     *
+     * One [StateFlow] rather than five scattered ones because every control
+     * that reads one reads the button states of the others too — and because
+     * prefs are the source of truth on disk while this flow is the source in
+     * memory, they are loaded together at first use and written through
+     * together on each toggle.
+     */
+    data class PlayerExtras(
+        val shuffle: Boolean = false,
+        val repeat: TogetherDecisions.RepeatMode = TogetherDecisions.RepeatMode.OFF,
+        /** Live only when [shuffle] is on AND a queue exists; `null` otherwise. */
+        val order: List<Int>? = null,
+        val speed: Float = 1.0f,
+        val sleepEndsAtMs: Long? = null,
+    )
+
+    private val _extras = kotlinx.coroutines.flow.MutableStateFlow(PlayerExtras())
+    val extras: kotlinx.coroutines.flow.StateFlow<PlayerExtras> = _extras
+
+    private var extrasLoaded = false
+
+    /**
+     * Read what was remembered. Called from the screen entering the player —
+     * idempotent by construction, cheap by design.
+     */
+    fun loadExtras(context: Context) {
+        if (extrasLoaded) return
+        val shuffleOn = PlayerPrefs.shuffle(context)
+        val order = rebuildOrder(shuffleOn)
+        _extras.value = PlayerExtras(
+            shuffle = shuffleOn,
+            repeat = PlayerPrefs.repeat(context),
+            order = order,
+            speed = PlayerPrefs.speed(context),
+            sleepEndsAtMs = _extras.value.sleepEndsAtMs,
+        )
+        extrasLoaded = true
+        applySpeedIfAlone()
+    }
+
+    /** A fresh shuffle order over the live queue, keeping the current track first. */
+    private fun rebuildOrder(shuffleOn: Boolean): List<Int>? {
+        val at = _queue.value ?: return null
+        if (!shuffleOn) return null
+        return TogetherDecisions.shuffledOrder(at.tracks.size, at.index, kotlin.random.Random(System.nanoTime()))
+    }
+
+    fun toggleShuffle(context: Context) {
+        val on = !_extras.value.shuffle
+        PlayerPrefs.setShuffle(context, on)
+        val order = rebuildOrder(on)
+        _extras.value = _extras.value.copy(shuffle = on, order = order)
+    }
+
+    /** OFF → ALL → ONE → OFF, persisted per press. */
+    fun cycleRepeat(context: Context) {
+        val next = when (_extras.value.repeat) {
+            TogetherDecisions.RepeatMode.OFF -> TogetherDecisions.RepeatMode.ALL
+            TogetherDecisions.RepeatMode.ALL -> TogetherDecisions.RepeatMode.ONE
+            TogetherDecisions.RepeatMode.ONE -> TogetherDecisions.RepeatMode.OFF
+        }
+        PlayerPrefs.setRepeat(context, next)
+        _extras.value = _extras.value.copy(repeat = next)
+    }
+
+    /**
+     * User-facing playback rate. **Solo only** — see
+     * [TogetherDecisions.speedAllowed]; in a session the correction ladder owns
+     * this dial, and a listener turning it would fight their own sync.
+     */
+    fun setSpeed(context: Context, rate: Float) {
+        val clamped = TogetherDecisions.clampSpeed(rate)
+        PlayerPrefs.setSpeed(context, clamped)
+        _extras.value = _extras.value.copy(speed = clamped)
+        applySpeedIfAlone()
+    }
+
+    private fun applySpeedIfAlone() {
+        if (!alone) return
+        val rate = _extras.value.speed
+        if (rate != 1.0f) player?.setRate(rate)
+    }
+
+    /**
+     * Pause when the timer runs out — a command to the session, so a peer's
+     * device pauses too, which is what "sleep" means when two people fell
+     * asleep watching.
+     */
+    fun startSleepTimer(minutes: Int) {
+        cancelSleepTimer()
+        val endsAt = System.currentTimeMillis() + minutes * 60_000L
+        _extras.value = _extras.value.copy(sleepEndsAtMs = endsAt)
+        sleepJob = scope.launch {
+            delay(endsAt - System.currentTimeMillis())
+            (player?.positionMs)?.let { setState(it, false) }
+            _extras.value = _extras.value.copy(sleepEndsAtMs = null)
+        }
+    }
+
+    fun cancelSleepTimer() {
+        sleepJob?.cancel()
+        sleepJob = null
+        if (_extras.value.sleepEndsAtMs != null) {
+            _extras.value = _extras.value.copy(sleepEndsAtMs = null)
+        }
+    }
+
+    private var sleepJob: kotlinx.coroutines.Job? = null
+
+    /**
+     * What a finished track does next **when nobody else is listening**.
+     *
+     * Auto-advance is a solo-player behaviour by definition here: in a session
+     * the leader's completion is a playhead fact for the follower to follow,
+     * not a decision, and both devices deciding independently would race. So
+     * `alone` gates the whole function. Repeat-one with no queue at all still
+     * restarts — a single track is its own queue of one.
+     */
+    private fun maybeAutoAdvance() {
+        if (!alone || appContext == null) return
+        val repeatMode = _extras.value.repeat
+        val at = _queue.value
+        val ctx = appContext ?: return
+        if (at == null) {
+            if (repeatMode == TogetherDecisions.RepeatMode.ONE && player?.prepared == true) {
+                setState(0, true)
+            }
+            return
+        }
+        val next = TogetherDecisions.nextIndexOnEnd(repeatMode, _extras.value.order, at.index, at.tracks.size)
+            ?: return  // end of listen; the session stays, stopped, as it always has.
+        val pairing = _pairing.value ?: return
+        val track = at.tracks.getOrNull(next) ?: return
+        playTrack(ctx, pairing, track, at.tracks)
+    }
+
+    /**
+     * Rebuild a session from the queue snapshot the vault kept.
+     *
+     * **Solo only**, and only from tracks that are still resolvable — a saved
+     * row whose MediaStore entry was deleted since is skipped rather than
+     * offered as a broken button. Streams are deliberately not resumed: their
+     * URLs may have expired tokens or moved servers, and silently refetching
+     * one is how a resume turns into an error page. Returns whether anything
+     * actually started, so the screen can fall back to its ordinary sentence
+     * when everything it remembered has since been deleted.
+     */
+    suspend fun resumeSavedQueue(context: Context): Boolean {
+        if (!TogetherDecisions.mayChoosePerson(_pairing.value)) return false
+        val saved = runCatching { ComradeCore.queueLoad() }.getOrNull() ?: return false
+        if (saved.tracks.isEmpty()) return false
+
+        val resolver = context.contentResolver
+        val tracks = saved.tracks.mapNotNull { dto ->
+            if (dto.kind != uniffi.comrade_ui.PlayerTrackKind.LOCAL) return@mapNotNull null
+            val uri = dto.key.removePrefix("local:")
+            val uriObj = android.net.Uri.parse(uri)
+            val exists = when (uriObj.scheme) {
+                null, "file" -> uriObj.path?.let { java.io.File(it).exists() } == true
+                "content" -> runCatching {
+                    resolver.query(uriObj, arrayOf(android.provider.MediaStore.Audio.Media._ID), null, null, null)
+                        ?.use { it.count > 0 } == true
+                }.getOrDefault(false)
+                else -> false
+            }
+            if (!exists) return@mapNotNull null
+            TogetherDecisions.Track(
+                uri = uri,
+                title = dto.title,
+                artist = dto.artist,
+                album = dto.album,
+                durationMs = dto.durationMs.toLong(),
+                albumId = null,
+            )
+        }
+        if (tracks.isEmpty()) return false
+
+        val index = saved.index.toInt().coerceIn(0, tracks.lastIndex)
+        beginSession(context, TogetherDecisions.ALONE.npub, TogetherDecisions.ALONE.label)
+        _queue.value = TogetherDecisions.Queue(tracks, index)
+        _extras.value = _extras.value.copy(order = rebuildOrder(_extras.value.shuffle))
+        rememberPlayedLocal(
+            android.net.Uri.parse(tracks[index].uri),
+            MusicLibrary.recordingOf(tracks[index]),
+        )
+        start(
+            context = context,
+            peer = TogetherDecisions.ALONE.npub,
+            peerLabel = TogetherDecisions.ALONE.label,
+            uri = android.net.Uri.parse(tracks[index].uri),
+            recording = MusicLibrary.recordingOf(tracks[index]),
+            queue = TogetherDecisions.Queue(tracks, index),
+            resumeAtMs = saved.positionMs.toLong(),
+        )
+        return true
     }
 
     /**
@@ -1625,6 +1866,103 @@ object TogetherManager {
         openPlayerWith(ctx, onReady) { it.open(uri) }
     }
 
+    // ── The player's own library: what this device just played ──────────────
+
+    /**
+     * Write one recently-played row — fire-and-forget, off the main thread,
+     * and never allowed to fail a session over: the diary is the least
+     * important thing happening while music starts.
+     *
+     * Duration is deliberately not passed even when known; history rows are
+     * for finding something again, and `0` reads as "unknown" everywhere that
+     * renders them. Embeds are skipped entirely: an eleven-character id with
+     * no title is not a row anybody can recognise.
+     */
+    private fun rememberPlayed(
+        key: String,
+        kind: uniffi.comrade_ui.PlayerTrackKind,
+        title: String,
+        artist: String,
+        album: String?,
+        url: String?,
+    ) {
+        scope.launch(Dispatchers.IO) {
+            runCatching {
+                ComradeCore.historyRecord(
+                    uniffi.comrade_ui.PlayerTrackDto(
+                        key = key,
+                        title = title,
+                        artist = artist,
+                        album = album,
+                        durationMs = 0uL,
+                        url = url,
+                        kind = kind,
+                    ),
+                    System.currentTimeMillis(),
+                )
+            }.onFailure { Log.w(TAG, "history write skipped", it) }
+        }
+    }
+
+    private fun rememberPlayedLocal(uri: Uri, recording: uniffi.comrade_core.Recording?) {
+        val rec = recording ?: return
+        rememberPlayed(
+            key = "local:$uri",
+            kind = uniffi.comrade_ui.PlayerTrackKind.LOCAL,
+            title = rec.title,
+            artist = rec.artist,
+            album = rec.album,
+            url = null,
+        )
+    }
+
+    private fun rememberPlayedStream(url: String, recording: uniffi.comrade_core.Recording?) {
+        rememberPlayed(
+            key = "stream:$url",
+            kind = uniffi.comrade_ui.PlayerTrackKind.STREAM,
+            title = recording?.title ?: hostOf(url),
+            artist = recording?.artist.orEmpty(),
+            album = recording?.album,
+            url = url,
+        )
+    }
+
+    /**
+     * Snapshot the live queue into the vault, if there is one to snapshot.
+     *
+     * Called when playback pauses and when a session ends — the two moments a
+     * "come back later" decision is actually made. Local tracks carry their
+     * MediaStore identity so a future restore can find them again; stream rows
+     * carry their URL, which is re-fetchable exactly as long as the server is.
+     * Best-effort like [rememberPlayed]: persistence must never cost playback.
+     */
+    fun saveQueueSnapshot() {
+        val at = _queue.value ?: return
+        val tracks = at.tracks.map { t ->
+            uniffi.comrade_ui.PlayerTrackDto(
+                key = "local:${t.uri}",
+                title = t.title,
+                artist = t.artist,
+                album = t.album,
+                durationMs = t.durationMs.toULong(),
+                url = null,
+                kind = uniffi.comrade_ui.PlayerTrackKind.LOCAL,
+            )
+        }
+        scope.launch(Dispatchers.IO) {
+            runCatching {
+                ComradeCore.queueSave(
+                    uniffi.comrade_ui.SavedQueueDto(
+                        tracks = tracks,
+                        index = at.index.toUInt(),
+                        positionMs = currentPositionMs().toULong(),
+                        savedAtMs = System.currentTimeMillis().toULong(),
+                    ),
+                )
+            }.onFailure { Log.w(TAG, "queue snapshot skipped", it) }
+        }
+    }
+
     /**
      * The file path's player, wherever its bytes come from.
      *
@@ -1667,6 +2005,7 @@ object TogetherManager {
 
             override fun onCompletion(posMs: Long) {
                 emitIfUserCaused("completion", posMs)
+                maybeAutoAdvance()
             }
 
             override fun onError(message: String) {
@@ -1699,6 +2038,9 @@ object TogetherManager {
             }
         })
         feed(p)
+        // The session id is minted inside `feed`'s `open`, so it exists only
+        // now — one Equalizer instance per open, never per frame.
+        PlayerEffects.attach(p.audioSessionId)
     }
 
     /**
@@ -2093,6 +2435,7 @@ object TogetherManager {
     private fun stopPlayback(replacing: Boolean = false) {
         pollJob?.cancel()
         pollJob = null
+        PlayerEffects.detach()
         player?.release()
         player = null
         suppressor.clear()

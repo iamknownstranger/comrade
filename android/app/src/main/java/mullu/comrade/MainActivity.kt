@@ -132,7 +132,13 @@ import mullu.comrade.ui.TransportPrecedence
 import mullu.comrade.ui.TransportRoute
 import mullu.comrade.ui.VideocamIcon
 import mullu.comrade.ui.WifiTetheringIcon
+import mullu.comrade.ui.theme.ComradeRadii
 import mullu.comrade.ui.theme.ComradeTheme
+import mullu.comrade.ui.theme.GlassElevation
+import mullu.comrade.ui.theme.comradeFocusRing
+import mullu.comrade.ui.theme.glassCenterAlignedTopAppBarColors
+import mullu.comrade.ui.theme.glassSurface
+import mullu.comrade.ui.theme.glassTopAppBarColors
 import mullu.comrade.update.UpdateChecker
 import mullu.comrade.call.CallManager
 import mullu.comrade.call.CallScreen
@@ -832,6 +838,8 @@ private fun MainShell(
                     topBar = {
                         when {
                             tab == MainTab.Chats && openChat != null -> TopAppBar(
+                                modifier = Modifier.glassSurface(GlassElevation.Chrome),
+                                colors = glassTopAppBarColors(),
                                 navigationIcon = {
                                     IconButton(onClick = { chatNav = ChatNav.List }) {
                                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
@@ -1003,6 +1011,8 @@ private fun MainShell(
                                 },
                             )
                             tab == MainTab.Chats && chatNav == ChatNav.NewChat -> TopAppBar(
+                                modifier = Modifier.glassSurface(GlassElevation.Chrome),
+                                colors = glassTopAppBarColors(),
                                 navigationIcon = {
                                     IconButton(onClick = { chatNav = ChatNav.List }) {
                                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
@@ -1011,6 +1021,8 @@ private fun MainShell(
                                 title = { Text("New chat") },
                             )
                             tab == MainTab.Chats && chatNav == ChatNav.Requests -> TopAppBar(
+                                modifier = Modifier.glassSurface(GlassElevation.Chrome),
+                                colors = glassTopAppBarColors(),
                                 navigationIcon = {
                                     IconButton(onClick = { chatNav = ChatNav.List }) {
                                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
@@ -1019,6 +1031,8 @@ private fun MainShell(
                                 title = { Text("Message requests") },
                             )
                             tab == MainTab.Chats && chatNav == ChatNav.CallHistory -> TopAppBar(
+                                modifier = Modifier.glassSurface(GlassElevation.Chrome),
+                                colors = glassTopAppBarColors(),
                                 navigationIcon = {
                                     IconButton(onClick = { chatNav = ChatNav.List }) {
                                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
@@ -1027,6 +1041,8 @@ private fun MainShell(
                                 title = { Text(stringResource(R.string.call_history_title)) },
                             )
                             tab == MainTab.Chats && chatNav == ChatNav.Comrades -> TopAppBar(
+                                modifier = Modifier.glassSurface(GlassElevation.Chrome),
+                                colors = glassTopAppBarColors(),
                                 navigationIcon = {
                                     IconButton(onClick = { chatNav = ChatNav.List }) {
                                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
@@ -1035,6 +1051,8 @@ private fun MainShell(
                                 title = { Text(stringResource(R.string.comrades_title)) },
                             )
                             tab == MainTab.Chats && chatNav == ChatNav.Tasks -> TopAppBar(
+                                modifier = Modifier.glassSurface(GlassElevation.Chrome),
+                                colors = glassTopAppBarColors(),
                                 navigationIcon = {
                                     IconButton(onClick = { chatNav = ChatNav.List }) {
                                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
@@ -1043,6 +1061,8 @@ private fun MainShell(
                                 title = { Text(stringResource(R.string.tasks_title)) },
                             )
                             tab == MainTab.Chats && chatNav == ChatNav.List -> CenterAlignedTopAppBar(
+                                modifier = Modifier.glassSurface(GlassElevation.Chrome),
+                                colors = glassCenterAlignedTopAppBarColors(),
                                 navigationIcon = {
                                     IconButton(
                                         onClick = { scope.launch { drawerState.open() } },
@@ -1060,6 +1080,8 @@ private fun MainShell(
                             // A Focus sub-screen gets a back arrow to the
                             // session list, like the Chats sub-screens do.
                             tab == MainTab.Focus && focusNav != FocusNav.Sessions -> TopAppBar(
+                                modifier = Modifier.glassSurface(GlassElevation.Chrome),
+                                colors = glassTopAppBarColors(),
                                 navigationIcon = {
                                     IconButton(onClick = { focusNav = FocusNav.Sessions }) {
                                         Icon(
@@ -1081,6 +1103,8 @@ private fun MainShell(
                                 },
                             )
                             else -> CenterAlignedTopAppBar(
+                                modifier = Modifier.glassSurface(GlassElevation.Chrome),
+                                colors = glassCenterAlignedTopAppBarColors(),
                                 title = {
                                     Text(
                                         when (tab) {
@@ -1100,13 +1124,20 @@ private fun MainShell(
                     bottomBar = {
                         // The conversation view owns the whole screen, Telegram-style.
                         if (openChat == null || tab != MainTab.Chats) {
-                            NavigationBar {
+                            NavigationBar(
+                                modifier = Modifier.glassSurface(GlassElevation.Chrome),
+                                containerColor = Color.Transparent,
+                            ) {
                                 MainTab.entries.forEach { t ->
                                     NavigationBarItem(
                                         selected = tab == t,
                                         onClick = { tab = t },
                                         icon = { Icon(t.icon, contentDescription = null) },
                                         label = { Text(t.label) },
+                                        // §4: a visible ring on focus — TV
+                                        // remote/keyboard/switch-access
+                                        // navigate this bar by focus, not touch.
+                                        modifier = Modifier.comradeFocusRing(),
                                     )
                                 }
                             }
@@ -1391,8 +1422,12 @@ private fun ChatMenuRow(action: ChatMenuAction, onClick: () -> Unit) {
  */
 @Composable
 private fun EncryptionDetailsDialog(peer: String, onDismiss: () -> Unit) {
+    val dialogShape = RoundedCornerShape(ComradeRadii.xl)
     AlertDialog(
         onDismissRequest = onDismiss,
+        modifier = Modifier.glassSurface(GlassElevation.Sheet, shape = dialogShape),
+        shape = dialogShape,
+        containerColor = Color.Transparent,
         icon = { Icon(Icons.Filled.Lock, contentDescription = null) },
         title = { Text(stringResource(R.string.encryption_title)) },
         text = {
@@ -1440,8 +1475,12 @@ private fun EncryptionDetailsDialog(peer: String, onDismiss: () -> Unit) {
  */
 @Composable
 private fun BlockPeerDialog(onDismiss: () -> Unit, onConfirm: () -> Unit) {
+    val dialogShape = RoundedCornerShape(ComradeRadii.xl)
     AlertDialog(
         onDismissRequest = onDismiss,
+        modifier = Modifier.glassSurface(GlassElevation.Sheet, shape = dialogShape),
+        shape = dialogShape,
+        containerColor = Color.Transparent,
         icon = {
             Icon(
                 Icons.Filled.Warning,
@@ -1581,6 +1620,8 @@ private fun RidePushedScreen(onBack: () -> Unit) {
     Scaffold(
         topBar = {
             TopAppBar(
+                modifier = Modifier.glassSurface(GlassElevation.Chrome),
+                colors = glassTopAppBarColors(),
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(
@@ -1620,6 +1661,8 @@ private fun FeedPushedScreen(
             modifier = Modifier.weight(1f),
             topBar = {
                 TopAppBar(
+                    modifier = Modifier.glassSurface(GlassElevation.Chrome),
+                    colors = glassTopAppBarColors(),
                     navigationIcon = {
                         IconButton(onClick = onBack) {
                             Icon(
@@ -1660,6 +1703,8 @@ private fun SettingsPushedScreen(
             modifier = Modifier.weight(1f),
             topBar = {
                 TopAppBar(
+                    modifier = Modifier.glassSurface(GlassElevation.Chrome),
+                    colors = glassTopAppBarColors(),
                     navigationIcon = {
                         IconButton(onClick = onBack) {
                             Icon(
@@ -1927,9 +1972,13 @@ private fun EditAliasDialog(
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
+    val dialogShape = RoundedCornerShape(ComradeRadii.xl)
 
     AlertDialog(
         onDismissRequest = { if (!busy) onDismiss() },
+        modifier = Modifier.glassSurface(GlassElevation.Sheet, shape = dialogShape),
+        shape = dialogShape,
+        containerColor = Color.Transparent,
         title = { Text("Alias for this contact") },
         text = {
             Column {

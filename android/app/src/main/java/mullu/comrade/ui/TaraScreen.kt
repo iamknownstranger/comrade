@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -33,6 +34,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
@@ -41,6 +43,9 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import mullu.comrade.ComradeCore
+import mullu.comrade.ui.theme.ComradeRadii
+import mullu.comrade.ui.theme.GlassElevation
+import mullu.comrade.ui.theme.glassSurface
 
 private const val PREFS = "tara"
 private const val KEY_ACCEPTED = "accepted"
@@ -311,8 +316,12 @@ private fun TaraThread(modifier: Modifier = Modifier) {
     }
 
     if (confirmClear) {
+        val dialogShape = RoundedCornerShape(ComradeRadii.xl)
         AlertDialog(
             onDismissRequest = { confirmClear = false },
+            modifier = Modifier.glassSurface(GlassElevation.Sheet, shape = dialogShape),
+            shape = dialogShape,
+            containerColor = Color.Transparent,
             title = { Text("Clear this conversation?") },
             text = { Text("Every message will be removed from this phone. There is no other copy.") },
             confirmButton = {

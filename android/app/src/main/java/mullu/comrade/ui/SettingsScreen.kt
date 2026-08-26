@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -43,6 +44,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
@@ -73,6 +75,8 @@ import mullu.comrade.update.UpdateDownloadState
 import mullu.comrade.update.UpdateDownloads
 import mullu.comrade.update.UpdateStatus
 import mullu.comrade.call.CallManager
+import mullu.comrade.together.StreamingSources
+import mullu.comrade.together.StreamingSourcesStore
 import mullu.comrade.voice.CommandDispatcher
 import mullu.comrade.voice.ComradeCoreBackend
 import mullu.comrade.voice.ComradeTts
@@ -81,6 +85,9 @@ import mullu.comrade.voice.VoiceCommand
 import mullu.comrade.voice.VoiceModelMissingException
 import mullu.comrade.voice.VoskModel
 import mullu.comrade.voice.WakeWordService
+import mullu.comrade.ui.theme.ComradeRadii
+import mullu.comrade.ui.theme.GlassElevation
+import mullu.comrade.ui.theme.glassSurface
 
 @Composable
 fun SettingsScreen(
@@ -158,6 +165,8 @@ fun SettingsScreen(
         TurnRelaySection()
         ShareRelaySection()
 
+        MusicSourcesSection()
+
         TravelRatingsSection()
         VaultLockSection(onLock = onLock)
 
@@ -215,9 +224,13 @@ private fun EditUsernameDialog(
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
+    val dialogShape = RoundedCornerShape(ComradeRadii.xl)
 
     AlertDialog(
         onDismissRequest = { if (!busy) onDismiss() },
+        modifier = Modifier.glassSurface(GlassElevation.Sheet, shape = dialogShape),
+        shape = dialogShape,
+        containerColor = Color.Transparent,
         title = { Text("Username") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1110,8 +1123,12 @@ private fun VaultLockSection(onLock: () -> Unit) {
     }
 
     if (confirming) {
+        val dialogShape = RoundedCornerShape(ComradeRadii.xl)
         AlertDialog(
             onDismissRequest = { if (!busy) confirming = false },
+            modifier = Modifier.glassSurface(GlassElevation.Sheet, shape = dialogShape),
+            shape = dialogShape,
+            containerColor = Color.Transparent,
             title = { Text(stringResource(R.string.settings_lock_vault_title)) },
             text = { Text(stringResource(R.string.settings_lock_vault_summary)) },
             confirmButton = {
@@ -1268,8 +1285,12 @@ private fun EditTurnServerDialog(
         }
     }
 
+    val dialogShape = RoundedCornerShape(ComradeRadii.xl)
     AlertDialog(
         onDismissRequest = { if (!busy) onDismiss() },
+        modifier = Modifier.glassSurface(GlassElevation.Sheet, shape = dialogShape),
+        shape = dialogShape,
+        containerColor = Color.Transparent,
         title = { Text(stringResource(R.string.settings_turn_title)) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1486,3 +1507,130 @@ private fun voicePermissions(): Array<String> =
 private fun assistSettingsIntent(): Intent =
     Intent(Settings.ACTION_VOICE_INPUT_SETTINGS)
         .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+
+// ── Music sources (docs/TOGETHER.md §23) ─────────────────────────────────────
+
+/**
+ * Where the Together tab's streaming sources get their credentials.
+ *
+ * One card, two resolvers:
+ *
+ * - **Your server** — a Subsonic-compatible host (Navidrome, Gonic, …) whose
+ *   library streams to the Together tab and across a session. All three
+ *   fields are required before the source card offers anything; core
+ *   re-checks the address shape at search time and says which part is wrong.
+ * - **Jamendo** — an optional key for the openly-licensed catalogue that
+ *   gives the by-name search real, downloadable answers alongside
+ *   MusicBrainz's metadata-only ones.
+ *
+ * Saved as one JSON blob through [StreamingSourcesStore], so the card can
+ * never half-remember a config: it is either all there or not at all. The
+ * password field is masked on screen like every other secret here, and it
+ * travels only as a salted token inside stream URLs (see core's subsonic
+ * module header for why that ordering matters).
+ */
+@Composable
+private fun MusicSourcesSection() {
+    val context = LocalContext.current
+    var sources by remember {
+        mutableStateOf(StreamingSourcesStore.load(context))
+    }
+    // Drafts, edited independently of what is saved: a search started from the
+    // Together tab uses whatever was last saved here, never the unsent draft.
+    var server by remember(sources) { mutableStateOf(sources.server) }
+    var username by remember(sources) { mutableStateOf(sources.username) }
+    var password by remember(sources) { mutableStateOf(sources.password) }
+    var jamendo by remember(sources) { mutableStateOf(sources.jamendoClientId) }
+    var saved by remember { mutableStateOf(false) }
+
+    ElevatedCard(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(
+                stringResource(R.string.settings_music_sources_title),
+                style = MaterialTheme.typography.titleMedium,
+            )
+            Text(
+                stringResource(R.string.settings_music_sources_explainer),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
+            OutlinedTextField(
+                value = server,
+                onValueChange = { server = it; saved = false },
+                label = { Text(stringResource(R.string.settings_music_sources_server)) },
+                placeholder = { Text("https://music.example.com") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                value = username,
+                onValueChange = { username = it; saved = false },
+                label = { Text(stringResource(R.string.settings_music_sources_username)) },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                value = password,
+                onValueChange = { password = it; saved = false },
+                label = { Text(stringResource(R.string.settings_music_sources_password)) },
+                singleLine = true,
+                visualTransformation = PasswordVisualTransformation(),
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                value = jamendo,
+                onValueChange = { jamendo = it; saved = false },
+                label = { Text(stringResource(R.string.settings_music_sources_jamendo)) },
+                placeholder = { Text(stringResource(R.string.settings_music_sources_jamendo_hint)) },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Text(
+                stringResource(R.string.settings_music_sources_jamendo_note),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Button(
+                    enabled = server.isNotBlank() || username.isNotBlank() ||
+                        password.isNotBlank() || jamendo.isNotBlank(),
+                    onClick = {
+                        StreamingSourcesStore.save(
+                            context,
+                            StreamingSources(
+                                server = server.trim(),
+                                username = username.trim(),
+                                password = password,
+                                jamendoClientId = jamendo.trim(),
+                            ),
+                        )
+                        sources = StreamingSourcesStore.load(context)
+                        saved = true
+                    },
+                ) {
+                    Text(stringResource(R.string.settings_music_sources_save))
+                }
+                OutlinedButton(
+                    enabled = sources != StreamingSources.EMPTY,
+                    onClick = {
+                        StreamingSourcesStore.clear(context)
+                        sources = StreamingSourcesStore.load(context)
+                        server = ""; username = ""; password = ""; jamendo = ""
+                        saved = false
+                    },
+                ) {
+                    Text(stringResource(R.string.settings_music_sources_clear))
+                }
+            }
+            if (saved) {
+                Text(
+                    stringResource(R.string.settings_music_sources_saved),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
+        }
+    }
+}

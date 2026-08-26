@@ -80,19 +80,22 @@ use comrade_core::crypto::KeyProfile;
 use comrade_core::handoff::{AttachmentRoute, HandoffSignal};
 use comrade_core::share::transport::RelayPolicy;
 use comrade_core::share::ShareSignal;
+use comrade_core::subsonic::SubsonicConfig;
 use comrade_core::together::{MusicLink, Recording, ServiceAccess, TogetherContent};
 use comrade_state::AppWorkspace;
 use comrade_ui::{
     AppAction, AttentionDayDto, AttentionSummaryDto, BridgeEvent, CallRecordDto, CallSessionDto,
-    ChatCommand, ChitthiDto, CommandSpec, ComradeDto, ComradeRuntime, ContactDto, ConversationDto,
-    CrisisResourceDto, DownloadVerdictDto, DownloadedTrackDto, FocusSessionDto, FoundProfileDto,
-    IceServerDto, IdentityDto, JournalEntryDto, JournalRecordingDto, LibraryCandidateDto,
-    MediaBytesDto, MediaMessageDto, Mention, MentionMatchDto, MeshStatusDto, MessageDto,
-    MessageRequestDto, MetricDto, MusicService, OfferOutcomeDto, PeerProfileDto, PlayPlan,
-    PlayRoute, PlayTargetDto, PresenceDto, ProfileDto, ReactionDto, ReadSample, ReadVerdict,
-    SavedReadDto, SavedReadSummaryDto, ShareVerdictDto, StretchStepDto, TaraChatDto,
-    TaraMessageDto, TaskDto, TaskState, ThreadDto, ThreadSummaryDto, TogetherSessionDto, TopicDto,
-    TravelGuideDto, TurnServerStatusDto, UiError, UpiIntentDto, WorkspaceDto,
+    ChatCommand, ChitthiDto, CollectionSearchOutcome, CommandSpec, ComradeDto, ComradeRuntime,
+    ContactDto, ConversationDto, CrisisResourceDto, DownloadVerdictDto, DownloadedTrackDto,
+    FocusSessionDto, FoundProfileDto, HistoryEntryDto, IceServerDto, IdentityDto, JournalEntryDto,
+    JournalRecordingDto, LibraryCandidateDto, LyricsOutcome, MediaBytesDto, MediaMessageDto,
+    Mention, MentionMatchDto, MeshStatusDto, MessageDto, MessageRequestDto, MetricDto,
+    MusicService, OfferOutcomeDto, PeerProfileDto, PlayPlan, PlayRoute, PlayTargetDto,
+    PlayerTrackDto, PlaylistDto, PresenceDto, ProfileDto, ReactionDto, ReadSample, ReadVerdict,
+    SavedQueueDto, SavedReadDto, SavedReadSummaryDto, ShareVerdictDto, StreamSearchOutcome,
+    StretchStepDto, TaraChatDto, TaraMessageDto, TaskDto, TaskState, ThreadDto, ThreadSummaryDto,
+    TogetherSessionDto, TopicDto, TrackListOutcome, TravelGuideDto, TurnServerStatusDto, UiError,
+    UpiIntentDto, WorkspaceDto,
 };
 use tokio::sync::RwLock;
 use tracing::warn;
@@ -1180,8 +1183,145 @@ impl Comrade {
     /// `.claude/rules/rust.md` that two shipped deadlocks came from. A method on
     /// the runtime would have made the lock unavoidable, because the returned
     /// future would borrow the guard.
-    pub async fn catalogue_lookup(&self, query: String) -> Result<Vec<CatalogueMatch>, UiError> {
-        comrade_ui::catalogue_lookup(&query).await
+    pub async fn catalogue_lookup(
+        &self,
+        query: String,
+        jamendo_client_id: Option<String>,
+    ) -> Result<Vec<CatalogueMatch>, UiError> {
+        comrade_ui::catalogue_lookup(&query, jamendo_client_id).await
+    }
+
+    /// Search one self-hosted streaming server (Subsonic/Navidrome).
+    ///
+    /// The online-streaming path `docs/TOGETHER.md` §23 records the decision
+    /// for: your library, your server, plain progressive HTTPS out — and every
+    /// returned URL has already passed the same guard a Together invitation
+    /// applies, so a row here is startable as a session unchanged.
+    ///
+    /// Flat [`StreamSearchOutcome`] rather than a `Result`, for the reasons on
+    /// that type: "no server saved", "this build cannot stream" and "the server
+    /// said no" are three different sentences, none of them exceptional.
+    /// Takes no lock — free function underneath, like [`Self::catalogue_lookup`]
+    /// — and persists nothing: the config arrives per call from settings.
+    pub async fn subsonic_search(
+        &self,
+        config: Option<SubsonicConfig>,
+        query: String,
+    ) -> StreamSearchOutcome {
+        comrade_ui::subsonic_search(config, query).await
+    }
+
+    // ── The player's own library ─────────────────────────────────────────────
+    //
+    // Favourites, recently-played, playlists and the saved queue — the half
+    // docs/TOGETHER.md §20 called "the half that makes it a music player
+    // rather than a session tool". Every method is a quick local vault read or
+    // write: plain `fn` (not suspend), because there is no network and no
+    // reason to make Kotlin dispatch; and all of them throw `VaultLocked`
+    // while locked, because listening data is diary data.
+
+    /// Every favourited track.
+    pub fn favourites_list(&self) -> Result<Vec<PlayerTrackDto>, UiError> {
+        self.inner.blocking_read().favourites_list()
+    }
+
+    /// Whether `key` is favourited — one cheap call per row while drawing.
+    pub fn favourite_is(&self, key: String) -> Result<bool, UiError> {
+        self.inner.blocking_read().favourite_is(key)
+    }
+
+    /// Toggle a favourite; answers what it now is, so the button renders from
+    /// the return value without a second call racing it.
+    pub fn favourite_toggle(&self, track: PlayerTrackDto) -> Result<bool, UiError> {
+        self.inner.blocking_read().favourite_toggle(track)
+    }
+
+    /// Record that a track was just played. Fire-and-forget by contract: a
+    /// failed diary write never fails playback, so this returns Unit either way.
+    pub fn history_record(&self, track: PlayerTrackDto, at_ms: u64) {
+        let _ = self.inner.blocking_read().history_record(track, at_ms);
+    }
+
+    /// Recently played, newest first.
+    pub fn history_list(&self) -> Result<Vec<HistoryEntryDto>, UiError> {
+        self.inner.blocking_read().history_list()
+    }
+
+    /// Forget everything recently played.
+    pub fn history_clear(&self) -> Result<(), UiError> {
+        self.inner.blocking_read().history_clear()
+    }
+
+    /// Every playlist with its tracks in playlist order.
+    pub fn playlists_list(&self) -> Result<Vec<PlaylistDto>, UiError> {
+        self.inner.blocking_read().playlists_list()
+    }
+
+    /// Create an empty playlist; answers its id.
+    pub fn playlist_create(&self, name: String, created_at_ms: u64) -> Result<String, UiError> {
+        self.inner
+            .blocking_read()
+            .playlist_create(name, created_at_ms)
+    }
+
+    /// Delete a playlist. Its tracks are untouched elsewhere.
+    pub fn playlist_delete(&self, id: String) -> Result<(), UiError> {
+        self.inner.blocking_read().playlist_delete(id)
+    }
+
+    /// Append a track to a playlist. Duplicates allowed.
+    pub fn playlist_add_track(&self, id: String, track: PlayerTrackDto) -> Result<(), UiError> {
+        self.inner.blocking_read().playlist_add_track(id, track)
+    }
+
+    /// Remove every copy of a track from a playlist.
+    pub fn playlist_remove_track(&self, id: String, track_key: String) -> Result<(), UiError> {
+        self.inner
+            .blocking_read()
+            .playlist_remove_track(id, track_key)
+    }
+
+    /// Save the live queue over any previous snapshot.
+    pub fn queue_save(&self, queue: SavedQueueDto) -> Result<(), UiError> {
+        self.inner.blocking_read().queue_save(queue)
+    }
+
+    /// The saved queue, if any.
+    pub fn queue_load(&self) -> Result<Option<SavedQueueDto>, UiError> {
+        self.inner.blocking_read().queue_load()
+    }
+
+    /// Forget the saved queue.
+    pub fn queue_clear(&self) -> Result<(), UiError> {
+        self.inner.blocking_read().queue_clear()
+    }
+
+    // ── Public collections & lyrics ──────────────────────────────────────────
+
+    /// Search the Internet Archive's audio collections. Free function
+    /// underneath — no lock, like every networked call here.
+    pub async fn archive_search(&self, query: String) -> CollectionSearchOutcome {
+        comrade_ui::archive_search(query).await
+    }
+
+    /// List one archive item's playable files.
+    pub async fn archive_tracks(&self, identifier: String) -> TrackListOutcome {
+        comrade_ui::archive_tracks(identifier).await
+    }
+
+    /// List one podcast feed's episodes.
+    pub async fn podcast_episodes(&self, feed_url: String) -> TrackListOutcome {
+        comrade_ui::podcast_episodes(feed_url).await
+    }
+
+    /// Synced lyrics for a recording; empty `Found` means none exist.
+    pub async fn lyrics_lookup(
+        &self,
+        title: String,
+        artist: String,
+        duration_ms: u64,
+    ) -> LyricsOutcome {
+        comrade_ui::lyrics_lookup(title, artist, duration_ms).await
     }
 
     /// Whether a catalogue answer may be downloaded, and if not, why.
@@ -2312,7 +2452,10 @@ mod tests {
         let c = isolated();
 
         // Empty query: no socket, no error.
-        assert_eq!(c.catalogue_lookup("  ".into()).await.unwrap(), Vec::new());
+        assert_eq!(
+            c.catalogue_lookup("  ".into(), None).await.unwrap(),
+            Vec::new()
+        );
 
         // And the pure half decides a tier with no vault and no network.
         let want = Recording::titled("Kun Faya Kun");

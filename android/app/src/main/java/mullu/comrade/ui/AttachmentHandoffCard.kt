@@ -21,12 +21,16 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import androidx.core.content.FileProvider
 import java.io.File
 import mullu.comrade.handoff.AttachmentHandoffManager
+import mullu.comrade.ui.theme.ComradeRadii
+import mullu.comrade.ui.theme.GlassElevation
+import mullu.comrade.ui.theme.glassSurface
 
 /**
  * The large-attachment handoff, in the thread it belongs to.
@@ -58,8 +62,12 @@ fun AttachmentHandoffPanel(peer: String, modifier: Modifier = Modifier) {
     // relay. Unanswered it stalls in silence, which is the failure the whole
     // consent path exists to remove.
     relayQuestion?.let { question ->
+        val dialogShape = RoundedCornerShape(ComradeRadii.xl)
         AlertDialog(
             onDismissRequest = { AttachmentHandoffManager.refuseRelayConsent() },
+            modifier = Modifier.testTag("handoff-relay-consent").glassSurface(GlassElevation.Sheet, shape = dialogShape),
+            shape = dialogShape,
+            containerColor = Color.Transparent,
             title = { Text("Send it anyway?") },
             text = { Text(question) },
             confirmButton = {
@@ -72,7 +80,6 @@ fun AttachmentHandoffPanel(peer: String, modifier: Modifier = Modifier) {
                     Text("Don't")
                 }
             },
-            modifier = Modifier.testTag("handoff-relay-consent"),
         )
     }
 

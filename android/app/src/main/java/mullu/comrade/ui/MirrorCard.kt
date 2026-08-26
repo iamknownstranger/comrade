@@ -21,11 +21,15 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import mullu.comrade.ComradeCore
 import mullu.comrade.R
+import mullu.comrade.ui.theme.ComradeRadii
+import mullu.comrade.ui.theme.GlassElevation
+import mullu.comrade.ui.theme.glassSurface
 
 /**
  * The attention **mirror** — phase 1 of `docs/ATTENTION.md`.
@@ -205,8 +209,12 @@ fun DoomAppPicker(
     onToggle: (String) -> Unit,
     onDismiss: () -> Unit,
 ) {
+    val dialogShape = RoundedCornerShape(ComradeRadii.xl)
     AlertDialog(
         onDismissRequest = onDismiss,
+        modifier = Modifier.glassSurface(GlassElevation.Sheet, shape = dialogShape),
+        shape = dialogShape,
+        containerColor = Color.Transparent,
         title = { Text(stringResource(R.string.mirror_pick_apps_title)) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {

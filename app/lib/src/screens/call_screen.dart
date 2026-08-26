@@ -1222,8 +1222,7 @@ class _DockItemState extends State<_DockItem> {
 
   @override
   Widget build(BuildContext context) {
-    final Color tint =
-        widget.active ? CallPalette.controlActive : Colors.white;
+    final Color tint = widget.active ? CallPalette.controlActive : Colors.white;
     return ComradeFocusRing(
       focusNode: _focusNode,
       child: InkWell(

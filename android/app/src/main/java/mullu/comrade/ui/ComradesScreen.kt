@@ -29,7 +29,6 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.pluralStringResource
@@ -43,9 +42,7 @@ import kotlinx.coroutines.withContext
 import mullu.comrade.ComradeCore
 import mullu.comrade.PresenceMonitor
 import mullu.comrade.R
-
-/** The green of a live presence dot; muted grey when the peer isn't around. */
-private val OnlineGreen = Color(0xFF10B981)
+import mullu.comrade.ui.theme.OnlineGreen
 
 /**
  * A presence dot: green while the peer is online, a muted grey otherwise.

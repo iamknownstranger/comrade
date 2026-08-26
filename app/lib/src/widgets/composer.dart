@@ -319,8 +319,7 @@ class _MessageComposerState extends ConsumerState<MessageComposer> {
                         key: const Key('dm-attach'),
                         focusNode: _attachFocus,
                         tooltip: 'Attach a file (max 10 MB, encrypted)',
-                        onPressed:
-                            (widget.attaching || _busy) ? null : _attach,
+                        onPressed: (widget.attaching || _busy) ? null : _attach,
                         icon: (widget.attaching || _busy)
                             ? const SizedBox(
                                 width: 18,

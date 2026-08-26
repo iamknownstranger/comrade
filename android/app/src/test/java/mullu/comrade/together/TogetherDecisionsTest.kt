@@ -943,7 +943,7 @@ class TogetherDecisionsTest {
         // A source that vanished on a refusal would leave no way back to it.
         for (granted in listOf(true, false)) {
             val sources = TogetherDecisions.sources(libraryGranted = granted)
-            assertEquals(4, sources.size)
+            assertEquals(6, sources.size)
             assertEquals(
                 TogetherDecisions.Source.OnThisPhone(needsPermission = !granted),
                 sources.first(),
@@ -951,6 +951,8 @@ class TogetherDecisionsTest {
             assertTrue(sources.contains(TogetherDecisions.Source.PickAFile))
             assertTrue(sources.contains(TogetherDecisions.Source.FromALink))
             assertTrue(sources.contains(TogetherDecisions.Source.SearchByName))
+            assertTrue(sources.contains(TogetherDecisions.Source.YourServer))
+            assertTrue(sources.contains(TogetherDecisions.Source.PublicCollections))
         }
     }
 
@@ -1419,17 +1421,36 @@ class TogetherDecisionsTest {
     // ── Searching a catalogue by name ────────────────────────────────────────
 
     @Test
-    fun searchIsOfferedLastBecauseItIsTheOnlySourceThatTellsAnyoneAnything() {
+    fun searchIsOfferedLastAmongTheNoSetupSourcesBecauseItTellsAThirdPartyThings() {
         val offered = TogetherDecisions.sources(libraryGranted = true)
+        // Your own server needs credentials before it can do anything at all,
+        // so it sits below the cards that just work — but it does not outrank
+        // the catalogue's disclosure either, so the catalogue keeps its place
+        // ahead of every networked-but-unconfigured option.
         assertEquals(
-            "search must be the last source offered",
-            TogetherDecisions.Source.SearchByName,
+            "the collections card must be offered last",
+            TogetherDecisions.Source.PublicCollections,
             offered.last(),
+        )
+        assertTrue(
+            "the server card must sit below the catalogue too — it also needs setup",
+            offered.indexOf(TogetherDecisions.Source.SearchByName) <
+                offered.indexOf(TogetherDecisions.Source.YourServer),
         )
         assertEquals(
             "on-device music must still be first",
             TogetherDecisions.Source.OnThisPhone(needsPermission = false),
             offered.first(),
+        )
+        assertTrue(
+            "the catalogue must sit before the server card",
+            offered.indexOf(TogetherDecisions.Source.SearchByName) <
+                offered.indexOf(TogetherDecisions.Source.YourServer),
+        )
+        assertTrue(
+            "the catalogue must sit after the sources that need nothing but the phone",
+            offered.indexOf(TogetherDecisions.Source.FromALink) <
+                offered.indexOf(TogetherDecisions.Source.SearchByName),
         )
     }
 
@@ -1590,4 +1611,129 @@ class TogetherDecisionsTest {
             TogetherDecisions.needsOwnCopy(embed = false, external = false, stream = false),
         )
     }
+
+    // ── Player extras ────────────────────────────────────────────────────────
+
+    @Test
+    fun shuffleKeepsTheCurrentTrackFirstAndLosesNothing() {
+        for (seed in 1..50) {
+            val order = TogetherDecisions.shuffledOrder(8, 3, kotlin.random.Random(seed))
+            assertEquals("current track leads", 3, order.first())
+            assertEquals(
+                "every index exactly once",
+                (0 until 8).toSet(),
+                order.toSet(),
+            )
+        }
+        assertEquals("a one-track queue shuffles to itself", listOf(0), TogetherDecisions.shuffledOrder(1, 0, kotlin.random.Random(1)))
+        assertTrue("an empty queue shuffles to nothing", TogetherDecisions.shuffledOrder(0, 0, kotlin.random.Random(1)).isEmpty())
+    }
+
+    @Test
+    fun repeatOneRestartsWhateverEndedEvenUnderShuffle() {
+        val order = TogetherDecisions.shuffledOrder(5, 2, kotlin.random.Random(7))
+        assertEquals(4, TogetherDecisions.nextIndexOnEnd(TogetherDecisions.RepeatMode.ONE, null, 4, 5))
+        assertEquals(2, TogetherDecisions.nextIndexOnEnd(TogetherDecisions.RepeatMode.ONE, order, 2, 5))
+    }
+
+    @Test
+    fun endOfQueueStopsWithoutRepeatAndWrapsWithIt() {
+        // Straight order, last track.
+        assertEquals(null, TogetherDecisions.nextIndexOnEnd(TogetherDecisions.RepeatMode.OFF, null, 4, 5))
+        assertEquals(0, TogetherDecisions.nextIndexOnEnd(TogetherDecisions.RepeatMode.ALL, null, 4, 5))
+        // Mid-queue advances either way.
+        assertEquals(3, TogetherDecisions.nextIndexOnEnd(TogetherDecisions.RepeatMode.OFF, null, 2, 5))
+    }
+
+    @Test
+    fun shuffleAdvancesAlongItsOwnOrderAndWrapsShuffled() {
+        val order = TogetherDecisions.shuffledOrder(6, 1, kotlin.random.Random(42))
+        val at = order.indexOf(1)
+        // The next track is the next element of the ORDER, not of the files.
+        if (at + 1 < order.size) {
+            assertEquals(order[at + 1], TogetherDecisions.nextIndexOnEnd(TogetherDecisions.RepeatMode.OFF, order, 1, 6))
+        }
+        // At the order's end: stop without repeat…
+        assertEquals(null, TogetherDecisions.nextIndexOnEnd(TogetherDecisions.RepeatMode.OFF, order, order.last(), 6))
+        // …and wrap to the order's head with it — shuffled stays shuffled.
+        assertEquals(order.first(), TogetherDecisions.nextIndexOnEnd(TogetherDecisions.RepeatMode.ALL, order, order.last(), 6))
+    }
+
+    @Test
+    fun skipBackFollowsTheOrderToo() {
+        val order = TogetherDecisions.shuffledOrder(5, 2, kotlin.random.Random(9))
+        val at = order.indexOf(2)
+        if (at > 0) {
+            assertEquals(order[at - 1], TogetherDecisions.previousIndexWith(order, 2, 5))
+        } else {
+            assertEquals(null, TogetherDecisions.previousIndexWith(order, 2, 5))
+        }
+        assertEquals(null, TogetherDecisions.previousIndexWith(null, 0, 5))
+        assertEquals(1, TogetherDecisions.previousIndexWith(null, 2, 5))
+    }
+
+    @Test
+    fun manualSkipForwardIgnoresRepeatOneButNotShuffle() {
+        val order = TogetherDecisions.shuffledOrder(4, 0, kotlin.random.Random(3))
+        // Repeat-one does not trap a manual next…
+        assertEquals(1, TogetherDecisions.manualNextIndex(null, 0, 4))
+        assertEquals(null, TogetherDecisions.manualNextIndex(null, 3, 4))
+        // …but shuffle still chooses which track comes next.
+        val at = order.indexOf(0)
+        assertEquals(order.getOrNull(at + 1), TogetherDecisions.manualNextIndex(order, 0, 4))
+    }
+
+    @Test
+    fun speedIsASoloLuxuryAndSnapsToItsSteps() {
+        assertTrue(TogetherDecisions.speedAllowed(solo = true))
+        assertFalse("in a session the correction ladder owns the rate", TogetherDecisions.speedAllowed(solo = false))
+        assertEquals(1.0f, TogetherDecisions.clampSpeed(1.02f))
+        assertEquals(1.15f, TogetherDecisions.clampSpeed(1.17f))
+        assertEquals(0.5f, TogetherDecisions.clampSpeed(0.1f))
+        assertEquals(2.0f, TogetherDecisions.clampSpeed(9f))
+    }
+
+    @Test
+    fun sleepTimerCountsDownOnlyWhileItLives() {
+        assertEquals(null, TogetherDecisions.sleepRemainingMs(null, 600_000, 999))
+        assertEquals(401_000L, TogetherDecisions.sleepRemainingMs(1_000, 601_000, 201_000))
+        // JUnit4 puts the message first; getting that backwards asserts the
+        // message equals the value, which is how this line once passed a null
+        // expectation against the string it was named with.
+        assertNull("expired is none", TogetherDecisions.sleepRemainingMs(1_000, 600_000, 601_000))
+    }
+
+    @Test
+    fun lrcParsesTimestampsSortsAndDropsMetadata() {
+        val doc = "[ar:A. R. Rahman]\n" +
+            "[00:30.50]second line\n" +
+            "[01:05][00:10]chorus appears twice\n" +
+            "no tags at all\n" +
+            "[00:20.250]fraction of three digits\n"
+        val lines = TogetherDecisions.parseLrc(doc)
+        assertEquals(listOf(10_000L, 20_250L, 30_500L, 65_000L), lines.map { it.atMs })
+        assertEquals("chorus appears twice", lines[0].text)
+        assertEquals("chorus appears twice", lines[3].text)
+        assertEquals("second line", lines[2].text)
+    }
+
+    @Test
+    fun plainUntimedTextIsNoSyncedLyricsRatherThanAnEmptyDocument() {
+        assertTrue(TogetherDecisions.parseLrc("just words\nmore words").isEmpty())
+        assertEquals("metadata-only is empty too", 0, TogetherDecisions.parseLrc("[ti:title]").size)
+    }
+
+    @Test
+    fun theLyricHighlightIsTheLastLineThatStarted() {
+        val lines = listOf(
+            TogetherDecisions.LyricLine(1_000, "a"),
+            TogetherDecisions.LyricLine(5_000, "b"),
+            TogetherDecisions.LyricLine(9_000, "c"),
+        )
+        assertEquals(-1, TogetherDecisions.lyricIndexAt(lines, 500))
+        assertEquals(0, TogetherDecisions.lyricIndexAt(lines, 1_000))
+        assertEquals(1, TogetherDecisions.lyricIndexAt(lines, 5_500))
+        assertEquals(2, TogetherDecisions.lyricIndexAt(lines, 99_000))
+    }
+
 }

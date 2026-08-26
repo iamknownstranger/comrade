@@ -136,6 +136,14 @@ all three fallbacks; a frontend that cannot is listed in §5.
 Focus is never suppressed. Every interactive element shows a 2px `ring`
 offset 2px on `:focus-visible`, in every tier including glass.
 
+That is the rule; it is not yet the state of the code on two of the three
+frontends. CSS applies `:focus-visible` to every focusable element at once, so
+desktop satisfies it by construction — Compose and Flutter need the ring
+applied per call site, and today it reaches the nav bar, the composer and the
+call controls, not the long tail. `AUDIT.md` V5 tracks the gap and names the
+two cases that need more than a call site. Treat the rule as binding on new
+code rather than as a description of what already ships.
+
 ## 5. Where the frontends diverge, and why
 
 **Desktop** gets the full material. The Tauri webview (WebKitGTK / WebView2 /

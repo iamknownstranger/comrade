@@ -2,84 +2,35 @@ package mullu.comrade.ui.theme
 
 import android.app.Activity
 import android.os.Build
+import android.provider.Settings
 import androidx.compose.foundation.isSystemInDarkTheme
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.*
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.dynamicDarkColorScheme
+import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.SideEffect
-import androidx.compose.ui.graphics.Color
+import androidx.compose.runtime.remember
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
 
 /*
- * Fallback brand palette, used when Material You dynamic color is unavailable
- * (below Android 12). Mirrors the desktop shell's visual system: indigo
- * accent, emerald "good", amber "warn", deep navy surfaces
- * (desktop/ui/styles.css `:root`).
+ * The token layer lives across this package:
+ *  - ColorTokens.kt   raw ARGB hex, framework-free (JUnit-testable)
+ *  - Color.kt         those tokens as M3 ColorSchemes + CallPalette/AvatarPalette
+ *  - Surfaces.kt       ComradeSurfaces: the shadcn-named ramp M3 has no slot for
+ *  - Shape.kt          §3.2's derived radius scale
+ *  - Type.kt           the type hierarchy
+ *  - StateLayer.kt      §3.3's fixed state-layer opacities
+ *  - Motion.kt          §3.5's durations/easing
+ *  - Glass.kt           §3.4's glass tier (§5: no backdrop blur on Android)
+ *  - Focus.kt            §4's focus ring
+ *
+ * This file only wires them together into one [ComradeTheme] composable —
+ * see `docs/DESIGN_SYSTEM.md` for the contract itself.
  */
-
-private val DarkColorScheme = darkColorScheme(
-    primary = Color(0xFF818CF8),
-    onPrimary = Color(0xFF1E1B4B),
-    primaryContainer = Color(0xFF3730A3),
-    onPrimaryContainer = Color(0xFFE0E7FF),
-    secondary = Color(0xFF34D399),
-    onSecondary = Color(0xFF022C22),
-    tertiary = Color(0xFFFBBF24),
-    onTertiary = Color(0xFF2A1B06),
-    background = Color(0xFF0A0E1A),
-    onBackground = Color(0xFFE6EBF5),
-    surface = Color(0xFF0F1525),
-    onSurface = Color(0xFFE6EBF5),
-    surfaceVariant = Color(0xFF1A2438),
-    onSurfaceVariant = Color(0xFF9AA7C2),
-    outline = Color(0xFF6B7894),
-)
-
-private val LightColorScheme = lightColorScheme(
-    primary = Color(0xFF4F46E5),
-    onPrimary = Color(0xFFFFFFFF),
-    primaryContainer = Color(0xFFE0E7FF),
-    onPrimaryContainer = Color(0xFF1E1B4B),
-    secondary = Color(0xFF059669),
-    onSecondary = Color(0xFFFFFFFF),
-    tertiary = Color(0xFFB45309),
-    onTertiary = Color(0xFFFFFFFF),
-)
-
-/**
- * Soft, generous corner radii — cards, dialogs and sheets read as one
- * rounded, modern surface system instead of the sharper M3 defaults.
- */
-private val ComradeShapes = Shapes(
-    extraSmall = RoundedCornerShape(8.dp),
-    small = RoundedCornerShape(12.dp),
-    medium = RoundedCornerShape(16.dp),
-    large = RoundedCornerShape(22.dp),
-    extraLarge = RoundedCornerShape(28.dp),
-)
-
-/**
- * Default M3 type with a firmer title hierarchy: names and headings sit
- * semi-bold so lists scan by name first, metadata second.
- */
-private val ComradeTypography = Typography().let { base ->
-    base.copy(
-        headlineMedium = base.headlineMedium.copy(fontWeight = FontWeight.Bold),
-        titleLarge = base.titleLarge.copy(fontWeight = FontWeight.SemiBold),
-        titleMedium = base.titleMedium.copy(fontWeight = FontWeight.SemiBold),
-        titleSmall = base.titleSmall.copy(
-            fontWeight = FontWeight.SemiBold,
-            letterSpacing = 0.1.sp,
-        ),
-        labelSmall = base.labelSmall.copy(letterSpacing = 0.2.sp),
-    )
-}
 
 @Composable
 fun ComradeTheme(
@@ -87,15 +38,40 @@ fun ComradeTheme(
     dynamicColor: Boolean = true,
     content: @Composable () -> Unit,
 ) {
+    val context = LocalContext.current
+    // AUDIT V4 / §4.3: reduced motion is the one accessibility request
+    // Android actually exposes, so it has to be *read* here — a
+    // CompositionLocal left at its default is a hatch that looks wired and
+    // never fires. ANIMATOR_DURATION_SCALE is the same setting backing
+    // Flutter's MediaQuery.disableAnimations on this platform, which is why
+    // both frontends collapse on the same user action. The decision itself
+    // lives in MotionDecisions, framework-free, so the JUnit lane checks it
+    // without an Android classpath.
+    val reducedMotion = remember(context) {
+        MotionDecisions.isReducedMotion(
+            Settings.Global.getFloat(
+                context.contentResolver,
+                Settings.Global.ANIMATOR_DURATION_SCALE,
+                1f,
+            ),
+        )
+    }
+
     val colorScheme = when {
         dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
-            val context = LocalContext.current
             if (darkTheme) dynamicDarkColorScheme(context)
             else dynamicLightColorScheme(context)
         }
-        darkTheme -> DarkColorScheme
-        else -> LightColorScheme
+        darkTheme -> ComradeDarkColorScheme
+        else -> ComradeLightColorScheme
     }
+    // Material You dynamic colour has no source for the shadcn-named ramp
+    // (there is no wallpaper-derived "card" or "ring"), so ComradeSurfaces
+    // always follows the *brand* ramp for the given brightness rather than
+    // trying to derive one from `colorScheme` — the same reasoning
+    // `comrade_theme.dart`'s header comment gives for going brand-coloured
+    // everywhere on the unified app.
+    val surfaces = if (darkTheme) ComradeSurfaces.Dark else ComradeSurfaces.Light
 
     val view = LocalView.current
     if (!view.isInEditMode) {
@@ -107,10 +83,15 @@ fun ComradeTheme(
         }
     }
 
-    MaterialTheme(
-        colorScheme = colorScheme,
-        shapes = ComradeShapes,
-        typography = ComradeTypography,
-        content = content,
-    )
+    CompositionLocalProvider(
+        LocalComradeSurfaces provides surfaces,
+        LocalReducedMotion provides reducedMotion,
+    ) {
+        MaterialTheme(
+            colorScheme = colorScheme,
+            shapes = ComradeShapes,
+            typography = ComradeTypography,
+            content = content,
+        )
+    }
 }

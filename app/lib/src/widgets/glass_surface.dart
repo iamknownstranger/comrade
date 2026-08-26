@@ -137,7 +137,13 @@ class GlassSurface extends StatelessWidget {
       // ends up looking like a plain translucent box (§3.4).
       child: Stack(
         children: <Widget>[
-          child,
+          // `ListTile`, `InkWell` and friends paint their ink on the nearest
+          // Material ancestor. The DecoratedBox above is not one, so without
+          // this every tappable row inside a glass sheet or dialog loses its
+          // ripple — and Flutter asserts about it in debug, which is how this
+          // was caught. `MaterialType.transparency` supplies the ink surface
+          // without painting a fill that would sit on top of the tint.
+          Material(type: MaterialType.transparency, child: child),
           Positioned(
             top: 0,
             left: 0,
