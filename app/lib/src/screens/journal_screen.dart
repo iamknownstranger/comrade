@@ -32,6 +32,7 @@ import '../util/journal_note.dart';
 import '../util/journal_recording.dart';
 import '../widgets/app_chrome.dart';
 import '../widgets/glass_surface.dart';
+import '../widgets/list_skeleton.dart';
 
 /// Self-reported mood markers, low → high. Stored as the emoji itself.
 const List<String> kMoods = <String>['😞', '😕', '😐', '🙂', '😄'];
@@ -202,20 +203,19 @@ class _JournalScreenState extends ConsumerState<JournalScreen> {
           _composer(context),
           const SizedBox(height: 10),
           ...entries.when(
-            loading: () => const <Widget>[
-              Padding(
-                padding: EdgeInsets.only(top: 24),
-                child: Center(
-                  child: SizedBox(
-                    width: 28,
-                    height: 28,
-                    child: CircularProgressIndicator(),
-                  ),
-                ),
-              ),
+            // §7.3: the row shape is known before the list loads.
+            loading: () => <Widget>[
+              ListSkeleton.cardRows(key: const Key('journal-skeleton')),
             ],
             error: (Object e, StackTrace s) => <Widget>[
-              EmptyState(title: 'Could not load the journal', body: '$e'),
+              EmptyState(
+                title: 'Could not load the journal',
+                body: '$e',
+                action: FilledButton(
+                  onPressed: () => ref.invalidate(journalProvider),
+                  child: const Text('Try again'),
+                ),
+              ),
             ],
             data: (List<JournalEntryInfo> list) {
               if (list.isEmpty) {

@@ -55,8 +55,14 @@ class CallHistoryScreen extends ConsumerWidget {
       loading: () => ListSkeleton.peerRows(
         key: const Key('call-history-skeleton'),
       ),
-      error: (Object e, StackTrace s) =>
-          EmptyState(title: 'Could not load call history', body: '$e'),
+      error: (Object e, StackTrace s) => EmptyState(
+        title: 'Could not load call history',
+        body: '$e',
+        action: FilledButton(
+          onPressed: () => ref.invalidate(callHistoryProvider),
+          child: const Text('Try again'),
+        ),
+      ),
       data: (List<CallRecordInfo> list) {
         if (list.isEmpty) return const EmptyState(title: 'No calls yet');
         return ReadingColumn(

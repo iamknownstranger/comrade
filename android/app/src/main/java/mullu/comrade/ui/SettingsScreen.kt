@@ -87,6 +87,7 @@ import mullu.comrade.voice.VoskModel
 import mullu.comrade.voice.WakeWordService
 import mullu.comrade.ui.theme.ComradeRadii
 import mullu.comrade.ui.theme.GlassElevation
+import mullu.comrade.ui.theme.Spacing
 import mullu.comrade.ui.theme.glassSurface
 
 @Composable
@@ -425,7 +426,7 @@ private fun ShareRelaySection() {
             )
             options.forEach { (option, label) ->
                 Row(
-                    modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                    modifier = Modifier.fillMaxWidth().padding(vertical = Spacing.space1),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     RadioButton(
@@ -717,7 +718,7 @@ private fun HourStepper(
     onChange: (Int) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    Column(modifier, verticalArrangement = Arrangement.spacedBy(2.dp)) {
+    Column(modifier, verticalArrangement = Arrangement.spacedBy(Spacing.space1)) {
         Text(
             label,
             style = MaterialTheme.typography.labelSmall,

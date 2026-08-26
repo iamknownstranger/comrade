@@ -534,7 +534,7 @@ body.theme-travel {
 code {
   font-family: var(--mono);
   background: var(--bg-elev);
-  padding: 1px 5px;
+  padding: var(--space-1) var(--space-1);
   border-radius: 5px;
   font-size: 0.92em;
 }
@@ -600,10 +600,17 @@ code {
   border: 1px solid var(--border);
   color: var(--text-dim);
   border-radius: var(--radius-sm);
-  padding: 8px 10px;
+  padding: var(--space-2) var(--space-3);
   cursor: pointer;
+  /* Icon glyph, not running text — outside §7.2's roles, like `.tab-icon`. */
   font-size: 14px;
   line-height: 1;
+  /* §7.5: 48px hit-area floor, real box growth rather than a drawn size. */
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: var(--space-12);
+  min-height: var(--space-12);
   transition: background 0.15s ease, color 0.15s ease;
 }
 
@@ -654,8 +661,8 @@ code {
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
-  gap: 18px;
-  padding: 16px 12px 14px;
+  gap: var(--space-5);
+  padding: var(--space-4) var(--space-3) var(--space-4);
   background: var(--glass-tint);
   backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
   -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
@@ -667,8 +674,8 @@ code {
 .sidebar-brand {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 2px 6px;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-2);
 }
 
 .sidebar-brand .ws-badge {
@@ -678,12 +685,16 @@ code {
 .sidebar-section {
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  padding: 0 6px;
+  gap: var(--space-3);
+  padding: 0 var(--space-2);
 }
 
 .sidebar-heading {
-  font-size: 11px;
+  /* §7.2 caption role: the 0.07em uppercase tracking is deliberately wider
+     than caption's own 0.02em (this is an all-caps eyebrow, not running
+     text), so tracking and weight stay call-site while size comes from the
+     role. */
+  font-size: var(--text-caption-size);
   text-transform: uppercase;
   letter-spacing: 0.07em;
   color: var(--muted-foreground);
@@ -692,7 +703,7 @@ code {
 
 .partner-btn {
   justify-content: flex-start;
-  gap: 8px;
+  gap: var(--space-2);
   font-weight: 600;
 }
 
@@ -700,8 +711,8 @@ code {
   margin-top: auto;
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  padding: 12px 6px 0;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-2) 0;
   border-top: 1px solid var(--border);
 }
 
@@ -718,29 +729,32 @@ code {
 }
 
 .ws-badge {
-  font-size: 11px;
+  /* §7.2 caption role, same uppercase-eyebrow exception as `.sidebar-heading`. */
+  font-size: var(--text-caption-size);
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.05em;
   color: var(--accent-contrast);
   background: var(--accent);
-  padding: 3px 9px;
+  padding: var(--space-1) var(--space-2);
   border-radius: 999px;
 }
 
 .net-pills {
   display: flex;
-  gap: 6px;
+  gap: var(--space-2);
 }
 
 .pill {
-  font-size: 10px;
+  /* §7.2 caption role: was 10px, a seventh size that did the same job as
+     caption at 12px; collapsed onto it rather than kept as a separate step. */
+  font-size: var(--text-caption-size);
   text-transform: uppercase;
   letter-spacing: 0.04em;
   color: var(--muted-foreground);
   border: 1px solid var(--border);
   border-radius: 999px;
-  padding: 2px 8px;
+  padding: var(--space-1) var(--space-2);
 }
 
 .pill.on {
@@ -756,14 +770,14 @@ code {
 .identity-chip {
   display: inline-flex;
   align-items: center;
-  gap: 7px;
+  gap: var(--space-2);
   background: var(--bg-elev);
   border: 1px solid var(--border);
   border-radius: 999px;
-  padding: 5px 11px;
+  padding: var(--space-1) var(--space-3);
   color: var(--text-dim);
   cursor: pointer;
-  font-size: 12px;
+  font-size: var(--text-caption-size);
 }
 
 .identity-chip:hover {
@@ -787,7 +801,7 @@ code {
 .switch {
   display: inline-flex;
   align-items: center;
-  gap: 7px;
+  gap: var(--space-2);
   cursor: pointer;
   user-select: none;
 }
@@ -810,6 +824,9 @@ code {
 
 .switch-thumb {
   position: absolute;
+  /* §7.1 optical correction: centers an 18px thumb inside the 22px track
+     ((22 - 18) / 2 = 2px) — a derived inset from the track/thumb geometry
+     above, not a spacing-scale choice, so it does not round to the grid. */
   top: 2px;
   left: 2px;
   width: 18px;
@@ -842,7 +859,7 @@ code {
 .tabs {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: var(--space-1);
   background: var(--glass-tint);
   backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
   -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
@@ -855,13 +872,13 @@ code {
   border-left: 3px solid transparent;
   border-radius: var(--radius-sm);
   color: var(--text-dim);
-  padding: 10px 12px;
+  padding: var(--space-3) var(--space-3);
   cursor: pointer;
   font: inherit;
   font-weight: 600;
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: var(--space-3);
   text-align: left;
   transition: background 0.15s ease, color 0.15s ease;
 }
@@ -885,7 +902,7 @@ code {
 .tab-text {
   display: flex;
   flex-direction: column;
-  gap: 1px;
+  gap: var(--space-1);
 }
 
 .tab-sub {
@@ -926,8 +943,8 @@ code {
   max-width: clamp(720px, 66vw, 1280px);
   width: 100%;
   margin: 0 auto;
-  padding: 16px;
-  gap: 14px;
+  padding: var(--space-4);
+  gap: var(--space-4);
 }
 
 /* Glass tier: the composer floats over whatever feed/log it sits below. */
@@ -938,14 +955,14 @@ code {
   border: var(--glass-border);
   border-radius: var(--radius);
   box-shadow: var(--glass-shadow), var(--glass-highlight);
-  padding: 12px;
+  padding: var(--space-3);
 }
 
 .composer-foot {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-top: 8px;
+  margin-top: var(--space-2);
 }
 
 .feed {
@@ -953,15 +970,15 @@ code {
   overflow-y: auto;
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  padding-right: 4px;
+  gap: var(--space-3);
+  padding-right: var(--space-1);
 }
 
 .chitthi {
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 12px 14px;
+  padding: var(--space-3) var(--space-4);
   animation: rise 0.25s ease;
 }
 
@@ -973,18 +990,21 @@ code {
 .chitthi-meta {
   display: flex;
   justify-content: space-between;
-  gap: 10px;
-  margin-bottom: 6px;
+  gap: var(--space-3);
+  margin-bottom: var(--space-2);
 }
 
 .chitthi-author {
   font-family: var(--mono);
-  font-size: 12px;
+  /* §7.2 caption role. */
+  font-size: var(--text-caption-size);
   color: var(--accent-2);
 }
 
 .chitthi-time {
-  font-size: 11px;
+  /* §7.2 caption role: was 11px, one point off `.chitthi-author` doing the
+     same "small meta" job — collapsed onto the same role. */
+  font-size: var(--text-caption-size);
   color: var(--muted-foreground);
 }
 
@@ -994,9 +1014,9 @@ code {
 }
 
 .chitthi-reply {
-  font-size: 11px;
+  font-size: var(--text-caption-size);
   color: var(--muted-foreground);
-  margin-top: 6px;
+  margin-top: var(--space-2);
 }
 
 /* Vault — a two-column CSS Grid: the conversation list gets a track that
@@ -1018,8 +1038,9 @@ code {
 }
 
 .contacts-head {
-  padding: 12px 14px;
-  font-size: 12px;
+  padding: var(--space-3) var(--space-4);
+  /* §7.2 caption role, uppercase eyebrow treatment (see `.sidebar-heading`). */
+  font-size: var(--text-caption-size);
   text-transform: uppercase;
   letter-spacing: 0.05em;
   color: var(--accent-2);
@@ -1030,24 +1051,24 @@ code {
 .contact-list {
   list-style: none;
   margin: 0;
-  padding: 6px;
+  padding: var(--space-2);
   overflow-y: auto;
   flex: 1;
 }
 
 .contact {
-  padding: 9px 10px;
+  padding: var(--space-2) var(--space-3);
   border-radius: var(--radius-sm);
   cursor: pointer;
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: var(--space-1);
 }
 
 .contact-title {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-2);
 }
 
 /* Comrade presence: a small dot on the rows the user chose. Grey (not
@@ -1077,12 +1098,14 @@ code {
 
 .contact-name {
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: var(--text-caption-size);
   color: var(--text);
 }
 
 .contact-last {
-  font-size: 11px;
+  /* §7.2 caption role; matches `.contact-name` above rather than sitting one
+     point below it. */
+  font-size: var(--text-caption-size);
   color: var(--muted-foreground);
   white-space: nowrap;
   overflow: hidden;
@@ -1101,25 +1124,26 @@ code {
 }
 
 .chat-header {
-  padding: 12px 16px;
+  padding: var(--space-3) var(--space-4);
   border-bottom: 1px solid var(--border);
   font-family: var(--mono);
-  font-size: 13px;
+  /* §7.2 label role. */
+  font-size: var(--text-label-size);
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
+  gap: var(--space-3);
 }
 
 .chat-actions {
   display: flex;
-  gap: 6px;
+  gap: var(--space-2);
 }
 
 /* "online" / "waiting for them to choose you back" next to the peer key. */
 .chat-presence {
   font-family: var(--font);
-  font-size: 11px;
+  font-size: var(--text-caption-size);
   color: var(--muted-foreground);
   margin-right: auto;
 }
@@ -1150,10 +1174,10 @@ code {
   min-width: 0;
   min-height: 0;
   overflow-y: auto;
-  padding: 16px;
+  padding: var(--space-4);
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--space-2);
 }
 
 .threads-drawer {
@@ -1162,16 +1186,16 @@ code {
   min-height: 0;
   overflow-y: auto;
   border-left: 1px solid var(--border);
-  padding: 12px;
+  padding: var(--space-3);
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--space-2);
 }
 
 .threads-head {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
 }
 
 .threads-title {
@@ -1182,7 +1206,7 @@ code {
 .threads-topics {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: var(--space-2);
 }
 
 /* A topic reads as a label on a thread, never as something somebody said — so
@@ -1190,8 +1214,10 @@ code {
 .topic-chip {
   border: 1px solid var(--border);
   border-radius: 999px;
-  padding: 3px 10px;
-  font-size: 0.85em;
+  padding: var(--space-1) var(--space-3);
+  /* §7.2 caption role: was 0.85em (~12.75px against the body base), a
+     seventh size doing the same "small chip label" job as `.pill`. */
+  font-size: var(--text-caption-size);
   cursor: pointer;
   background: none;
   color: inherit;
@@ -1210,7 +1236,7 @@ code {
 .thread-log {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: var(--space-2);
   min-height: 0;
 }
 
@@ -1224,7 +1250,7 @@ code {
   background: none;
   border: 1px solid var(--border);
   border-radius: 10px;
-  padding: 8px 10px;
+  padding: var(--space-2) var(--space-3);
   cursor: pointer;
   color: inherit;
 }
@@ -1232,8 +1258,9 @@ code {
 .thread-row .thread-row-meta {
   display: block;
   opacity: 0.7;
-  font-size: 0.82em;
-  margin-top: 2px;
+  /* §7.2 caption role: was 0.82em. */
+  font-size: var(--text-caption-size);
+  margin-top: var(--space-1);
 }
 
 .thread-row.unread {
@@ -1243,13 +1270,13 @@ code {
 .thread-open {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--space-2);
   min-height: 0;
 }
 
 .thread-bubble {
   border-radius: 10px;
-  padding: 6px 10px;
+  padding: var(--space-2) var(--space-3);
   max-width: 90%;
   align-self: flex-start;
   background: var(--surface-2);
@@ -1266,7 +1293,7 @@ code {
      too so a long message wraps at a readable line length instead of
      stretching across the whole monitor. */
   max-width: min(72%, 640px);
-  padding: 8px 12px;
+  padding: var(--space-2) var(--space-3);
   border-radius: 14px;
   word-break: break-word;
   white-space: pre-wrap;
@@ -1299,10 +1326,12 @@ code {
 
 .bubble-author {
   display: block;
-  font-size: 11px;
+  /* §7.2 caption role: was 11px, a point off `.bubble-time` below doing
+     comparably small meta work. */
+  font-size: var(--text-caption-size);
   font-weight: 600;
   color: var(--accent);
-  margin-bottom: 2px;
+  margin-bottom: var(--space-1);
 }
 
 .bubble-text {
@@ -1313,20 +1342,24 @@ code {
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 5px;
-  margin-top: 3px;
+  gap: var(--space-1);
+  margin-top: var(--space-1);
 }
 
 .bubble-time {
-  font-size: 10px;
+  /* §7.2 caption role: was 10px, one more step of the same "small meta"
+     size `.bubble-author`/`.bubble-status` also use; `opacity` (not size)
+     is what sets it apart. */
+  font-size: var(--text-caption-size);
   opacity: 0.6;
 }
 
 /* Delivery/read ticks on outgoing bubbles (sent ✓ · delivered ✓✓ · read ✓✓). */
 .bubble-status {
-  font-size: 10px;
+  font-size: var(--text-caption-size);
   line-height: 1;
   opacity: 0.65;
+  /* Not §7.1 spacing — this tightens the ✓✓ glyph pair itself, not layout. */
   letter-spacing: -1px;
 }
 
@@ -1341,9 +1374,9 @@ code {
   border-left: 2px solid currentColor;
   background: color-mix(in srgb, currentColor 12%, transparent);
   border-radius: 4px;
-  padding: 4px 8px;
-  margin-bottom: 5px;
-  font-size: 12px;
+  padding: var(--space-1) var(--space-2);
+  margin-bottom: var(--space-1);
+  font-size: var(--text-caption-size);
   opacity: 0.85;
   max-width: 100%;
 }
@@ -1367,18 +1400,19 @@ code {
 .bubble-note-head {
   display: flex;
   align-items: center;
-  gap: 6px;
-  margin-bottom: 3px;
+  gap: var(--space-2);
+  margin-bottom: var(--space-1);
 }
 
 .bubble-note-label {
-  font-size: 11px;
+  font-size: var(--text-caption-size);
   font-weight: 600;
   opacity: 0.75;
 }
 
 .bubble-note-mood {
-  font-size: 13px;
+  /* §7.2 label role. */
+  font-size: var(--text-label-size);
   line-height: 1;
 }
 
@@ -1386,13 +1420,13 @@ code {
    styled back down to a link so it does not read as an action on the message. */
 .bubble-note-more {
   display: inline-block;
-  margin-top: 3px;
+  margin-top: var(--space-1);
   padding: 0;
   border: none;
   background: none;
   color: inherit;
   font: inherit;
-  font-size: 11px;
+  font-size: var(--text-caption-size);
   font-weight: 600;
   text-decoration: underline;
   cursor: pointer;
@@ -1437,10 +1471,14 @@ code {
   }
 }
 
-/* Hover-revealed "reply" affordance hugging the outer edge of a bubble. */
+/* Hover-revealed "reply" affordance hugging the outer edge of a bubble. The
+   drawn circle stays 24px — enlarging it would overlap the next bubble — so
+   §7.5's 48px floor comes from `::before` extending the hit area rather than
+   the visible size. */
 .bubble-reply {
   position: absolute;
-  top: -9px;
+  /* §7.1: -9px rounds to the nearest grid step. */
+  top: calc(var(--space-2) * -1);
   width: 24px;
   height: 24px;
   padding: 0;
@@ -1448,7 +1486,7 @@ code {
   border: 1px solid var(--border);
   background: var(--panel);
   color: var(--text-dim);
-  font-size: 12px;
+  font-size: var(--text-caption-size);
   line-height: 1;
   cursor: pointer;
   display: flex;
@@ -1456,6 +1494,12 @@ code {
   justify-content: center;
   opacity: 0;
   transition: opacity 0.12s ease, background 0.12s ease;
+}
+
+.bubble-reply::before {
+  content: "";
+  position: absolute;
+  inset: calc(var(--space-3) * -1);
 }
 
 .bubble:hover .bubble-reply {
@@ -1467,18 +1511,19 @@ code {
   color: var(--text);
 }
 
+/* §7.1: -10px rounds to the nearest grid step. */
 .bubble.in .bubble-reply {
-  right: -10px;
+  right: calc(var(--space-3) * -1);
 }
 
 .bubble.out .bubble-reply {
-  left: -10px;
+  left: calc(var(--space-3) * -1);
 }
 
 /* Glass tier: same composer chrome, the DM variant. */
 .chat-composer {
   border-top: var(--glass-border);
-  padding: 12px 16px;
+  padding: var(--space-3) var(--space-4);
   background: var(--glass-tint);
   backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
   -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
@@ -1487,9 +1532,9 @@ code {
 
 /* Encrypted media in chat bubbles */
 .media-caption {
-  font-size: 12px;
+  font-size: var(--text-caption-size);
   opacity: 0.85;
-  margin-bottom: 6px;
+  margin-bottom: var(--space-2);
 }
 
 .media-img {
@@ -1510,7 +1555,7 @@ code {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
-  gap: 4px;
+  gap: var(--space-1);
 }
 
 /* Full-screen photo/video viewing. Black, deliberately: a photo is judged
@@ -1524,23 +1569,23 @@ code {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 12px;
-  padding: 48px 24px 24px;
+  gap: var(--space-3);
+  padding: var(--space-12) var(--space-6) var(--space-6);
   background: #000;
 }
 
 .lightbox-bar {
   position: absolute;
-  top: 8px;
-  left: 8px;
+  top: var(--space-2);
+  left: var(--space-2);
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
   color: #fff;
 }
 
 .lightbox-kind {
-  font-size: 13px;
+  font-size: var(--text-label-size);
   opacity: 0.8;
 }
 
@@ -1553,7 +1598,9 @@ code {
 
 .lightbox-caption {
   color: #fff;
-  font-size: 14px;
+  /* §7.2 body role: was 14px, a point off the body size for a full caption
+     sentence that reads as running text, not a label. */
+  font-size: var(--text-body-size);
   max-width: 80ch;
   text-align: center;
 }
@@ -1569,13 +1616,13 @@ code {
 .attach-preview {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: var(--space-3);
   width: min(560px, 92vw);
   /* Scrolls rather than overflowing: on a short window the caption box and Send
      are the controls that must stay reachable. */
   max-height: 100%;
   overflow-y: auto;
-  padding: 16px;
+  padding: var(--space-4);
   background: var(--glass-tint);
   backdrop-filter: blur(var(--glass-blur-lg)) saturate(var(--glass-saturate));
   -webkit-backdrop-filter: blur(var(--glass-blur-lg)) saturate(var(--glass-saturate));
@@ -1587,7 +1634,7 @@ code {
 .attach-preview-head {
   display: flex;
   align-items: flex-start;
-  gap: 8px;
+  gap: var(--space-2);
 }
 
 .attach-preview-titles {
@@ -1596,12 +1643,12 @@ code {
 }
 
 .attach-preview-kind {
-  font-size: 15px;
+  font-size: var(--text-body-size);
   font-weight: 600;
 }
 
 .attach-preview-detail {
-  font-size: 12px;
+  font-size: var(--text-caption-size);
   color: var(--text-dim);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1630,8 +1677,8 @@ code {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 6px;
-  padding: 28px 16px;
+  gap: var(--space-2);
+  padding: var(--space-8) var(--space-4);
   color: var(--text-dim);
   background: var(--panel-2);
   border-radius: var(--radius-sm);
@@ -1643,7 +1690,7 @@ code {
 
 .attach-preview-caption {
   width: 100%;
-  padding: 8px 10px;
+  padding: var(--space-2) var(--space-3);
   color: var(--text);
   font: inherit;
   background: var(--panel-2);
@@ -1655,19 +1702,19 @@ code {
 .attach-preview-actions {
   display: flex;
   justify-content: flex-end;
-  gap: 8px;
+  gap: var(--space-2);
 }
 
 /* Which road this file takes. Quiet for the hosted road — it is the one people
    already expect — and marked for the direct one, because that road asks
    something of the recipient that the other does not. */
 .attach-preview-route {
-  font-size: 12px;
+  font-size: var(--text-caption-size);
   color: var(--text-dim);
 }
 
 .attach-preview-route.is-direct {
-  padding: 7px 9px;
+  padding: var(--space-2) var(--space-2);
   color: var(--text);
   background: var(--panel-2);
   border: 1px solid var(--border);
@@ -1675,7 +1722,7 @@ code {
 }
 
 .attach-preview-note {
-  font-size: 12px;
+  font-size: var(--text-caption-size);
   color: var(--warn, var(--text-dim));
 }
 
@@ -1685,9 +1732,9 @@ code {
    this file has happened yet. */
 .handoff-card {
   display: grid;
-  gap: 8px;
-  margin-bottom: 8px;
-  padding: 10px 12px;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
+  padding: var(--space-3) var(--space-3);
   background: var(--panel-2);
   border: 1px solid var(--border);
   border-radius: var(--radius);
@@ -1696,9 +1743,11 @@ code {
 .handoff-head {
   display: flex;
   align-items: flex-start;
-  gap: 10px;
+  gap: var(--space-3);
 }
 
+/* Emoji glyph, not running text — sized on its own rather than through
+   §7.2's roles, the same as `.brand-mark`/`.tab-icon`. */
 .handoff-glyph {
   font-size: 22px;
   line-height: 1.1;
@@ -1710,7 +1759,8 @@ code {
 }
 
 .handoff-kind {
-  font-size: 14px;
+  /* §7.2 body role, matching `.attach-preview-kind`'s equivalent card header. */
+  font-size: var(--text-body-size);
   font-weight: 600;
 }
 
@@ -1718,7 +1768,7 @@ code {
    the truncation is what stops a long name pushing the buttons off the card. */
 .handoff-detail,
 .handoff-status {
-  font-size: 12px;
+  font-size: var(--text-caption-size);
   color: var(--text-dim);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1726,7 +1776,7 @@ code {
 }
 
 .handoff-caption {
-  font-size: 13px;
+  font-size: var(--text-label-size);
   /* A peer wrote this and it can be 512 characters — five lines at this width,
      measured in Chromium. It wraps rather than stretching the card, and it stops
      at four lines rather than pushing the conversation off its own screen: the
@@ -1738,7 +1788,7 @@ code {
 }
 
 .handoff-refusal {
-  font-size: 12px;
+  font-size: var(--text-caption-size);
   color: var(--warn, var(--text));
 }
 
@@ -1759,7 +1809,7 @@ code {
 .handoff-actions {
   display: flex;
   justify-content: flex-end;
-  gap: 8px;
+  gap: var(--space-2);
 }
 
 .handoff-actions:empty {
@@ -1773,23 +1823,23 @@ code {
 }
 
 .btn-sm {
-  padding: 6px 11px;
-  font-size: 12px;
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--text-caption-size);
 }
 
 .media-locked {
   display: flex;
   align-items: center;
-  gap: 8px;
-  font-size: 12px;
+  gap: var(--space-2);
+  font-size: var(--text-caption-size);
   color: var(--text-dim);
 }
 
 .upi-preview {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  margin-bottom: 8px;
+  gap: var(--space-1);
+  margin-bottom: var(--space-2);
 }
 
 /* Inside the chat log, chips hug their content like bubbles do. */
@@ -1802,8 +1852,8 @@ code {
   border: 1px solid color-mix(in srgb, var(--good) 45%, transparent);
   color: var(--good);
   border-radius: var(--radius-sm);
-  padding: 6px 10px;
-  font-size: 12px;
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--text-caption-size);
 }
 
 /* ─────────────────────────── Reply composer chip ─────────────────────────── */
@@ -1812,12 +1862,12 @@ code {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: var(--space-2);
   background: var(--panel-2);
   border-left: 3px solid var(--accent);
   border-radius: var(--radius-sm);
-  padding: 6px 8px;
-  margin-bottom: 8px;
+  padding: var(--space-2) var(--space-2);
+  margin-bottom: var(--space-2);
 }
 
 .reply-chip-body {
@@ -1827,7 +1877,8 @@ code {
 }
 
 .reply-chip-label {
-  font-size: 10px;
+  /* §7.2 caption role, uppercase eyebrow treatment (see `.sidebar-heading`). */
+  font-size: var(--text-caption-size);
   text-transform: uppercase;
   letter-spacing: 0.05em;
   color: var(--accent-2);
@@ -1835,7 +1886,7 @@ code {
 }
 
 .reply-chip-text {
-  font-size: 12px;
+  font-size: var(--text-caption-size);
   color: var(--text-dim);
   white-space: nowrap;
   overflow: hidden;
@@ -1858,48 +1909,48 @@ code {
   background: var(--accent);
   color: var(--accent-contrast);
   border-radius: 999px;
-  font-size: 10px;
+  font-size: var(--text-caption-size);
   font-weight: 700;
-  padding: 0 6px;
-  margin-left: 4px;
+  padding: 0 var(--space-2);
+  margin-left: var(--space-1);
   vertical-align: middle;
 }
 
 .request-list {
   list-style: none;
   margin: 0;
-  padding: 6px;
+  padding: var(--space-2);
   max-height: 240px;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: var(--space-2);
 }
 
 .request {
   background: var(--panel-2);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  padding: 8px;
+  padding: var(--space-2);
   display: flex;
   flex-direction: column;
-  gap: 7px;
+  gap: var(--space-2);
 }
 
 .request-info {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: var(--space-1);
   overflow: hidden;
 }
 
 .request-name {
-  font-size: 12px;
+  font-size: var(--text-caption-size);
   color: var(--text);
 }
 
 .request-last {
-  font-size: 11px;
+  font-size: var(--text-caption-size);
   color: var(--muted-foreground);
   white-space: nowrap;
   overflow: hidden;
@@ -1908,7 +1959,7 @@ code {
 
 .request-actions {
   display: flex;
-  gap: 6px;
+  gap: var(--space-2);
 }
 
 .request-actions .btn {
@@ -1936,12 +1987,12 @@ code {
   border: 1px solid var(--border);
   border-radius: 18px;
   box-shadow: var(--shadow);
-  padding: 30px 26px;
+  padding: var(--space-8) var(--space-6);
   text-align: center;
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-2);
   animation: rise 0.25s ease;
 }
 
@@ -1960,7 +2011,7 @@ code {
 
 .ring-peer {
   font-size: 14px;
-  margin-top: 4px;
+  margin-top: var(--space-1);
 }
 
 .ring-media {
@@ -1970,8 +2021,8 @@ code {
 
 .call-ring-actions {
   display: flex;
-  gap: 16px;
-  margin-top: 16px;
+  gap: var(--space-4);
+  margin-top: var(--space-4);
 }
 
 .call-round {
@@ -2065,8 +2116,8 @@ code {
 }
 
 .call-active.is-minimized .call-controls {
-  padding: 4px 0 8px;
-  gap: 8px;
+  padding: var(--space-1) 0 var(--space-2);
+  gap: var(--space-2);
 }
 
 .call-active.is-minimized .call-btn {
@@ -2149,7 +2200,7 @@ code {
   pointer-events: none;
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: var(--space-1);
 }
 
 .call-peer {
@@ -2180,9 +2231,9 @@ code {
   align-self: center;
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  margin-top: 6px;
-  padding: 5px 12px;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+  padding: var(--space-1) var(--space-3);
   border-radius: 999px;
   background: rgba(0, 0, 0, 0.4);
 }
@@ -2190,7 +2241,7 @@ code {
 .call-bars {
   display: inline-flex;
   align-items: flex-end;
-  gap: 2px;
+  gap: var(--space-1);
   height: 14px;
 }
 
@@ -2250,7 +2301,7 @@ code {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 10px;
+  gap: var(--space-3);
   font-size: 15px;
   color: #fff;
   background: rgba(14, 22, 33, 0.92);
@@ -2266,9 +2317,9 @@ code {
 .call-controls {
   position: relative; /* the ⋮ dock is anchored to this */
   display: flex;
-  gap: 18px;
+  gap: var(--space-5);
   justify-content: center;
-  padding: 18px;
+  padding: var(--space-5);
   background: linear-gradient(to top, rgba(0, 0, 0, 0.55), transparent);
 }
 
@@ -2282,7 +2333,7 @@ code {
   bottom: calc(100% - 6px);
   z-index: 2;
   min-width: 200px;
-  padding: 6px;
+  padding: var(--space-2);
   border: var(--glass-border);
   border-radius: var(--radius-xl);
   background: var(--glass-tint);
@@ -2299,10 +2350,10 @@ code {
 
 .call-dock-item {
   display: flex;
-  gap: 12px;
+  gap: var(--space-3);
   align-items: center;
   width: 100%;
-  padding: 10px 12px;
+  padding: var(--space-3) var(--space-3);
   border: 0;
   border-radius: 10px;
   background: transparent;
@@ -2409,7 +2460,7 @@ code {
 .view-focus {
   position: relative;
   overflow-y: auto;
-  padding: 20px 16px;
+  padding: var(--space-5) var(--space-4);
 }
 
 /* Two soft radial colour fields, blurred and drifting on a minutes-long
@@ -2473,7 +2524,7 @@ code {
   margin: 0 auto;
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: var(--space-4);
 }
 
 /* Frosted glass over the ambient field. `backdrop-filter` needs a translucent
@@ -2482,7 +2533,7 @@ code {
 .view-focus .focus-card {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: var(--space-3);
   background: var(--glass-tint);
   backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
   -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
@@ -2495,28 +2546,28 @@ code {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
-  gap: 10px;
+  gap: var(--space-3);
 }
 
 .focus-head h3,
 .focus-head h4 {
   margin: 0;
-  font-size: 13px;
+  font-size: var(--text-label-size);
   font-weight: 600;
   color: var(--accent-2);
 }
 
 .focus-prompt {
-  margin: 0 0 10px;
+  margin: 0 0 var(--space-3);
   color: var(--text-dim);
-  font-size: 13px;
+  font-size: var(--text-label-size);
 }
 
 .chip-row {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 10px;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
 }
 
 .chip {
@@ -2524,7 +2575,7 @@ code {
   background: var(--panel-2);
   color: var(--text-dim);
   border-radius: 999px;
-  padding: 5px 14px;
+  padding: var(--space-1) var(--space-4);
   font: inherit;
   font-size: 12px;
   cursor: pointer;
@@ -2544,7 +2595,7 @@ code {
 
 /* Tabular figures so the seconds ticking down don't shift the layout. */
 .focus-clock {
-  margin: 6px 0 12px;
+  margin: var(--space-2) 0 var(--space-3);
   font-family: var(--mono);
   font-variant-numeric: tabular-nums;
   font-size: 44px;
@@ -2554,12 +2605,12 @@ code {
 
 .focus-actions {
   display: flex;
-  gap: 8px;
+  gap: var(--space-2);
 }
 
 .focus-reflection {
   margin: 0;
-  padding-top: 8px;
+  padding-top: var(--space-2);
   border-top: 1px solid var(--border);
   color: var(--text-dim);
   font-size: 13px;
@@ -2571,13 +2622,13 @@ code {
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: var(--space-2);
 }
 
 .focus-history li {
   color: var(--text-dim);
   font-size: 13px;
-  padding: 6px 0;
+  padding: var(--space-2) 0;
   border-bottom: 1px solid var(--border);
 }
 
@@ -2604,17 +2655,17 @@ code {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
+  gap: var(--space-3);
 }
 
 /* The reading library list. */
 .reader-list {
   list-style: none;
-  margin: 0 0 6px;
+  margin: 0 0 var(--space-2);
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: var(--space-2);
 }
 
 .reader-item-open {
@@ -2622,8 +2673,8 @@ code {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
-  gap: 10px;
-  padding: 10px 12px;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-3);
   font: inherit;
   text-align: left;
   color: var(--text);
@@ -2653,7 +2704,7 @@ code {
 }
 
 .reader-open-source {
-  margin: -4px 0 0;
+  margin: calc(var(--space-1) * -1) 0 0;
   font-size: 12px;
 }
 
@@ -2666,7 +2717,7 @@ code {
   position: relative;
   display: grid;
   place-items: center;
-  padding: 10px 0 2px;
+  padding: var(--space-3) 0 var(--space-1);
 }
 
 /* The halo: a slow breath-paced pulse behind the figure. */
@@ -2851,7 +2902,7 @@ code {
 }
 
 .stretch-name {
-  margin: 8px 0 0;
+  margin: var(--space-2) 0 0;
   text-align: center;
   font-size: 17px;
   font-weight: 600;
@@ -2869,7 +2920,7 @@ code {
 }
 
 .stretch-cue {
-  margin: 4px auto 6px;
+  margin: var(--space-1) auto var(--space-2);
   max-width: 40ch;
   /* Two rows reserved, like the breathing lines: cues wrap differently and a
      hopping layout is the roughest edge a calm screen can have. */
@@ -2885,7 +2936,7 @@ code {
   border-radius: 999px;
   background: var(--panel-2);
   overflow: hidden;
-  margin-bottom: 10px;
+  margin-bottom: var(--space-3);
 }
 
 .stretch-bar {
@@ -2920,15 +2971,15 @@ code {
 .empty {
   text-align: center;
   color: var(--text-dim);
-  padding: 40px 16px;
+  padding: var(--space-10) var(--space-4);
 }
 
 .empty p {
-  margin: 4px 0;
+  margin: var(--space-1) 0;
 }
 
 .empty.sm {
-  padding: 20px 12px;
+  padding: var(--space-5) var(--space-3);
   font-size: 12px;
 }
 
@@ -2940,7 +2991,7 @@ code {
 .loading-rows {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: var(--space-3);
 }
 
 /* §7.3: a skeleton pulses opacity in place — it never sweeps. A travelling
@@ -2975,7 +3026,7 @@ code {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 16px 22px;
+  padding: var(--space-4) var(--space-6);
   border-bottom: 1px solid var(--border);
   background: var(--panel);
 }
@@ -2983,7 +3034,7 @@ code {
 .couple-title {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: var(--space-3);
 }
 
 .couple-title h2 {
@@ -3002,7 +3053,7 @@ code {
   text-transform: uppercase;
   background: var(--accent);
   color: var(--accent-contrast);
-  padding: 3px 9px;
+  padding: var(--space-1) var(--space-2);
   border-radius: 999px;
 }
 
@@ -3015,12 +3066,12 @@ code {
 .couple-body {
   flex: 1;
   overflow-y: auto;
-  padding: 24px;
+  padding: var(--space-6);
   display: grid;
   grid-template-columns: minmax(0, min(620px, 100%));
   justify-content: center;
   align-content: start;
-  gap: 18px;
+  gap: var(--space-5);
 }
 
 .ledger-panel {
@@ -3028,15 +3079,15 @@ code {
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 20px;
+  padding: var(--space-5);
 }
 
 .ledger-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 8px;
+  gap: var(--space-3);
+  margin-bottom: var(--space-2);
 }
 
 .ledger-head h3 {
@@ -3045,8 +3096,8 @@ code {
 }
 
 .ledger-status {
-  margin-top: 16px;
-  padding: 14px;
+  margin-top: var(--space-4);
+  padding: var(--space-4);
   border-radius: var(--radius-sm);
   background: var(--bg-elev);
   border: 1px solid var(--border);
@@ -3061,8 +3112,8 @@ code {
 .ledger-entry-form {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
-  margin: 14px 0;
+  gap: var(--space-2);
+  margin: var(--space-4) 0;
 }
 
 .ledger-entry-form .input {
@@ -3112,10 +3163,10 @@ code {
   border: var(--glass-border);
   border-radius: var(--radius-xl);
   box-shadow: var(--glass-shadow), var(--glass-highlight);
-  padding: 22px;
+  padding: var(--space-6);
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: var(--space-3);
   animation: rise var(--duration-slow) var(--ease-standard);
 }
 
@@ -3140,7 +3191,7 @@ code {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 8px;
+  gap: var(--space-2);
   background: var(--bg-elev);
 }
 
@@ -3166,20 +3217,20 @@ code {
 .role-picker {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  padding: 10px 12px;
+  padding: var(--space-3) var(--space-3);
   display: flex;
-  gap: 18px;
+  gap: var(--space-5);
   align-items: center;
 }
 
 .role-picker legend {
-  padding: 0 6px;
+  padding: 0 var(--space-2);
 }
 
 .radio {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-2);
   cursor: pointer;
   font-size: 13px;
 }
@@ -3191,7 +3242,7 @@ code {
 .pair-existing {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: var(--space-3);
 }
 
 .pair-existing code {
@@ -3206,7 +3257,7 @@ code {
   right: 18px;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: var(--space-3);
   z-index: 700; /* above the call overlay (300) so alerts stay visible mid-call */
   max-width: min(360px, 90vw);
 }
@@ -3219,10 +3270,10 @@ code {
   border: var(--glass-border);
   border-left-width: 4px;
   border-radius: var(--radius-sm);
-  padding: 11px 14px;
+  padding: var(--space-3) var(--space-4);
   box-shadow: var(--glass-shadow), var(--glass-highlight);
   display: flex;
-  gap: 10px;
+  gap: var(--space-3);
   align-items: flex-start;
   animation: toast-in var(--duration-base) var(--ease-standard);
 }
@@ -3273,7 +3324,7 @@ code {
 
 .toast-title {
   font-weight: 700;
-  margin-bottom: 1px;
+  margin-bottom: var(--space-1);
 }
 
 /* ─────────────────────────── Preview banner ─────────────────────────── */
@@ -3287,7 +3338,7 @@ code {
   color: #1a1206;
   font-size: 11px;
   font-weight: 700;
-  padding: 3px 14px;
+  padding: var(--space-1) var(--space-4);
   border-radius: 0 0 8px 8px;
   z-index: 200;
 }
@@ -3306,8 +3357,8 @@ code {
     flex-direction: row;
     flex-wrap: wrap;
     align-items: center;
-    gap: 10px 14px;
-    padding: 10px 14px;
+    gap: var(--space-3) var(--space-4);
+    padding: var(--space-3) var(--space-4);
     border-right: none;
     border-bottom: 1px solid var(--border);
     overflow-y: visible;
@@ -3321,7 +3372,7 @@ code {
     border-left: none;
     border-bottom: 2px solid transparent;
     border-radius: var(--radius-sm) var(--radius-sm) 0 0;
-    padding: 8px 10px;
+    padding: var(--space-2) var(--space-3);
   }
 
   .tab.is-active {
@@ -3417,11 +3468,11 @@ code {
 .command-picker {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: var(--space-1);
   max-height: 220px;
   overflow-y: auto;
-  margin-bottom: 6px;
-  padding: 4px;
+  margin-bottom: var(--space-2);
+  padding: var(--space-1);
   border: 1px solid var(--border, #2a2a2a);
   border-radius: 10px;
   background: var(--panel, #161616);
@@ -3430,9 +3481,9 @@ code {
 .command-row {
   display: grid;
   grid-template-columns: minmax(7rem, auto) minmax(0, auto) 1fr;
-  gap: 8px;
+  gap: var(--space-2);
   align-items: baseline;
-  padding: 6px 8px;
+  padding: var(--space-2) var(--space-2);
   border: 0;
   border-radius: 8px;
   background: transparent;
@@ -3463,7 +3514,7 @@ code {
 
 /* What will happen if Enter is pressed now — including why it will not. */
 .command-hint {
-  margin: 0 0 4px;
+  margin: 0 0 var(--space-1);
   opacity: 0.8;
 }
 
@@ -3471,7 +3522,7 @@ code {
    Both the note and the field itself change, so the difference is visible
    whether or not the note is in view. */
 .aside-note {
-  margin: 0 0 4px;
+  margin: 0 0 var(--space-1);
   font-style: italic;
   opacity: 0.85;
 }
@@ -3495,18 +3546,18 @@ code {
 .mention-chooser {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: var(--space-1);
   max-height: 220px;
   overflow-y: auto;
-  margin-bottom: 6px;
-  padding: 4px;
+  margin-bottom: var(--space-2);
+  padding: var(--space-1);
   border: 1px solid var(--border, #2a2a2a);
   border-radius: 10px;
   background: var(--panel, #161616);
 }
 
 .chooser-question {
-  padding: 4px 8px;
+  padding: var(--space-1) var(--space-2);
   font-size: 0.85rem;
   opacity: 0.85;
 }
@@ -3777,7 +3828,7 @@ code {
 /* ── Task list (see desktop/ui/task_list.mjs) ─────────────────────────────── */
 
 .view-tasks {
-  padding: 16px;
+  padding: var(--space-4);
   overflow-y: auto;
 }
 
@@ -3789,7 +3840,7 @@ code {
 }
 
 .task-heading {
-  margin: 20px 0 6px;
+  margin: var(--space-5) 0 var(--space-2);
   font-size: 0.85rem;
   font-weight: 600;
   letter-spacing: 0.04em;
@@ -3800,8 +3851,8 @@ code {
 .task-row {
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  padding: 12px 4px;
+  gap: var(--space-1);
+  padding: var(--space-3) var(--space-1);
   border-bottom: 1px solid var(--border, #2a2a2a);
 }
 
@@ -3821,12 +3872,12 @@ code {
 
 .task-actions {
   display: flex;
-  gap: 6px;
-  margin-top: 6px;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
 }
 
 .btn-small {
-  padding: 3px 10px;
+  padding: var(--space-1) var(--space-3);
   font-size: 0.85rem;
 }
 

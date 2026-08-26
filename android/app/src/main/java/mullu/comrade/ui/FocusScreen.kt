@@ -48,6 +48,7 @@ import mullu.comrade.ComradeCore
 import mullu.comrade.R
 import mullu.comrade.ui.theme.ComradeRadii
 import mullu.comrade.ui.theme.GlassElevation
+import mullu.comrade.ui.theme.Spacing
 import mullu.comrade.ui.theme.glassSurface
 
 /**
@@ -163,12 +164,12 @@ fun FocusScreen(
         modifier = modifier
             .fillMaxSize()
             .padding(horizontal = 16.dp, vertical = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
+        verticalArrangement = Arrangement.spacedBy(Spacing.space3),
     ) {
         item {
             val running = active
             ElevatedCard(Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(Spacing.space3)) {
                     Text(
                         stringResource(R.string.focus_title),
                         style = MaterialTheme.typography.titleSmall,
@@ -188,7 +189,7 @@ fun FocusScreen(
                                 .fillMaxWidth()
                                 .testTag("focus-intent"),
                         )
-                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(Spacing.space2)) {
                             presets.forEach { minutes ->
                                 FilterChip(
                                     selected = chosenMinutes == minutes,
@@ -289,7 +290,7 @@ fun FocusScreen(
                 stringResource(R.string.focus_history_title),
                 style = MaterialTheme.typography.titleSmall,
                 color = MaterialTheme.colorScheme.primary,
-                modifier = Modifier.padding(top = 6.dp),
+                modifier = Modifier.padding(top = Spacing.space2),
             )
         }
         if (history.isEmpty()) {

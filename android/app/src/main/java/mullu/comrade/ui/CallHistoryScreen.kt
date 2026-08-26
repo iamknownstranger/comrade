@@ -7,11 +7,14 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -31,6 +34,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import mullu.comrade.ComradeCore
 import mullu.comrade.R
+import mullu.comrade.ui.theme.ComradeRadii
+import mullu.comrade.ui.theme.ComradeSkeletonRowCount
+import mullu.comrade.ui.theme.Spacing
+import mullu.comrade.ui.theme.comradeSkeleton
 
 /** Outcomes a call-history row renders with the "problem" (error) tint. */
 private val ProblemOutcomes = setOf("missed", "declined", "busy", "failed")
@@ -62,8 +69,10 @@ fun CallHistoryScreen(
 
     val list = records
     when {
-        list == null -> Box(modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            CircularProgressIndicator(Modifier.size(28.dp))
+        list == null -> Column(modifier.fillMaxSize()) {
+            // §7.3: the real row geometry, pulsing, rather than a spinner over
+            // a blank screen — the list's shape is known before it arrives.
+            repeat(ComradeSkeletonRowCount) { CallHistoryRowSkeleton() }
         }
         list.isEmpty() -> Box(
             modifier.fillMaxSize().padding(32.dp),
@@ -118,9 +127,9 @@ private fun CallHistoryRow(
         modifier = Modifier
             .fillMaxWidth()
             .clickable { onClick() }
-            .padding(horizontal = 16.dp, vertical = 11.dp),
+            .padding(horizontal = Spacing.space4, vertical = Spacing.space3),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(14.dp),
+        horizontalArrangement = Arrangement.spacedBy(Spacing.space4),
     ) {
         PeerAvatar(title, seed = record.peer)
         Column(Modifier.weight(1f)) {
@@ -143,5 +152,29 @@ private fun CallHistoryRow(
             contentDescription = stringResource(if (isVideo) R.string.call_video else R.string.call_voice),
             tint = tint,
         )
+    }
+}
+
+/**
+ * §7.3's row geometry for a call-history entry: an avatar, a name line, a
+ * direction/outcome/time line, and a trailing icon-shaped block — the same
+ * silhouette as [CallHistoryRow] with real content swapped for
+ * [comradeSkeleton] fills.
+ */
+@Composable
+private fun CallHistoryRowSkeleton() {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = Spacing.space4, vertical = Spacing.space3),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(Spacing.space4),
+    ) {
+        Box(Modifier.size(46.dp).comradeSkeleton(CircleShape))
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(Spacing.space1)) {
+            Box(Modifier.fillMaxWidth(0.4f).height(16.dp).comradeSkeleton(RoundedCornerShape(ComradeRadii.sm)))
+            Box(Modifier.fillMaxWidth(0.55f).height(12.dp).comradeSkeleton(RoundedCornerShape(ComradeRadii.sm)))
+        }
+        Box(Modifier.size(24.dp).comradeSkeleton(RoundedCornerShape(ComradeRadii.sm)))
     }
 }

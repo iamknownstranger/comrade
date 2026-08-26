@@ -8,12 +8,38 @@
 /// recording has none — no share control offering a send the core would refuse.
 library;
 
+import 'dart:async';
+
+import 'package:comrade/src/data/comrade_repository.dart';
 import 'package:comrade/src/data/fake_comrade_repository.dart';
+import 'package:comrade/src/data/models.dart';
 import 'package:comrade/src/screens/journal_screen.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'helpers.dart';
+
+/// Never resolves — holds the journal list on `loading` for the length of a
+/// test, so the skeleton frame can be asserted rather than raced past.
+class _StuckJournalRepo extends FakeComradeRepository {
+  _StuckJournalRepo() : super(latency: Duration.zero, seed: true);
+
+  @override
+  Future<List<JournalEntryInfo>> journal() =>
+      Completer<List<JournalEntryInfo>>().future;
+}
+
+/// Fails the journal fetch outright, so the error branch and its retry can be
+/// exercised without depending on the seeded fixtures.
+class _FailingJournalRepo extends FakeComradeRepository {
+  _FailingJournalRepo() : super(latency: Duration.zero, seed: true);
+
+  @override
+  Future<List<JournalEntryInfo>> journal() =>
+      Future<List<JournalEntryInfo>>.error(
+        const ComradeException('could not reach the store'),
+      );
+}
 
 void main() {
   late FakeComradeRepository repo;
@@ -82,5 +108,29 @@ void main() {
     // Titles are opt-in: the entries that never had one draw no heading at
     // all rather than a placeholder.
     expect(find.byKey(const Key('journal-entry-title')), findsNWidgets(2));
+  });
+
+  testWidgets('the row shape shows while the journal loads, not a bare spinner',
+      (WidgetTester tester) async {
+    final _StuckJournalRepo stuck = _StuckJournalRepo();
+    await stuck.unlockVault(path: 'test-vault', passphrase: 'passphrase');
+    await tester.pumpWidget(harness(const JournalScreen(), repo: stuck));
+
+    // Deliberately no `pumpAndSettle` — `journal()` never resolves, so the
+    // loading branch is the only frame there is to look at (§7.3).
+    expect(find.byKey(const Key('journal-skeleton')), findsOneWidget);
+    expect(find.byType(CircularProgressIndicator), findsNothing);
+  });
+
+  testWidgets('a failed journal load says so and offers a retry',
+      (WidgetTester tester) async {
+    final _FailingJournalRepo failing = _FailingJournalRepo();
+    await failing.unlockVault(path: 'test-vault', passphrase: 'passphrase');
+    await tester.pumpWidget(harness(const JournalScreen(), repo: failing));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Could not load the journal'), findsOneWidget);
+    expect(find.textContaining('could not reach the store'), findsOneWidget);
+    expect(find.widgetWithText(FilledButton, 'Try again'), findsOneWidget);
   });
 }
