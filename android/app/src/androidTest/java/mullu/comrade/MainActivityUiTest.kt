@@ -317,14 +317,21 @@ class MainActivityUiTest {
         composeRule.waitForIdle()
 
         // Travel moved off the bottom bar into the drawer beside Ride
-        // (`docs/DESIGN_SYSTEM.md` §7.7) — asserted the same way Feed is
-        // above: "off the nav, not removed" only holds if there is still a
-        // route to it. The title is asserted rather than a loaded-guide tag
-        // because the guide itself needs a location fix the emulator may not
-        // have; the app bar renders regardless of that state.
+        // (`docs/DESIGN_SYSTEM.md` §7.7) — asserted for the same reason Feed
+        // is above: "off the nav, not removed" only holds if there is still a
+        // route to it.
+        //
+        // The screen's own tag, not the word "Travel": the drawer item carries
+        // that same `travel_tab` string, and a closed `ModalNavigationDrawer`
+        // keeps its content composed — so a text finder matches two nodes and
+        // `assertIsDisplayed` throws on the ambiguity rather than failing for
+        // any reason to do with Travel. Feed dodges this only because its
+        // assertion happens to use a string unique to the screen. Not the
+        // loaded-guide tag either: that needs a location fix the emulator may
+        // not have, whereas the screen root renders in every state.
         composeRule.onNodeWithTag("drawer-travel").performClick()
         composeRule.waitForIdle()
-        composeRule.onNodeWithText("Travel").assertIsDisplayed()
+        composeRule.onNodeWithTag("travel-screen").assertIsDisplayed()
         Espresso.pressBack()
         composeRule.waitForIdle()
         composeRule.onNodeWithTag("nav-drawer-button").performClick()
