@@ -53,11 +53,24 @@ const val ComradeSkeletonRowCount = 5
 @Composable
 fun Modifier.comradeSkeleton(shape: Shape = RectangleShape): Modifier {
     val surfaces = LocalComradeSurfaces.current
-    val reducedMotion = LocalReducedMotion.current
+
+    // Under reduced motion the animation is not started at all, rather than
+    // started with its ends set equal. That distinction is not cosmetic: an
+    // infinite transition keeps running whether or not its value changes, and
+    // Compose counts a running animation as pending work — so the test clock
+    // never reports idle, and every `waitForIdle`/`waitUntil` in a UI test
+    // hangs for as long as one skeleton is on screen. `MainActivityUiTest`
+    // died exactly that way, 60s into waiting for the shell, because CI runs
+    // the emulator with `disable-animations: true` and the chat list shows
+    // skeletons while it loads.
+    if (LocalReducedMotion.current) {
+        return this.background(surfaces.muted.copy(alpha = SkeletonRestAlpha), shape)
+    }
+
     val transition = rememberInfiniteTransition(label = "comradeSkeleton")
     val alpha by transition.animateFloat(
-        initialValue = if (reducedMotion) SkeletonRestAlpha else SkeletonMinAlpha,
-        targetValue = if (reducedMotion) SkeletonRestAlpha else SkeletonMaxAlpha,
+        initialValue = SkeletonMinAlpha,
+        targetValue = SkeletonMaxAlpha,
         animationSpec = infiniteRepeatable(
             animation = tween(SkeletonPulseMs, easing = ComradeMotion.easing),
             repeatMode = RepeatMode.Reverse,
