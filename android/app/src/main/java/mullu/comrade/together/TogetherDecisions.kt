@@ -1577,6 +1577,28 @@ object TogetherDecisions {
     fun movedTo(queue: Queue, to: Int): Queue? =
         if (to in queue.tracks.indices) queue.copy(index = to) else null
 
+    /**
+     * The index permutation a drag-reorder produces: every position once, the
+     * item at [from] moved to sit at [to].
+     *
+     * Mirrors core's `reorder_tracks` (`comrade_ui::runtime`) exactly — both
+     * indices clamp into range, and `from == to`, a one-item list and an empty
+     * list are no-ops — so the row a finger drags and the row the vault writes
+     * end up in the same place. Returned as a permutation of `0 until count`
+     * rather than a reordered list so the caller keeps ownership of whatever
+     * it is actually reordering (a `LazyColumn`'s items, the persisted tracks)
+     * and this stays a pure arithmetic answer.
+     */
+    fun reorderedOrder(count: Int, from: Int, to: Int): List<Int> {
+        if (count <= 0) return emptyList()
+        val f = from.coerceIn(0, count - 1)
+        val t = to.coerceIn(0, count - 1)
+        val order = (0 until count).toMutableList()
+        if (f == t) return order
+        order.add(t, order.removeAt(f))
+        return order
+    }
+
     // ── Player extras: shuffle, repeat, speed, sleep ─────────────────────────
 
     /**

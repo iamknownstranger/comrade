@@ -2862,8 +2862,11 @@ and the existing server adapter.
 
 ### What is still missing
 
-- **Playlist editing depth** - create/open/play/remove shipped; reordering
-  within a playlist did not.
+- **Playlist editing depth** - create/open/play/remove/reorder/rename shipped
+  (reorder and rename added 2026-08-31; `reorder_tracks` in core, mirrored by
+  `TogetherDecisions.reorderedOrder`, surfaced on Android as Move up/down plus
+  a rename field). A drag-handle affordance for reorder is still a follow-up -
+  the current control is up/down buttons.
 - **Desktop and Flutter reach.** Android-first per the standing directive;
   desktop's panel can call the same free functions, and Flutter needs the frb
   mirror regenerated (`flutter_rust_bridge_codegen generate`) - deliberately

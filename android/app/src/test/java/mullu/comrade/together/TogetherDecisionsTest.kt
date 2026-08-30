@@ -1308,6 +1308,22 @@ class TogetherDecisionsTest {
         assertNull(TogetherDecisions.movedTo(queue, -1))
     }
 
+    @Test
+    fun aDragReorderMovesOneRowAndClampsTheRest() {
+        // The dragged row lands *at* `to`; every other row closes the gap.
+        assertEquals(listOf(1, 2, 3, 0), TogetherDecisions.reorderedOrder(4, 0, 3))
+        assertEquals(listOf(3, 0, 1, 2), TogetherDecisions.reorderedOrder(4, 3, 0))
+        assertEquals(listOf(0, 2, 1, 3), TogetherDecisions.reorderedOrder(4, 1, 2))
+        // Out of range is a drag to the nearest end, matching core's clamp.
+        assertEquals(listOf(1, 2, 3, 0), TogetherDecisions.reorderedOrder(4, 0, 99))
+        assertEquals(listOf(3, 0, 1, 2), TogetherDecisions.reorderedOrder(4, 99, 0))
+        assertEquals(listOf(1, 2, 3, 0), TogetherDecisions.reorderedOrder(4, -5, 3))
+        // No-ops round-trip untouched.
+        assertEquals(listOf(0, 1, 2, 3), TogetherDecisions.reorderedOrder(4, 2, 2))
+        assertEquals(listOf(0), TogetherDecisions.reorderedOrder(1, 0, 0))
+        assertTrue(TogetherDecisions.reorderedOrder(0, 0, 1).isEmpty())
+    }
+
     // ── Answering an invitation ─────────────────────────────────────────────
 
     @Test

@@ -3652,6 +3652,9 @@ private fun PlaylistsScreen(
     var loaded by remember { mutableStateOf(false) }
     var openId by remember { mutableStateOf<String?>(null) }
     var newName by remember { mutableStateOf("") }
+    // Cleared whenever a different playlist is opened, so a half-typed rename
+    // never bleeds from one list onto another.
+    var renameDraft by remember(openId) { mutableStateOf("") }
 
     fun refresh() {
         scope.launch {
@@ -3675,6 +3678,37 @@ private fun PlaylistsScreen(
                 return@Column
             }
             BrowserHeader(list.name, onBack = { openId = null })
+
+            // Rename: the name is authored, like the list itself. Placeholder
+            // carries the current name so an empty field reads as "unchanged",
+            // and core refuses a blank one anyway.
+            Row(
+                Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                OutlinedTextField(
+                    value = renameDraft,
+                    onValueChange = { renameDraft = it },
+                    placeholder = { Text(list.name) },
+                    singleLine = true,
+                    modifier = Modifier.weight(1f),
+                )
+                TextButton(
+                    enabled = renameDraft.isNotBlank() && renameDraft.trim() != list.name,
+                    onClick = {
+                        val name = renameDraft.trim()
+                        scope.launch {
+                            withContext(Dispatchers.IO) {
+                                runCatching { ComradeCore.playlistRename(id, name) }
+                            }
+                            renameDraft = ""
+                            refresh()
+                        }
+                    },
+                ) { Text(stringResource(R.string.library_rename)) }
+            }
+
+            val lastIndex = list.tracks.size - 1
             list.tracks.forEachIndexed { i, t ->
                 Row(
                     Modifier.fillMaxWidth().clickable { onPlayTracks(list.tracks, i) },
@@ -3683,6 +3717,32 @@ private fun PlaylistsScreen(
                     Column(Modifier.weight(1f).padding(vertical = 8.dp)) {
                         Text(t.title, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
+                    // Up/down rather than a drag handle: a drag reorder in a
+                    // plain scrolling Column is fiddly to get right and
+                    // impossible to verify without a device. The arithmetic is
+                    // shared with core via TogetherDecisions.reorderedOrder.
+                    TextButton(
+                        enabled = i > 0,
+                        onClick = {
+                            scope.launch {
+                                withContext(Dispatchers.IO) {
+                                    runCatching { ComradeCore.playlistReorder(id, i, i - 1) }
+                                }
+                                refresh()
+                            }
+                        },
+                    ) { Text(stringResource(R.string.library_move_up)) }
+                    TextButton(
+                        enabled = i < lastIndex,
+                        onClick = {
+                            scope.launch {
+                                withContext(Dispatchers.IO) {
+                                    runCatching { ComradeCore.playlistReorder(id, i, i + 1) }
+                                }
+                                refresh()
+                            }
+                        },
+                    ) { Text(stringResource(R.string.library_move_down)) }
                     TextButton(onClick = {
                         scope.launch {
                             withContext(Dispatchers.IO) {

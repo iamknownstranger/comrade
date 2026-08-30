@@ -760,6 +760,10 @@
     <string name="library_new_playlist_hint">New playlist name</string>
     <string name="library_create">Create</string>
     <string name="library_remove_from_playlist">Remove</string>
+    <string name="library_move_up">Move up</string>
+    <string name="library_move_down">Move down</string>
+    <string name="library_rename">Rename</string>
+    <string name="library_rename_hint">Playlist name</string>
     <string name="together_search_not_on_phone">No copy of \u201C%1$s\u201D on this phone. Try another result, pick a file, or ask the other person to send theirs.</string>
     <!-- Downloading an openly-licensed track into the phone's music library. -->
     <string name="together_buffering">buffering\u2026</string>

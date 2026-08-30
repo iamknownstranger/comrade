@@ -1281,6 +1281,17 @@ impl Comrade {
             .playlist_remove_track(id, track_key)
     }
 
+    /// Move the track at `from` so it sits at `to`. Out-of-range indices clamp
+    /// to the nearest end rather than erroring.
+    pub fn playlist_reorder(&self, id: String, from: u32, to: u32) -> Result<(), UiError> {
+        self.inner.blocking_read().playlist_reorder(id, from, to)
+    }
+
+    /// Rename a playlist. Its tracks and position on the shelf are untouched.
+    pub fn playlist_rename(&self, id: String, name: String) -> Result<(), UiError> {
+        self.inner.blocking_read().playlist_rename(id, name)
+    }
+
     /// Save the live queue over any previous snapshot.
     pub fn queue_save(&self, queue: SavedQueueDto) -> Result<(), UiError> {
         self.inner.blocking_read().queue_save(queue)

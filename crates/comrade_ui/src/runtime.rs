@@ -1294,6 +1294,33 @@ pub fn prune_history(mut entries: Vec<HistoryEntryDto>) -> Vec<HistoryEntryDto> 
     entries
 }
 
+/// Move the track at `from` so it sits at `to`, shifting the rest.
+///
+/// Pure, so the reorder rule is testable without a vault and the Android
+/// decision layer can mirror it exactly (`TogetherDecisions.reorderedOrder`).
+/// Both indices are **clamped** into range rather than erroring — a drag that
+/// ends past the last row is a drag to the end, not a mistake — and `from ==
+/// to`, a one-track list and an empty list are all no-ops. The moved element
+/// lands *at* `to` in the result: reordering `[a, b, c]` from `0` to `2`
+/// yields `[b, c, a]`.
+pub fn reorder_tracks(
+    mut tracks: Vec<PlayerTrackDto>,
+    from: usize,
+    to: usize,
+) -> Vec<PlayerTrackDto> {
+    if tracks.is_empty() {
+        return tracks;
+    }
+    let from = from.min(tracks.len() - 1);
+    let to = to.min(tracks.len() - 1);
+    if from == to {
+        return tracks;
+    }
+    let item = tracks.remove(from);
+    tracks.insert(to, item);
+    tracks
+}
+
 /// An id for a new playlist.
 ///
 /// Nanoseconds plus a process-lifetime counter: unique enough for keys in one
@@ -4380,6 +4407,46 @@ impl ComradeRuntime {
             .map_err(|e| UiError::Storage(e.to_string()))?
             .ok_or_else(|| UiError::Engine(format!("no playlist {id}")))?;
         list.tracks.retain(|t| t.key != track_key);
+        store
+            .put(PLAYER_PLAYLISTS_TREE, &id, &list)
+            .and_then(|()| store.flush())
+            .map_err(|e| UiError::Storage(e.to_string()))
+    }
+
+    /// Reorder a playlist: move the track at `from` so it sits at `to`.
+    ///
+    /// The clamping rule is [`reorder_tracks`]'s — an out-of-range index is a
+    /// drag to the nearest end, not an error — so a drag gesture never has to
+    /// second-guess its own arithmetic. `created_at_ms` is untouched:
+    /// arranging a list is not creating it, and it must not jump the shelf.
+    pub fn playlist_reorder(&self, id: String, from: u32, to: u32) -> Result<(), UiError> {
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        let mut list = store
+            .get::<PlaylistDto>(PLAYER_PLAYLISTS_TREE, &id)
+            .map_err(|e| UiError::Storage(e.to_string()))?
+            .ok_or_else(|| UiError::Engine(format!("no playlist {id}")))?;
+        list.tracks = reorder_tracks(list.tracks, from as usize, to as usize);
+        store
+            .put(PLAYER_PLAYLISTS_TREE, &id, &list)
+            .and_then(|()| store.flush())
+            .map_err(|e| UiError::Storage(e.to_string()))
+    }
+
+    /// Rename a playlist. Its tracks and `created_at_ms` are untouched, so a
+    /// rename never reorders [`Self::playlists_list`]. An empty name is refused
+    /// exactly as it is at [creation][Self::playlist_create] — a nameless
+    /// playlist is not a thing this store invents.
+    pub fn playlist_rename(&self, id: String, name: String) -> Result<(), UiError> {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return Err(UiError::Engine("a playlist needs a name".into()));
+        }
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        let mut list = store
+            .get::<PlaylistDto>(PLAYER_PLAYLISTS_TREE, &id)
+            .map_err(|e| UiError::Storage(e.to_string()))?
+            .ok_or_else(|| UiError::Engine(format!("no playlist {id}")))?;
+        list.name = name;
         store
             .put(PLAYER_PLAYLISTS_TREE, &id, &list)
             .and_then(|()| store.flush())
@@ -19440,6 +19507,98 @@ mod tests {
         assert!(rt.playlists_list().unwrap().is_empty());
     }
 
+    #[test]
+    fn reorder_tracks_moves_one_row_and_clamps_the_rest() {
+        let ks = |ts: &[PlayerTrackDto]| ts.iter().map(|t| t.key.clone()).collect::<Vec<_>>();
+        let base = vec![a_track("a"), a_track("b"), a_track("c"), a_track("d")];
+
+        // First to last: everything else shuffles up one, the moved row lands *at* `to`.
+        assert_eq!(
+            ks(&reorder_tracks(base.clone(), 0, 3)),
+            ["b", "c", "d", "a"]
+        );
+        // Last to first.
+        assert_eq!(
+            ks(&reorder_tracks(base.clone(), 3, 0)),
+            ["d", "a", "b", "c"]
+        );
+        // A middle nudge.
+        assert_eq!(
+            ks(&reorder_tracks(base.clone(), 1, 2)),
+            ["a", "c", "b", "d"]
+        );
+        // Out-of-range is a drag to the nearest end, not a panic.
+        assert_eq!(
+            ks(&reorder_tracks(base.clone(), 0, 99)),
+            ["b", "c", "d", "a"]
+        );
+        assert_eq!(
+            ks(&reorder_tracks(base.clone(), 99, 0)),
+            ["d", "a", "b", "c"]
+        );
+        // No-ops round-trip untouched.
+        assert_eq!(
+            ks(&reorder_tracks(base.clone(), 2, 2)),
+            ["a", "b", "c", "d"]
+        );
+        assert!(reorder_tracks(Vec::new(), 0, 1).is_empty());
+    }
+
+    #[tokio::test]
+    async fn playlist_reorder_and_rename_leave_created_at_and_the_shelf_alone() {
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+        rt.unlock_vault(dir.path(), "pin").await.unwrap();
+
+        // Two lists, created oldest-first so a rename that moved the shelf would show.
+        let older = rt.playlist_create("Morning".into(), 10).unwrap();
+        let newer = rt.playlist_create("Evening".into(), 20).unwrap();
+        for k in ["a", "b", "c"] {
+            rt.playlist_add_track(older.clone(), a_track(k)).unwrap();
+        }
+
+        rt.playlist_reorder(older.clone(), 0, 2).unwrap();
+        let keys = |rt: &ComradeRuntime, id: &str| {
+            rt.playlists_list()
+                .unwrap()
+                .into_iter()
+                .find(|l| l.id == id)
+                .unwrap()
+                .tracks
+                .iter()
+                .map(|t| t.key.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            keys(&rt, &older),
+            ["b", "c", "a"],
+            "the dragged row lands at `to`"
+        );
+
+        // Out-of-range index clamps rather than erroring.
+        rt.playlist_reorder(older.clone(), 99, 0).unwrap();
+        assert_eq!(keys(&rt, &older), ["a", "b", "c"]);
+
+        // Rename keeps the tracks, and keeps the shelf in creation order.
+        assert!(
+            rt.playlist_rename(older.clone(), "  ".into()).is_err(),
+            "a blank name is refused here as it is at creation"
+        );
+        rt.playlist_rename(older.clone(), "Sunrise".into()).unwrap();
+        let shelf = rt.playlists_list().unwrap();
+        assert_eq!(
+            shelf.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(),
+            ["Sunrise", "Evening"],
+            "rename edits in place — created_at_ms is untouched, so the order holds"
+        );
+        assert_eq!(
+            keys(&rt, &older),
+            ["a", "b", "c"],
+            "rename does not touch the tracks"
+        );
+        let _ = newer;
+    }
+
     #[tokio::test]
     async fn the_queue_survives_a_save_load_cycle_and_clamps_nothing_here() {
         let dir = TempDir::new().unwrap();
@@ -19476,6 +19635,14 @@ mod tests {
         assert!(matches!(rt.favourites_list(), Err(UiError::VaultLocked)));
         assert!(matches!(rt.history_list(), Err(UiError::VaultLocked)));
         assert!(matches!(rt.playlists_list(), Err(UiError::VaultLocked)));
+        assert!(matches!(
+            rt.playlist_reorder("pl0".into(), 0, 1),
+            Err(UiError::VaultLocked)
+        ));
+        assert!(matches!(
+            rt.playlist_rename("pl0".into(), "x".into()),
+            Err(UiError::VaultLocked)
+        ));
         assert!(matches!(rt.queue_load(), Err(UiError::VaultLocked)));
     }
 
