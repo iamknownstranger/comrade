@@ -973,6 +973,12 @@ object ComradeCore {
     suspend fun playlistRemoveTrack(id: String, trackKey: String) =
         withContext(Dispatchers.IO) { ffi.playlistRemoveTrack(id, trackKey) }
 
+    suspend fun playlistReorder(id: String, from: Int, to: Int) =
+        withContext(Dispatchers.IO) { ffi.playlistReorder(id, from.toUInt(), to.toUInt()) }
+
+    suspend fun playlistRename(id: String, name: String) =
+        withContext(Dispatchers.IO) { ffi.playlistRename(id, name) }
+
     suspend fun queueSave(queue: uniffi.comrade_ui.SavedQueueDto) =
         withContext(Dispatchers.IO) { ffi.queueSave(queue) }
 

@@ -78,8 +78,8 @@ pub use runtime::{
 };
 // The player's own library — favourites, history, playlists, saved queue.
 pub use runtime::{
-    prune_history, HistoryEntryDto, PlayerTrackDto, PlayerTrackKind, PlaylistDto, SavedQueueDto,
-    HISTORY_MAX_ENTRIES,
+    prune_history, reorder_tracks, HistoryEntryDto, PlayerTrackDto, PlayerTrackKind, PlaylistDto,
+    SavedQueueDto, HISTORY_MAX_ENTRIES,
 };
 // The travel guide: one network call, deliberately a free function so no caller
 // can hold the runtime lock across three round trips (see its doc).
