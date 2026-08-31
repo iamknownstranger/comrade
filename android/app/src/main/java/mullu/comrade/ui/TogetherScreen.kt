@@ -3249,6 +3249,7 @@ private fun ExtrasRow(s: TogetherManager.UiState.Live) {
     var showSleep by remember { mutableStateOf(false) }
     var showEq by remember { mutableStateOf(false) }
     var showLyrics by remember { mutableStateOf(false) }
+    var showQueue by remember { mutableStateOf(false) }
     val filePlayer = !s.embed && !s.external
 
     Row(
@@ -3300,6 +3301,11 @@ private fun ExtrasRow(s: TogetherManager.UiState.Live) {
                 Icon(LyricsIcon, contentDescription = stringResource(R.string.extras_lyrics), tint = TogetherMuted)
             }
         }
+        if ((queue?.tracks?.size ?: 0) > 1) {
+            IconButton(onClick = { showQueue = true }) {
+                Icon(QueueMusicIcon, contentDescription = stringResource(R.string.extras_queue), tint = TogetherMuted)
+            }
+        }
     }
 
     if (showSpeed) {
@@ -3319,6 +3325,69 @@ private fun ExtrasRow(s: TogetherManager.UiState.Live) {
             positionMs = s.positionMs,
             onDismiss = { showLyrics = false },
         )
+    }
+    if (showQueue) {
+        QueueSheet(onDismiss = { showQueue = false })
+    }
+}
+
+/**
+ * Up next — the queue, arrangeable.
+ *
+ * Reordering and removing here are local: the session syncs a playhead, not a
+ * playlist, so what this device plays *after* the current track is its own
+ * business ([TogetherManager.reorderQueue] / [removeFromQueue] send nothing to
+ * the peer). The row that is playing is marked and cannot be removed from this
+ * sheet — that is a skip decision, and the transport controls own it. A plain
+ * Column rather than a LazyColumn, like `PlaylistsScreen`: the queue is short
+ * and the rows carry no state worth keying.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun QueueSheet(onDismiss: () -> Unit) {
+    val queue by TogetherManager.queue.collectAsState()
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        val q = queue
+        Column(
+            Modifier.padding(20.dp).verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Text(stringResource(R.string.queue_sheet_title), style = MaterialTheme.typography.titleMedium)
+            if (q == null || q.tracks.isEmpty()) {
+                Text(stringResource(R.string.queue_empty), color = TogetherMuted)
+            } else {
+                val lastIndex = q.tracks.size - 1
+                q.tracks.forEachIndexed { i, t ->
+                    val playing = i == q.index
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f).padding(vertical = 6.dp)) {
+                            Text(
+                                t.title.ifBlank { stringResource(R.string.queue_untitled) },
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                color = if (playing) MaterialTheme.colorScheme.primary else TogetherText,
+                            )
+                            if (playing) {
+                                Text(
+                                    stringResource(R.string.queue_now_playing),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.primary,
+                                )
+                            }
+                        }
+                        TextButton(enabled = i > 0, onClick = { TogetherManager.reorderQueue(i, i - 1) }) {
+                            Text(stringResource(R.string.library_move_up))
+                        }
+                        TextButton(enabled = i < lastIndex, onClick = { TogetherManager.reorderQueue(i, i + 1) }) {
+                            Text(stringResource(R.string.library_move_down))
+                        }
+                        TextButton(enabled = !playing, onClick = { TogetherManager.removeFromQueue(i) }) {
+                            Text(stringResource(R.string.library_remove_from_playlist))
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

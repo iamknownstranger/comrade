@@ -1324,6 +1324,65 @@ class TogetherDecisionsTest {
         assertTrue(TogetherDecisions.reorderedOrder(0, 0, 1).isEmpty())
     }
 
+    @Test
+    fun reorderingTheQueueKeepsThePlayheadOnItsTrack() {
+        val four = listOf(track("A"), track("B"), track("C"), track("D"))
+        fun keys(q: TogetherDecisions.Queue) = q.tracks.map { it.title } to q.index
+
+        // Playing "B" (index 1). Move a later row (C, 2 -> 3): playhead unmoved.
+        assertEquals(
+            listOf("A", "B", "D", "C") to 1,
+            keys(TogetherDecisions.reorderedQueue(TogetherDecisions.Queue(four, 1), 2, 3)),
+        )
+        // Move an earlier row (A, 0) past the playhead (to 2): B steps down one, 1 -> 0.
+        assertEquals(
+            listOf("B", "C", "A", "D") to 0,
+            keys(TogetherDecisions.reorderedQueue(TogetherDecisions.Queue(four, 1), 0, 2)),
+        )
+        // Move a later row (D, 3) to before the playhead (0): B steps down 1->2.
+        assertEquals(
+            listOf("D", "A", "B", "C") to 2,
+            keys(TogetherDecisions.reorderedQueue(TogetherDecisions.Queue(four, 1), 3, 0)),
+        )
+        // Move the playing row itself (B, 1 -> 3): the index follows it.
+        assertEquals(
+            listOf("A", "C", "D", "B") to 3,
+            keys(TogetherDecisions.reorderedQueue(TogetherDecisions.Queue(four, 1), 1, 3)),
+        )
+        // Clamp + no-ops.
+        assertEquals(
+            listOf("A", "B", "C", "D") to 1,
+            keys(TogetherDecisions.reorderedQueue(TogetherDecisions.Queue(four, 1), 2, 2)),
+        )
+        assertEquals(
+            listOf("D", "A", "B", "C") to 2,
+            keys(TogetherDecisions.reorderedQueue(TogetherDecisions.Queue(four, 1), 99, 0)),
+        )
+        val one = TogetherDecisions.Queue(listOf(track("solo")), 0)
+        assertEquals(one, TogetherDecisions.reorderedQueue(one, 0, 0))
+    }
+
+    @Test
+    fun removingFromTheQueueLeavesThePlayheadWhereItWasPlaying() {
+        val four = listOf(track("A"), track("B"), track("C"), track("D"))
+        fun keys(q: TogetherDecisions.Queue) = q.tracks.map { it.title } to q.index
+
+        // Playing "C" (index 2). Drop a row above it: index shifts up.
+        assertEquals(
+            listOf("A", "C", "D") to 1,
+            keys(TogetherDecisions.queueWithout(TogetherDecisions.Queue(four, 2), 1)!!),
+        )
+        // Drop a row below it: index unchanged.
+        assertEquals(
+            listOf("A", "B", "C") to 2,
+            keys(TogetherDecisions.queueWithout(TogetherDecisions.Queue(four, 2), 3)!!),
+        )
+        // Removing the playing row is the caller's decision (skip vs stop), not this function's.
+        assertNull(TogetherDecisions.queueWithout(TogetherDecisions.Queue(four, 2), 2))
+        // Out of range: nothing to do.
+        assertNull(TogetherDecisions.queueWithout(TogetherDecisions.Queue(four, 2), 9))
+    }
+
     // ── Answering an invitation ─────────────────────────────────────────────
 
     @Test

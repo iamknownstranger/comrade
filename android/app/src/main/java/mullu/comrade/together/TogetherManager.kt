@@ -1603,6 +1603,34 @@ object TogetherManager {
         }
     }
 
+    /**
+     * Reorder the up-next list: move the track at [from] so it sits at [to].
+     *
+     * Local only. The queue is this device's own list of what to play next —
+     * the session syncs a playhead, not a playlist — so rearranging it sends
+     * nothing to the peer. [TogetherDecisions.reorderedQueue] keeps the index
+     * on whatever is playing; the snapshot is re-saved so a resume matches.
+     */
+    fun reorderQueue(from: Int, to: Int) {
+        val at = _queue.value ?: return
+        val moved = TogetherDecisions.reorderedQueue(at, from, to)
+        if (moved == at) return
+        _queue.value = moved
+        saveQueueSnapshot()
+    }
+
+    /**
+     * Drop the track at [at] from the up-next list. Also local, also re-saved.
+     * Removing the row that is *playing* is not offered here — the UI disables
+     * it — so a `null` from [TogetherDecisions.queueWithout] is left as a no-op.
+     */
+    fun removeFromQueue(at: Int) {
+        val queue = _queue.value ?: return
+        val without = TogetherDecisions.queueWithout(queue, at) ?: return
+        _queue.value = without
+        saveQueueSnapshot()
+    }
+
     // ── Player extras: shuffle, repeat, speed, sleep timer ──────────────────
 
     /**
