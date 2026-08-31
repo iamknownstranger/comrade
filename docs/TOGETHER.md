@@ -2867,6 +2867,13 @@ and the existing server adapter.
   `TogetherDecisions.reorderedOrder`, surfaced on Android as Move up/down plus
   a rename field). A drag-handle affordance for reorder is still a follow-up -
   the current control is up/down buttons.
+- **Queue editing** - shipped 2026-09-01. An "Up next" sheet lists the queue
+  with the playing row marked; Move up/down and Remove per row.
+  `TogetherDecisions.reorderedQueue` keeps `index` on whatever is playing when
+  a move steps across it; `queueWithout` refuses to remove the playing row
+  (that is a skip decision). Local only - the session syncs a playhead, not a
+  playlist - so no signal goes to the peer, and the snapshot is re-saved so a
+  resume matches. Drag-handle reorder is the same follow-up as playlists.
 - **Desktop and Flutter reach.** Android-first per the standing directive;
   desktop's panel can call the same free functions, and Flutter needs the frb
   mirror regenerated (`flutter_rust_bridge_codegen generate`) - deliberately

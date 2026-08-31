@@ -738,6 +738,11 @@
     <string name="extras_sleep">Sleep timer</string>
     <string name="extras_equalizer">Equalizer</string>
     <string name="extras_lyrics">Lyrics</string>
+    <string name="extras_queue">Up next</string>
+    <string name="queue_sheet_title">Up next</string>
+    <string name="queue_empty">Nothing queued.</string>
+    <string name="queue_untitled">Untitled</string>
+    <string name="queue_now_playing">Now playing</string>
     <string name="speed_sheet_title">Playback speed</string>
     <string name="sleep_sheet_title">Sleep timer</string>
     <string name="sleep_off">Off</string>

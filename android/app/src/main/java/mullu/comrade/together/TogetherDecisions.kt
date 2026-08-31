@@ -1578,6 +1578,54 @@ object TogetherDecisions {
         if (to in queue.tracks.indices) queue.copy(index = to) else null
 
     /**
+     * The queue with the track at [from] moved to sit at [to], and [index] kept
+     * pointing at whatever is playing.
+     *
+     * This is not [movedTo], which moves the *playhead*. Here the playing track
+     * does not change — but its position does whenever a move steps across it,
+     * so [index] is recomputed from where that track lands rather than left
+     * stale. Indices clamp into range, matching core's `reorder_tracks`
+     * (`comrade_ui::runtime`); `from == to`, an empty queue and a one-track
+     * queue are no-ops. Reordering the up-next list is a local act — the shared
+     * playhead is untouched — so nothing here goes to the peer.
+     */
+    fun reorderedQueue(queue: Queue, from: Int, to: Int): Queue {
+        val n = queue.tracks.size
+        if (n <= 1) return queue
+        val f = from.coerceIn(0, n - 1)
+        val t = to.coerceIn(0, n - 1)
+        if (f == t) return queue
+        val tracks = queue.tracks.toMutableList()
+        tracks.add(t, tracks.removeAt(f))
+        val newIndex = when {
+            queue.index == f -> t
+            f < t && queue.index in (f + 1)..t -> queue.index - 1
+            f > t && queue.index in t until f -> queue.index + 1
+            else -> queue.index
+        }
+        return Queue(tracks, newIndex)
+    }
+
+    /**
+     * The queue with the track at [at] removed, and [index] still on the track
+     * that was playing.
+     *
+     * Removing a row above the playhead shifts it up one; removing a row below
+     * leaves it. Removing the **playing** track is not this function's job — a
+     * player has to decide whether that means "skip" or "stop", and that
+     * belongs with the caller that knows the transport state — so it returns
+     * `null` and the caller routes to a real skip. An out-of-range [at] is also
+     * `null`: nothing to remove.
+     */
+    fun queueWithout(queue: Queue, at: Int): Queue? {
+        if (at !in queue.tracks.indices || at == queue.index) return null
+        val tracks = queue.tracks.toMutableList()
+        tracks.removeAt(at)
+        val newIndex = if (at < queue.index) queue.index - 1 else queue.index
+        return Queue(tracks, newIndex)
+    }
+
+    /**
      * The index permutation a drag-reorder produces: every position once, the
      * item at [from] moved to sit at [to].
      *
