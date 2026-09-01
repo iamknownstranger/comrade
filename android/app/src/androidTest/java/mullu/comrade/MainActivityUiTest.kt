@@ -335,9 +335,11 @@ class MainActivityUiTest {
         composeRule.onNodeWithText("Your identity key").assertIsDisplayed()
         composeRule.onNodeWithText("@$USERNAME").assertIsDisplayed()
 
-        // The profile page, reached where Telegram puts it: the name and key at
+        // Your own profile, reached where Telegram puts it: the name and key at
         // the top of the drawer. This is the screen D35 moved the public key to,
-        // so the key row is what proves it drew.
+        // so the key row is what proves it drew. It proves only that much —
+        // the self page composes from what it was handed, so nothing on it
+        // changes state and the peer leg below is what exercises that.
         Espresso.pressBack()
         composeRule.waitForIdle()
         composeRule.onNodeWithTag("nav-drawer-button").performClick()
@@ -345,17 +347,49 @@ class MainActivityUiTest {
         composeRule.onNodeWithTag("drawer-profile").performClick()
         composeRule.waitForIdle()
         composeRule.onNodeWithTag("profile-screen").assertIsDisplayed()
-        // Wait past a state change, not just the first frame: the screen reads
-        // the avatar and the shared history off the vault *after* composing, and
-        // an early return in a composable throws on that second pass — the bug
-        // class Tasks and Ride both shipped, which a bare "the node exists"
-        // assertion passes straight through.
-        composeRule.waitUntil(timeoutMillis = 10_000) { hasText("Public key") }
         composeRule.onNodeWithText("Public key").assertIsDisplayed()
-        // Still alive after the recomposition, and still takes a tap.
         composeRule.onNodeWithText("Copy key").performClick()
         composeRule.waitForIdle()
         composeRule.onNodeWithTag("profile-screen").assertIsDisplayed()
+        Espresso.pressBack()
+        composeRule.waitForIdle()
+
+        // A *peer's* profile, which is the half with state in it: the body is
+        // behind a skeleton until the cached record is read, and the tab strip,
+        // the media rows and the link rows are all behind `if (!isSelf)`. None
+        // of that is composed on the page above, so without this leg an early
+        // return in any of it would reach a handset — the bug class Tasks and
+        // Ride both shipped, which a bare "the node exists" assertion passes
+        // straight through.
+        //
+        // The contact is pinned through the core rather than through the UI: a
+        // directory search needs a relay, and this test is about the screen.
+        // The key is secp256k1's generator point — a real, valid x-only key
+        // that belongs to nobody.
+        ComradeCore.addContactTyped(PEER_NPUB, PEER_ALIAS)
+        composeRule.onNodeWithContentDescription("New chat").performClick()
+        composeRule.waitForIdle()
+        composeRule.waitUntil(timeoutMillis = 10_000) { hasText(PEER_ALIAS) }
+        composeRule.onAllNodesWithText(PEER_ALIAS)[0].performClick()
+        composeRule.waitForIdle()
+        // Tapping the conversation header is the gesture every messenger has,
+        // and the one that has to reach the page.
+        composeRule.onNodeWithTag("chat-header").performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("profile-screen").assertIsDisplayed()
+        // "Media 0" appears only once the record has been read and the skeleton
+        // has been replaced — i.e. strictly after a state change, which is what
+        // the assertion above cannot prove on its own.
+        composeRule.waitUntil(timeoutMillis = 10_000) { hasText("Media 0") }
+        composeRule.onNodeWithText("Media 0").assertIsDisplayed()
+        // A stranger's row: no Call (this device would gather ICE for someone
+        // unaccepted), and the four tabs regardless of their being empty.
+        composeRule.onNodeWithText("Links 0").performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("No links yet").assertIsDisplayed()
+        composeRule.onNodeWithText("Public key").assertIsDisplayed()
+        Espresso.pressBack()
+        composeRule.waitForIdle()
         Espresso.pressBack()
         composeRule.waitForIdle()
     }
@@ -363,6 +397,15 @@ class MainActivityUiTest {
     private companion object {
         const val USERNAME = "ci_tester"
         const val PASSCODE = "comrade-ci-passcode"
+
+        /**
+         * secp256k1's generator point as an x-only key: a *valid* npub — the
+         * core parses it with `PublicKey::from_bech32`, so an invented string
+         * would be rejected before the contact was written — that no human
+         * holds the secret for.
+         */
+        const val PEER_NPUB = "npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d"
+        const val PEER_ALIAS = "Profile Peer"
 
         /**
          * How long to wait for the activity window to gain focus. Generous

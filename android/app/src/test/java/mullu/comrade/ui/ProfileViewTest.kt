@@ -487,6 +487,24 @@ class ProfileViewTest {
     }
 
     @Test
+    fun `an ideographic space is whitespace, the way the other two ports have it`() {
+        // Java's `\s` is ASCII only, where the JS and Dart `\s` are not — and
+        // the gap is not cosmetic. U+3000 is the ordinary word space in
+        // Japanese and Chinese, and `extractLinks` splits on what this leaves:
+        // two URLs separated by one read as a single link whose *drawn* host
+        // was the first and whose copied text carried the second.
+        val ideographic = Char(0x3000)
+        assertEquals("a b", sanitizeDisplayText("a${ideographic}b", 0))
+        assertEquals(
+            listOf("https://good.example/", "https://evil.example/"),
+            extractLinks("https://good.example/${ideographic}https://evil.example/").map { it.url },
+        )
+        for (space in listOf(0x00A0, 0x1680, 0x2000, 0x200A, 0x2028, 0x2029, 0x202F, 0x205F, 0xFEFF)) {
+            assertEquals("a b", sanitizeDisplayText("a${Char(space)}b", 0))
+        }
+    }
+
+    @Test
     fun `text longer than the bound is truncated with an ellipsis inside the bound`() {
         val out = sanitizeDisplayText("abcdefghij", 5)
         assertEquals("abcd…", out)

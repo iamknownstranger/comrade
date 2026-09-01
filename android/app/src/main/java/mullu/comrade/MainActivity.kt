@@ -907,10 +907,12 @@ private fun MainShell(
                                         // the gesture every messenger has, and
                                         // the place D35 sent the key when it
                                         // left this header.
-                                        modifier = Modifier.clickable {
-                                            profileTarget = openChat.peer
-                                            profileOpen = true
-                                        },
+                                        modifier = Modifier
+                                            .testTag("chat-header")
+                                            .clickable {
+                                                profileTarget = openChat.peer
+                                                profileOpen = true
+                                            },
                                         verticalAlignment = Alignment.CenterVertically,
                                         horizontalArrangement = Arrangement.spacedBy(10.dp),
                                     ) {

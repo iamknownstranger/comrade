@@ -117,10 +117,11 @@ fun ProfileScreen(
 
     var reloadTick by remember { mutableIntStateOf(0) }
     var peer by remember(target) { mutableStateOf<ComradeCore.PeerProfileInfo?>(null) }
-    // Starts true for your own page, which needs no read: everything it draws
-    // was handed in. For a peer it gates the body, because an unread profile
-    // and a stranger's are the same empty record — and drawing the second
-    // while waiting for the first flashes "Add contact" at an old friend.
+    // Starts true for your own page, whose *body* needs no read — the rows come
+    // from `ownProfile`, and only the avatar is fetched from the store. For a
+    // peer it gates the body, because an unread profile and a stranger's are
+    // the same empty record, and drawing the second while waiting for the first
+    // flashes "Add contact" at an old friend.
     var loadedOnce by remember(target) { mutableStateOf(isSelf) }
     var loadFailed by remember(target) { mutableStateOf(false) }
     var avatar by remember(target) { mutableStateOf<ImageBitmap?>(null) }
@@ -146,7 +147,24 @@ fun ProfileScreen(
         val loaded = withContext(Dispatchers.IO) {
             val profile = target?.let { runCatching { ComradeCore.peerProfileTyped(it) }.getOrNull() }
             val cached = if (target == null) ownProfile.avatarCached else profile?.avatarCached == true
-            val bytes = if (cached) {
+            // `mayFetchAvatar` gates the *drawing*, not only the fetching, and
+            // this is its first caller on any frontend. Turning the switch off
+            // does not purge what is already in the store — `set_remote_avatars_
+            // enabled` writes a flag and nothing else — so a page that asked
+            // only "are there bytes?" would keep showing a peer-chosen picture
+            // after the user turned pictures off, which is what the Settings
+            // copy promises it will not do. The contact/blocked halves matter
+            // for the same reason: bytes cached while someone was a contact
+            // outlive their being one.
+            val allowed = cached && mayFetchAvatar(
+                url = if (target == null) ownProfile.picture else profile?.picture,
+                remoteAvatarsEnabled = runCatching { ComradeCore.remoteAvatarsEnabledTyped() }
+                    .getOrDefault(true),
+                isContact = profile?.contact == true,
+                isSelf = target == null,
+                isBlocked = profile?.blocked == true,
+            )
+            val bytes = if (allowed) {
                 runCatching { ComradeCore.peerAvatarTyped(npub) }.getOrNull()
             } else {
                 null

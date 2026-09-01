@@ -251,6 +251,18 @@ test("a bidi override inside a URL cannot reorder the host on screen", () => {
   assert.ok(!links[0].url.includes(RLO), "the override is gone before anything is drawn");
 });
 
+test("an ideographic space separates two links, as it does in the prose it comes from", () => {
+  // The case that proved Java's ASCII-only `\s` had drifted from this file:
+  // U+3000 is the ordinary word space in Japanese and Chinese, and one between
+  // two URLs must not fuse them into a single link labelled with the first
+  // one's host.
+  const links = extractLinks("https://good.example/\u3000https://evil.example/");
+  assert.deepEqual(
+    links.map((l) => l.url),
+    ["https://good.example/", "https://evil.example/"],
+  );
+});
+
 test("the same link twice is one link", () => {
   const links = extractLinks("https://example.com/a https://example.com/a");
   assert.equal(links.length, 1);

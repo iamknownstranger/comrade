@@ -329,6 +329,19 @@ void main() {
       expect(sanitizeDisplayText('holiday${rlo}gnp.exe', 0), 'holiday gnp.exe');
     });
 
+    test('an ideographic space is whitespace, the way the other two ports have it',
+        () {
+      // Dart's `\s` already matches it, as JavaScript's does; Kotlin's did not
+      // until 2026-09-01, and the mirrored suites had no case that said so.
+      final ideographic = String.fromCharCode(0x3000);
+      expect(sanitizeDisplayText('a${ideographic}b', 0), 'a b');
+      for (final space in [
+        0x00A0, 0x1680, 0x2000, 0x200A, 0x2028, 0x2029, 0x202F, 0x205F, 0xFEFF,
+      ]) {
+        expect(sanitizeDisplayText('a${String.fromCharCode(space)}b', 0), 'a b');
+      }
+    });
+
     test('text longer than the bound is truncated with an ellipsis inside it',
         () {
       final out = sanitizeDisplayText('abcdefghij', 5);

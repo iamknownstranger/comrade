@@ -399,6 +399,7 @@ private fun ScreenshotSection() {
 private fun RemoteAvatarsSection() {
     val scope = rememberCoroutineScope()
     var enabled by remember { mutableStateOf<Boolean?>(null) }
+    var writeFailed by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
         enabled = withContext(Dispatchers.IO) {
@@ -425,6 +426,14 @@ private fun RemoteAvatarsSection() {
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(top = 4.dp),
                 )
+                if (writeFailed) {
+                    Text(
+                        stringResource(R.string.settings_remote_avatars_failed),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.padding(top = 4.dp),
+                    )
+                }
             }
             Switch(
                 // Until the stored value is read, the switch shows the default
@@ -433,11 +442,18 @@ private fun RemoteAvatarsSection() {
                 // this screen's own rule forbids.
                 checked = enabled ?: true,
                 onCheckedChange = { checked ->
-                    enabled = checked
                     scope.launch {
-                        withContext(Dispatchers.IO) {
+                        // The store decides, and the switch follows it. Moving
+                        // first and writing after would leave the control saying
+                        // "off" while pictures still load — the same fake switch
+                        // read from the other end — and the lie would survive
+                        // until the next launch re-read the flag.
+                        val ok = withContext(Dispatchers.IO) {
                             runCatching { ComradeCore.setRemoteAvatarsEnabledTyped(checked) }
+                                .isSuccess
                         }
+                        writeFailed = !ok
+                        if (ok) enabled = checked
                     }
                 },
                 modifier = Modifier.padding(start = 12.dp),
