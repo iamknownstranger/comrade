@@ -256,6 +256,67 @@
     <string name="cancel">Cancel</string>
     <string name="close">Close</string>
 
+    <!-- Profile page (Telegram-shaped: a collapsing header, then who this person
+         is, then what has been exchanged). Every rule behind it is in
+         ui/ProfileView.kt; only the wording is here. -->
+    <string name="profile_title">Profile</string>
+    <string name="profile_open">View profile</string>
+    <string name="profile_mine">My profile</string>
+    <string name="profile_self_status">This is you</string>
+    <string name="profile_status_contact">Contact</string>
+    <string name="profile_status_stranger">Not a contact</string>
+    <string name="profile_unavailable">This profile could not be read</string>
+    <!-- A cached record is what the page draws; saying when it was written keeps
+         a day-old bio from reading as live truth. -->
+    <string name="profile_updated">Known as of %1$s</string>
+    <string name="profile_row_bio">Bio</string>
+    <string name="profile_row_handle">Handle</string>
+    <string name="profile_row_nip05">Nostr address</string>
+    <string name="profile_row_lud16">Lightning address</string>
+    <string name="profile_row_key">Public key</string>
+    <string name="profile_row_unset">Not set</string>
+    <string name="profile_copy">Copy</string>
+    <string name="profile_copied">%1$s copied</string>
+    <string name="profile_edit">Edit</string>
+    <string name="profile_add">Add</string>
+    <string name="profile_action_message">Message</string>
+    <string name="profile_action_call">Call</string>
+    <string name="profile_action_mute">Mute</string>
+    <string name="profile_action_unmute">Unmute</string>
+    <string name="profile_action_add_contact">Add contact</string>
+    <string name="profile_action_add_comrade">Add comrade</string>
+    <string name="profile_action_remove_comrade">Remove comrade</string>
+    <string name="profile_action_block">Block</string>
+    <string name="profile_action_edit">Edit profile</string>
+    <string name="profile_action_copy_key">Copy key</string>
+    <!-- A blocked peer gets this sentence instead of a row of buttons: there is
+         no unblock command in the core, and a button that cannot work is worse
+         than an absent one. -->
+    <string name="profile_blocked_note">You blocked this person. Nothing from them reaches you, and there is no way to undo it from here yet.</string>
+    <string name="profile_bio_title">Your bio</string>
+    <string name="profile_bio_hint">A line about you. Everyone who can find your key can read it.</string>
+    <string name="profile_handle_title">Your handle</string>
+    <string name="profile_handle_hint">3–24 letters, numbers or _</string>
+    <string name="profile_save">Save</string>
+    <string name="profile_tab_media">Media</string>
+    <string name="profile_tab_files">Files</string>
+    <string name="profile_tab_links">Links</string>
+    <string name="profile_tab_voice">Voice</string>
+    <string name="profile_tab_count">%1$s %2$d</string>
+    <string name="profile_empty_media">No photos or videos yet</string>
+    <string name="profile_empty_files">No files yet</string>
+    <string name="profile_empty_links">No links yet</string>
+    <string name="profile_empty_voice">No voice notes yet</string>
+    <string name="profile_sent">Sent</string>
+    <string name="profile_received">Received</string>
+    <!-- The Links tab draws the host large and the URL small: a link is only as
+         trustworthy as its host, and nothing here opens on a tap. -->
+    <string name="profile_link_copy">Copy link</string>
+    <string name="profile_link_copied">Link copied</string>
+    <!-- Settings: the off switch D40 promised, now that a page draws avatars. -->
+    <string name="settings_remote_avatars">Load profile pictures</string>
+    <string name="settings_remote_avatars_hint">A contact\'s picture is a web address they chose, so loading it tells that host your IP. Off means initials everywhere; strangers are never fetched either way.</string>
+
     <!-- Notifications (settings card + grouping) -->
     <string name="notification_messages_summary">New messages</string>
     <!-- The "self" name in a MessagingStyle notification. Only ever drawn beside

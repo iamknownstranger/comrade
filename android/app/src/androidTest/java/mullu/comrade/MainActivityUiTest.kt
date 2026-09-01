@@ -334,6 +334,30 @@ class MainActivityUiTest {
         composeRule.waitForIdle()
         composeRule.onNodeWithText("Your identity key").assertIsDisplayed()
         composeRule.onNodeWithText("@$USERNAME").assertIsDisplayed()
+
+        // The profile page, reached where Telegram puts it: the name and key at
+        // the top of the drawer. This is the screen D35 moved the public key to,
+        // so the key row is what proves it drew.
+        Espresso.pressBack()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("nav-drawer-button").performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("drawer-profile").performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("profile-screen").assertIsDisplayed()
+        // Wait past a state change, not just the first frame: the screen reads
+        // the avatar and the shared history off the vault *after* composing, and
+        // an early return in a composable throws on that second pass — the bug
+        // class Tasks and Ride both shipped, which a bare "the node exists"
+        // assertion passes straight through.
+        composeRule.waitUntil(timeoutMillis = 10_000) { hasText("Public key") }
+        composeRule.onNodeWithText("Public key").assertIsDisplayed()
+        // Still alive after the recomposition, and still takes a tap.
+        composeRule.onNodeWithText("Copy key").performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("profile-screen").assertIsDisplayed()
+        Espresso.pressBack()
+        composeRule.waitForIdle()
     }
 
     private companion object {

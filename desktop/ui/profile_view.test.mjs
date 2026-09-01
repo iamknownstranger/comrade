@@ -219,6 +219,15 @@ test("a host is lowercased, so two spellings of one host read as one host", () =
   assert.equal(hostOf("https://ExAmPlE.CoM/x"), "example.com");
 });
 
+test("a string with no scheme has no host, rather than a mangled one", () => {
+  // Not reachable through `extractLinks`, which tests the scheme first — but
+  // `hostOf` is exported, and a function that answers `ample.com` for
+  // `example.com/x` is a wrong host waiting for its first caller.
+  assert.equal(hostOf("example.com/x"), "");
+  assert.equal(hostOf(""), "");
+  assert.equal(hostOf(null), "");
+});
+
 test("a scheme with no host is not a link", () => {
   assert.deepEqual(extractLinks("https:// https://"), []);
 });

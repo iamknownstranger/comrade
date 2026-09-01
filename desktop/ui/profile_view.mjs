@@ -189,7 +189,15 @@ export function extractLinks(text) {
  * phishing trick there is.
  */
 export function hostOf(url) {
-  const afterScheme = String(url ?? "").slice(String(url ?? "").indexOf("://") + 3);
+  const raw = String(url ?? "");
+  const marker = raw.indexOf("://");
+  // No scheme, no answer. Slicing at `indexOf(...) + 3` regardless — which this
+  // did until the Kotlin port was written against it — takes two characters off
+  // the front of a schemeless string and calls the remainder a host, so
+  // `example.com/x` reads as `ample.com`. A wrong host is the one output this
+  // function must never produce.
+  if (marker === -1) return "";
+  const afterScheme = raw.slice(marker + 3);
   const authority = afterScheme.split(/[/?#]/)[0] ?? "";
   const afterUserinfo = authority.includes("@")
     ? authority.slice(authority.lastIndexOf("@") + 1)
