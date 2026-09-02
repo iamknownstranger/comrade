@@ -392,6 +392,11 @@ class MainActivityUiTest {
         composeRule.waitForIdle()
         Espresso.pressBack()
         composeRule.waitForIdle()
+        // Leave the vault as this test found it. Every class in this suite runs
+        // in one process against one app vault, so a contact left behind is
+        // state the next test did not ask for — and this one's peer would keep
+        // the profile refresher reaching for a key that answers to nobody.
+        ComradeCore.removeContactTyped(PEER_NPUB)
     }
 
     private companion object {
