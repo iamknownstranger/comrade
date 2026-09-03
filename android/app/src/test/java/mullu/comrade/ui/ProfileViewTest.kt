@@ -160,6 +160,142 @@ class ProfileViewTest {
         assertEquals(MediaTab.Media, initialMediaTab(emptyList()))
     }
 
+    @Test
+    fun `a bucketed history reads newest first, though the store hands it over oldest first`() {
+        val items = listOf("image/png" to "old", "image/png" to "new")
+        assertEquals(
+            // A profile's media tab is a what-have-we-exchanged view; the recent
+            // end is the answer.
+            listOf("new", "old"),
+            bucketMedia(items) { it.first }.getValue(MediaTab.Media).map { it.second },
+        )
+    }
+
+    @Test
+    fun `counts and buckets agree, and an empty history counts zero everywhere`() {
+        val items = listOf("image/png", "audio/ogg", "text/plain")
+        assertEquals(
+            mapOf(MediaTab.Media to 1, MediaTab.Voice to 1, MediaTab.Files to 1),
+            mediaTabCounts(items),
+        )
+        assertEquals(
+            mapOf(MediaTab.Media to 0, MediaTab.Voice to 0, MediaTab.Files to 0),
+            mediaTabCounts(emptyList()),
+        )
+        for (tab in MediaTab.entries) {
+            assertEquals(
+                // Every tab is present in both, so a strip can render "Files 0"
+                // rather than omitting a tab and moving the ones beside it.
+                mediaTabCounts(items).getValue(tab),
+                bucketMedia(items) { it }.getValue(tab).size,
+            )
+        }
+    }
+
+    // ── Links ────────────────────────────────────────────────────────────────
+
+    @Test
+    fun `only http and https are ever treated as links`() {
+        val hostile =
+            "javascript:alert(1) data:text/html,x file:///etc/passwd //evil.example ftp://x.example/a"
+        assertEquals(emptyList<ProfileLink>(), extractLinks(hostile))
+    }
+
+    @Test
+    fun `a link's host is returned separately so it can be the prominent part`() {
+        val link = extractLinks("see https://evil.example/login?next=paypal.com").first()
+        assertEquals("evil.example", link.host)
+        assertEquals("https://evil.example/login?next=paypal.com", link.url)
+    }
+
+    @Test
+    fun `userinfo never becomes the displayed host`() {
+        // The oldest phishing trick there is: everything before the @ is not the host.
+        assertEquals("evil.example", hostOf("https://paypal.com@evil.example/"))
+        assertEquals("evil.example", hostOf("https://a@b@evil.example/x"))
+    }
+
+    @Test
+    fun `a port is not part of the host, and an IPv6 literal keeps its brackets`() {
+        assertEquals("example.com", hostOf("https://example.com:8443/x"))
+        assertEquals("[2001:db8::1]", hostOf("https://[2001:db8::1]:8443/x"))
+        assertEquals("[2001:db8::1]", hostOf("https://[2001:db8::1]/x"))
+    }
+
+    @Test
+    fun `a host is lowercased, so two spellings of one host read as one host`() {
+        assertEquals("example.com", hostOf("https://ExAmPlE.CoM/x"))
+    }
+
+    @Test
+    fun `a string with no scheme has no host, rather than a mangled one`() {
+        // Not reachable through `extractLinks`, which tests the scheme first —
+        // but `hostOf` is public, and a function that answers `ample.com` for
+        // `example.com/x` is a wrong host waiting for its first caller.
+        assertEquals("", hostOf("example.com/x"))
+        assertEquals("", hostOf(""))
+        assertEquals("", hostOf(null))
+    }
+
+    @Test
+    fun `a scheme with no host is not a link`() {
+        assertEquals(emptyList<ProfileLink>(), extractLinks("https:// https://"))
+    }
+
+    @Test
+    fun `trailing prose punctuation is not part of the URL`() {
+        assertEquals("https://example.com/a", extractLinks("see https://example.com/a.").first().url)
+        assertEquals("https://example.com/a", extractLinks("(https://example.com/a)").first().url)
+        assertEquals("https://example.com/a", extractLinks("'https://example.com/a',").first().url)
+    }
+
+    @Test
+    fun `a bracket the URL itself opened is kept`() {
+        // Stripping it would break every Wikipedia link ever pasted.
+        assertEquals(
+            "https://en.example.org/wiki/Foo_(bar)",
+            extractLinks("https://en.example.org/wiki/Foo_(bar)").first().url,
+        )
+    }
+
+    @Test
+    fun `a bidi override inside a URL cannot reorder the host on screen`() {
+        val links = extractLinks("https://example.com/${rlo}gnp.exe")
+        assertFalse(links.first().url.contains(rlo))
+    }
+
+    @Test
+    fun `the same link twice is one link`() {
+        assertEquals(1, extractLinks("https://example.com/a https://example.com/a").size)
+    }
+
+    @Test
+    fun `links across a thread are newest first and de-duplicated across messages`() {
+        val messages = listOf(
+            LinkMessage("old https://example.com/a", 100L, outgoing = false),
+            LinkMessage("new https://example.com/b", 300L, outgoing = true),
+            LinkMessage("again https://example.com/a", 200L, outgoing = false),
+        )
+        val links = collectLinks(messages)
+        assertEquals(
+            listOf("https://example.com/b", "https://example.com/a"),
+            links.map { it.url },
+        )
+        assertEquals(300L, links[0].at)
+        assertTrue(links[0].outgoing)
+        // The newest sighting of a repeated link is the one kept.
+        assertEquals(200L, links[1].at)
+    }
+
+    @Test
+    fun `collecting links tolerates a message with no body`() {
+        assertEquals(emptyList<SharedLink>(), collectLinks(emptyList()))
+        assertEquals(
+            emptyList<SharedLink>(),
+            collectLinks(listOf(LinkMessage(null, 0L, false), LinkMessage("no link here", 1L, false))),
+        )
+    }
+
     // ── The collapsing header ────────────────────────────────────────────────
 
     @Test
@@ -348,6 +484,24 @@ class ProfileViewTest {
         // turns a two-line name into one word nobody is called.
         assertEquals("Bob Smith", sanitizeDisplayText("Bob\nSmith", 0))
         assertEquals("holiday gnp.exe", sanitizeDisplayText("holiday${rlo}gnp.exe", 0))
+    }
+
+    @Test
+    fun `an ideographic space is whitespace, the way the other two ports have it`() {
+        // Java's `\s` is ASCII only, where the JS and Dart `\s` are not — and
+        // the gap is not cosmetic. U+3000 is the ordinary word space in
+        // Japanese and Chinese, and `extractLinks` splits on what this leaves:
+        // two URLs separated by one read as a single link whose *drawn* host
+        // was the first and whose copied text carried the second.
+        val ideographic = Char(0x3000)
+        assertEquals("a b", sanitizeDisplayText("a${ideographic}b", 0))
+        assertEquals(
+            listOf("https://good.example/", "https://evil.example/"),
+            extractLinks("https://good.example/${ideographic}https://evil.example/").map { it.url },
+        )
+        for (space in listOf(0x00A0, 0x1680, 0x2000, 0x200A, 0x2028, 0x2029, 0x202F, 0x205F, 0xFEFF)) {
+            assertEquals("a b", sanitizeDisplayText("a${Char(space)}b", 0))
+        }
     }
 
     @Test

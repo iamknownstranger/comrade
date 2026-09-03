@@ -36,6 +36,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -159,6 +160,7 @@ fun SettingsScreen(
         }
 
         BackgroundConnectivitySection()
+        RemoteAvatarsSection()
         ScreenshotSection()
         NotificationsSection()
         QuietHoursSection()
@@ -371,6 +373,88 @@ private fun ScreenshotSection() {
                     blocked = checked
                     ScreenSecurity.setBlocked(context, checked)
                     activity?.let { ScreenSecurity.apply(it, checked) }
+                },
+                modifier = Modifier.padding(start = 12.dp),
+            )
+        }
+    }
+}
+
+/**
+ * Whether a contact's published profile picture may be loaded.
+ *
+ * The switch `comrade_core::avatar` has always had and no frontend had drawn.
+ * It matters now that the profile page renders pictures: a Kind-0 `picture` is
+ * a web address the *peer* chose, so loading it tells that host this device's
+ * IP address. Default on — the owner's explicit call — with the fetch narrowed
+ * instead: accepted contacts only, never a stranger, never a blocked peer, and
+ * never anything but HTTPS to a public host (the core refuses the rest, for
+ * every caller at once).
+ *
+ * Off means initials everywhere, immediately: nothing is fetched again, and the
+ * page falls back to the generated avatar it already draws for a peer with no
+ * picture at all.
+ */
+@Composable
+private fun RemoteAvatarsSection() {
+    val scope = rememberCoroutineScope()
+    var enabled by remember { mutableStateOf<Boolean?>(null) }
+    var writeFailed by remember { mutableStateOf(false) }
+
+    LaunchedEffect(Unit) {
+        enabled = withContext(Dispatchers.IO) {
+            runCatching { ComradeCore.remoteAvatarsEnabledTyped() }.getOrDefault(true)
+        }
+    }
+
+    OutlinedCard(Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text(
+                    stringResource(R.string.settings_remote_avatars),
+                    style = MaterialTheme.typography.titleSmall,
+                )
+                Text(
+                    stringResource(R.string.settings_remote_avatars_hint),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 4.dp),
+                )
+                if (writeFailed) {
+                    Text(
+                        stringResource(R.string.settings_remote_avatars_failed),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.padding(top = 4.dp),
+                    )
+                }
+            }
+            Switch(
+                // Until the stored value is read, the switch shows the default
+                // the core uses. It is never left indeterminate: a control whose
+                // position does not match what is happening is the fake switch
+                // this screen's own rule forbids.
+                checked = enabled ?: true,
+                onCheckedChange = { checked ->
+                    scope.launch {
+                        // The store decides, and the switch follows it. Moving
+                        // first and writing after would leave the control saying
+                        // "off" while pictures still load — the same fake switch
+                        // read from the other end — and the lie would survive
+                        // until the next launch re-read the flag.
+                        val ok = withContext(Dispatchers.IO) {
+                            runCatching { ComradeCore.setRemoteAvatarsEnabledTyped(checked) }
+                                .isSuccess
+                        }
+                        writeFailed = !ok
+                        if (ok) enabled = checked
+                    }
                 },
                 modifier = Modifier.padding(start = 12.dp),
             )

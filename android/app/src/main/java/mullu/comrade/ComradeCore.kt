@@ -312,7 +312,63 @@ object ComradeCore {
 
     // ── Vault (E2E DMs) ────────────────────────────────────────────────────────
 
-    data class Profile(val npub: String, val username: String?)
+    /**
+     * The local identity, as the profile page and the drawer draw it.
+     *
+     * [about], [picture] and [avatarCached] were added when the profile page
+     * landed. The bio is editable from that page; [picture] is carried but not
+     * drawn anywhere yet — no frontend can set your own picture (there is no
+     * `set_own_avatar` call), and a row showing a URL you cannot change would
+     * be a control that isn't one.
+     */
+    data class Profile(
+        val npub: String,
+        val username: String?,
+        val about: String? = null,
+        /** The `picture` URL currently published for this identity. */
+        val picture: String? = null,
+        /** Whether vetted bytes for [picture] are cached — avatar or initials. */
+        val avatarCached: Boolean = false,
+    )
+
+    /**
+     * Everything the profile page draws for one peer, from the local cache
+     * alone — one call, no relay, and it works with no connection at all.
+     *
+     * Assembled in the core out of three trees (contact, cached Kind-0,
+     * presence against the clock) rather than joined here, so the three
+     * frontends cannot each join them slightly differently.
+     */
+    data class PeerProfileInfo(
+        val npub: String,
+        /** The local petname. Empty = none; the only name the peer cannot influence. */
+        val alias: String,
+        /** Their own published @handle — a claim, never an identifier. */
+        val name: String?,
+        val about: String?,
+        /**
+         * The `picture` URL as published. Carried so the page can say a picture
+         * exists that we have not loaded; **never** fetched from here — whether
+         * a fetch was ever allowed was decided in the core.
+         */
+        val picture: String?,
+        /** Unverified: the core does not check NIP-05, so this earns no checkmark. */
+        val nip05: String?,
+        val lud16: String?,
+        val avatarCached: Boolean,
+        val contact: Boolean,
+        val comrade: Boolean,
+        /**
+         * Reported so the page can say so. There is no unblock command to pair
+         * with it, which is why `actionRow` offers a blocked peer nothing.
+         */
+        val blocked: Boolean,
+        val online: Boolean,
+        val lastSeenAt: Long,
+        val peerMarkedUs: Boolean,
+        /** When the cached record was last written — "as of", not "live". */
+        val updatedAt: Long,
+    )
 
     data class FoundProfile(val npub: String, val name: String?, val about: String?)
 
@@ -470,12 +526,63 @@ object ComradeCore {
 
     // ── Profile & contacts ────────────────────────────────────────────────────
 
-    private fun uniffi.comrade_ui.ProfileDto.toInfo() = Profile(npub = npub, username = username)
+    private fun uniffi.comrade_ui.ProfileDto.toInfo() = Profile(
+        npub = npub,
+        username = username,
+        about = about,
+        picture = picture,
+        avatarCached = avatarCached,
+    )
 
     fun setUsernameTyped(name: String): Profile =
         rethrowing("Username") { runBlocking { ffi.setUsername(name) }.toInfo() }
 
     fun currentProfileTyped(): Profile = rethrowing("Profile") { ffi.profile().toInfo() }
+
+    /** Set (or clear, with an empty string) your own bio, and republish it. */
+    fun setAboutTyped(about: String): Profile =
+        rethrowing("Bio") { runBlocking { ffi.setAbout(about) }.toInfo() }
+
+    private fun uniffi.comrade_ui.PeerProfileDto.toInfo() = PeerProfileInfo(
+        npub = npub,
+        alias = alias,
+        name = name,
+        about = about,
+        picture = picture,
+        nip05 = nip05,
+        lud16 = lud16,
+        avatarCached = avatarCached,
+        contact = contact,
+        comrade = comrade,
+        blocked = blocked,
+        online = online,
+        lastSeenAt = lastSeenAt.toLong(),
+        peerMarkedUs = peerMarkedUs,
+        updatedAt = updatedAt.toLong(),
+    )
+
+    /** Everything the profile page draws for [npub], from the cache alone. */
+    fun peerProfileTyped(npub: String): PeerProfileInfo =
+        rethrowing("Peer profile") { ffi.peerProfile(npub).toInfo() }
+
+    /**
+     * A peer's cached avatar bytes, or `null` to draw initials.
+     *
+     * Reads the encrypted store and never the network, so calling it cannot
+     * disclose anything — the decision about whether the picture was ever
+     * fetched was made in `comrade_core::avatar`, not on this screen.
+     */
+    fun peerAvatarTyped(npub: String): MediaBytesInfo? =
+        rethrowing("Avatar") {
+            ffi.peerAvatar(npub)?.let { MediaBytesInfo(mimeType = it.mimeType, base64 = it.base64) }
+        }
+
+    /** Whether peer-published pictures may be fetched at all (default on). */
+    fun remoteAvatarsEnabledTyped(): Boolean =
+        rethrowing("Remote avatars") { ffi.remoteAvatarsEnabled() }
+
+    fun setRemoteAvatarsEnabledTyped(on: Boolean) =
+        rethrowing("Remote avatars") { ffi.setRemoteAvatarsEnabled(on) }
 
     fun searchProfilesTyped(query: String): List<FoundProfile> = rethrowing("Search") {
         runBlocking { ffi.searchProfiles(query) }.map {

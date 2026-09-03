@@ -65,4 +65,19 @@ fun sanitizeDisplayText(text: String?, maxChars: Int): String {
     return stripped.take(maxChars - 1) + "…"
 }
 
-private val WHITESPACE_RUN = Regex("\\s+")
+/**
+ * What counts as whitespace, spelled out rather than left to `\s`.
+ *
+ * Java's `\s` is **ASCII only** — `[ \t\n\x0B\f\r]` — where the JavaScript and
+ * Dart ports' `\s` also covers U+00A0, U+1680, U+2000–200A, U+2028, U+2029,
+ * U+202F, U+205F, U+3000 and U+FEFF. Left at `\s`, this function silently
+ * disagreed with its own mirrors, and the disagreement had teeth:
+ * [extractLinks] splits on the single spaces this leaves behind, so
+ * `https://good.example/<U+3000>https://evil.example/` collapsed to **one**
+ * link on Android — drawn with `good.example` as its prominent host and the
+ * whole two-URL token copied to the clipboard. U+3000 is also the ordinary
+ * word space in Japanese and Chinese, so a link sent in either never reached
+ * the Links tab at all.
+ */
+private val WHITESPACE_RUN =
+    Regex("[\\s\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000\\uFEFF]+")

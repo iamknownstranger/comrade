@@ -329,6 +329,23 @@ void main() {
       expect(sanitizeDisplayText('holiday${rlo}gnp.exe', 0), 'holiday gnp.exe');
     });
 
+    test('unicode spaces collapse, as they do in the other two ports', () {
+      // Dart's `\s` already matches these, as JavaScript's does; Kotlin's did
+      // not until 2026-09-01, and the mirrored suites had no case that said so.
+      // U+3000 is the ordinary word space in Japanese and Chinese, and a link
+      // with one beside it has to stay two tokens.
+      expect(sanitizeDisplayText('a\u3000b', 0), 'a b');
+      expect(sanitizeDisplayText('a\u00A0b', 0), 'a b');
+      expect(sanitizeDisplayText('a\u1680b', 0), 'a b');
+      expect(sanitizeDisplayText('a\u2000b', 0), 'a b');
+      expect(sanitizeDisplayText('a\u200Ab', 0), 'a b');
+      expect(sanitizeDisplayText('a\u2028b', 0), 'a b');
+      expect(sanitizeDisplayText('a\u2029b', 0), 'a b');
+      expect(sanitizeDisplayText('a\u202Fb', 0), 'a b');
+      expect(sanitizeDisplayText('a\u205Fb', 0), 'a b');
+      expect(sanitizeDisplayText('a\uFEFFb', 0), 'a b');
+    });
+
     test('text longer than the bound is truncated with an ellipsis inside it',
         () {
       final out = sanitizeDisplayText('abcdefghij', 5);

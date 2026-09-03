@@ -111,6 +111,7 @@ import mullu.comrade.ui.NotificationsOffIcon
 import mullu.comrade.ui.OnboardingScreen
 import mullu.comrade.ui.PeerAvatar
 import mullu.comrade.ui.PresenceDot
+import mullu.comrade.ui.ProfileScreen
 import mullu.comrade.ui.presenceText
 import mullu.comrade.ui.ReaderScreen
 import mullu.comrade.ui.RequestsScreen
@@ -521,6 +522,11 @@ private fun MainShell(
     // Settings is a pushed screen (Telegram-style), reached from the drawer,
     // not a bottom-nav tab. The drawer is the app-wide navigation menu.
     var settingsOpen by rememberSaveable { mutableStateOf(false) }
+    // The profile page, same shape. Two pieces of state rather than one
+    // nullable: the target is *itself* nullable — null means your own profile —
+    // so "closed" and "mine" would otherwise be the same value.
+    var profileOpen by rememberSaveable { mutableStateOf(false) }
+    var profileTarget by rememberSaveable { mutableStateOf<String?>(null) }
     /// Feed is a pushed screen now, reached from the drawer — see [MainTab].
     var feedOpen by rememberSaveable { mutableStateOf(false) }
     var rideOpen by rememberSaveable { mutableStateOf(false) }
@@ -754,15 +760,20 @@ private fun MainShell(
     val peerPresence = openChat?.peer?.let { presenceNow[it] }
     val comradeOnline = peerPresence?.online == true
     // Back priority, innermost first: an open drawer closes, then a pushed
-    // Settings screen closes, then a Chats sub-screen returns to the list.
+    // profile, then a pushed Settings screen, then a Chats sub-screen returns
+    // to the list.
     BackHandler(
         enabled = drawerState.isOpen ||
-            settingsOpen || feedOpen || rideOpen || travelOpen ||
+            profileOpen || settingsOpen || feedOpen || rideOpen || travelOpen ||
             (tab == MainTab.Chats && chatNav != ChatNav.List) ||
             (tab == MainTab.Focus && focusNav != FocusNav.Sessions),
     ) {
         when {
             drawerState.isOpen -> scope.launch { drawerState.close() }
+            // Innermost first: a profile is reached *from* a conversation
+            // header or the drawer, so back returns to whichever it was
+            // opened over.
+            profileOpen -> profileOpen = false
             settingsOpen -> settingsOpen = false
             feedOpen -> feedOpen = false
             rideOpen -> rideOpen = false
@@ -773,7 +784,35 @@ private fun MainShell(
     }
 
     Box(modifier = Modifier.fillMaxSize()) {
-        if (feedOpen) {
+        if (profileOpen) {
+            // First among the pushed screens because it is reached from the
+            // deepest place — a conversation header — and closing it has to
+            // return there rather than to whatever else was open.
+            ProfileScreen(
+                target = profileTarget,
+                ownProfile = profile,
+                onOwnProfileChange = onProfileChange,
+                onBack = { profileOpen = false },
+                onMessage = { peer, alias, username ->
+                    profileOpen = false
+                    tab = MainTab.Chats
+                    chatNav = ChatNav.Open(peer, alias, username)
+                },
+                onCall = { peer, label ->
+                    withCallPermissions(video = false) {
+                        CallManager.startOutgoingCall(context, peer, label, CallMediaKind.AUDIO)
+                    }
+                },
+                onBlocked = { blocked ->
+                    profileOpen = false
+                    // The thread is gone from the list, so returning to it would
+                    // show a conversation that no longer exists.
+                    chatNav = ChatNav.List
+                    Notifier.clearForPeer(context, blocked)
+                    ChatEventRouter.bumpChatTick()
+                },
+            )
+        } else if (feedOpen) {
             // Reached from the drawer since Together took the bottom-nav slot.
             // A pushed screen with its own back arrow rather than a tab, because
             // that is what the drawer's other destinations are.
@@ -809,6 +848,11 @@ private fun MainShell(
                 drawerContent = {
                     ComradeDrawerSheet(
                         profile = profile,
+                        onOpenProfile = {
+                            scope.launch { drawerState.close() }
+                            profileTarget = null
+                            profileOpen = true
+                        },
                         onOpenSettings = {
                             scope.launch { drawerState.close() }
                             settingsOpen = true
@@ -859,6 +903,16 @@ private fun MainShell(
                                 title = {
                                     val title = peerTitle(openChat.peer, openChat.alias, openChat.username)
                                     Row(
+                                        // Tapping the name opens their profile —
+                                        // the gesture every messenger has, and
+                                        // the place D35 sent the key when it
+                                        // left this header.
+                                        modifier = Modifier
+                                            .testTag("chat-header")
+                                            .clickable {
+                                                profileTarget = openChat.peer
+                                                profileOpen = true
+                                            },
                                         verticalAlignment = Alignment.CenterVertically,
                                         horizontalArrangement = Arrangement.spacedBy(10.dp),
                                     ) {
@@ -1526,6 +1580,7 @@ private fun BlockPeerDialog(onDismiss: () -> Unit, onConfirm: () -> Unit) {
 @Composable
 private fun ComradeDrawerSheet(
     profile: ComradeCore.Profile,
+    onOpenProfile: () -> Unit,
     onOpenSettings: () -> Unit,
     onOpenCallHistory: () -> Unit,
     onOpenComrades: () -> Unit,
@@ -1535,10 +1590,13 @@ private fun ComradeDrawerSheet(
     onOpenTravel: () -> Unit,
 ) {
     ModalDrawerSheet {
+        // Telegram's affordance, and now it leads where it reads: the name and
+        // key at the top of the drawer open *your profile*. It opened Settings
+        // until this page existed, which was the nearest thing available.
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .clickable(onClick = onOpenSettings)
+                .clickable(onClick = onOpenProfile)
                 .testTag("drawer-profile")
                 .padding(horizontal = 20.dp, vertical = 20.dp),
             verticalAlignment = Alignment.CenterVertically,

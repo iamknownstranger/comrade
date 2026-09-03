@@ -142,6 +142,155 @@ fun mediaTabFor(mimeType: String): MediaTab =
     }
 
 /**
+ * Split a peer's media history into the three tabs, newest first within each.
+ *
+ * [ComradeCore.media] hands back the merged both-directions history oldest
+ * first. A profile's tabs are a "what have we exchanged" view, where the recent
+ * end is what anyone is looking for, so this reverses — once, here, rather than
+ * in every renderer.
+ *
+ * Nothing is ever dropped: an unrecognised MIME type lands in Files, because a
+ * bucket that silently swallows an attachment makes it unreachable.
+ *
+ * Generic over the row type, with [mimeOf] doing the reading, so the rule can be
+ * tested without a `MediaMessageInfo` and the screen can keep drawing the real
+ * one — the alternative is a second shape that exists only to be mapped into.
+ */
+fun <T> bucketMedia(items: List<T>, mimeOf: (T) -> String): Map<MediaTab, List<T>> {
+    val buckets = MediaTab.entries.associateWith { mutableListOf<T>() }
+    for (item in items) buckets.getValue(mediaTabFor(mimeOf(item))).add(item)
+    return buckets.mapValues { (_, rows) -> rows.asReversed().toList() }
+}
+
+/** How many items each tab would show — what the tab strip's counts render. */
+fun mediaTabCounts(mimeTypes: List<String>): Map<MediaTab, Int> {
+    val counts = MediaTab.entries.associateWith { 0 }.toMutableMap()
+    for (mime in mimeTypes) {
+        val tab = mediaTabFor(mime)
+        counts[tab] = counts.getValue(tab) + 1
+    }
+    return counts
+}
+
+/** One link found in a message body: the URL, and its host as a separate field. */
+data class ProfileLink(val url: String, val host: String)
+
+/**
+ * The http(s) URLs in a message body, in the order they appear, de-duplicated.
+ *
+ * Deliberately **not** a regex for the matching. Three languages means three
+ * regex dialects, and a link scanner is exactly the rule that drifts invisibly
+ * when each port writes its own pattern — so this is whitespace splitting plus a
+ * scheme test, which mirrors identically from `desktop/ui/profile_view.mjs`.
+ *
+ * Only `http://` and `https://`. `javascript:`, `data:`, `file:` and
+ * scheme-relative `//host` are refused *here*, so no frontend has to remember.
+ *
+ * [ProfileLink.host] is returned **separately** and callers must render it as
+ * the prominent part: `https://evil.example/login?next=paypal.com` must not be
+ * presentable as a PayPal link.
+ */
+fun extractLinks(text: String?): List<ProfileLink> {
+    val found = mutableListOf<ProfileLink>()
+    val seen = mutableSetOf<String>()
+    // Sanitize first: a bidi override inside a URL can reorder a displayed host.
+    for (token in sanitizeDisplayText(text, 0).split(" ")) {
+        val url = trimUrlPunctuation(token)
+        if (url.isEmpty()) continue
+        val lower = url.lowercase()
+        if (!lower.startsWith("https://") && !lower.startsWith("http://")) continue
+        val host = hostOf(url)
+        // A scheme with no host is not a link.
+        if (host.isEmpty()) continue
+        if (!seen.add(url)) continue
+        found.add(ProfileLink(url, host))
+    }
+    return found
+}
+
+/**
+ * The host of an http(s) URL, lowercased, without userinfo or port.
+ *
+ * Hand-parsed rather than through `java.net.URI`, because the desktop and Dart
+ * ports must agree with it character for character and three platform URL
+ * parsers do not. Userinfo is dropped rather than shown:
+ * `https://paypal.com@evil.example/` has a host of `evil.example`, and rendering
+ * the part before the `@` is the oldest phishing trick there is.
+ */
+fun hostOf(url: String?): String {
+    val raw = url ?: ""
+    val marker = raw.indexOf("://")
+    // No scheme, no answer — the desktop original sliced at the index anyway
+    // and turned `example.com/x` into `ample.com`. A wrong host is the one
+    // output this function must never produce, so both ports refuse instead.
+    if (marker == -1) return ""
+    val afterScheme = raw.substring(marker + 3)
+    val authority = afterScheme.takeWhile { it != '/' && it != '?' && it != '#' }
+    val afterUserinfo = if (authority.contains('@')) {
+        authority.substring(authority.lastIndexOf('@') + 1)
+    } else {
+        authority
+    }
+    // An IPv6 literal keeps its brackets; anything else loses a :port.
+    if (afterUserinfo.startsWith("[")) {
+        val close = afterUserinfo.indexOf(']')
+        return if (close == -1) "" else afterUserinfo.substring(0, close + 1).lowercase()
+    }
+    return afterUserinfo.substringBefore(':').lowercase()
+}
+
+/** Strip the punctuation a URL collects from the prose around it. */
+private fun trimUrlPunctuation(token: String): String {
+    var url = token
+    while (url.isNotEmpty() && url.first() in "(<[\"'") url = url.substring(1)
+    while (true) {
+        val last = url.lastOrNull() ?: break
+        if (last !in ".,;:!?)]}>\"'") break
+        // Keep a closing bracket the URL itself opened — Wikipedia links carry
+        // balanced parens.
+        if (last == ')' && url.count { it == '(' } > url.count { it == ')' } - 1) break
+        if (last == ']' && url.count { it == '[' } > url.count { it == ']' } - 1) break
+        url = url.dropLast(1)
+    }
+    return url
+}
+
+/**
+ * The fields the Links tab reads off a message, so [collectLinks] has one
+ * signature rather than a lambda per field — [ProfileFields]'s reasoning.
+ */
+data class LinkMessage(val content: String?, val createdAt: Long, val outgoing: Boolean)
+
+/** One link exchanged with a peer, with where it came from. */
+data class SharedLink(
+    val url: String,
+    val host: String,
+    val at: Long,
+    val outgoing: Boolean,
+)
+
+/**
+ * Every link exchanged with a peer, newest first — the Links tab.
+ *
+ * Sourced from message *text*, because no DTO carries links: a message has a
+ * body and nothing else, so the alternative to scanning is not having the tab.
+ *
+ * A URL sent twice appears once, at its newest occurrence, because the tab
+ * answers "where did that link go" and not "how often was it repeated".
+ */
+fun collectLinks(messages: List<LinkMessage>): List<SharedLink> {
+    val out = mutableListOf<SharedLink>()
+    val seen = mutableSetOf<String>()
+    for (msg in messages.sortedByDescending { it.createdAt }) {
+        for (link in extractLinks(msg.content)) {
+            if (!seen.add(link.url)) continue
+            out.add(SharedLink(link.url, link.host, msg.createdAt, msg.outgoing))
+        }
+    }
+    return out
+}
+
+/**
  * The avatar's side length at a given header collapse fraction, where 0 is fully
  * expanded and 1 fully collapsed.
  *
