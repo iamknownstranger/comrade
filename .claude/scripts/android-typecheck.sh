@@ -153,9 +153,18 @@ echo "== compiling =="
 # Everything except the files that import androidx.compose. Discovered rather
 # than listed, so a new Compose file drops out and a new plain one is picked up
 # without editing this script.
+#
+# The pattern is anchored to an actual import line, and must stay that way: it
+# mirrors `composeImport` in app/android/app/build.gradle.kts, which decides
+# which sources `stagePreservedServices` copies into the Flutter build. An
+# unanchored grep was here first and matched the words "androidx.compose"
+# inside a KDoc comment, which dropped a plain file out of this lane while
+# Gradle still staged it — so the lane reported an unresolved reference against
+# a class that compiles perfectly well in both real builds. A lane that is
+# stricter than the rule it stands in for reports bugs that do not exist.
 FILES=()
 while IFS= read -r f; do
-  grep -q "androidx\.compose" "$f" || FILES+=("$f")
+  grep -qE "^[[:space:]]*import[[:space:]]+androidx\.compose" "$f" || FILES+=("$f")
 done < <(find "$SRC" -name '*.kt' | sort)
 while IFS= read -r f; do FILES+=("$f"); done < <(find "$CACHE/uniffi" -name '*.kt')
 FILES+=("$CACHE/stub/Generated.kt")
