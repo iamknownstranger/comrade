@@ -1599,6 +1599,124 @@ object TogetherDecisions {
         return order
     }
 
+    // ── Queue mutation: play next, add, remove, reorder, jump, clear ────────
+    //
+    // `Queue` above is immutable and derived — there is no way for the person
+    // to see it, reorder it, remove from it or add to it, which is the single
+    // biggest gap against a real music player. Everything below closes that
+    // gap with pure functions that return a **new** `Queue`, and the one rule
+    // every one of them has to hold is that `index` keeps pointing at the
+    // *same track*, wherever the mutation moved it to — a "Play next" that
+    // silently jumped playback to a different song would be worse than not
+    // having the feature.
+
+    /**
+     * "Play next": insert [track] immediately after the track that is playing.
+     *
+     * The current track's own position never moves — the insertion happens
+     * strictly after it, or at the very front when there is no current track
+     * to speak of — so [Queue.index] is carried through unchanged rather than
+     * recomputed.
+     */
+    fun playNext(queue: Queue, track: Track): Queue {
+        val insertAt = (queue.index + 1).coerceIn(0, queue.tracks.size)
+        val tracks = queue.tracks.toMutableList().apply { add(insertAt, track) }
+        return queue.copy(tracks = tracks, index = queue.index)
+    }
+
+    /**
+     * "Add to queue": append [track] at the end.
+     *
+     * An append never shifts anything before it, current track included, so
+     * this is the one mutation that needs no index arithmetic at all.
+     */
+    fun addToQueue(queue: Queue, track: Track): Queue =
+        queue.copy(tracks = queue.tracks + track, index = queue.index)
+
+    /**
+     * Remove the row at [at].
+     *
+     * Removing anything **other** than the current track leaves it current
+     * still — its identity does not change — and only its numeric position
+     * does, by one, and only when the removed row sat before it.
+     *
+     * Removing the **current** track is the interesting case, and the answer
+     * is: **the slot stays where it was and inherits whatever now sits
+     * there.** That is the track [nextTrack] already calls "next" — the one
+     * that was playing after this one — so playback continuing onto it is the
+     * same neighbour the person would have reached by pressing next anyway.
+     * At the very end of the queue there is no next, so the slot clamps to the
+     * new last row instead, which is what used to be *previous* — still a
+     * neighbour, never nothing, the same "always land on something" rule
+     * [backStep] already follows for the button beside this one.
+     *
+     * Emptying the queue this way returns **`null`**, not a `Queue` with
+     * nothing in it. A `Queue` holding an out-of-range index is a dangling
+     * pointer waiting to be dereferenced by whoever reads [Queue.current]
+     * next; `null` is the same "no list to speak of" answer [queueFrom]
+     * already gives every source that is not a list, so a caller that already
+     * handles a `null` queue handles this for free. What happens on screen
+     * when the last thing left is removed — stop, or fall back to something
+     * else — is the caller's question, not this file's; what this file
+     * guarantees is that it is never asked to draw a `Queue` claiming a track
+     * that is not there.
+     *
+     * Total: an [at] outside the list is a no-op, the same answer [movedTo]
+     * gives a target that does not exist.
+     */
+    fun removeAt(queue: Queue, at: Int): Queue? {
+        if (queue.tracks.isEmpty()) return null
+        if (at !in queue.tracks.indices) return queue
+        val tracks = queue.tracks.toMutableList().also { it.removeAt(at) }
+        if (tracks.isEmpty()) return null
+        val index = when {
+            at < queue.index -> queue.index - 1
+            at > queue.index -> queue.index
+            else -> queue.index.coerceAtMost(tracks.size - 1)
+        }
+        return queue.copy(tracks = tracks, index = index)
+    }
+
+    /**
+     * Drag-reorder the queue. [reorderedOrder] is the permutation; this only
+     * applies it to the tracks and then asks the permutation the one question
+     * it exists to answer, without a second implementation of the same
+     * arithmetic: where the track at [Queue.index] ended up.
+     */
+    fun moveInQueue(queue: Queue, from: Int, to: Int): Queue {
+        val count = queue.tracks.size
+        if (count == 0) return queue
+        val order = reorderedOrder(count, from, to)
+        val tracks = order.map { queue.tracks[it] }
+        return queue.copy(tracks = tracks, index = order.indexOf(queue.index))
+    }
+
+    /**
+     * The person tapped a row in the up-next sheet.
+     *
+     * Not a second implementation: a tap in the list is exactly [movedTo]'s
+     * question ("the queue, moved to `to`") asked from a different screen, and
+     * a thin alias is what keeps the two answers from being able to drift
+     * apart from each other.
+     */
+    fun jumpTo(queue: Queue, at: Int): Queue? = movedTo(queue, at)
+
+    /**
+     * "Clear up next": drop everything **after** the current track, keeping
+     * the track itself and everything before it.
+     *
+     * History is not up next, so it is not touched — only what would show in
+     * [upNext] disappears. An [Queue.index] that is not actually in the queue
+     * (a `Queue` built by hand rather than by this file) has nothing to
+     * anchor on, so it is left untouched rather than guessed at.
+     */
+    fun clearUpNext(queue: Queue): Queue =
+        if (queue.index !in queue.tracks.indices) {
+            queue
+        } else {
+            queue.copy(tracks = queue.tracks.take(queue.index + 1))
+        }
+
     // ── Player extras: shuffle, repeat, speed, sleep ─────────────────────────
 
     /**
@@ -1687,6 +1805,96 @@ object TogetherDecisions {
         return (currentIndex + 1).takeIf { it < count }
     }
 
+    // ── What the up-next list shows, and what a mutation does to a shuffle ──
+    //
+    // A mutation above changes `Queue.tracks`, and `shuffledOrder`'s output is
+    // a permutation of *positions* in that list — insert, remove or
+    // drag-reorder, and every position after the change names a different
+    // track than it did a moment ago. Reusing the old order past that point is
+    // not merely stale, it is a queue that silently plays the wrong song,
+    // which is the failure this section exists to make impossible rather than
+    // unlikely.
+    //
+    // `manualNextIndex` above (and `nextIndexOnEnd`, `previousIndexWith`)
+    // already carry one layer of protection for free: each refuses an order
+    // whose `size` does not match the live track count and falls back to
+    // plain sequence. That catches every mutation that changes how many
+    // tracks there are — [playNext], [addToQueue], [removeAt], [clearUpNext]
+    // — automatically. It does **not** catch [moveInQueue]: a drag-reorder
+    // keeps the same count, so a stale order slips straight past that guard
+    // and points at whichever track now happens to sit at the position it
+    // used to name. [carryOverOrder] is the fix for that case, and every
+    // count-preserving mutation besides — it must be called by whoever holds
+    // a live order, since this file keeps no state of its own to call it from.
+
+    /**
+     * The tracks after the one playing now, for the up-next sheet.
+     *
+     * **Never includes the current track**: it already has its own "now
+     * playing" display, and repeating it atop this list would say the same
+     * song is both playing and about to play. **Always follows [order]** by
+     * walking [manualNextIndex] rather than the plain file list, because a
+     * sheet that showed file order while shuffle actually played something
+     * else would be lying about what comes next — the one failure this
+     * section's own header names.
+     *
+     * Total at [limit]: stops early at the end of the queue rather than
+     * padding, and a non-positive [limit] is an empty sheet.
+     */
+    fun upNext(queue: Queue, order: List<Int>?, limit: Int): List<Track> {
+        if (limit <= 0) return emptyList()
+        val out = mutableListOf<Track>()
+        var at = queue.index
+        while (out.size < limit) {
+            val next = manualNextIndex(order, at, queue.tracks.size) ?: break
+            out += queue.tracks[next]
+            at = next
+        }
+        return out
+    }
+
+    /**
+     * Carry a live shuffle order across a queue mutation that keeps the same
+     * track current — [playNext], [addToQueue], [moveInQueue] and
+     * [clearUpNext]. **Not** for a mutation that removed the current track
+     * itself; see below.
+     *
+     * Walks [oldOrder] by **identity** (a track's `uri`, the same key
+     * [queueFrom] looks a track up by) rather than by number, because the
+     * number is exactly what the mutation just changed the meaning of.
+     * Whatever the mutation removed drops out silently; whatever it added is
+     * filed onto the **end**, in the new list's order, because a newly queued
+     * track was never part of the draw and inserting it into the middle would
+     * invent a position for it that no shuffle ever chose. A track that
+     * appears more than once (the same `uri` queued twice) is matched to the
+     * first remaining occurrence, one at a time, so two copies of one song
+     * cannot collapse onto a single slot.
+     *
+     * **Not for a mutation that removed the current track.** That changes
+     * *which* track is current, and a fresh [shuffledOrder] anchored at the
+     * new current index is the right answer there — this function preserves
+     * identity, not [shuffledOrder]'s "current track leads" contract, and
+     * calling it after the current track's own removal would carry the old
+     * leader's position forward as an ordinary row instead of restarting the
+     * lead from whoever is playing now.
+     */
+    fun carryOverOrder(oldOrder: List<Int>, oldTracks: List<Track>, newTracks: List<Track>): List<Int> {
+        if (newTracks.isEmpty()) return emptyList()
+        val remaining = LinkedHashMap<String, ArrayDeque<Int>>()
+        for ((i, t) in newTracks.withIndex()) remaining.getOrPut(t.uri) { ArrayDeque() }.addLast(i)
+        val used = HashSet<Int>()
+        val carried = mutableListOf<Int>()
+        for (oldIndex in oldOrder) {
+            val uri = oldTracks.getOrNull(oldIndex)?.uri ?: continue
+            val bucket = remaining[uri] ?: continue
+            val newIndex = bucket.firstOrNull { it !in used } ?: continue
+            used += newIndex
+            carried += newIndex
+        }
+        for (i in newTracks.indices) if (i !in used) carried += i
+        return carried
+    }
+
     /**
      * Whether a playback-speed control makes sense right now.
      *
@@ -1709,6 +1917,241 @@ object TogetherDecisions {
         val started = startedAtMs ?: return null
         val remaining = durationMs - (nowMs - started)
         return remaining.takeIf { it > 0 }
+    }
+
+    /**
+     * Whether the sleep timer says stop, in either of its two modes.
+     *
+     * The wall-clock mode ([endOfTrack] `false`) is what a duration-only
+     * timer gives every music player its one complaint about: [endsAtMs] is a
+     * fixed instant and the timer fires there wherever in the track that
+     * happens to land, mid-song more often than not. The end-of-track mode
+     * answers a different question — stop at the next natural pause rather
+     * than an arbitrary one — by treating [endsAtMs] as a **floor** rather
+     * than a deadline: the timer must not fire *before* the requested time
+     * (that would shorten "thirty minutes", not honour it), but once past it,
+     * it waits for [positionMs] to reach [durationMs] instead of firing the
+     * instant the clock ticks over. Passing `0` for [endsAtMs] with
+     * [endOfTrack] `true` is then "stop at the end of *this* track, whenever
+     * that is" with no deadline at all — the same rule, at its own floor.
+     *
+     * [durationMs] `<= 0` cannot supply an honest "end of track" — an embed
+     * before it has loaded, or an external session, which never reports one
+     * — so that combination falls back to the wall clock rather than a timer
+     * that silently never stops, which is the worse of the two wrong answers.
+     *
+     * A pure poll rather than a callback, like [sleepRemainingMs] beside it:
+     * the manager calls this on the same tick it already reads the playhead
+     * on, so no new timer thread is needed for the new mode.
+     */
+    fun sleepTimerDone(
+        endsAtMs: Long,
+        nowMs: Long,
+        positionMs: Long,
+        durationMs: Long,
+        endOfTrack: Boolean,
+    ): Boolean {
+        if (nowMs < endsAtMs) return false
+        if (!endOfTrack || durationMs <= 0) return true
+        return positionMs >= durationMs
+    }
+
+    // ── Media notification and hardware-key decisions ────────────────────────
+    //
+    // The notification and lock-screen controls are built against these, not
+    // against a second reading of `Transport` in `ui/TogetherScreen.kt` — two
+    // readings of "when is next available" is exactly the drift this file
+    // exists to prevent one section up.
+
+    /** One control slot on the media notification / lock screen. */
+    enum class NotificationAction { SKIP_PREVIOUS, PLAY, PAUSE, SKIP_NEXT }
+
+    /**
+     * Which transport actions belong on the notification, in the order they
+     * sit.
+     *
+     * **Previous is never left out.** [backStep] always does something — it
+     * restarts the current track when there is nothing behind it — the same
+     * reasoning `Transport` in `ui/TogetherScreen.kt` already gives for never
+     * greying its own previous button out. [hasPrevious] is accepted for
+     * symmetry with [hasNext] and is not what decides this; a caller that
+     * ever computes it `false` has not found a case this file's own back
+     * button lacks.
+     *
+     * **Next genuinely can be absent** — [hasNext] mirrors [nextTrack]
+     * returning `null`, the same fact `Transport` greys its own next button
+     * on, because a pasted link and a picked file are each one thing with
+     * nothing to skip to.
+     *
+     * **[external] returns nothing at all.** An external session is another
+     * app's audio, reached through `ExternalSessionPlayer` as a proxy, and
+     * that app already carries its own `MediaSession` — which the platform is
+     * already turning into its own notification with its own transport.
+     * Adding a second, Comrade-branded set of buttons over the same audio
+     * would not be a convenience, it would be two notifications disagreeing
+     * about who is in charge of one stream — the same "Comrade holds no
+     * player" limit `ui/TogetherScreen.kt` already draws around the
+     * play-something-else button, for the same session.
+     */
+    fun notificationActions(
+        playing: Boolean,
+        hasNext: Boolean,
+        hasPrevious: Boolean,
+        external: Boolean,
+    ): List<NotificationAction> {
+        if (external) return emptyList()
+        val actions = mutableListOf(NotificationAction.SKIP_PREVIOUS)
+        actions += if (playing) NotificationAction.PAUSE else NotificationAction.PLAY
+        if (hasNext) actions += NotificationAction.SKIP_NEXT
+        return actions
+    }
+
+    /**
+     * Whether the notification / lock-screen seek bar may be dragged.
+     *
+     * The exact question [scrubbable] already answers for the in-app slider,
+     * and the exact same answer for the exact same reason — an external
+     * session reports no duration either surface can trust, and no duration
+     * at all is no distance for a thumb to express. Reusing it rather than
+     * writing "`> 0`" a second time is what keeps the two sliders from being
+     * able to disagree about when they may move.
+     */
+    fun mediaSeekAllowed(durationMs: Long, external: Boolean): Boolean = scrubbable(durationMs, external)
+
+    /**
+     * Headphones came out, or a Bluetooth speaker dropped — the routing that
+     * is left is the phone's own loudspeaker.
+     *
+     * **Pauses regardless of [solo], and that needs defending because pausing
+     * runs through `setState`, which in a paired session pauses the other
+     * person's device too.** The alternative — pausing only this device,
+     * quietly — is not actually available in this architecture to weigh
+     * against it: `setState` is the one channel that moves the session's
+     * playing state at all (`planCorrection`'s `adopt` arm takes it wholesale
+     * from a verdict), so a pause kept local would leave this device's player
+     * paused while the session still believed it playing — an unexplained
+     * divergence the next correction would have to paper back over. That is
+     * the same shape of interruption `TogetherManager.requestAudioFocus`'s
+     * own comment already accepts for losing audio focus outright ("pauses
+     * **and tells the peer**, so what they see is 'they paused' rather than
+     * an unexplained drift"), and a phone suddenly routing a film to its
+     * loudspeaker in someone's pocket is that same kind of interruption, not
+     * a different one. [solo] is threaded through so the two branches can be
+     * pinned as equal on purpose, rather than the equality being an accident
+     * of an unfinished `when`.
+     *
+     * `false` (nothing to do) when already paused — there is no playing state
+     * to leave.
+     */
+    fun becomingNoisyAction(playing: Boolean, solo: Boolean): Boolean = playing
+
+    /** Why audio focus changed, in `AudioManager`'s own four-way vocabulary. */
+    enum class FocusChange { GAIN, LOSS, LOSS_TRANSIENT, LOSS_TRANSIENT_CAN_DUCK }
+
+    /**
+     * What this device should do about a focus change, as a decision rather
+     * than a boolean — see [FocusWatch] for why a boolean cannot carry it.
+     */
+    sealed interface FocusOutcome {
+        /** Nothing to do. */
+        data object None : FocusOutcome
+
+        /** Pause, and remember that **this** is why — so a later gain may resume it. */
+        data object PauseAndRemember : FocusOutcome
+
+        /** Pause. A later gain must never resume this on its own. */
+        data object PauseForever : FocusOutcome
+
+        /** Lower the stream volume; play/pause is untouched. */
+        data class Duck(val volume: Float) : FocusOutcome
+
+        /** Restore full volume; play/pause is untouched. */
+        data object Unduck : FocusOutcome
+
+        /** Resume — reached only because *this* is what paused it. */
+        data object Resume : FocusOutcome
+    }
+
+    /**
+     * Typical duck level: loud enough to still hear the film's own sound is
+     * happening, quiet enough that it is not competing with whatever asked
+     * for focus.
+     */
+    const val DUCK_VOLUME: Float = 0.2f
+
+    /**
+     * Turns an `AudioManager` focus change into a decision, remembering
+     * exactly one bit across calls: **did we pause or duck this, or did the
+     * person.**
+     *
+     * That bit is the whole point, and the reason this is a class with state
+     * rather than the pure function the rest of this file prefers. A gain
+     * must resume playback that a transient loss paused, and must *never*
+     * resume playback the person paused deliberately a moment before losing
+     * focus — collapsing that distinction into "were we playing when we lost
+     * focus" is the "music started by itself" bug, because both cases answer
+     * that question the same way. So [focusAction] is asked, not computed:
+     * the flag it reads is the only source of truth for what a later
+     * [FocusChange.GAIN] is allowed to do, the same reason [EchoSuppressor]
+     * keeps a ledger instead of a boolean for its own version of "did we
+     * cause this."
+     *
+     * Not thread-safe, like [EchoSuppressor], [CoarsePlayhead] and
+     * [StallWatch]: it belongs to the thread that owns the focus listener.
+     */
+    class FocusWatch {
+        private var pausedByUs = false
+        private var duckedByUs = false
+
+        fun focusAction(change: FocusChange, playing: Boolean): FocusOutcome = when (change) {
+            FocusChange.LOSS_TRANSIENT_CAN_DUCK -> {
+                duckedByUs = true
+                FocusOutcome.Duck(DUCK_VOLUME)
+            }
+
+            FocusChange.LOSS_TRANSIENT ->
+                if (playing) {
+                    pausedByUs = true
+                    FocusOutcome.PauseAndRemember
+                } else {
+                    // Already paused, and not by us — nothing here has paused
+                    // anything yet. A later gain must not resume something
+                    // the person stopped on purpose.
+                    FocusOutcome.None
+                }
+
+            FocusChange.LOSS -> {
+                // Permanent, and not ours to reverse — whatever a later gain
+                // does, it must not be a resume, so both flags are cleared
+                // rather than left armed to fire on the next one.
+                pausedByUs = false
+                duckedByUs = false
+                if (playing) FocusOutcome.PauseForever else FocusOutcome.None
+            }
+
+            FocusChange.GAIN -> when {
+                // Resume wins over un-ducking: a duck followed by a transient
+                // loss with no gain in between leaves both flags set, and
+                // resuming already restores full volume, so there is nothing
+                // left for a separate Unduck to do.
+                pausedByUs -> {
+                    pausedByUs = false
+                    duckedByUs = false
+                    FocusOutcome.Resume
+                }
+                duckedByUs -> {
+                    duckedByUs = false
+                    FocusOutcome.Unduck
+                }
+                else -> FocusOutcome.None
+            }
+        }
+
+        /** A session ending, or the focus request itself abandoned. */
+        fun reset() {
+            pausedByUs = false
+            duckedByUs = false
+        }
     }
 
     // ── Lyrics ───────────────────────────────────────────────────────────────

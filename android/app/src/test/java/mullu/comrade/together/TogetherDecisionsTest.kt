@@ -1324,6 +1324,163 @@ class TogetherDecisionsTest {
         assertTrue(TogetherDecisions.reorderedOrder(0, 0, 1).isEmpty())
     }
 
+    // ── The queue: mutation ─────────────────────────────────────────────────
+    //
+    // The rule every one of these has to hold: `index` keeps pointing at the
+    // *same track*, wherever the mutation moved it to.
+
+    @Test
+    fun playNextInsertsRightAfterTheCurrentTrackAndTheCurrentTrackDoesNotMove() {
+        val queue = TogetherDecisions.Queue(threeTracks, 0) // "One"
+        val added = TogetherDecisions.playNext(queue, track("Inserted"))
+        assertEquals(listOf("One", "Inserted", "Two", "Three"), added.tracks.map { it.title })
+        assertEquals("still \"One\"", "One", added.current?.title)
+        assertEquals(0, added.index)
+    }
+
+    @Test
+    fun playNextAtTheEndOfTheQueueJustAppends() {
+        val queue = TogetherDecisions.Queue(threeTracks, 2) // "Three", the last row
+        val added = TogetherDecisions.playNext(queue, track("Inserted"))
+        assertEquals(listOf("One", "Two", "Three", "Inserted"), added.tracks.map { it.title })
+        assertEquals("Three", added.current?.title)
+    }
+
+    @Test
+    fun addToQueueAlwaysAppendsAndNeverMovesTheCurrentTrack() {
+        val queue = TogetherDecisions.Queue(threeTracks, 1) // "Two"
+        val added = TogetherDecisions.addToQueue(queue, track("Appended"))
+        assertEquals(listOf("One", "Two", "Three", "Appended"), added.tracks.map { it.title })
+        assertEquals("Two", added.current?.title)
+        assertEquals(1, added.index)
+    }
+
+    @Test
+    fun removingATrackBeforeTheCurrentOneShiftsItsPositionButNotItsIdentity() {
+        val queue = TogetherDecisions.Queue(threeTracks, 2) // "Three"
+        val after = TogetherDecisions.removeAt(queue, 0) // remove "One"
+        assertNotNull(after)
+        assertEquals(listOf("Two", "Three"), after!!.tracks.map { it.title })
+        assertEquals("still \"Three\", now one slot earlier", "Three", after.current?.title)
+        assertEquals(1, after.index)
+    }
+
+    @Test
+    fun removingATrackAfterTheCurrentOneDoesNotMoveItAtAll() {
+        val queue = TogetherDecisions.Queue(threeTracks, 0) // "One"
+        val after = TogetherDecisions.removeAt(queue, 2) // remove "Three"
+        assertNotNull(after)
+        assertEquals("One", after!!.current?.title)
+        assertEquals(0, after.index)
+    }
+
+    @Test
+    fun removingTheCurrentTrackHandsTheSlotToWhatWasNext() {
+        val queue = TogetherDecisions.Queue(threeTracks, 1) // "Two"
+        val after = TogetherDecisions.removeAt(queue, 1)
+        assertNotNull(after)
+        assertEquals(listOf("One", "Three"), after!!.tracks.map { it.title })
+        assertEquals(
+            "the slot that was current now holds what used to be next",
+            "Three",
+            after.current?.title,
+        )
+    }
+
+    @Test
+    fun removingTheLastTrackWhileItIsCurrentFallsBackToWhatWasPrevious() {
+        val queue = TogetherDecisions.Queue(threeTracks, 2) // "Three", last row
+        val after = TogetherDecisions.removeAt(queue, 2)
+        assertNotNull(after)
+        assertEquals(listOf("One", "Two"), after!!.tracks.map { it.title })
+        assertEquals(
+            "no next at the end, so the slot clamps to the new last row",
+            "Two",
+            after.current?.title,
+        )
+    }
+
+    @Test
+    fun removingTheOnlyTrackEmptiesTheQueueToNullRatherThanADanglingIndex() {
+        val queue = TogetherDecisions.Queue(listOf(threeTracks[0]), 0)
+        assertNull(
+            "a Queue with nothing in it is the no-list answer, same as queueFrom gives elsewhere",
+            TogetherDecisions.removeAt(queue, 0),
+        )
+    }
+
+    @Test
+    fun removeAtIsTotalOverOutOfRangeAndEmpty() {
+        val queue = TogetherDecisions.Queue(threeTracks, 1)
+        assertEquals("no-op on a target that is not a row", queue, TogetherDecisions.removeAt(queue, 99))
+        assertEquals("no-op on a negative target", queue, TogetherDecisions.removeAt(queue, -1))
+        assertNull(TogetherDecisions.removeAt(TogetherDecisions.Queue(emptyList(), 0), 0))
+    }
+
+    @Test
+    fun moveInQueueFollowsTheDraggedRowAndAlsoWhicheverRowWasCurrent() {
+        // Drag row 0 ("One") to the end. The current track is "Two", at index
+        // 1, and its own identity — not its number — is what must survive.
+        val queue = TogetherDecisions.Queue(threeTracks, 1)
+        val moved = TogetherDecisions.moveInQueue(queue, from = 0, to = 2)
+        assertEquals(listOf("Two", "Three", "One"), moved.tracks.map { it.title })
+        assertEquals("Two", moved.current?.title)
+        assertEquals(0, moved.index)
+    }
+
+    @Test
+    fun draggingTheCurrentRowItselfFollowsIt() {
+        val queue = TogetherDecisions.Queue(threeTracks, 0) // "One" is current
+        val moved = TogetherDecisions.moveInQueue(queue, from = 0, to = 2)
+        assertEquals("One", moved.current?.title)
+        assertEquals(2, moved.index)
+    }
+
+    @Test
+    fun moveInQueueIsTotalOverFromEqualsToAQueueOfOneAndEmpty() {
+        val queue = TogetherDecisions.Queue(threeTracks, 1)
+        val noop = TogetherDecisions.moveInQueue(queue, from = 2, to = 2)
+        assertEquals(queue.tracks.map { it.title }, noop.tracks.map { it.title })
+        assertEquals(1, noop.index)
+
+        val one = TogetherDecisions.Queue(listOf(threeTracks[0]), 0)
+        assertEquals("One", TogetherDecisions.moveInQueue(one, 0, 0).current?.title)
+
+        val empty = TogetherDecisions.Queue(emptyList(), 0)
+        assertTrue(TogetherDecisions.moveInQueue(empty, 0, 0).tracks.isEmpty())
+    }
+
+    @Test
+    fun jumpToIsMovedToUnderTheNameTheUpNextSheetActuallyUses() {
+        val queue = TogetherDecisions.Queue(threeTracks, 0)
+        assertEquals(TogetherDecisions.movedTo(queue, 2), TogetherDecisions.jumpTo(queue, 2))
+        assertNull(TogetherDecisions.jumpTo(queue, 99))
+    }
+
+    @Test
+    fun clearUpNextDropsWhatComesAfterButKeepsHistoryAndWhatIsPlaying() {
+        val queue = TogetherDecisions.Queue(threeTracks, 1) // "Two"
+        val cleared = TogetherDecisions.clearUpNext(queue)
+        assertEquals(listOf("One", "Two"), cleared.tracks.map { it.title })
+        assertEquals("Two", cleared.current?.title)
+        assertEquals(1, cleared.index)
+    }
+
+    @Test
+    fun clearUpNextOnTheLastTrackIsANoOpAndOnAQueueOfOneToo() {
+        val atEnd = TogetherDecisions.Queue(threeTracks, 2)
+        assertEquals(threeTracks.map { it.title }, TogetherDecisions.clearUpNext(atEnd).tracks.map { it.title })
+
+        val one = TogetherDecisions.Queue(listOf(threeTracks[0]), 0)
+        assertEquals(1, TogetherDecisions.clearUpNext(one).tracks.size)
+    }
+
+    @Test
+    fun clearUpNextWithNoValidCurrentIndexIsLeftUntouched() {
+        val broken = TogetherDecisions.Queue(threeTracks, 99)
+        assertEquals(threeTracks, TogetherDecisions.clearUpNext(broken).tracks)
+    }
+
     // ── Answering an invitation ─────────────────────────────────────────────
 
     @Test
@@ -1699,6 +1856,95 @@ class TogetherDecisionsTest {
         assertEquals(order.getOrNull(at + 1), TogetherDecisions.manualNextIndex(order, 0, 4))
     }
 
+    // ── The up-next sheet, and a shuffle order surviving a mutation ─────────
+
+    @Test
+    fun upNextNeverRepeatsTheCurrentTrackAndFollowsFileOrderWithNoShuffle() {
+        val queue = TogetherDecisions.Queue(threeTracks, 0) // "One"
+        assertEquals(
+            listOf("Two", "Three"),
+            TogetherDecisions.upNext(queue, order = null, limit = 5).map { it.title },
+        )
+    }
+
+    @Test
+    fun upNextStopsAtTheEndRatherThanPaddingAndAnswersNothingAtANonPositiveLimit() {
+        val queue = TogetherDecisions.Queue(threeTracks, 1) // "Two"
+        assertEquals(listOf("Three"), TogetherDecisions.upNext(queue, null, limit = 5).map { it.title })
+        assertTrue(TogetherDecisions.upNext(queue, null, limit = 0).isEmpty())
+        assertTrue(TogetherDecisions.upNext(queue, null, limit = -1).isEmpty())
+    }
+
+    @Test
+    fun upNextFollowsTheShuffleOrderRatherThanTheFileListOrItWouldBeLying() {
+        val order = TogetherDecisions.shuffledOrder(3, keepFirst = 0, kotlin.random.Random(11))
+        val queue = TogetherDecisions.Queue(threeTracks, 0)
+        val fromManual = generateSequence(0) { TogetherDecisions.manualNextIndex(order, it, 3) }
+            .drop(1)
+            .toList()
+            .map { threeTracks[it].title }
+        assertEquals(fromManual, TogetherDecisions.upNext(queue, order, limit = 5).map { it.title })
+    }
+
+    @Test
+    fun aReorderWithoutCarryingTheOrderCanNameTheWrongNextSong() {
+        // The trap the whole section is about: moveInQueue keeps the same
+        // track count, so a stale order slips past the `order.size == count`
+        // guard `manualNextIndex` already has, and still resolves to *a*
+        // track — just not the one the shuffle actually meant.
+        val four = listOf(track("A"), track("B"), track("C"), track("D"))
+        val queue = TogetherDecisions.Queue(four, 0) // "A"
+        val order = listOf(0, 3, 1, 2) // by identity: A, D, B, C
+
+        val moved = TogetherDecisions.moveInQueue(queue, from = 1, to = 0) // drag "B" to the front
+        assertEquals(listOf("B", "A", "C", "D"), moved.tracks.map { it.title })
+        assertEquals("A", moved.current?.title)
+
+        // Reusing the pre-mutation order as-is: still a valid-looking index,
+        // still the wrong song.
+        val staleNext = TogetherDecisions.manualNextIndex(order, moved.index, moved.tracks.size)
+        assertEquals(
+            "the bug this section exists to prevent: a plausible index naming the wrong track",
+            "C",
+            staleNext?.let { moved.tracks[it].title },
+        )
+
+        // Carried by identity instead, "A"'s real neighbour — "D" — survives
+        // the drag.
+        val carried = TogetherDecisions.carryOverOrder(order, queue.tracks, moved.tracks)
+        val correctNext = TogetherDecisions.manualNextIndex(carried, moved.index, moved.tracks.size)
+        assertEquals("D", correctNext?.let { moved.tracks[it].title })
+    }
+
+    @Test
+    fun carryOverOrderKeepsTheCurrentTrackLeadingWhenItSurvivesTheMutation() {
+        val order = TogetherDecisions.shuffledOrder(3, keepFirst = 0, kotlin.random.Random(3))
+        val added = TogetherDecisions.addToQueue(TogetherDecisions.Queue(threeTracks, 0), track("Appended"))
+        val carried = TogetherDecisions.carryOverOrder(order, threeTracks, added.tracks)
+        assertEquals(
+            "current track was first in the old order and was not removed, so it leads still",
+            "One",
+            added.tracks[carried.first()].title,
+        )
+        // The newly queued track was never part of the draw; it is filed at
+        // the end rather than shuffled into the middle.
+        assertEquals("Appended", added.tracks[carried.last()].title)
+    }
+
+    @Test
+    fun carryOverOrderDropsWhatWasRemovedAndKeepsTheRestInPlace() {
+        val order = listOf(0, 2, 1) // One, Three, Two
+        val removed = TogetherDecisions.removeAt(TogetherDecisions.Queue(threeTracks, 0), 2)!! // drop "Three"
+        val carried = TogetherDecisions.carryOverOrder(order, threeTracks, removed.tracks)
+        assertEquals(listOf("One", "Two"), carried.map { removed.tracks[it].title })
+    }
+
+    @Test
+    fun carryOverOrderIsTotalOnAnEmptyOldOrderAndAnEmptyNewList() {
+        assertEquals(listOf(0, 1, 2), TogetherDecisions.carryOverOrder(emptyList(), threeTracks, threeTracks))
+        assertTrue(TogetherDecisions.carryOverOrder(listOf(0, 1, 2), threeTracks, emptyList()).isEmpty())
+    }
+
     @Test
     fun speedIsASoloLuxuryAndSnapsToItsSteps() {
         assertTrue(TogetherDecisions.speedAllowed(solo = true))
@@ -1717,6 +1963,242 @@ class TogetherDecisionsTest {
         // message equals the value, which is how this line once passed a null
         // expectation against the string it was named with.
         assertNull("expired is none", TogetherDecisions.sleepRemainingMs(1_000, 600_000, 601_000))
+    }
+
+    // ── The sleep timer's end-of-track mode ─────────────────────────────────
+
+    @Test
+    fun wallClockModeStopsTheInstantTheDeadlineArrivesWhereverInTheTrackThatIs() {
+        assertFalse(TogetherDecisions.sleepTimerDone(10_000, 9_999, 500, 200_000, endOfTrack = false))
+        assertTrue(
+            TogetherDecisions.sleepTimerDone(10_000, 10_000, positionMs = 500, durationMs = 200_000, endOfTrack = false),
+        )
+    }
+
+    @Test
+    fun endOfTrackModeWaitsPastTheDeadlineForTheTrackToActuallyEnd() {
+        // Deadline reached, but the song is still going: not done yet.
+        assertFalse(
+            TogetherDecisions.sleepTimerDone(
+                endsAtMs = 10_000, nowMs = 20_000, positionMs = 100_000, durationMs = 200_000, endOfTrack = true,
+            ),
+        )
+        // The track reaches its own end: done.
+        assertTrue(
+            TogetherDecisions.sleepTimerDone(
+                endsAtMs = 10_000, nowMs = 20_000, positionMs = 200_000, durationMs = 200_000, endOfTrack = true,
+            ),
+        )
+    }
+
+    @Test
+    fun endOfTrackModeNeverFiresBeforeItsOwnDeadlineEitherWayWhichIsTheWholePointOfAFloor() {
+        assertFalse(
+            "a floor must not fire early just because the track happens to end early",
+            TogetherDecisions.sleepTimerDone(
+                endsAtMs = 30_000, nowMs = 10_000, positionMs = 200_000, durationMs = 200_000, endOfTrack = true,
+            ),
+        )
+    }
+
+    @Test
+    fun aZeroDeadlineWithEndOfTrackModeMeansStopAtTheNextNaturalEndWithNoTimerAtAll() {
+        assertFalse(
+            TogetherDecisions.sleepTimerDone(
+                endsAtMs = 0, nowMs = 1_000, positionMs = 50_000, durationMs = 200_000, endOfTrack = true,
+            ),
+        )
+        assertTrue(
+            TogetherDecisions.sleepTimerDone(
+                endsAtMs = 0, nowMs = 1_000, positionMs = 200_000, durationMs = 200_000, endOfTrack = true,
+            ),
+        )
+    }
+
+    @Test
+    fun endOfTrackModeWithNoTrustworthyLengthFallsBackToTheWallClockRatherThanNeverStopping() {
+        // An embed before it loads, or an external session, which never
+        // reports one at all. A timer that silently never stops is worse than
+        // one that stops on the wall clock it was also given.
+        for (badDuration in listOf(0L, -1L)) {
+            assertTrue(
+                "duration $badDuration",
+                TogetherDecisions.sleepTimerDone(
+                    endsAtMs = 10_000, nowMs = 10_000, positionMs = 500, durationMs = badDuration, endOfTrack = true,
+                ),
+            )
+        }
+    }
+
+    // ── Media notification and hardware-key decisions ───────────────────────
+
+    @Test
+    fun previousIsAlwaysOnTheNotificationBecauseItAlwaysDoesSomething() {
+        for (hasNext in listOf(true, false)) {
+            for (hasPrevious in listOf(true, false)) {
+                assertTrue(
+                    "hasNext=$hasNext hasPrevious=$hasPrevious",
+                    TogetherDecisions.notificationActions(true, hasNext, hasPrevious, external = false)
+                        .contains(TogetherDecisions.NotificationAction.SKIP_PREVIOUS),
+                )
+            }
+        }
+    }
+
+    @Test
+    fun nextIsOnTheNotificationOnlyWhenThereIsSomewhereToSkipTo() {
+        val withNext = TogetherDecisions.notificationActions(true, hasNext = true, hasPrevious = true, external = false)
+        assertTrue(withNext.contains(TogetherDecisions.NotificationAction.SKIP_NEXT))
+        val withoutNext =
+            TogetherDecisions.notificationActions(true, hasNext = false, hasPrevious = true, external = false)
+        assertFalse(withoutNext.contains(TogetherDecisions.NotificationAction.SKIP_NEXT))
+    }
+
+    @Test
+    fun theNotificationShowsPauseWhilePlayingAndPlayWhilePaused() {
+        val playing = TogetherDecisions.notificationActions(true, true, true, external = false)
+        assertTrue(playing.contains(TogetherDecisions.NotificationAction.PAUSE))
+        assertFalse(playing.contains(TogetherDecisions.NotificationAction.PLAY))
+        val paused = TogetherDecisions.notificationActions(false, true, true, external = false)
+        assertTrue(paused.contains(TogetherDecisions.NotificationAction.PLAY))
+        assertFalse(paused.contains(TogetherDecisions.NotificationAction.PAUSE))
+    }
+
+    @Test
+    fun anExternalSessionGetsNoTransportActionsAtAllOnComradesOwnNotification() {
+        // The followed app already carries its own MediaSession notification;
+        // a second, Comrade-branded transport over the same audio is two
+        // notifications disagreeing about who is in charge of one stream.
+        assertTrue(
+            TogetherDecisions.notificationActions(true, hasNext = true, hasPrevious = true, external = true).isEmpty(),
+        )
+    }
+
+    @Test
+    fun mediaSeekAllowedIsExactlyScrubbable() {
+        for (duration in listOf(0L, -1L, 180_000L)) {
+            for (external in listOf(true, false)) {
+                assertEquals(
+                    TogetherDecisions.scrubbable(duration, external),
+                    TogetherDecisions.mediaSeekAllowed(duration, external),
+                )
+            }
+        }
+    }
+
+    @Test
+    fun becomingNoisyAlwaysPausesWhilePlayingWhateverSoloSays() {
+        assertTrue(TogetherDecisions.becomingNoisyAction(playing = true, solo = true))
+        assertTrue(TogetherDecisions.becomingNoisyAction(playing = true, solo = false))
+    }
+
+    @Test
+    fun becomingNoisyDoesNothingWhenAlreadyPaused() {
+        assertFalse(TogetherDecisions.becomingNoisyAction(playing = false, solo = true))
+        assertFalse(TogetherDecisions.becomingNoisyAction(playing = false, solo = false))
+    }
+
+    // ── Audio focus, and the bit that stops music starting by itself ────────
+
+    @Test
+    fun aTransientLossPausesAndRemembersDoingItSo() {
+        val w = TogetherDecisions.FocusWatch()
+        assertEquals(
+            TogetherDecisions.FocusOutcome.PauseAndRemember,
+            w.focusAction(TogetherDecisions.FocusChange.LOSS_TRANSIENT, playing = true),
+        )
+    }
+
+    @Test
+    fun aGainResumesOnlyBecauseATransientLossIsWhatPausedIt() {
+        val w = TogetherDecisions.FocusWatch()
+        w.focusAction(TogetherDecisions.FocusChange.LOSS_TRANSIENT, playing = true)
+        assertEquals(
+            TogetherDecisions.FocusOutcome.Resume,
+            w.focusAction(TogetherDecisions.FocusChange.GAIN, playing = false),
+        )
+    }
+
+    @Test
+    fun aGainMustNeverResumeMusicThePersonPausedOnPurpose() {
+        // The "music started by itself" bug: a transient loss arriving while
+        // already paused must not arm a resume for the gain that follows it.
+        val w = TogetherDecisions.FocusWatch()
+        assertEquals(
+            TogetherDecisions.FocusOutcome.None,
+            w.focusAction(TogetherDecisions.FocusChange.LOSS_TRANSIENT, playing = false),
+        )
+        assertEquals(
+            TogetherDecisions.FocusOutcome.None,
+            w.focusAction(TogetherDecisions.FocusChange.GAIN, playing = false),
+        )
+    }
+
+    @Test
+    fun duckableLossLowersVolumeWithoutTouchingPlayback() {
+        val w = TogetherDecisions.FocusWatch()
+        assertEquals(
+            TogetherDecisions.FocusOutcome.Duck(TogetherDecisions.DUCK_VOLUME),
+            w.focusAction(TogetherDecisions.FocusChange.LOSS_TRANSIENT_CAN_DUCK, playing = true),
+        )
+    }
+
+    @Test
+    fun aGainAfterOnlyDuckingRestoresVolumeRatherThanResuming() {
+        val w = TogetherDecisions.FocusWatch()
+        w.focusAction(TogetherDecisions.FocusChange.LOSS_TRANSIENT_CAN_DUCK, playing = true)
+        assertEquals(
+            TogetherDecisions.FocusOutcome.Unduck,
+            w.focusAction(TogetherDecisions.FocusChange.GAIN, playing = true),
+        )
+    }
+
+    @Test
+    fun permanentLossPausesAndAGainAfterItNeverResumes() {
+        val w = TogetherDecisions.FocusWatch()
+        assertEquals(
+            TogetherDecisions.FocusOutcome.PauseForever,
+            w.focusAction(TogetherDecisions.FocusChange.LOSS, playing = true),
+        )
+        assertEquals(
+            "a permanent loss must never be reversed by a later gain",
+            TogetherDecisions.FocusOutcome.None,
+            w.focusAction(TogetherDecisions.FocusChange.GAIN, playing = false),
+        )
+    }
+
+    @Test
+    fun aPermanentLossAfterATransientOneCancelsTheRememberedResume() {
+        val w = TogetherDecisions.FocusWatch()
+        w.focusAction(TogetherDecisions.FocusChange.LOSS_TRANSIENT, playing = true)
+        w.focusAction(TogetherDecisions.FocusChange.LOSS, playing = false)
+        assertEquals(
+            "the transient loss's own resume flag must not survive a permanent loss on top of it",
+            TogetherDecisions.FocusOutcome.None,
+            w.focusAction(TogetherDecisions.FocusChange.GAIN, playing = false),
+        )
+    }
+
+    @Test
+    fun resumeWinsOverUnduckingWhenBothFlagsHappenToBeSet() {
+        val w = TogetherDecisions.FocusWatch()
+        w.focusAction(TogetherDecisions.FocusChange.LOSS_TRANSIENT_CAN_DUCK, playing = true)
+        w.focusAction(TogetherDecisions.FocusChange.LOSS_TRANSIENT, playing = true)
+        assertEquals(
+            TogetherDecisions.FocusOutcome.Resume,
+            w.focusAction(TogetherDecisions.FocusChange.GAIN, playing = false),
+        )
+    }
+
+    @Test
+    fun resetForgetsWhoPausedOrDuckedAnything() {
+        val w = TogetherDecisions.FocusWatch()
+        w.focusAction(TogetherDecisions.FocusChange.LOSS_TRANSIENT, playing = true)
+        w.reset()
+        assertEquals(
+            TogetherDecisions.FocusOutcome.None,
+            w.focusAction(TogetherDecisions.FocusChange.GAIN, playing = false),
+        )
     }
 
     @Test

@@ -293,18 +293,18 @@ private fun InlinePreviewImage(pending: PendingAttachment, bytes: ByteArray) {
  * A 10 MB JPEG can be 50 megapixels, which is 200 MB of ARGB_8888 and an OOM on
  * a mid-range phone — for a thumbnail that will be drawn 280 dp tall. The
  * original bytes are what gets sent; this is only what gets looked at.
+ *
+ * The bounds-then-sample shape, and the power-of-two arithmetic itself, live in
+ * [BitmapBudget] — shared with [MediaCache.decodeImage] and
+ * `ProfileScreen.decodeAvatar` rather than re-derived here a third time.
  */
 private fun decodePreview(bytes: ByteArray): Bitmap? {
     val probe = BitmapFactory.Options().apply { inJustDecodeBounds = true }
     BitmapFactory.decodeByteArray(bytes, 0, bytes.size, probe)
     if (probe.outWidth <= 0 || probe.outHeight <= 0) return null
-    var sample = 1
-    while (
-        (probe.outWidth / sample).toLong() * (probe.outHeight / sample) > PREVIEW_MAX_PIXELS
-    ) {
-        sample *= 2
+    val options = BitmapFactory.Options().apply {
+        inSampleSize = BitmapBudget.sampleSizeFor(probe.outWidth, probe.outHeight, PREVIEW_MAX_PIXELS)
     }
-    val options = BitmapFactory.Options().apply { inSampleSize = sample }
     return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
 }
 

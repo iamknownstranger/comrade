@@ -1,10 +1,7 @@
 package mullu.comrade.ui
 
-import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import android.util.Base64
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -38,108 +35,8 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
-import androidx.core.content.FileProvider
-import java.io.File
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import mullu.comrade.ComradeCore
-
-/**
- * Decrypts an encrypted NIP-94/96 attachment on demand and caches the
- * plaintext, so re-viewing (or scrolling past and back to) an attachment
- * never re-decrypts or re-downloads it.
- *
- * Images decode straight to an in-memory [Bitmap] (a small bounded LRU —
- * never touching disk) since that's the common, low-risk case. Audio, video,
- * and generic files need an actual file path/URI for `MediaPlayer`/
- * `VideoView`/`Intent.ACTION_VIEW` to work at all, so those are written to
- * the app-private cache dir (never backed up — see AndroidManifest's
- * `allowBackup=false`) and reused by event id.
- */
-internal object MediaCache {
-    private const val BITMAP_CACHE_CAPACITY = 24
-
-    // Insertion-ordered map used as a simple bounded LRU: re-inserting a key
-    // (done on every cache hit, see decodeImage) moves it to the end, so the
-    // key at the front is always the least-recently-used one to evict.
-    private val bitmapCache = LinkedHashMap<String, Bitmap>()
-    private val fileMemo = HashMap<String, File>()
-
-    private fun cachedBitmap(eventId: String): Bitmap? = synchronized(bitmapCache) {
-        bitmapCache.remove(eventId)?.also { bitmapCache[eventId] = it }
-    }
-
-    private fun cacheBitmap(eventId: String, bitmap: Bitmap) = synchronized(bitmapCache) {
-        bitmapCache.remove(eventId)
-        bitmapCache[eventId] = bitmap
-        while (bitmapCache.size > BITMAP_CACHE_CAPACITY) {
-            bitmapCache.keys.firstOrNull()?.let(bitmapCache::remove) ?: break
-        }
-    }
-
-    private fun extensionFor(mime: String): String = when (mime) {
-        "image/jpeg" -> "jpg"
-        "image/png" -> "png"
-        "image/webp" -> "webp"
-        "image/gif" -> "gif"
-        "audio/mpeg" -> "mp3"
-        "audio/ogg", "audio/oga" -> "ogg"
-        "audio/wav" -> "wav"
-        "audio/aac" -> "aac"
-        "video/mp4" -> "mp4"
-        "application/pdf" -> "pdf"
-        else -> "bin"
-    }
-
-    suspend fun decodeImage(info: ComradeCore.MediaMessageInfo): Bitmap = withContext(Dispatchers.IO) {
-        cachedBitmap(info.eventId)?.let { return@withContext it }
-        val bytes = ComradeCore.downloadMediaTyped(info.eventId)
-        val raw = Base64.decode(bytes.base64, Base64.NO_WRAP)
-        val bitmap = BitmapFactory.decodeByteArray(raw, 0, raw.size)
-            ?: error("Could not decode image")
-        cacheBitmap(info.eventId, bitmap)
-        bitmap
-    }
-
-    suspend fun resolveFile(context: Context, info: ComradeCore.MediaMessageInfo): File =
-        withContext(Dispatchers.IO) {
-            synchronized(fileMemo) { fileMemo[info.eventId] }
-                ?.let { if (it.exists()) return@withContext it }
-            val dir = File(context.cacheDir, "media").apply { mkdirs() }
-            val file = File(dir, "${info.eventId}.${extensionFor(info.mimeType)}")
-            if (!file.exists()) {
-                val bytes = ComradeCore.downloadMediaTyped(info.eventId)
-                file.writeBytes(Base64.decode(bytes.base64, Base64.NO_WRAP))
-            }
-            synchronized(fileMemo) { fileMemo[info.eventId] = file }
-            file
-        }
-
-    fun uriFor(context: Context, file: File) =
-        FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
-
-    /**
-     * Drop every decrypted plaintext this cache is holding: the in-memory image
-     * LRU and each file written under `cacheDir/media`. Anything still needed is
-     * transparently re-decrypted on next view, so this is safe to call any time
-     * the app should not be sitting on plaintext (backgrounded / vault locked).
-     */
-    fun clear(context: Context) {
-        synchronized(bitmapCache) { bitmapCache.clear() }
-        synchronized(fileMemo) { fileMemo.clear() }
-        val dir = File(context.cacheDir, "media")
-        dir.listFiles()?.forEach { it.delete() }
-    }
-}
-
-/**
- * Wipe all decrypted media the app has cached to `cacheDir/media` (and the
- * in-memory bitmap LRU). Called when the app is backgrounded or the vault is
- * locked so plaintext attachments — including received voice notes — never
- * outlive a foreground session on disk (AUDIT S-4).
- */
-internal fun purgeDecryptedMedia(context: Context) = MediaCache.clear(context)
 
 /**
  * A chat bubble for one NIP-94/96 attachment — renders images, audio, and

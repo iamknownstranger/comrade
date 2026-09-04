@@ -238,6 +238,16 @@ class TogetherPlayer(private val context: Context) : SessionPlayer {
         }.onFailure { Log.w(TAG, "rate trim failed", it) }
     }
 
+    /**
+     * The decoder's own output level. Applied to both channels equally — this
+     * is a duck, not a pan.
+     */
+    override fun setVolume(level: Float) {
+        val v = level.coerceIn(0f, 1f)
+        runCatching { player?.setVolume(v, v) }
+            .onFailure { Log.w(TAG, "could not set volume", it) }
+    }
+
     override fun release() {
         // Drop the surface before the player goes: the view may outlive this,
         // and a released player still holding it is the crash above.

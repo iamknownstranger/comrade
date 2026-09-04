@@ -1621,6 +1621,15 @@ object TogetherManager {
         val order: List<Int>? = null,
         val speed: Float = 1.0f,
         val sleepEndsAtMs: Long? = null,
+        /**
+         * Stop at the end of the track rather than at [sleepEndsAtMs] exactly.
+         *
+         * The complaint every duration-only sleep timer earns: thirty minutes
+         * lands mid-song more often than not. In this mode the instant is a
+         * floor rather than a deadline — see
+         * [TogetherDecisions.sleepTimerDone].
+         */
+        val sleepEndOfTrack: Boolean = false,
     )
 
     private val _extras = kotlinx.coroutines.flow.MutableStateFlow(PlayerExtras())
@@ -1695,26 +1704,227 @@ object TogetherManager {
      * device pauses too, which is what "sleep" means when two people fell
      * asleep watching.
      */
-    fun startSleepTimer(minutes: Int) {
-        cancelSleepTimer()
+    /**
+     * Set the timer, in either mode.
+     *
+     * **Polled rather than scheduled**, which is a change from the `delay` this
+     * used to be and not merely a refactor: end-of-track cannot be scheduled at
+     * all, because the instant it fires is not known when it is set — it
+     * depends on where the playhead gets to. The wall-clock mode rides the same
+     * poll for free, and loses nothing by it: the poll already runs while
+     * anything is playing, and a timer that fires up to one tick late is a
+     * timer nobody can perceive being late.
+     *
+     * [minutes] `0` with [endOfTrack] is "stop when this track ends", which is
+     * the floor case [TogetherDecisions.sleepTimerDone] documents.
+     */
+    fun startSleepTimer(minutes: Int, endOfTrack: Boolean = false) {
         val endsAt = System.currentTimeMillis() + minutes * 60_000L
-        _extras.value = _extras.value.copy(sleepEndsAtMs = endsAt)
-        sleepJob = scope.launch {
-            delay(endsAt - System.currentTimeMillis())
-            (player?.positionMs)?.let { setState(it, false) }
-            _extras.value = _extras.value.copy(sleepEndsAtMs = null)
-        }
+        _extras.value = _extras.value.copy(sleepEndsAtMs = endsAt, sleepEndOfTrack = endOfTrack)
     }
 
     fun cancelSleepTimer() {
-        sleepJob?.cancel()
-        sleepJob = null
         if (_extras.value.sleepEndsAtMs != null) {
-            _extras.value = _extras.value.copy(sleepEndsAtMs = null)
+            _extras.value = _extras.value.copy(sleepEndsAtMs = null, sleepEndOfTrack = false)
         }
     }
 
-    private var sleepJob: kotlinx.coroutines.Job? = null
+    /**
+     * Ask the timer, once per poll, whether this is the moment.
+     *
+     * Pauses through [setState] so both devices stop together — which is what
+     * "sleep" means when two people fell asleep watching, and unchanged from
+     * the scheduled version.
+     */
+    private fun checkSleepTimer(p: SessionPlayer) {
+        val endsAt = _extras.value.sleepEndsAtMs ?: return
+        val done = TogetherDecisions.sleepTimerDone(
+            endsAtMs = endsAt,
+            nowMs = System.currentTimeMillis(),
+            positionMs = p.positionMs,
+            durationMs = p.durationMs,
+            endOfTrack = _extras.value.sleepEndOfTrack,
+        )
+        if (!done) return
+        cancelSleepTimer()
+        setState(p.positionMs, false)
+    }
+
+    // ── The queue as something you can change ───────────────────────────────
+
+    /**
+     * Replace the live queue, keeping any shuffle order pointing at the same
+     * songs it pointed at before.
+     *
+     * The carry-over is the whole reason this is one function rather than two
+     * lines at each call site. [rebuildOrder] draws a *fresh* permutation, which
+     * is correct when the person asks for shuffle and wrong after every
+     * mutation: it would reshuffle what they are looking at each time they drag
+     * a row. [TogetherDecisions.carryOverOrder] walks the old order by track
+     * identity instead, so the up-next list they can see stays the up-next list
+     * that plays.
+     *
+     * A count-changing mutation would in fact be caught anyway — `manualNextIndex`
+     * and its siblings refuse an order whose size does not match the queue — but
+     * a **reorder** preserves the count, so a stale same-size order there
+     * resolves to a plausible, wrong index. That case has its own test next door
+     * (`aReorderWithoutCarryingTheOrderCanNameTheWrongNextSong`), and this is
+     * the call that keeps it from happening.
+     */
+    private fun applyQueue(next: TogetherDecisions.Queue?) {
+        val before = _queue.value
+        val order = _extras.value.order
+        _queue.value = next
+        if (order == null || before == null || next == null) return
+        _extras.value = _extras.value.copy(
+            order = TogetherDecisions.carryOverOrder(order, before.tracks, next.tracks),
+        )
+    }
+
+    /** Put a track straight after the one playing. */
+    fun playNext(track: TogetherDecisions.Track) {
+        val at = _queue.value ?: return
+        applyQueue(TogetherDecisions.playNext(at, track))
+    }
+
+    /** Put a track at the end of what is already lined up. */
+    fun addToQueue(track: TogetherDecisions.Track) {
+        val at = _queue.value ?: return
+        applyQueue(TogetherDecisions.addToQueue(at, track))
+    }
+
+    /** Drag a row to a new place in the up-next list. */
+    fun moveInQueue(from: Int, to: Int) {
+        val at = _queue.value ?: return
+        applyQueue(TogetherDecisions.moveInQueue(at, from, to))
+    }
+
+    /** Everything after the current track goes; what is playing keeps playing. */
+    fun clearUpNext() {
+        val at = _queue.value ?: return
+        applyQueue(TogetherDecisions.clearUpNext(at))
+    }
+
+    /**
+     * Take one row out of the queue.
+     *
+     * **Removing the row that is playing is a content change, not a list edit**,
+     * and it is handled as one: the slot inherits whatever now sits at the same
+     * position, and that track is started exactly as pressing next would start
+     * it. Leaving the removed track playing under a queue that no longer
+     * contains it is the alternative, and it is the one that reads as broken —
+     * the up-next list would disagree with the sleeve above it.
+     *
+     * Emptying the queue entirely leaves the current track playing with no list
+     * behind it, which is [TogetherDecisions.removeAt]'s `null` and the same
+     * state a pasted link has always been in.
+     */
+    fun removeFromQueue(context: Context, at: Int) {
+        val queue = _queue.value ?: return
+        val wasCurrent = at == queue.index
+        val next = TogetherDecisions.removeAt(queue, at)
+        applyQueue(next)
+        if (!wasCurrent || next == null) return
+        val pairing = _pairing.value ?: return
+        val track = next.current ?: return
+        playTrack(context, pairing, track, next.tracks)
+    }
+
+    /** A tap on a row of the up-next list. */
+    fun jumpTo(context: Context, at: Int) {
+        val queue = _queue.value ?: return
+        val pairing = _pairing.value ?: return
+        val moved = TogetherDecisions.jumpTo(queue, at) ?: return
+        val track = moved.current ?: return
+        playTrack(context, pairing, track, moved.tracks)
+    }
+
+    // ── Loving what is on ───────────────────────────────────────────────────
+
+    private val _loved = kotlinx.coroutines.flow.MutableStateFlow(false)
+
+    /**
+     * Whether the track playing right now is a favourite.
+     *
+     * A flow rather than a per-row lookup because the heart sits on the
+     * now-playing sleeve, which is drawn continuously — and because until this
+     * existed there was **no way to favourite anything at all**, while
+     * `library_empty_favourites` had been telling people to "tap the heart on a
+     * row in your library" since favourites shipped. The list could only ever
+     * be empty.
+     */
+    val loved: kotlinx.coroutines.flow.StateFlow<Boolean> = _loved.asStateFlow()
+
+    /**
+     * What the vault calls the track on now, or `null` when there is nothing
+     * nameable playing.
+     *
+     * The key convention is [rememberPlayed]'s, and deliberately the same one:
+     * a track loved here and the same track in the history have to be one row,
+     * or "loved" and "played" would disagree about what a track is.
+     */
+    private fun nowPlayingDto(): uniffi.comrade_ui.PlayerTrackDto? {
+        _queue.value?.current?.let { t ->
+            return uniffi.comrade_ui.PlayerTrackDto(
+                key = "local:${t.uri}",
+                title = t.title,
+                artist = t.artist,
+                album = t.album,
+                durationMs = t.durationMs.toULong(),
+                url = null,
+                kind = uniffi.comrade_ui.PlayerTrackKind.LOCAL,
+            )
+        }
+        val url = playingStreamUrl ?: return null
+        val live = _state.value as? UiState.Live ?: return null
+        return uniffi.comrade_ui.PlayerTrackDto(
+            key = "stream:$url",
+            title = live.title.ifBlank { hostOf(url) },
+            artist = "",
+            album = null,
+            durationMs = live.durationMs.toULong(),
+            url = url,
+            kind = uniffi.comrade_ui.PlayerTrackKind.STREAM,
+        )
+    }
+
+    /**
+     * Ask the vault whether what is playing is loved, and say so.
+     *
+     * Best-effort exactly as [rememberPlayed] is: a locked vault throws here,
+     * and an unanswerable heart draws as not-loved rather than failing the
+     * screen around it. The one thing it must not do is *lie the other way* —
+     * a false "loved" would make the toggle below remove something.
+     */
+    fun refreshLoved() {
+        val dto = nowPlayingDto()
+        if (dto == null) {
+            _loved.value = false
+            return
+        }
+        scope.launch(Dispatchers.IO) {
+            _loved.value = runCatching { ComradeCore.favouriteIs(dto.key) }.getOrDefault(false)
+        }
+    }
+
+    /** Toggle it, and render from what the vault says it now is. */
+    fun toggleLoved() {
+        val dto = nowPlayingDto() ?: return
+        scope.launch(Dispatchers.IO) {
+            runCatching { ComradeCore.favouriteToggle(dto) }
+                .onSuccess { _loved.value = it }
+                .onFailure { Log.w(TAG, "could not love that track", it) }
+        }
+    }
+
+    /** Add what is playing to a named playlist. */
+    fun addNowPlayingToPlaylist(playlistId: String) {
+        val dto = nowPlayingDto() ?: return
+        scope.launch(Dispatchers.IO) {
+            runCatching { ComradeCore.playlistAddTrack(playlistId, dto) }
+                .onFailure { Log.w(TAG, "could not add to that playlist", it) }
+        }
+    }
 
     /**
      * What a finished track does next **when nobody else is listening**.
@@ -1902,6 +2112,10 @@ object TogetherManager {
                 )
             }.onFailure { Log.w(TAG, "history write skipped", it) }
         }
+        // The heart belongs to the track, so it is re-asked exactly where the
+        // diary is written: this is the one call every route to a new track
+        // passes through, local and stream alike.
+        refreshLoved()
     }
 
     private fun rememberPlayedLocal(uri: Uri, recording: uniffi.comrade_core.Recording?) {
@@ -2345,6 +2559,7 @@ object TogetherManager {
                 // [SessionPlayer.onPoll].
                 p.onPoll(System.currentTimeMillis())
                 applyShareVerdict(p)
+                checkSleepTimer(p)
                 ComradeCore.togetherReportPosition(p.positionMs, p.isPlaying, p.outputLatencyMs)
                 if (TogetherDecisions.pollMayMoveSlider(scrub)) {
                     refreshLive(positionMs = p.positionMs)
@@ -2461,6 +2676,7 @@ object TogetherManager {
         _openFailed.value = false
         _embedFailure.value = null
         scrub = TogetherDecisions.ScrubState(scrubbing = false, pendingRemoteMs = null)
+        _loved.value = false
         abandonAudioFocus()
         stopService()
     }
@@ -2473,15 +2689,21 @@ object TogetherManager {
      * and the two silently diverge. Losing focus pauses **and tells the peer**,
      * so what they see is "they paused" rather than an unexplained drift.
      */
+    /**
+     * What a focus change means, remembered across changes.
+     *
+     * Rebuilt with the request rather than held for the app's life: a new
+     * session has not paused anything, and carrying an armed "we paused this"
+     * across sessions is a resume firing on the wrong film.
+     */
+    private var focusWatch = TogetherDecisions.FocusWatch()
+
     private fun requestAudioFocus() {
         val ctx = appContext ?: return
         val am = ctx.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+        focusWatch = TogetherDecisions.FocusWatch()
         val listener = AudioManager.OnAudioFocusChangeListener { change ->
-            if (change == AudioManager.AUDIOFOCUS_LOSS ||
-                change == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT
-            ) {
-                player?.let { setState(it.positionMs, false) }
-            }
+            onFocusChange(change)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
@@ -2496,6 +2718,63 @@ object TogetherManager {
             focusRequest = req
             am.requestAudioFocus(req)
         }
+    }
+
+    /**
+     * One focus change, decided by [TogetherDecisions.FocusWatch] and applied
+     * here.
+     *
+     * The decision is next door rather than inline because the bit that matters
+     * cannot be recomputed from anything visible at this moment: **a gain may
+     * resume only playback that a transient loss paused, never playback the
+     * person paused deliberately.** The old listener here could not tell those
+     * apart — it treated `LOSS` and `LOSS_TRANSIENT` identically and never
+     * resumed at all, so a phone call stopped the music permanently and a
+     * navigation prompt did too.
+     *
+     * Pausing and resuming go through [setState], so the other person follows
+     * them, exactly as the previous version did and for the reason its comment
+     * gave: what they see is "they paused" rather than an unexplained drift.
+     * **Ducking deliberately does not** — it changes this device's output level
+     * and nothing about the session, because a car's navigation prompt is not
+     * an event in someone else's living room.
+     */
+    private fun onFocusChange(change: Int) {
+        val p = player ?: return
+        val kind = when (change) {
+            AudioManager.AUDIOFOCUS_GAIN -> TogetherDecisions.FocusChange.GAIN
+            AudioManager.AUDIOFOCUS_LOSS -> TogetherDecisions.FocusChange.LOSS
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> TogetherDecisions.FocusChange.LOSS_TRANSIENT
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK ->
+                TogetherDecisions.FocusChange.LOSS_TRANSIENT_CAN_DUCK
+            else -> return
+        }
+        when (val outcome = focusWatch.focusAction(kind, p.isPlaying)) {
+            is TogetherDecisions.FocusOutcome.None -> Unit
+            is TogetherDecisions.FocusOutcome.PauseAndRemember -> setState(p.positionMs, false)
+            is TogetherDecisions.FocusOutcome.PauseForever -> setState(p.positionMs, false)
+            is TogetherDecisions.FocusOutcome.Duck -> p.setVolume(outcome.volume)
+            is TogetherDecisions.FocusOutcome.Unduck -> p.setVolume(1f)
+            is TogetherDecisions.FocusOutcome.Resume -> {
+                p.setVolume(1f)
+                setState(p.positionMs, true)
+            }
+        }
+    }
+
+    /**
+     * The headphones came out, or the Bluetooth speaker dropped.
+     *
+     * Registered by [TogetherService], which owns the receiver because it owns
+     * the lifetime this has to match. Pauses through [setState] like everything
+     * else, which in a paired session stops the other person too —
+     * [TogetherDecisions.becomingNoisyAction] carries the argument for why that
+     * is the right answer here and not merely the convenient one.
+     */
+    fun onBecomingNoisy() {
+        val p = player ?: return
+        if (!TogetherDecisions.becomingNoisyAction(p.isPlaying, alone)) return
+        setState(p.positionMs, false)
     }
 
     private fun abandonAudioFocus() {
