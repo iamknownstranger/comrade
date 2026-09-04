@@ -84,6 +84,10 @@ pub use runtime::{
 // The travel guide: one network call, deliberately a free function so no caller
 // can hold the runtime lock across three round trips (see its doc).
 pub use runtime::{travel_guide, TravelCache, TRAVEL_NO_KEY_NOTICE};
+// Link previews: sender-built, zero-network-request-to-render — see
+// `comrade_core::unfurl`'s module doc. Free functions for the same "no lock
+// held across a network call" reason `catalogue_lookup` is one.
+pub use runtime::{attach_link_preview, compose_link_preview, LinkPreviewDto, PreviewKindDto};
 
 pub use runtime::{
     AttachmentHandoffDto, AttentionDayDto, AttentionSummaryDto, BleRouter, BridgeEvent,
@@ -91,9 +95,9 @@ pub use runtime::{
     ContactDto, ConversationDto, CrisisResourceDto, DirectMessageDto, DownloadVerdictDto,
     DownloadedTrackDto, FocusSessionDto, FoundProfileDto, IceServerDto, JournalEntryDto,
     JournalRecordingDto, LibraryCandidateDto, MediaBytesDto, MediaMessageDto, MentionMatchDto,
-    MeshStatusDto, MessageAuthor, MessageDto, MessageRequestDto, MetricDto, OfferOutcomeDto,
-    PeerProfileDto, PlayPlan, PlayRoute, PlayTargetDto, PresenceDto, ProfileDto, ReactionDto,
-    RideSignalDto, RuntimeHandles, SakhaStatusDto, SavedReadDto, SavedReadSummaryDto,
+    MeshStatusDto, MessageActionState, MessageAuthor, MessageDto, MessageRequestDto, MetricDto,
+    OfferOutcomeDto, PeerProfileDto, PlayPlan, PlayRoute, PlayTargetDto, PresenceDto, ProfileDto,
+    ReactionDto, RideSignalDto, RuntimeHandles, SakhaStatusDto, SavedReadDto, SavedReadSummaryDto,
     ShareVerdictDto, SharedNoteDto, StretchStepDto, TaraChatDto, TaraMessageDto, TaskDto,
     ThreadDto, ThreadSummaryDto, TogetherCommandDto, TogetherCorrectionDto, TogetherInviteDto,
     TogetherSessionDto, TogetherShareDto, TopicDto, TravelFactDto, TravelGuideDto, TravelPlaceDto,

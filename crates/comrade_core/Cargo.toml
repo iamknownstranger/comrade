@@ -33,6 +33,7 @@ secp256k1     = { workspace = true }
 hex           = { workspace = true }
 hmac          = { workspace = true }
 sha1          = { workspace = true }
+url           = { workspace = true }
 # Wipes the anonymity device seed (`anon::DeviceSeed`) from memory on drop —
 # a leaked seed would deanonymise every persona ever derived from it.
 zeroize       = { workspace = true }
@@ -62,3 +63,13 @@ catalogue-http = ["dep:reqwest"]
 # unconditionally, so `cargo test --workspace` covers every fixture. Only the
 # socket is behind this flag.
 travel-http = ["dep:reqwest"]
+# Receiver-side link-unfurling (fetch the page behind a URL to build a preview
+# card). Off by default, and for a sharper reason than the three flags above:
+# every one of those calls out to a host *this device* chose (a catalogue
+# provider, a places API); this one calls out to a host *someone else* chose,
+# so turning it on tells that host "this npub opened this link" — exactly the
+# metadata this app exists to not leak. `unfurl.rs`'s sender-side preview
+# (built and attached before the message is sent) is the default path and
+# needs no feature at all. A frontend may only reach this from an explicit,
+# off-by-default "load previews for links I receive" setting.
+unfurl-http = ["dep:reqwest"]
