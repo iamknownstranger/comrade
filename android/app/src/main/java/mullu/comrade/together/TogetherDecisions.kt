@@ -1963,6 +1963,28 @@ object TogetherDecisions {
     // readings of "when is next available" is exactly the drift this file
     // exists to prevent one section up.
 
+    /**
+     * Everything the shade actually draws, and nothing that merely ticks.
+     *
+     * The notification is refreshed from a poll that fires several times a
+     * second, and rebuilding it at that rate is a battery and jank bug rather
+     * than a fresh-looking notification: the position is carried by the
+     * `PlaybackState` (which the platform extrapolates from its own timestamp
+     * and does not need re-posting to advance), so re-posting on a position
+     * change buys nothing at all. This is the subset a person can see change —
+     * compare two of them and post only when they differ.
+     */
+    data class Shade(
+        val title: String,
+        val artist: String,
+        val album: String?,
+        val durationMs: Long,
+        val playing: Boolean,
+        val actions: List<NotificationAction>,
+        /** What the art is keyed on, so a new cover re-posts and the same one does not. */
+        val artKey: String?,
+    )
+
     /** One control slot on the media notification / lock screen. */
     enum class NotificationAction { SKIP_PREVIOUS, PLAY, PAUSE, SKIP_NEXT }
 
