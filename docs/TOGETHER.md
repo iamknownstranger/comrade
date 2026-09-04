@@ -2877,3 +2877,156 @@ and the existing server adapter.
   Music means InnerTube extraction. The sanctioned set stands instead: your
   server, public collections, podcasts, open licences, embeds, and an
   external-app follow mode.
+
+## 24. The controls a music player has, and the cache that was measuring the wrong thing
+
+_Added 2026-09-03, owner request: the music controls of a full player, and
+"why does it use 680 MB on my Pixel 9"._
+
+### What was missing, which was less than it looked and worse than it read
+
+§23 had already landed shuffle, repeat, speed, EQ, the sleep timer, lyrics,
+favourites, history and playlists. So the gap was not the control *set*. It was
+that three of the things a music player is judged on were either invisible or
+absent:
+
+- **The queue could not be looked at.** It was the list a track was picked out
+  of and nothing more: no up-next, no reorder, no remove, no "play next". The
+  data was right there and had no screen.
+- **The notification was not a media notification.** A title, a line of text and
+  one button, *Leave*. The lock screen said nothing about the track, there was
+  no artwork anywhere, and a Bluetooth headset's next-track button reached a
+  `MediaSession` that had never advertised `ACTION_SKIP_TO_NEXT` — so nothing
+  happened, silently, which is the worst way for a control to fail.
+- **Nothing could be favourited.** `library_empty_favourites` told people to
+  "tap the heart on a row in your library". There was no heart in the app. The
+  vault could store favourites, the FFI could toggle them, the list screen could
+  draw them, and the list could only ever be empty. A string had been asserting
+  a control that did not exist.
+
+### The one that is a rule, not a feature
+
+`PlaybackState` actions and the `MediaSession.Callback` are **one contract in
+two halves**, and both halves are now derived from the same `TogetherDecisions`
+answers rather than written twice. A state advertising an action the callback
+ignores is a dead button on somebody's steering wheel, and it is invisible from
+this side of the wire — the phone looks fine.
+
+The same rule decides the scrubber: `METADATA_KEY_DURATION` is what makes it
+appear, so it is published only for a session `mediaSeekAllowed` says can take a
+seek. An external session gets no transport in the shade **at all**, because the
+app being followed publishes its own and two notifications over one stream is
+not a convenience.
+
+### Audio focus, which had a bug with a name
+
+The old listener treated `AUDIOFOCUS_LOSS` and `AUDIOFOCUS_LOSS_TRANSIENT`
+identically and never resumed on gain. So a phone call stopped the music
+permanently, and so did a navigation prompt.
+
+It is now four outcomes with ducking, and the resume is gated on one remembered
+bit: **did we pause this, or did the person.** That bit cannot be recomputed at
+the moment of the gain — "were we playing when we lost focus" answers the same
+for both cases — which is why `FocusWatch` is a small stateful class rather than
+the pure function the rest of that file prefers. Collapsing the distinction is
+the "music started by itself" bug.
+
+Pause and resume go through `setState`, so the other person follows them.
+**Ducking deliberately does not**: a navigation prompt in someone's car is not
+an event in the other person's living room.
+
+### Why 680 MB, with the arithmetic
+
+`ui/MediaAttachment.kt`'s `MediaCache` held decoded chat-attachment bitmaps in a
+process-wide object bounded at **24 pictures — not at any number of bytes** —
+and decoded them with no bounds probe and no `inSampleSize`.
+
+A 4032x3024 camera photo is `4032 x 3024 x 4` = 48.8 MB as ARGB_8888. Twenty-four
+of those is **1.17 GB**. Since Android 8 puts bitmaps in the native heap, it
+inflates the process without ever throwing the OOM that would have made it
+obvious, and nothing evicted it: the only sweep was `MainActivity.onStop`'s S-4
+plaintext purge, which a still-foreground scroll through a photo thread never
+reaches.
+
+This repo had already learned this once. §22 fixed exactly this shape in
+`MusicLibrary.artwork` — count-keyed to size-keyed, with a byte budget — and
+`MediaCache` never got the same treatment.
+
+Three changes, in the order they matter: downsample to ~4 MP (48.8 MB to 15.3 MB
+worst case), bound by `allocationByteCount` at 64 MB, and evict on
+`onTrimMemory`, which is the pressure signal `onStop` cannot see. The same
+missing sample size was in `ProfileScreen.decodeAvatar`, decoding a
+full-resolution profile photo to draw it at 72 dp.
+
+Two judgement calls, recorded because either could be revisited. Bubble and
+viewer share **one** decode rather than caching per size, because a miss here is
+a network round trip and not a re-decode — `download_and_decrypt_media` re-fetches
+and re-decrypts every call. And the JPEG path stays ARGB_8888; RGB_565 would
+halve it again, but this is the bitmap the full-screen viewer pinch-zooms, and
+16-bit colour bands visibly on a sky.
+
+**The 680 MB attribution is arithmetic from the code, not a measurement.** There
+is no device or profiler in the sandbox. What a profiler would still have to
+answer is how much of the remainder is native — WebRTC and Vosk both hold heap
+this pass does not touch.
+
+### The second-order finding, not fixed
+
+Media **download** still crosses the FFI as a base64 `String`
+(`MediaBytesDto.base64`), though upload was converted to `Vec<u8>`. For a 5 MB
+image that is ~6.7 MB of base64 text arriving as a JVM `String` — **~13.4 MB in
+UTF-16** — plus the decoded `ByteArray`, plus the bitmap, all live at once.
+
+Not fixed here, and the reason is that the obvious fix is wrong: desktop's
+webview genuinely needs base64, so changing the existing method breaks the one
+frontend that wants it. The honest change is an *additional* bytes-returning
+method for the native frontends, which is an FFI addition needing the frb mirror
+regenerated — and codegen must not be run blind where Dart cannot build.
+
+### What is checked here, and what is not
+
+`android-typecheck-compose.sh` reports the frontend clean: every source resolves
+against real Compose 1.6.1 and Material3 1.2.0, real WebRTC/Vosk/YouTube AARs,
+and the real generated uniffi bindings. `TogetherDecisionsTest` is 175 tests,
+`BitmapBudgetTest` 7, both run in the sandbox.
+
+None of it has run on a device. The notification's appearance, whether a car head
+unit honours the actions, whether the memory figure actually moves, and the
+`PlaylistsScreen` recomposition fix below are all beyond every lane that runs
+here.
+
+### One bug found next door, worth naming separately
+
+`PlaylistsScreen` had three `return@Column` inside a composable, one of them
+gated on a `loaded` flag flipped by a `LaunchedEffect` a moment after the first
+frame. That is precisely the shape `.claude/rules/android.md` records as having
+killed `TaskListScreen` (2026-08-04) and `RideScreen` (2026-08-15): the branch
+emits a different number of composable groups, so it throws on the
+*recomposition* rather than on the frame that drew — and every lane that runs in
+this sandbox goes on passing. One of the three also assigned state during
+composition. Now a `when`, with the clearing moved into an effect.
+
+**And the lane that finds these was itself wrong.** `.claude/scripts/android-typecheck.sh`
+filtered Compose sources with an unanchored `grep -q "androidx\.compose"`, so it
+matched those words inside a **KDoc comment** and dropped a plain Kotlin file
+from the lane — while Gradle, whose `composeImport` regex is anchored to
+`^\s*import\s+androidx\.compose`, still staged it. The lane reported an
+unresolved reference against a class that compiles fine in both real builds. A
+lane stricter than the rule it stands in for invents failures. Anchored to match;
+it now compiles two files it had been silently skipping.
+
+### Still not built
+
+- **Desktop and Flutter have none of this.** Android-first per the standing
+  directive in `CLAUDE.md`; the queue mutations, the notification decisions and
+  the focus ladder are all pure functions in `TogetherDecisions.kt` that
+  desktop's panel could call, and Flutter needs the frb mirror regenerated.
+- **A drag handle for reorder.** Still Move up / Move down, matching
+  `PlaylistsScreen`; §23 named this follow-up and it is still open, now in two
+  places rather than one.
+- **Crossfade and gapless.** `MediaPlayer` has no gapless path worth the name;
+  this is the argument for the Media3 migration `TogetherPlayer`'s header
+  already names for a different reason (a real `AudioTrack` to measure output
+  latency from).
+- **Volume normalisation.** Wants a loudness analysis pass this app has nowhere
+  to run.
