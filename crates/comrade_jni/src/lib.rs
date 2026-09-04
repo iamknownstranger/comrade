@@ -88,9 +88,9 @@ use comrade_ui::{
     ChatCommand, ChitthiDto, CollectionSearchOutcome, CommandSpec, ComradeDto, ComradeRuntime,
     ContactDto, ConversationDto, CrisisResourceDto, DownloadVerdictDto, DownloadedTrackDto,
     FocusSessionDto, FoundProfileDto, HistoryEntryDto, IceServerDto, IdentityDto, JournalEntryDto,
-    JournalRecordingDto, LibraryCandidateDto, LyricsOutcome, MediaBytesDto, MediaMessageDto,
-    Mention, MentionMatchDto, MeshStatusDto, MessageDto, MessageRequestDto, MetricDto,
-    MusicService, OfferOutcomeDto, PeerProfileDto, PlayPlan, PlayRoute, PlayTargetDto,
+    JournalRecordingDto, LibraryCandidateDto, LinkPreviewDto, LyricsOutcome, MediaBytesDto,
+    MediaMessageDto, Mention, MentionMatchDto, MeshStatusDto, MessageDto, MessageRequestDto,
+    MetricDto, MusicService, OfferOutcomeDto, PeerProfileDto, PlayPlan, PlayRoute, PlayTargetDto,
     PlayerTrackDto, PlaylistDto, PresenceDto, ProfileDto, ReactionDto, ReadSample, ReadVerdict,
     SavedQueueDto, SavedReadDto, SavedReadSummaryDto, ShareVerdictDto, StreamSearchOutcome,
     StretchStepDto, TaraChatDto, TaraMessageDto, TaskDto, TaskState, ThreadDto, ThreadSummaryDto,
@@ -829,6 +829,108 @@ impl Comrade {
 
     pub fn messages_with(&self, peer: String) -> Result<Vec<MessageDto>, UiError> {
         self.inner.blocking_read().messages_with(&peer)
+    }
+
+    /// Every pinned message in `peer`'s conversation, oldest pin first. See
+    /// `comrade_ui::ComradeRuntime::pinned_messages`.
+    pub fn pinned_messages(&self, peer: String) -> Result<Vec<MessageDto>, UiError> {
+        self.inner.blocking_read().pinned_messages(&peer)
+    }
+
+    /// Every starred message across every conversation, oldest star first —
+    /// the "Starred Messages" screen. See
+    /// `comrade_ui::ComradeRuntime::starred_messages`.
+    pub fn starred_messages(&self) -> Result<Vec<MessageDto>, UiError> {
+        self.inner.blocking_read().starred_messages()
+    }
+
+    /// Star or un-star one of `peer`'s messages. Local device state only;
+    /// returns whether the stored state changed. See
+    /// `comrade_ui::ComradeRuntime::star_message`.
+    pub fn star_message(
+        &self,
+        peer: String,
+        message_id: String,
+        starred: bool,
+    ) -> Result<bool, UiError> {
+        self.inner
+            .blocking_read()
+            .star_message(&peer, &message_id, starred)
+    }
+
+    /// Pin one of `peer`'s messages. Refuses once the conversation is already
+    /// at the pin cap — unpin one first. `false` (not an error) if it was
+    /// already pinned. See `comrade_ui::ComradeRuntime::pin_message`.
+    pub fn pin_message(&self, peer: String, message_id: String) -> Result<bool, UiError> {
+        self.inner.blocking_read().pin_message(&peer, &message_id)
+    }
+
+    /// Unpin one of `peer`'s messages. `true` if it was pinned. See
+    /// `comrade_ui::ComradeRuntime::unpin_message`.
+    pub fn unpin_message(&self, peer: String, message_id: String) -> Result<bool, UiError> {
+        self.inner.blocking_read().unpin_message(&peer, &message_id)
+    }
+
+    /// Hide one of `peer`'s messages on this device only. See
+    /// `comrade_ui::ComradeRuntime::delete_message_for_me`.
+    pub fn delete_message_for_me(&self, peer: String, message_id: String) -> Result<(), UiError> {
+        self.inner
+            .blocking_read()
+            .delete_message_for_me(&peer, &message_id)
+    }
+
+    /// Delete a message you sent for everyone in `peer`'s conversation — a
+    /// best-effort courtesy, not a protocol guarantee. See
+    /// `comrade_ui::ComradeRuntime::delete_message_for_everyone`.
+    ///
+    /// Not wrapped through [`Comrade::broadcast_chitthi`]'s `handles()`
+    /// snapshot: `comrade_ui::ComradeRuntime::delete_message_for_everyone`
+    /// takes `&self` rather than exposing a `RuntimeHandles` counterpart, so
+    /// this holds a shared read guard across its network send — the same
+    /// shape as [`Comrade::lock_vault`] and [`Comrade::panic_wipe`], not the
+    /// exclusive-write case those two guard against.
+    pub async fn delete_message_for_everyone(
+        &self,
+        peer: String,
+        message_id: String,
+    ) -> Result<(), UiError> {
+        self.inner
+            .read()
+            .await
+            .delete_message_for_everyone(&peer, &message_id)
+            .await
+    }
+
+    /// Forward one of `from_peer`'s messages to each of `to_peers`, as a new
+    /// message in each conversation. See
+    /// `comrade_ui::ComradeRuntime::forward_message`.
+    ///
+    /// Same lock-discipline note as [`Comrade::delete_message_for_everyone`]:
+    /// no `RuntimeHandles` counterpart exists for this one either.
+    pub async fn forward_message(
+        &self,
+        from_peer: String,
+        message_id: String,
+        to_peers: Vec<String>,
+    ) -> Result<Vec<MessageDto>, UiError> {
+        self.inner
+            .read()
+            .await
+            .forward_message(&from_peer, &message_id, &to_peers)
+            .await
+    }
+
+    /// Fetch and build a link preview for the first link in `content`, if
+    /// any — sender-side only, run before a send. Takes no lock, like
+    /// [`Comrade::catalogue_lookup`]. See `comrade_ui::compose_link_preview`.
+    pub async fn compose_link_preview(&self, content: String) -> Option<LinkPreviewDto> {
+        comrade_ui::compose_link_preview(&content).await
+    }
+
+    /// Attach `preview` to `content`, producing the body [`Comrade::send_dm`]
+    /// should actually send. See `comrade_ui::attach_link_preview`.
+    pub fn attach_link_preview(&self, content: String, preview: LinkPreviewDto) -> String {
+        comrade_ui::attach_link_preview(&content, &preview)
     }
 
     /// Full encrypted-media history with `peer`, oldest first — the media

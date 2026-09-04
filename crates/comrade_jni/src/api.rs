@@ -80,12 +80,13 @@ pub use comrade_core::together::{MusicLink, Recording, StateChange, SyncVerdict,
 pub use comrade_ui::{
     AttachmentHandoffDto, BridgeEvent, CallRecordDto, CallSessionDto, CallSignalDto, ChitthiDto,
     ComradeDto, ContactDto, ConversationDto, CrisisResourceDto, DirectMessageDto, FoundProfileDto,
-    IceServerDto, IdentityDto, JournalEntryDto, JournalRecordingDto, MediaBytesDto,
-    MediaMessageDto, MeshStatusDto, MessageAuthor, MessageDto, MessageRequestDto, MetricDto,
-    PeerProfileDto, PresenceDto, ProfileDto, ReactionDto, RideSignalDto, ShareVerdictDto,
-    SharedNoteDto, TaraMessageDto, ThreadDto, ThreadSummaryDto, TogetherCommandDto,
-    TogetherCorrectionDto, TogetherInviteDto, TogetherSessionDto, TogetherShareDto, TopicDto,
-    TurnServerStatusDto, UiError, UpiIntentDto, WorkspaceDto,
+    IceServerDto, IdentityDto, JournalEntryDto, JournalRecordingDto, LinkPreviewDto, MediaBytesDto,
+    MediaMessageDto, MeshStatusDto, MessageActionState, MessageAuthor, MessageDto,
+    MessageRequestDto, MetricDto, PeerProfileDto, PresenceDto, PreviewKindDto, ProfileDto,
+    ReactionDto, RideSignalDto, ShareVerdictDto, SharedNoteDto, TaraMessageDto, ThreadDto,
+    ThreadSummaryDto, TogetherCommandDto, TogetherCorrectionDto, TogetherInviteDto,
+    TogetherSessionDto, TogetherShareDto, TopicDto, TurnServerStatusDto, UiError, UpiIntentDto,
+    WorkspaceDto,
 };
 
 /// The process-global runtime every function in this module reads.
@@ -184,6 +185,39 @@ pub struct _MessageDto {
     pub status: Option<String>,
     pub reply_to: Option<String>,
     pub shared_note: Option<SharedNoteDto>,
+    pub link_preview: Option<LinkPreviewDto>,
+    pub forwarded: bool,
+    pub actions: MessageActionState,
+}
+
+#[frb(mirror(MessageActionState))]
+pub struct _MessageActionState {
+    pub starred: bool,
+    pub pinned: bool,
+}
+
+// No `image_url` here — deliberately. See the field-removal note on
+// `comrade_ui::runtime::LinkPreviewDto`: a URL on the linked host must not
+// cross this boundary, or a frontend rendering it as `<img src=…>` tells that
+// host which npub read the link, defeating the zero-network-request design.
+#[frb(mirror(LinkPreviewDto))]
+pub struct _LinkPreviewDto {
+    pub url: String,
+    pub canonical_url: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub site_name: Option<String>,
+    pub kind: PreviewKindDto,
+    pub display_domain: Option<String>,
+}
+
+#[frb(mirror(PreviewKindDto))]
+pub enum _PreviewKindDto {
+    Article,
+    Photo,
+    Video,
+    Profile,
+    Unknown,
 }
 
 #[frb(mirror(SharedNoteDto))]
@@ -1018,6 +1052,98 @@ pub fn conversations() -> Result<Vec<ConversationDto>, UiError> {
 
 pub fn messages_with(peer: String) -> Result<Vec<MessageDto>, UiError> {
     runtime().blocking_read().messages_with(&peer)
+}
+
+/// Every pinned message in `peer`'s conversation, oldest pin first. See
+/// `comrade_ui::ComradeRuntime::pinned_messages`.
+pub fn pinned_messages(peer: String) -> Result<Vec<MessageDto>, UiError> {
+    runtime().blocking_read().pinned_messages(&peer)
+}
+
+/// Every starred message across every conversation, oldest star first — the
+/// "Starred Messages" screen. See `comrade_ui::ComradeRuntime::starred_messages`.
+pub fn starred_messages() -> Result<Vec<MessageDto>, UiError> {
+    runtime().blocking_read().starred_messages()
+}
+
+/// Star or un-star one of `peer`'s messages. Local device state only; returns
+/// whether the stored state changed. See
+/// `comrade_ui::ComradeRuntime::star_message`.
+pub fn star_message(peer: String, message_id: String, starred: bool) -> Result<bool, UiError> {
+    runtime()
+        .blocking_read()
+        .star_message(&peer, &message_id, starred)
+}
+
+/// Pin one of `peer`'s messages. Refuses once the conversation is already at
+/// the pin cap — unpin one first. `false` (not an error) if it was already
+/// pinned. See `comrade_ui::ComradeRuntime::pin_message`.
+pub fn pin_message(peer: String, message_id: String) -> Result<bool, UiError> {
+    runtime().blocking_read().pin_message(&peer, &message_id)
+}
+
+/// Unpin one of `peer`'s messages. `true` if it was pinned. See
+/// `comrade_ui::ComradeRuntime::unpin_message`.
+pub fn unpin_message(peer: String, message_id: String) -> Result<bool, UiError> {
+    runtime().blocking_read().unpin_message(&peer, &message_id)
+}
+
+/// Hide one of `peer`'s messages on this device only. See
+/// `comrade_ui::ComradeRuntime::delete_message_for_me`.
+pub fn delete_message_for_me(peer: String, message_id: String) -> Result<(), UiError> {
+    runtime()
+        .blocking_read()
+        .delete_message_for_me(&peer, &message_id)
+}
+
+/// Delete a message you sent for everyone in `peer`'s conversation — a
+/// best-effort courtesy, not a protocol guarantee. See
+/// `comrade_ui::ComradeRuntime::delete_message_for_everyone`.
+///
+/// Not wrapped through [`broadcast_chitthi`]'s `handles()` snapshot:
+/// `comrade_ui::ComradeRuntime::delete_message_for_everyone` takes `&self`
+/// rather than exposing a `RuntimeHandles` counterpart, so this holds a
+/// shared read guard across its network send — the same shape as
+/// [`panic_wipe`], not the exclusive-write case that one guards against.
+pub async fn delete_message_for_everyone(peer: String, message_id: String) -> Result<(), UiError> {
+    runtime()
+        .read()
+        .await
+        .delete_message_for_everyone(&peer, &message_id)
+        .await
+}
+
+/// Forward one of `from_peer`'s messages to each of `to_peers`, as a new
+/// message in each conversation. See
+/// `comrade_ui::ComradeRuntime::forward_message`.
+///
+/// Same lock-discipline note as [`delete_message_for_everyone`]: no
+/// `RuntimeHandles` counterpart exists for this one either.
+pub async fn forward_message(
+    from_peer: String,
+    message_id: String,
+    to_peers: Vec<String>,
+) -> Result<Vec<MessageDto>, UiError> {
+    runtime()
+        .read()
+        .await
+        .forward_message(&from_peer, &message_id, &to_peers)
+        .await
+}
+
+/// Fetch and build a link preview for the first link in `content`, if any —
+/// sender-side only, run before a send. Takes no lock: a free function
+/// underneath, so this wrapper cannot hold a guard across the network round
+/// trip. See `comrade_ui::compose_link_preview`.
+pub async fn compose_link_preview(content: String) -> Option<LinkPreviewDto> {
+    comrade_ui::compose_link_preview(&content).await
+}
+
+/// Attach `preview` to `content`, producing the body [`send_dm`] should
+/// actually send. See `comrade_ui::attach_link_preview`.
+#[frb(sync)]
+pub fn attach_link_preview(content: String, preview: LinkPreviewDto) -> String {
+    comrade_ui::attach_link_preview(&content, &preview)
 }
 
 /// Full encrypted-media history with `peer`, oldest first — the media

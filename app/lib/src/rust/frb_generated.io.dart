@@ -67,6 +67,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   JournalRecordingDto dco_decode_box_autoadd_journal_recording_dto(dynamic raw);
 
   @protected
+  LinkPreviewDto dco_decode_box_autoadd_link_preview_dto(dynamic raw);
+
+  @protected
   MediaBytesDto dco_decode_box_autoadd_media_bytes_dto(dynamic raw);
 
   @protected
@@ -209,6 +212,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   KeypairDto dco_decode_keypair_dto(dynamic raw);
 
   @protected
+  LinkPreviewDto dco_decode_link_preview_dto(dynamic raw);
+
+  @protected
   List<String> dco_decode_list_String(dynamic raw);
 
   @protected
@@ -287,6 +293,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   MeshStatusDto dco_decode_mesh_status_dto(dynamic raw);
 
   @protected
+  MessageActionState dco_decode_message_action_state(dynamic raw);
+
+  @protected
   MessageAuthor dco_decode_message_author(dynamic raw);
 
   @protected
@@ -313,6 +322,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   JournalRecordingDto? dco_decode_opt_box_autoadd_journal_recording_dto(
       dynamic raw);
+
+  @protected
+  LinkPreviewDto? dco_decode_opt_box_autoadd_link_preview_dto(dynamic raw);
 
   @protected
   MediaBytesDto? dco_decode_opt_box_autoadd_media_bytes_dto(dynamic raw);
@@ -349,6 +361,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   PresenceDto dco_decode_presence_dto(dynamic raw);
+
+  @protected
+  PreviewKindDto dco_decode_preview_kind_dto(dynamic raw);
 
   @protected
   ProfileDto dco_decode_profile_dto(dynamic raw);
@@ -500,6 +515,10 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   JournalRecordingDto sse_decode_box_autoadd_journal_recording_dto(
+      SseDeserializer deserializer);
+
+  @protected
+  LinkPreviewDto sse_decode_box_autoadd_link_preview_dto(
       SseDeserializer deserializer);
 
   @protected
@@ -659,6 +678,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   KeypairDto sse_decode_keypair_dto(SseDeserializer deserializer);
 
   @protected
+  LinkPreviewDto sse_decode_link_preview_dto(SseDeserializer deserializer);
+
+  @protected
   List<String> sse_decode_list_String(SseDeserializer deserializer);
 
   @protected
@@ -750,6 +772,10 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   MeshStatusDto sse_decode_mesh_status_dto(SseDeserializer deserializer);
 
   @protected
+  MessageActionState sse_decode_message_action_state(
+      SseDeserializer deserializer);
+
+  @protected
   MessageAuthor sse_decode_message_author(SseDeserializer deserializer);
 
   @protected
@@ -778,6 +804,10 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   JournalRecordingDto? sse_decode_opt_box_autoadd_journal_recording_dto(
+      SseDeserializer deserializer);
+
+  @protected
+  LinkPreviewDto? sse_decode_opt_box_autoadd_link_preview_dto(
       SseDeserializer deserializer);
 
   @protected
@@ -820,6 +850,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   PresenceDto sse_decode_presence_dto(SseDeserializer deserializer);
+
+  @protected
+  PreviewKindDto sse_decode_preview_kind_dto(SseDeserializer deserializer);
 
   @protected
   ProfileDto sse_decode_profile_dto(SseDeserializer deserializer);
@@ -983,6 +1016,10 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_box_autoadd_journal_recording_dto(
       JournalRecordingDto self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_box_autoadd_link_preview_dto(
+      LinkPreviewDto self, SseSerializer serializer);
 
   @protected
   void sse_encode_box_autoadd_media_bytes_dto(
@@ -1152,6 +1189,10 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_keypair_dto(KeypairDto self, SseSerializer serializer);
 
   @protected
+  void sse_encode_link_preview_dto(
+      LinkPreviewDto self, SseSerializer serializer);
+
+  @protected
   void sse_encode_list_String(List<String> self, SseSerializer serializer);
 
   @protected
@@ -1251,6 +1292,10 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_mesh_status_dto(MeshStatusDto self, SseSerializer serializer);
 
   @protected
+  void sse_encode_message_action_state(
+      MessageActionState self, SseSerializer serializer);
+
+  @protected
   void sse_encode_message_author(MessageAuthor self, SseSerializer serializer);
 
   @protected
@@ -1280,6 +1325,10 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_opt_box_autoadd_journal_recording_dto(
       JournalRecordingDto? self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_opt_box_autoadd_link_preview_dto(
+      LinkPreviewDto? self, SseSerializer serializer);
 
   @protected
   void sse_encode_opt_box_autoadd_media_bytes_dto(
@@ -1323,6 +1372,10 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_presence_dto(PresenceDto self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_preview_kind_dto(
+      PreviewKindDto self, SseSerializer serializer);
 
   @protected
   void sse_encode_profile_dto(ProfileDto self, SseSerializer serializer);

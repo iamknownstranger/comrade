@@ -2419,7 +2419,14 @@ pub struct LinkPreviewDto {
     pub title: Option<String>,
     pub description: Option<String>,
     pub site_name: Option<String>,
-    pub image_url: Option<String>,
+    /// Deliberately absent. `comrade_core::unfurl::LinkPreview::image_url` is
+    /// a URL on the linked host — carrying it across the FFI is one obvious
+    /// `<img src={preview.image_url}>` away from a frontend having the
+    /// receiver's device fetch it, which tells that host which npub read the
+    /// link. Nothing crosses this boundary until there is a thumbnail the
+    /// *sender* has already fetched and attached as bytes in the envelope;
+    /// only then can this DTO carry an image without becoming the leak the
+    /// zero-network-request design exists to prevent.
     pub kind: PreviewKindDto,
     /// The domain to draw on the card — from [`Self::url`], never
     /// [`Self::site_name`]. See `comrade_core::unfurl::display_domain`: a
@@ -2476,7 +2483,6 @@ impl From<comrade_core::unfurl::LinkPreview> for LinkPreviewDto {
             title: p.title,
             description: p.description,
             site_name: p.site_name,
-            image_url: p.image_url,
             kind: p.kind.into(),
             display_domain,
         }
@@ -2491,7 +2497,10 @@ impl From<LinkPreviewDto> for comrade_core::unfurl::LinkPreview {
             title: dto.title,
             description: dto.description,
             site_name: dto.site_name,
-            image_url: dto.image_url,
+            // Never carried across the bridge — see the field-removal note on
+            // `LinkPreviewDto`. `None` here, not a lossy round trip: nothing
+            // on this side ever had a URL to lose.
+            image_url: None,
             kind: dto.kind.into(),
         }
     }
@@ -15617,7 +15626,6 @@ mod tests {
             title: Some("t".into()),
             description: None,
             site_name: None,
-            image_url: None,
             kind: PreviewKindDto::Unknown,
             display_domain: Some("example.com".into()),
         };

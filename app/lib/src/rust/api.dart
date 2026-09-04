@@ -182,6 +182,85 @@ Future<List<ConversationDto>> conversations() =>
 Future<List<MessageDto>> messagesWith({required String peer}) =>
     RustLib.instance.api.crateApiMessagesWith(peer: peer);
 
+/// Every pinned message in `peer`'s conversation, oldest pin first. See
+/// `comrade_ui::ComradeRuntime::pinned_messages`.
+Future<List<MessageDto>> pinnedMessages({required String peer}) =>
+    RustLib.instance.api.crateApiPinnedMessages(peer: peer);
+
+/// Every starred message across every conversation, oldest star first — the
+/// "Starred Messages" screen. See `comrade_ui::ComradeRuntime::starred_messages`.
+Future<List<MessageDto>> starredMessages() =>
+    RustLib.instance.api.crateApiStarredMessages();
+
+/// Star or un-star one of `peer`'s messages. Local device state only; returns
+/// whether the stored state changed. See
+/// `comrade_ui::ComradeRuntime::star_message`.
+Future<bool> starMessage(
+        {required String peer,
+        required String messageId,
+        required bool starred}) =>
+    RustLib.instance.api.crateApiStarMessage(
+        peer: peer, messageId: messageId, starred: starred);
+
+/// Pin one of `peer`'s messages. Refuses once the conversation is already at
+/// the pin cap — unpin one first. `false` (not an error) if it was already
+/// pinned. See `comrade_ui::ComradeRuntime::pin_message`.
+Future<bool> pinMessage({required String peer, required String messageId}) =>
+    RustLib.instance.api.crateApiPinMessage(peer: peer, messageId: messageId);
+
+/// Unpin one of `peer`'s messages. `true` if it was pinned. See
+/// `comrade_ui::ComradeRuntime::unpin_message`.
+Future<bool> unpinMessage({required String peer, required String messageId}) =>
+    RustLib.instance.api.crateApiUnpinMessage(peer: peer, messageId: messageId);
+
+/// Hide one of `peer`'s messages on this device only. See
+/// `comrade_ui::ComradeRuntime::delete_message_for_me`.
+Future<void> deleteMessageForMe(
+        {required String peer, required String messageId}) =>
+    RustLib.instance.api
+        .crateApiDeleteMessageForMe(peer: peer, messageId: messageId);
+
+/// Delete a message you sent for everyone in `peer`'s conversation — a
+/// best-effort courtesy, not a protocol guarantee. See
+/// `comrade_ui::ComradeRuntime::delete_message_for_everyone`.
+///
+/// Not wrapped through [`broadcast_chitthi`]'s `handles()` snapshot:
+/// `comrade_ui::ComradeRuntime::delete_message_for_everyone` takes `&self`
+/// rather than exposing a `RuntimeHandles` counterpart, so this holds a
+/// shared read guard across its network send — the same shape as
+/// [`panic_wipe`], not the exclusive-write case that one guards against.
+Future<void> deleteMessageForEveryone(
+        {required String peer, required String messageId}) =>
+    RustLib.instance.api
+        .crateApiDeleteMessageForEveryone(peer: peer, messageId: messageId);
+
+/// Forward one of `from_peer`'s messages to each of `to_peers`, as a new
+/// message in each conversation. See
+/// `comrade_ui::ComradeRuntime::forward_message`.
+///
+/// Same lock-discipline note as [`delete_message_for_everyone`]: no
+/// `RuntimeHandles` counterpart exists for this one either.
+Future<List<MessageDto>> forwardMessage(
+        {required String fromPeer,
+        required String messageId,
+        required List<String> toPeers}) =>
+    RustLib.instance.api.crateApiForwardMessage(
+        fromPeer: fromPeer, messageId: messageId, toPeers: toPeers);
+
+/// Fetch and build a link preview for the first link in `content`, if any —
+/// sender-side only, run before a send. Takes no lock: a free function
+/// underneath, so this wrapper cannot hold a guard across the network round
+/// trip. See `comrade_ui::compose_link_preview`.
+Future<LinkPreviewDto?> composeLinkPreview({required String content}) =>
+    RustLib.instance.api.crateApiComposeLinkPreview(content: content);
+
+/// Attach `preview` to `content`, producing the body [`send_dm`] should
+/// actually send. See `comrade_ui::attach_link_preview`.
+String attachLinkPreview(
+        {required String content, required LinkPreviewDto preview}) =>
+    RustLib.instance.api
+        .crateApiAttachLinkPreview(content: content, preview: preview);
+
 /// Full encrypted-media history with `peer`, oldest first — the media
 /// counterpart of [`messages_with`].
 Future<List<MediaMessageDto>> mediaWith({required String peer}) =>
@@ -1312,6 +1391,49 @@ class JournalRecordingDto {
           sizeBytes == other.sizeBytes;
 }
 
+class LinkPreviewDto {
+  final String url;
+  final String canonicalUrl;
+  final String? title;
+  final String? description;
+  final String? siteName;
+  final PreviewKindDto kind;
+  final String? displayDomain;
+
+  const LinkPreviewDto({
+    required this.url,
+    required this.canonicalUrl,
+    this.title,
+    this.description,
+    this.siteName,
+    required this.kind,
+    this.displayDomain,
+  });
+
+  @override
+  int get hashCode =>
+      url.hashCode ^
+      canonicalUrl.hashCode ^
+      title.hashCode ^
+      description.hashCode ^
+      siteName.hashCode ^
+      kind.hashCode ^
+      displayDomain.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is LinkPreviewDto &&
+          runtimeType == other.runtimeType &&
+          url == other.url &&
+          canonicalUrl == other.canonicalUrl &&
+          title == other.title &&
+          description == other.description &&
+          siteName == other.siteName &&
+          kind == other.kind &&
+          displayDomain == other.displayDomain;
+}
+
 class MediaBytesDto {
   final String mimeType;
   final String base64;
@@ -1401,6 +1523,27 @@ class MeshStatusDto {
           peerCount == other.peerCount;
 }
 
+class MessageActionState {
+  final bool starred;
+  final bool pinned;
+
+  const MessageActionState({
+    required this.starred,
+    required this.pinned,
+  });
+
+  @override
+  int get hashCode => starred.hashCode ^ pinned.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is MessageActionState &&
+          runtimeType == other.runtimeType &&
+          starred == other.starred &&
+          pinned == other.pinned;
+}
+
 enum MessageAuthor {
   human,
   tara,
@@ -1417,6 +1560,9 @@ class MessageDto {
   final String? status;
   final String? replyTo;
   final SharedNoteDto? sharedNote;
+  final LinkPreviewDto? linkPreview;
+  final bool forwarded;
+  final MessageActionState actions;
 
   const MessageDto({
     required this.id,
@@ -1428,6 +1574,9 @@ class MessageDto {
     this.status,
     this.replyTo,
     this.sharedNote,
+    this.linkPreview,
+    required this.forwarded,
+    required this.actions,
   });
 
   @override
@@ -1440,7 +1589,10 @@ class MessageDto {
       author.hashCode ^
       status.hashCode ^
       replyTo.hashCode ^
-      sharedNote.hashCode;
+      sharedNote.hashCode ^
+      linkPreview.hashCode ^
+      forwarded.hashCode ^
+      actions.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -1455,7 +1607,10 @@ class MessageDto {
           author == other.author &&
           status == other.status &&
           replyTo == other.replyTo &&
-          sharedNote == other.sharedNote;
+          sharedNote == other.sharedNote &&
+          linkPreview == other.linkPreview &&
+          forwarded == other.forwarded &&
+          actions == other.actions;
 }
 
 class MessageRequestDto {
@@ -1623,6 +1778,15 @@ class PresenceDto {
           online == other.online &&
           lastSeenAt == other.lastSeenAt &&
           peerMarkedUs == other.peerMarkedUs;
+}
+
+enum PreviewKindDto {
+  article,
+  photo,
+  video,
+  profile,
+  unknown,
+  ;
 }
 
 class ProfileDto {
