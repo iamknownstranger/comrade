@@ -168,8 +168,7 @@ void main() {
     });
 
     test('exactly one of star or unstar appears', () {
-      final List<MessageAction> unstarred =
-          messageActions(ctx(starred: false));
+      final List<MessageAction> unstarred = messageActions(ctx(starred: false));
       expect(unstarred, contains(MessageAction.star));
       expect(unstarred, isNot(contains(MessageAction.unstar)));
 
