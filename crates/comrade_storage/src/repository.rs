@@ -26,9 +26,22 @@
  * [`Zeroizing`]: zeroize::Zeroizing
  */
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use serde::{Deserialize, Serialize};
 
 use crate::{EncryptedStore, StorageError};
+
+/// Wall clock in whole seconds, for the local-only timestamps
+/// ([`StarredMessage::starred_at`], [`PinnedMessage::pinned_at`]) that order
+/// those lists. Never used for anything a replay could exploit — those fields
+/// come from the caller, as [`MessageReaction::created_at`] does.
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
+}
 
 /// Monotonic rank of a delivery status so receipts only ever move forward:
 /// queued (0) < sent (1) < delivered (2) < read (3).
@@ -97,6 +110,17 @@ const TOPICS_TREE: &str = "conversation_topics";
 /// Which topic a thread is filed under, keyed by the thread root's event id.
 /// See [`ThreadTopic`].
 const THREAD_TOPICS_TREE: &str = "thread_topics";
+/// Starred (bookmarked) messages, keyed `<peer npub>:<message id>` — one row
+/// per starred message. Local device state only; see [`StarredMessage`].
+const STARRED_TREE: &str = "starred_messages";
+/// Pinned messages, keyed `<peer npub>:<message id>`, capped per conversation
+/// at [`EncryptedStore::MAX_PINNED_PER_CONVERSATION`]. See [`PinnedMessage`].
+const PINNED_TREE: &str = "pinned_messages";
+/// "Delete for me" tombstones, keyed `<peer npub>:<message id>` — presence of
+/// a row means the message is hidden on this device regardless of whether the
+/// message row itself exists. See [`EncryptedStore::delete_message_for_me`]
+/// for why a tombstone tree exists at all instead of just removing the row.
+const DELETED_FOR_ME_TREE: &str = "deleted_for_me";
 
 const IDENTITY_KEY: &str = "self";
 const LEDGER_SNAPSHOT_KEY: &str = "hisab_kitab";
@@ -239,6 +263,37 @@ pub struct MessageReaction {
     /// Whether *this device* sent it — drives the "your reaction" highlight, and
     /// stored rather than derived because the store does not know the identity.
     pub outgoing: bool,
+}
+
+/// One message the user starred (bookmarked) for themselves.
+///
+/// Unlike [`MessageReaction`] this never travels anywhere: there is no wire
+/// form, no peer copy, and no relay ever sees it, so
+/// [`EncryptedStore::star_message`] has no clock to defend the way
+/// [`EncryptedStore::set_reaction`] does — the caller's boolean always wins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StarredMessage {
+    pub peer_npub: String,
+    pub message_id: String,
+    /// When the star was placed (unix seconds) — the order the starred list
+    /// reads in.
+    pub starred_at: u64,
+}
+
+/// One message pinned to the top of a conversation.
+///
+/// Same standing as [`StarredMessage`]: Comrade has no protocol message that
+/// announces a pin to the other person, so "pinned" means pinned on *this*
+/// device, not on both ends of the conversation. Bounded per conversation by
+/// [`EncryptedStore::MAX_PINNED_PER_CONVERSATION`] — see that constant for why
+/// a flat cap rather than "as many as Telegram allows".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PinnedMessage {
+    pub peer_npub: String,
+    pub message_id: String,
+    /// When the pin was placed (unix seconds) — the order the pinned list
+    /// reads in.
+    pub pinned_at: u64,
 }
 
 /// A private journal entry — the wellbeing pillar's core record. Strictly
@@ -837,6 +892,158 @@ impl EncryptedStore {
         let row: Option<MessageReaction> =
             self.get(REACTIONS_TREE, &Self::reaction_key(target_id, reactor_npub))?;
         Ok(row.filter(|r| !r.emoji.is_empty()))
+    }
+
+    // Starred (bookmarked) messages ---------------------------------------------
+
+    /// Store key for one message in one conversation, shared by the starred,
+    /// pinned and delete-for-me trees — they all key the same way and none of
+    /// them need a reactor/sender component the way [`REACTIONS_TREE`] does.
+    fn peer_message_key(peer_npub: &str, message_id: &str) -> String {
+        format!("{peer_npub}:{message_id}")
+    }
+
+    /// Star or un-star a message. Returns whether the stored state changed, so
+    /// a caller only redraws when there is news — same contract as
+    /// [`Self::set_reaction`], but there is no timestamp to compare: this is
+    /// local device state with no sender to race against, so the caller's
+    /// `starred` always wins.
+    pub fn star_message(
+        &self,
+        peer_npub: &str,
+        message_id: &str,
+        starred: bool,
+    ) -> Result<bool, StorageError> {
+        let key = Self::peer_message_key(peer_npub, message_id);
+        let was_starred = self.get::<StarredMessage>(STARRED_TREE, &key)?.is_some();
+        if was_starred == starred {
+            return Ok(false);
+        }
+        if starred {
+            self.put(
+                STARRED_TREE,
+                &key,
+                &StarredMessage {
+                    peer_npub: peer_npub.to_string(),
+                    message_id: message_id.to_string(),
+                    starred_at: unix_now(),
+                },
+            )?;
+        } else {
+            self.delete(STARRED_TREE, &key)?;
+        }
+        Ok(true)
+    }
+
+    /// Every starred message in one conversation, oldest star first.
+    pub fn starred_with(&self, peer_npub: &str) -> Result<Vec<StarredMessage>, StorageError> {
+        let mut rows: Vec<StarredMessage> = self
+            .values::<StarredMessage>(STARRED_TREE)?
+            .into_iter()
+            .filter(|s| s.peer_npub == peer_npub)
+            .collect();
+        rows.sort_by_key(|s| s.starred_at);
+        Ok(rows)
+    }
+
+    /// Every starred message across every conversation, oldest star first —
+    /// the "Starred Messages" screen, which (like Telegram's) reads across
+    /// conversations rather than one at a time.
+    pub fn all_starred(&self) -> Result<Vec<StarredMessage>, StorageError> {
+        let mut rows: Vec<StarredMessage> = self.values(STARRED_TREE)?;
+        rows.sort_by_key(|s| s.starred_at);
+        Ok(rows)
+    }
+
+    // Pinned messages -------------------------------------------------------------
+
+    /// Cap on pinned messages per conversation. Telegram allows many more, but
+    /// nothing here pages the pinned list — [`Self::pinned_with`] is one
+    /// `values` scan — and 50 is comfortably past "the handful of messages
+    /// worth keeping at the top of a chat" without inviting the list to grow
+    /// into a second unbounded feed. Raise it if the pinned-message UI ever
+    /// grows pagination to match.
+    pub const MAX_PINNED_PER_CONVERSATION: usize = 50;
+
+    /// Pin a message. Refuses once the conversation already holds
+    /// [`Self::MAX_PINNED_PER_CONVERSATION`] pins; unpin one first. Returns
+    /// `false` (not an error) if the message was already pinned — pinning is
+    /// idempotent, only the cap is enforced.
+    pub fn pin_message(&self, peer_npub: &str, message_id: &str) -> Result<bool, StorageError> {
+        let key = Self::peer_message_key(peer_npub, message_id);
+        if self.get::<PinnedMessage>(PINNED_TREE, &key)?.is_some() {
+            return Ok(false);
+        }
+        let current = self.pinned_with(peer_npub)?;
+        if current.len() >= Self::MAX_PINNED_PER_CONVERSATION {
+            return Err(StorageError::LimitExceeded(format!(
+                "this conversation already has {} pinned messages — unpin one first",
+                Self::MAX_PINNED_PER_CONVERSATION
+            )));
+        }
+        self.put(
+            PINNED_TREE,
+            &key,
+            &PinnedMessage {
+                peer_npub: peer_npub.to_string(),
+                message_id: message_id.to_string(),
+                pinned_at: unix_now(),
+            },
+        )?;
+        Ok(true)
+    }
+
+    /// Unpin a message. `true` if it was pinned.
+    pub fn unpin_message(&self, peer_npub: &str, message_id: &str) -> Result<bool, StorageError> {
+        self.delete(PINNED_TREE, &Self::peer_message_key(peer_npub, message_id))
+    }
+
+    /// Every pinned message in one conversation, oldest pin first — the order
+    /// a pinned-messages bar scrolls through.
+    pub fn pinned_with(&self, peer_npub: &str) -> Result<Vec<PinnedMessage>, StorageError> {
+        let mut rows: Vec<PinnedMessage> = self
+            .values::<PinnedMessage>(PINNED_TREE)?
+            .into_iter()
+            .filter(|p| p.peer_npub == peer_npub)
+            .collect();
+        rows.sort_by_key(|p| p.pinned_at);
+        Ok(rows)
+    }
+
+    // Delete for me ---------------------------------------------------------------
+
+    /// Hide one message on this device, permanently. [`Self::remove_message`]
+    /// deletes the *row*, which is not enough on its own: a relay redelivers a
+    /// gift wrap on a cold-start rescan, and the mesh replays frames it is
+    /// unsure were received, so a message a backfill can resurrect needs a
+    /// marker a backfill cannot un-write. This tombstone is checked
+    /// independently of whether the message row exists at all — see
+    /// [`Self::is_deleted_for_me`] — so a re-delivery finds the message hidden
+    /// again the instant it lands, row or no row.
+    pub fn delete_message_for_me(
+        &self,
+        peer_npub: &str,
+        message_id: &str,
+    ) -> Result<(), StorageError> {
+        self.put(
+            DELETED_FOR_ME_TREE,
+            &Self::peer_message_key(peer_npub, message_id),
+            &true,
+        )
+    }
+
+    /// Whether a message carries a delete-for-me tombstone.
+    pub fn is_deleted_for_me(
+        &self,
+        peer_npub: &str,
+        message_id: &str,
+    ) -> Result<bool, StorageError> {
+        Ok(self
+            .get::<bool>(
+                DELETED_FOR_ME_TREE,
+                &Self::peer_message_key(peer_npub, message_id),
+            )?
+            .unwrap_or(false))
     }
 
     // Topics and threads ------------------------------------------------------
@@ -1640,6 +1847,122 @@ mod tests {
             s.reactions_with("npub1alice").unwrap()[0].target_id,
             "e-unseen"
         );
+    }
+
+    // Starred, pinned, delete-for-me -------------------------------------------
+
+    #[test]
+    fn starring_and_unstarring_reports_whether_anything_changed() {
+        let (_d, s) = store();
+        assert!(s.star_message("npub1alice", "e1", true).unwrap());
+        // Starring an already-starred message is not news.
+        assert!(!s.star_message("npub1alice", "e1", true).unwrap());
+        assert_eq!(s.starred_with("npub1alice").unwrap().len(), 1);
+        assert!(s.star_message("npub1alice", "e1", false).unwrap());
+        // Unstarring an already-unstarred message is not news either.
+        assert!(!s.star_message("npub1alice", "e1", false).unwrap());
+        assert!(s.starred_with("npub1alice").unwrap().is_empty());
+    }
+
+    #[test]
+    fn all_starred_reads_across_every_conversation() {
+        let (_d, s) = store();
+        s.star_message("npub1alice", "e1", true).unwrap();
+        s.star_message("npub1bob", "e9", true).unwrap();
+        let all = s.all_starred().unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(s.starred_with("npub1alice").unwrap().len(), 1);
+        assert_eq!(s.starred_with("npub1bob").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn pinning_is_idempotent_and_unpinning_says_whether_one_was_pinned() {
+        let (_d, s) = store();
+        assert!(s.pin_message("npub1alice", "e1").unwrap());
+        // Pinning twice is not an error and not news — no cap tripped either.
+        assert!(!s.pin_message("npub1alice", "e1").unwrap());
+        assert_eq!(s.pinned_with("npub1alice").unwrap().len(), 1);
+        assert!(s.unpin_message("npub1alice", "e1").unwrap());
+        assert!(!s.unpin_message("npub1alice", "e1").unwrap());
+        assert!(s.pinned_with("npub1alice").unwrap().is_empty());
+    }
+
+    #[test]
+    fn pins_are_capped_per_conversation() {
+        // Telegram allows many more; MAX_PINNED_PER_CONVERSATION exists so the
+        // pinned list — one flat `values` scan, no pagination — stays cheap to
+        // read. This pins the number rather than letting it drift unnoticed.
+        let (_d, s) = store();
+        for i in 0..EncryptedStore::MAX_PINNED_PER_CONVERSATION {
+            assert!(s.pin_message("npub1alice", &format!("e{i}")).unwrap());
+        }
+        let over_cap = s.pin_message("npub1alice", "one-too-many");
+        assert!(
+            matches!(over_cap, Err(StorageError::LimitExceeded(_))),
+            "the cap must refuse, not silently drop: {over_cap:?}"
+        );
+        assert_eq!(
+            s.pinned_with("npub1alice").unwrap().len(),
+            EncryptedStore::MAX_PINNED_PER_CONVERSATION
+        );
+        // Unpinning one frees a slot.
+        s.unpin_message("npub1alice", "e0").unwrap();
+        assert!(s.pin_message("npub1alice", "one-too-many").unwrap());
+    }
+
+    #[test]
+    fn pins_are_scoped_to_their_conversation() {
+        let (_d, s) = store();
+        s.pin_message("npub1alice", "e1").unwrap();
+        s.pin_message("npub1bob", "e9").unwrap();
+        assert_eq!(s.pinned_with("npub1alice").unwrap().len(), 1);
+        assert_eq!(s.pinned_with("npub1bob").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_backfill_cannot_undelete_a_message_deleted_for_me() {
+        // The whole reason `delete_message_for_me` is a tombstone and not just
+        // `remove_message`: a relay's cold-start rescan of its gift-wrap window,
+        // or a mesh replay, redelivers the same event id, and `save_message`
+        // would otherwise happily recreate the row the user hid.
+        let (_d, s) = store();
+        let msg = StoredMessage {
+            id: "e1".into(),
+            peer_npub: "npub1alice".into(),
+            content: "hi".into(),
+            created_at: 100,
+            outgoing: false,
+            status: None,
+            reply_to: None,
+        };
+        s.save_message(&msg).unwrap();
+        assert!(!s.is_deleted_for_me("npub1alice", "e1").unwrap());
+
+        s.remove_message("e1").unwrap();
+        s.delete_message_for_me("npub1alice", "e1").unwrap();
+        assert!(s.is_deleted_for_me("npub1alice", "e1").unwrap());
+
+        // The backfill redelivers the same event id.
+        s.save_message(&msg).unwrap();
+        assert!(
+            s.get_message("e1").unwrap().is_some(),
+            "the row is back — the cache does not know about the tombstone"
+        );
+        assert!(
+            s.is_deleted_for_me("npub1alice", "e1").unwrap(),
+            "but the tombstone survives the replay, which is the point"
+        );
+    }
+
+    #[test]
+    fn delete_for_me_is_scoped_per_conversation_key() {
+        // Same message id in two conversations (a forwarded message, say) is
+        // two different tombstone slots — deleting it from one thread must not
+        // hide it in the other.
+        let (_d, s) = store();
+        s.delete_message_for_me("npub1alice", "e1").unwrap();
+        assert!(s.is_deleted_for_me("npub1alice", "e1").unwrap());
+        assert!(!s.is_deleted_for_me("npub1bob", "e1").unwrap());
     }
 
     #[test]

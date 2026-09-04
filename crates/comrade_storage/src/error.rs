@@ -26,6 +26,12 @@ pub enum StorageError {
 
     #[error("stored record is malformed: {0}")]
     Corrupt(String),
+
+    /// A bounded collection (currently: pins per conversation) is already at
+    /// its cap. Distinct from [`Self::Corrupt`] because nothing is wrong with
+    /// the data — the caller just needs to unpin something first.
+    #[error("{0}")]
+    LimitExceeded(String),
 }
 
 impl From<sled::Error> for StorageError {

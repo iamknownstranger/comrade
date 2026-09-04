@@ -199,6 +199,64 @@ pub fn parse_reaction(content: &str) -> Option<ReactionEnvelope> {
     Some(env)
 }
 
+// ── Delete request ("delete for everyone") ───────────────────────────────────
+
+/// A courtesy request, sent over the same sealed DM channel, asking the peer
+/// to hide one earlier message on their side too.
+///
+/// **This is not a NIP-09 (kind-5) deletion request, and cannot be.** NIP-09
+/// only works when the deletion is signed by the same key that authored the
+/// event, but this app's DMs are NIP-17 gift wraps: `VaultEngine::send_dm_reply`
+/// signs the *published* Kind-1059 event with a fresh, one-time key that is
+/// generated and discarded inside that call (see its doc — the whole point of
+/// NIP-59 sealing is keeping the real sender's key off the wrapper). By the
+/// time a user asks to delete a message they sent, this device no longer
+/// holds — and by design never retained — the key that would need to sign a
+/// real retraction. There is nothing to check the nostr crate for here: it
+/// implements NIP-09 correctly (`nostr::nips::nip09::EventDeletionRequest`),
+/// the architecture this envelope rides on is what makes it inapplicable.
+///
+/// What this *is*: exactly the trust model WhatsApp's and Signal's "delete for
+/// everyone" already run on — a protocol message the recipient's client is
+/// expected to honour, not a cryptographic guarantee. A recipient on a client
+/// that ignores this envelope, or one who already read and screenshotted the
+/// message, is unaffected, same as those apps. Only the sender of the
+/// original message may issue one — see `comrade_ui`'s
+/// `RuntimeHandles::delete_message_for_everyone`, which enforces that before
+/// this is ever built.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteRequest {
+    /// Format marker; must equal [`CONTROL_ENVELOPE_MARKER`].
+    pub comrade_delete_request: u8,
+    /// Nostr event id (hex) of the message to hide.
+    pub target_id: String,
+}
+
+impl DeleteRequest {
+    pub fn new(target_id: impl Into<String>) -> Self {
+        Self {
+            comrade_delete_request: CONTROL_ENVELOPE_MARKER,
+            target_id: target_id.into(),
+        }
+    }
+
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+}
+
+/// Detect and parse a delete-request envelope out of a decrypted DM body.
+/// Rejects an empty `target_id` (nothing to hide) for the same reason
+/// [`parse_reaction`] rejects one: a malformed envelope must fall through to
+/// plain chat text, never surface as a bubble full of JSON.
+pub fn parse_delete_request(content: &str) -> Option<DeleteRequest> {
+    let env: DeleteRequest = serde_json::from_str(content).ok()?;
+    if env.comrade_delete_request != CONTROL_ENVELOPE_MARKER || env.target_id.is_empty() {
+        return None;
+    }
+    Some(env)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -324,5 +382,32 @@ mod tests {
             parse_receipt(r#"{"comrade_receipt":0,"status":"read","message_ids":[]}"#).is_none()
         );
         assert!(parse_reaction(r#"{"comrade_reaction":2,"target_id":"t","emoji":"🔥"}"#).is_none());
+    }
+
+    #[test]
+    fn delete_request_round_trips() {
+        let env = DeleteRequest::new("abc123");
+        let json = env.to_json().unwrap();
+        let back = parse_delete_request(&json).unwrap();
+        assert_eq!(back, env);
+        assert_eq!(back.target_id, "abc123");
+    }
+
+    #[test]
+    fn a_targetless_delete_request_is_refused() {
+        let orphan = DeleteRequest::new("").to_json().unwrap();
+        assert!(parse_delete_request(&orphan).is_none());
+    }
+
+    #[test]
+    fn delete_request_is_not_fooled_by_other_envelopes_or_chat_text() {
+        let reaction = ReactionEnvelope::new("m1", "🔥").to_json().unwrap();
+        let receipt = Receipt::new(ReceiptKind::Read, vec!["m1".into()])
+            .to_json()
+            .unwrap();
+        assert!(parse_delete_request(&reaction).is_none());
+        assert!(parse_delete_request(&receipt).is_none());
+        assert!(parse_delete_request("just saying hi").is_none());
+        assert!(parse_delete_request(r#"{"comrade_delete_request":2,"target_id":"t"}"#).is_none());
     }
 }

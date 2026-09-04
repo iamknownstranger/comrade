@@ -229,6 +229,85 @@ pub async fn media_with(
         .map_err(|e| e.to_string())
 }
 
+// ── Message actions (local device state — see `message_actions.mjs`) ─────────
+//
+// Star/pin/delete-for-me are plain, synchronous `ComradeRuntime` methods (no
+// network `.await` inside), so — unlike [`delete_message_for_everyone`] and
+// `forward_message`, deliberately *not* exposed here yet — holding the read
+// guard across the call is the same discipline [`messages_with`]/[`media_with`]
+// above already use, not the AUDIT P2 hazard [`sync_ledger`]'s doc warns about.
+
+/// Star or un-star one of `peer`'s messages, for the "starred messages" list.
+/// Local device state only — see `comrade_ui::ComradeRuntime::star_message`.
+/// Returns whether the stored state actually changed.
+#[tauri::command]
+pub async fn star_message(
+    state: tauri::State<'_, Runtime>,
+    peer: String,
+    message_id: String,
+    starred: bool,
+) -> Result<bool, String> {
+    state
+        .read()
+        .await
+        .star_message(&peer, &message_id, starred)
+        .map_err(|e| e.to_string())
+}
+
+/// Pin one of `peer`'s messages. Refused once the conversation is already at
+/// its per-conversation cap — see `comrade_ui::ComradeRuntime::pin_message`.
+/// `false` (not an error) if it was already pinned.
+#[tauri::command]
+pub async fn pin_message(
+    state: tauri::State<'_, Runtime>,
+    peer: String,
+    message_id: String,
+) -> Result<bool, String> {
+    state
+        .read()
+        .await
+        .pin_message(&peer, &message_id)
+        .map_err(|e| e.to_string())
+}
+
+/// Unpin one of `peer`'s messages. `true` if it was pinned.
+#[tauri::command]
+pub async fn unpin_message(
+    state: tauri::State<'_, Runtime>,
+    peer: String,
+    message_id: String,
+) -> Result<bool, String> {
+    state
+        .read()
+        .await
+        .unpin_message(&peer, &message_id)
+        .map_err(|e| e.to_string())
+}
+
+/// Hide one of `peer`'s messages on this device only — a tombstone, so a
+/// relay's cold-start rescan (or a mesh replay) cannot bring it back. See
+/// `comrade_ui::ComradeRuntime::delete_message_for_me`.
+///
+/// The *other* half of Android's and Telegram's pair, "delete for everyone",
+/// is deliberately not a command here: `ComradeRuntime::delete_message_for_everyone`
+/// is `async` and ends in a relay send with no `handles()`-detached form (unlike
+/// [`send_dm`]/[`assign_thread`]), so wiring it the same way as this command
+/// would hold the runtime lock across a network `.await` — exactly what
+/// [`sync_ledger`]'s doc comment calls out as AUDIT P2. Giving it a
+/// detached path is a `comrade_ui` change, not one this file makes alone.
+#[tauri::command]
+pub async fn delete_message_for_me(
+    state: tauri::State<'_, Runtime>,
+    peer: String,
+    message_id: String,
+) -> Result<(), String> {
+    state
+        .read()
+        .await
+        .delete_message_for_me(&peer, &message_id)
+        .map_err(|e| e.to_string())
+}
+
 /// Send a DM as a reply to a prior message (`reply_to` = replied event id hex).
 ///
 /// See [`sync_ledger`]'s doc comment for the lock discipline.

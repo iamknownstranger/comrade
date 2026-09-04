@@ -427,6 +427,195 @@ val StarOutlineIcon: ImageVector = materialIcon(name = "Filled.StarOutline") {
     }
 }
 
+/**
+ * Material "push_pin" (filled) — a message pinned to the top of a conversation.
+ *
+ * Defined here for the reason the rest of this file exists: the core Material
+ * artifact does not ship it, and depending on which subset it happens to carry
+ * is how a build breaks on an icon nobody changed.
+ */
+val PushPinIcon: ImageVector = materialIcon(name = "Filled.PushPin") {
+    materialPath {
+        moveTo(16.0f, 9.0f)
+        verticalLineTo(4.0f)
+        horizontalLineTo(17.0f)
+        curveTo(17.55f, 4.0f, 18.0f, 3.55f, 18.0f, 3.0f)
+        curveTo(18.0f, 2.45f, 17.55f, 2.0f, 17.0f, 2.0f)
+        horizontalLineTo(7.0f)
+        curveTo(6.45f, 2.0f, 6.0f, 2.45f, 6.0f, 3.0f)
+        curveTo(6.0f, 3.55f, 6.45f, 4.0f, 7.0f, 4.0f)
+        horizontalLineTo(8.0f)
+        verticalLineTo(9.0f)
+        curveTo(8.0f, 10.66f, 6.66f, 12.0f, 5.0f, 12.0f)
+        verticalLineTo(14.0f)
+        horizontalLineTo(10.2f)
+        verticalLineTo(21.0f)
+        lineTo(11.2f, 22.0f)
+        lineTo(12.2f, 21.0f)
+        verticalLineTo(14.0f)
+        horizontalLineTo(19.0f)
+        verticalLineTo(12.0f)
+        curveTo(17.34f, 12.0f, 16.0f, 10.66f, 16.0f, 9.0f)
+        close()
+    }
+}
+
+/** Material "delete" (filled) — removing a message. */
+val DeleteIcon: ImageVector = materialIcon(name = "Filled.Delete") {
+    materialPath {
+        moveTo(6.0f, 19.0f)
+        curveTo(6.0f, 20.1f, 6.9f, 21.0f, 8.0f, 21.0f)
+        horizontalLineTo(16.0f)
+        curveTo(17.1f, 21.0f, 18.0f, 20.1f, 18.0f, 19.0f)
+        verticalLineTo(7.0f)
+        horizontalLineTo(6.0f)
+        verticalLineTo(19.0f)
+        close()
+        moveTo(19.0f, 4.0f)
+        horizontalLineTo(15.5f)
+        lineTo(14.5f, 3.0f)
+        horizontalLineTo(9.5f)
+        lineTo(8.5f, 4.0f)
+        horizontalLineTo(5.0f)
+        verticalLineTo(6.0f)
+        horizontalLineTo(19.0f)
+        verticalLineTo(4.0f)
+        close()
+    }
+}
+
+/** Material "edit" (filled) — rewriting a message you already sent. */
+val EditIcon: ImageVector = materialIcon(name = "Filled.Edit") {
+    materialPath {
+        moveTo(3.0f, 17.25f)
+        verticalLineTo(21.0f)
+        horizontalLineTo(6.75f)
+        lineTo(17.81f, 9.94f)
+        lineTo(14.06f, 6.19f)
+        lineTo(3.0f, 17.25f)
+        close()
+        moveTo(20.71f, 7.04f)
+        curveTo(21.1f, 6.65f, 21.1f, 6.02f, 20.71f, 5.63f)
+        lineTo(18.37f, 3.29f)
+        curveTo(17.98f, 2.9f, 17.35f, 2.9f, 16.96f, 3.29f)
+        lineTo(15.13f, 5.12f)
+        lineTo(18.88f, 8.87f)
+        lineTo(20.71f, 7.04f)
+        close()
+    }
+}
+
+/** Material "info" (outlined) — the delivery detail behind one message. */
+val InfoIcon: ImageVector = materialIcon(name = "Filled.Info") {
+    materialPath {
+        moveTo(12.0f, 2.0f)
+        curveTo(6.48f, 2.0f, 2.0f, 6.48f, 2.0f, 12.0f)
+        reflectiveCurveTo(6.48f, 22.0f, 12.0f, 22.0f)
+        reflectiveCurveTo(22.0f, 17.52f, 22.0f, 12.0f)
+        reflectiveCurveTo(17.52f, 2.0f, 12.0f, 2.0f)
+        close()
+        moveTo(13.0f, 17.0f)
+        horizontalLineTo(11.0f)
+        verticalLineTo(11.0f)
+        horizontalLineTo(13.0f)
+        verticalLineTo(17.0f)
+        close()
+        moveTo(13.0f, 9.0f)
+        horizontalLineTo(11.0f)
+        verticalLineTo(7.0f)
+        horizontalLineTo(13.0f)
+        verticalLineTo(9.0f)
+        close()
+    }
+}
+
+/** Material "flag" (filled) — reporting a message someone else sent. */
+val FlagIcon: ImageVector = materialIcon(name = "Filled.Flag") {
+    materialPath {
+        moveTo(14.4f, 6.0f)
+        lineTo(14.0f, 4.0f)
+        horizontalLineTo(5.0f)
+        verticalLineTo(21.0f)
+        horizontalLineTo(7.0f)
+        verticalLineTo(14.0f)
+        horizontalLineTo(12.6f)
+        lineTo(13.0f, 16.0f)
+        horizontalLineTo(20.0f)
+        verticalLineTo(6.0f)
+        horizontalLineTo(14.4f)
+        close()
+    }
+}
+
+/** Material "checklist" (filled) — entering multi-select. */
+val SelectIcon: ImageVector = materialIcon(name = "Filled.Checklist") {
+    materialPath {
+        moveTo(22.0f, 7.0f)
+        horizontalLineTo(10.0f)
+        verticalLineTo(9.0f)
+        horizontalLineTo(22.0f)
+        verticalLineTo(7.0f)
+        close()
+        moveTo(22.0f, 15.0f)
+        horizontalLineTo(10.0f)
+        verticalLineTo(17.0f)
+        horizontalLineTo(22.0f)
+        verticalLineTo(15.0f)
+        close()
+        moveTo(5.47f, 11.0f)
+        lineTo(2.0f, 7.53f)
+        lineTo(3.4f, 6.13f)
+        lineTo(5.47f, 8.2f)
+        lineTo(9.6f, 4.07f)
+        lineTo(11.0f, 5.47f)
+        lineTo(5.47f, 11.0f)
+        close()
+        moveTo(5.47f, 19.0f)
+        lineTo(2.0f, 15.53f)
+        lineTo(3.4f, 14.13f)
+        lineTo(5.47f, 16.2f)
+        lineTo(9.6f, 12.07f)
+        lineTo(11.0f, 13.47f)
+        lineTo(5.47f, 19.0f)
+        close()
+    }
+}
+
+/** Material "download" (filled) — writing an attachment to the device. */
+val DownloadIcon: ImageVector = materialIcon(name = "Filled.Download") {
+    materialPath {
+        moveTo(19.0f, 9.0f)
+        horizontalLineTo(15.0f)
+        verticalLineTo(3.0f)
+        horizontalLineTo(9.0f)
+        verticalLineTo(9.0f)
+        horizontalLineTo(5.0f)
+        lineTo(12.0f, 16.0f)
+        lineTo(19.0f, 9.0f)
+        close()
+        moveTo(5.0f, 18.0f)
+        verticalLineTo(20.0f)
+        horizontalLineTo(19.0f)
+        verticalLineTo(18.0f)
+        horizontalLineTo(5.0f)
+        close()
+    }
+}
+
+/** Material "forward" (filled) — sending a copy of a message somewhere else. */
+val ForwardIcon: ImageVector = materialIcon(name = "Filled.Forward") {
+    materialPath {
+        moveTo(12.0f, 8.0f)
+        verticalLineTo(4.0f)
+        lineTo(20.0f, 12.0f)
+        lineTo(12.0f, 20.0f)
+        verticalLineTo(15.9f)
+        curveTo(6.0f, 15.9f, 4.0f, 18.0f, 4.0f, 18.0f)
+        curveTo(4.0f, 13.0f, 6.0f, 8.0f, 12.0f, 8.0f)
+        close()
+    }
+}
+
 /** Material "content copy" (filled) — copying a key to the clipboard. */
 val CopyIcon: ImageVector = materialIcon(name = "Filled.ContentCopy") {
     materialPath {

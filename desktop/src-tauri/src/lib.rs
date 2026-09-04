@@ -108,6 +108,11 @@ pub fn run() {
             commands::conversations,
             commands::messages_with,
             commands::media_with,
+            // Message actions (local device state — see message_actions.mjs)
+            commands::star_message,
+            commands::pin_message,
+            commands::unpin_message,
+            commands::delete_message_for_me,
             commands::current_profile,
             commands::set_username,
             commands::set_about,

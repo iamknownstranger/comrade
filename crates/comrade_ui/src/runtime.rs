@@ -48,8 +48,8 @@ use comrade_core::dak::outbox::local_message_id;
 use comrade_core::dak::{ble, open_dm, seal_dm, Envelope, MeshDm, Reassembler};
 use comrade_core::dak::{AttemptOutcome, Outbox, OutboxSnapshot, QueueOutcome, QueuedMessage};
 use comrade_core::dm::{
-    parse_profile_share, parse_reaction, parse_receipt, ProfileShare, ReactionEnvelope, Receipt,
-    ReceiptKind, MAX_REACTION_BYTES,
+    parse_delete_request, parse_profile_share, parse_reaction, parse_receipt, DeleteRequest,
+    ProfileShare, ReactionEnvelope, Receipt, ReceiptKind, MAX_REACTION_BYTES,
 };
 use comrade_core::handoff::{parse_handoff_envelope, HandoffEnvelope, HandoffSignal};
 use comrade_core::karya::{
@@ -2382,6 +2382,158 @@ pub struct MessageDto {
     /// [`SharedNoteDto`] and `comrade_core::note`. `None` for ordinary
     /// messages, which is nearly all of them.
     pub shared_note: Option<SharedNoteDto>,
+    /// The link preview the *sender* built and attached, if the message
+    /// carries one — see `comrade_core::unfurl`'s module doc for why this
+    /// never costs the receiver a network request.
+    pub link_preview: Option<LinkPreviewDto>,
+    /// Whether this is a forward — see [`forwarded_text`] for why the label
+    /// carries no claim about who wrote the original words.
+    pub forwarded: bool,
+    /// This device's local bookmark/pin state for the message. See
+    /// [`MessageActionState`] for why neither field means anything to the peer.
+    pub actions: MessageActionState,
+}
+
+/// A message's local bookmark/pin state, read from the encrypted store
+/// alongside its content.
+///
+/// Both fields are local device state, same standing as
+/// `comrade_storage::StarredMessage`/`PinnedMessage`: there is no protocol
+/// message that announces either to the peer, so starring or pinning a
+/// message on one device says nothing about any other device or the other
+/// person's copy of the conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct MessageActionState {
+    pub starred: bool,
+    pub pinned: bool,
+}
+
+/// A link preview card, as a frontend renders it — the bridge view of
+/// `comrade_core::unfurl::LinkPreview`. See that module's doc for the
+/// load-bearing decision this rides on: built by the sender, rendered by the
+/// receiver with zero network requests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct LinkPreviewDto {
+    pub url: String,
+    pub canonical_url: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub site_name: Option<String>,
+    /// Deliberately absent. `comrade_core::unfurl::LinkPreview::image_url` is
+    /// a URL on the linked host — carrying it across the FFI is one obvious
+    /// `<img src={preview.image_url}>` away from a frontend having the
+    /// receiver's device fetch it, which tells that host which npub read the
+    /// link. Nothing crosses this boundary until there is a thumbnail the
+    /// *sender* has already fetched and attached as bytes in the envelope;
+    /// only then can this DTO carry an image without becoming the leak the
+    /// zero-network-request design exists to prevent.
+    pub kind: PreviewKindDto,
+    /// The domain to draw on the card — from [`Self::url`], never
+    /// [`Self::site_name`]. See `comrade_core::unfurl::display_domain`: a
+    /// page's own metadata can claim to be named anything, but this cannot lie
+    /// about which host actually served the page.
+    pub display_domain: Option<String>,
+}
+
+/// What kind of thing a preview's link points at — the bridge mirror of
+/// `comrade_core::unfurl::PreviewKind`. A hint the linked page volunteered
+/// about itself, useful for picking a card layout, never treated as more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum)]
+#[serde(rename_all = "snake_case")]
+pub enum PreviewKindDto {
+    Article,
+    Photo,
+    Video,
+    Profile,
+    Unknown,
+}
+
+impl From<comrade_core::unfurl::PreviewKind> for PreviewKindDto {
+    fn from(k: comrade_core::unfurl::PreviewKind) -> Self {
+        use comrade_core::unfurl::PreviewKind as K;
+        match k {
+            K::Article => Self::Article,
+            K::Photo => Self::Photo,
+            K::Video => Self::Video,
+            K::Profile => Self::Profile,
+            K::Unknown => Self::Unknown,
+        }
+    }
+}
+
+impl From<PreviewKindDto> for comrade_core::unfurl::PreviewKind {
+    fn from(k: PreviewKindDto) -> Self {
+        use comrade_core::unfurl::PreviewKind as K;
+        match k {
+            PreviewKindDto::Article => K::Article,
+            PreviewKindDto::Photo => K::Photo,
+            PreviewKindDto::Video => K::Video,
+            PreviewKindDto::Profile => K::Profile,
+            PreviewKindDto::Unknown => K::Unknown,
+        }
+    }
+}
+
+impl From<comrade_core::unfurl::LinkPreview> for LinkPreviewDto {
+    fn from(p: comrade_core::unfurl::LinkPreview) -> Self {
+        let display_domain = comrade_core::unfurl::display_domain(&p.url);
+        Self {
+            url: p.url,
+            canonical_url: p.canonical_url,
+            title: p.title,
+            description: p.description,
+            site_name: p.site_name,
+            kind: p.kind.into(),
+            display_domain,
+        }
+    }
+}
+
+impl From<LinkPreviewDto> for comrade_core::unfurl::LinkPreview {
+    fn from(dto: LinkPreviewDto) -> Self {
+        comrade_core::unfurl::LinkPreview {
+            url: dto.url,
+            canonical_url: dto.canonical_url,
+            title: dto.title,
+            description: dto.description,
+            site_name: dto.site_name,
+            // Never carried across the bridge — see the field-removal note on
+            // `LinkPreviewDto`. `None` here, not a lossy round trip: nothing
+            // on this side ever had a URL to lose.
+            image_url: None,
+            kind: dto.kind.into(),
+        }
+    }
+}
+
+/// Fetch and build a link preview for the first link in `content`, if any.
+///
+/// Sender-side only: this is what [`ComradeRuntime::send_dm`]'s caller runs
+/// *before* sending, on the device that is about to send the message — the
+/// same fetch a browser would already have made had the sender opened the
+/// link themselves. It must never be called on the receive path; see
+/// `comrade_core::unfurl`'s module doc for why. `None` with no link, a failed
+/// fetch, or (in a build without the `unfurl-http` feature) always — the
+/// caller falls back to sending plain text, never blocking a send on a
+/// preview.
+///
+/// A free function, not a [`ComradeRuntime`] method, for the same reason
+/// [`catalogue_lookup`] is: it touches no engine state, so nothing needs to
+/// hold a lock across the fetch.
+pub async fn compose_link_preview(content: &str) -> Option<LinkPreviewDto> {
+    let url = comrade_core::unfurl::first_previewable_url(content)?;
+    comrade_core::unfurl::fetch_preview(&url)
+        .await
+        .ok()
+        .map(LinkPreviewDto::from)
+}
+
+/// Attach `preview` to `content`, producing the body [`ComradeRuntime::send_dm`]
+/// should actually send. See `comrade_core::unfurl::attach_preview` for the
+/// wire form — plain text with one suffix line, so a client that never learns
+/// to parse it still shows exactly what was typed.
+pub fn attach_link_preview(content: &str, preview: &LinkPreviewDto) -> String {
+    comrade_core::unfurl::attach_preview(content, &preview.clone().into())
 }
 
 /// A journal note one person handed to another, as the bubble draws it.
@@ -2423,28 +2575,92 @@ fn split_author(content: String) -> (MessageAuthor, String) {
     }
 }
 
-/// Everything a stored/wire body says about itself: who wrote it, whether it is
-/// a shared journal note, and the text a bubble draws.
+/// What a forwarded message starts with — a label, never an attestation, in
+/// exactly the sense [`MessageAuthor`] already is. Forwarding must not claim
+/// the original author cryptographically: the forwarder is the one signing
+/// and sending *this* copy, over their own conversation with the recipient,
+/// so the wire can only ever say "the forwarding Comrade says this came from
+/// somewhere else" — never who. Mirrors `comrade_core::tara::TARA_CHAT_PREFIX`
+/// and `comrade_core::note::JOURNAL_NOTE_PREFIX`'s wire-stays-text argument: a
+/// client with no idea about forwarding still shows the label as plain text
+/// instead of silently presenting the words as the forwarder's own.
+const FORWARDED_PREFIX: &str = "↪ Forwarded";
+
+/// Render `text` as a forwarded message body. `text` must already be the
+/// plain words to show — see [`RuntimeHandles::forward_message`], which
+/// strips any author/note/preview marker from the original before calling
+/// this, so a forward is never able to nest another claim inside its own.
+fn forwarded_line(text: &str) -> String {
+    format!("{FORWARDED_PREFIX}\n{}", text.trim())
+}
+
+/// The text of a forwarded message, if `content` is one.
+fn forwarded_text(content: &str) -> Option<&str> {
+    let rest = content.strip_prefix(FORWARDED_PREFIX)?;
+    let text = rest.strip_prefix('\n')?.trim();
+    (!text.is_empty()).then_some(text)
+}
+
+/// Everything a stored/wire body says about itself, read in one place so a
+/// message cannot parse one way when it is sent and another way after a
+/// reload — the same argument [`read_body`]'s predecessor made for
+/// [`split_author`] and the shared-note marker, extended to cover forwarding
+/// and link previews.
+struct BodyRead {
+    author: MessageAuthor,
+    shared_note: Option<SharedNoteDto>,
+    link_preview: Option<LinkPreviewDto>,
+    forwarded: bool,
+    text: String,
+}
+
+/// Split a stored/wire message body into who wrote it, what it carries, and
+/// the text a bubble draws. See [`BodyRead`].
 ///
-/// Both markers work the same way and for the same reasons — see
-/// [`split_author`] and `comrade_core::note` — and both are read here rather
-/// than at the call sites, because a message that parsed on send and not on
-/// reload would change shape under the reader.
-///
-/// A Tara line is never also a note. She answers the sentence she was handed
-/// and has no journal; a body that carries both markers is someone typing, and
-/// the outer one is the claim being made.
-fn read_body(content: String) -> (MessageAuthor, Option<SharedNoteDto>, String) {
+/// The markers are mutually exclusive, checked in this order: Tara's answer
+/// first (she has no journal and forwards nothing — a body carrying both
+/// markers is someone typing, and the outer claim is the one that stands);
+/// then a forward, whose contents [`RuntimeHandles::forward_message`] has
+/// already stripped down to plain text, so nothing further to split inside
+/// one; then a shared journal note; and only then a link preview, which is
+/// the one marker an ordinary human message can carry on its own.
+fn read_body(content: String) -> BodyRead {
     let (author, body) = split_author(content);
     if author != MessageAuthor::Human {
-        return (author, None, body);
+        return BodyRead {
+            author,
+            shared_note: None,
+            link_preview: None,
+            forwarded: false,
+            text: body,
+        };
     }
-    match shared_note_of(&body) {
-        Some(note) => {
-            let text = note.text.clone();
-            (author, Some(note), text)
-        }
-        None => (author, None, body),
+    if let Some(text) = forwarded_text(&body) {
+        return BodyRead {
+            author,
+            shared_note: None,
+            link_preview: None,
+            forwarded: true,
+            text: text.to_string(),
+        };
+    }
+    if let Some(note) = shared_note_of(&body) {
+        let text = note.text.clone();
+        return BodyRead {
+            author,
+            shared_note: Some(note),
+            link_preview: None,
+            forwarded: false,
+            text,
+        };
+    }
+    let (text, preview) = comrade_core::unfurl::split_preview(&body);
+    BodyRead {
+        author,
+        shared_note: None,
+        link_preview: preview.map(LinkPreviewDto::from),
+        forwarded: false,
+        text,
     }
 }
 
@@ -2454,6 +2670,63 @@ fn shared_note_of(content: &str) -> Option<SharedNoteDto> {
         text: note.text.to_string(),
         mood: note.mood.map(str::to_string),
     })
+}
+
+/// Build a [`MessageDto`] from a stored row plus the local action state a
+/// caller already looked up — one place, so `messages_with`, `pinned_messages`
+/// and `starred_messages` cannot read a message's content differently from
+/// one another.
+fn stored_message_dto(
+    m: comrade_storage::StoredMessage,
+    actions: MessageActionState,
+) -> MessageDto {
+    let read = read_body(m.content);
+    MessageDto {
+        id: m.id,
+        peer: m.peer_npub,
+        content: read.text,
+        created_at: m.created_at,
+        author: read.author,
+        status: if m.outgoing {
+            Some(m.status.unwrap_or_else(|| "sent".into()))
+        } else {
+            None
+        },
+        reply_to: m.reply_to,
+        outgoing: m.outgoing,
+        shared_note: read.shared_note,
+        link_preview: read.link_preview,
+        forwarded: read.forwarded,
+        actions,
+    }
+}
+
+/// Every starred message id in `peer`'s conversation, for an O(1) join
+/// against a list of stored rows.
+fn starred_ids(
+    store: &comrade_storage::EncryptedStore,
+    peer_npub: &str,
+) -> Result<std::collections::HashSet<String>, UiError> {
+    Ok(store
+        .starred_with(peer_npub)
+        .map_err(|e| UiError::Storage(e.to_string()))?
+        .into_iter()
+        .map(|s| s.message_id)
+        .collect())
+}
+
+/// Every pinned message id in `peer`'s conversation, for the same join
+/// [`starred_ids`] is for.
+fn pinned_ids(
+    store: &comrade_storage::EncryptedStore,
+    peer_npub: &str,
+) -> Result<std::collections::HashSet<String>, UiError> {
+    Ok(store
+        .pinned_with(peer_npub)
+        .map_err(|e| UiError::Storage(e.to_string()))?
+        .into_iter()
+        .map(|p| p.message_id)
+        .collect())
 }
 
 // ── Threads and topics (see `comrade_core::topic`) ───────────────────────────
@@ -3689,36 +3962,247 @@ impl ComradeRuntime {
     }
 
     /// Full offline message history with `peer` (npub or hex), oldest first —
-    /// carrying each message's delivery status and reply target. Not gated, so
-    /// a pending request's thread is viewable before it is accepted.
+    /// carrying each message's delivery status, reply target, and local
+    /// bookmark/pin state. Not gated, so a pending request's thread is
+    /// viewable before it is accepted.
+    ///
+    /// A message with a delete-for-me tombstone is excluded here — that is the
+    /// whole reason the tombstone exists rather than a row delete: a backfill
+    /// that redelivers the same event id must not bring it back. See
+    /// `EncryptedStore::delete_message_for_me`.
     pub fn messages_with(&self, peer: &str) -> Result<Vec<MessageDto>, UiError> {
         let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
         let peer = to_npub(peer);
+        let starred = starred_ids(store, &peer)?;
+        let pinned = pinned_ids(store, &peer)?;
         let mut msgs: Vec<MessageDto> = store
             .messages_with(&peer)
             .map_err(|e| UiError::Storage(e.to_string()))?
             .into_iter()
+            .filter(|m| !store.is_deleted_for_me(&peer, &m.id).unwrap_or(false))
             .map(|m| {
-                let (author, shared_note, content) = read_body(m.content);
-                MessageDto {
-                    id: m.id,
-                    peer: m.peer_npub,
-                    content,
-                    created_at: m.created_at,
-                    author,
-                    status: if m.outgoing {
-                        Some(m.status.unwrap_or_else(|| "sent".into()))
-                    } else {
-                        None
-                    },
-                    reply_to: m.reply_to,
-                    outgoing: m.outgoing,
-                    shared_note,
-                }
+                let actions = MessageActionState {
+                    starred: starred.contains(&m.id),
+                    pinned: pinned.contains(&m.id),
+                };
+                stored_message_dto(m, actions)
             })
             .collect();
         msgs.sort_by_key(|m| m.created_at);
         Ok(msgs)
+    }
+
+    /// Every pinned message in `peer`'s conversation, oldest pin first — the
+    /// order a pinned-messages bar scrolls through. A message unpinned or
+    /// deleted-for-me since being pinned is silently absent rather than an
+    /// error: the pin row and the message row are independent, so either can
+    /// outlive the other by a moment.
+    pub fn pinned_messages(&self, peer: &str) -> Result<Vec<MessageDto>, UiError> {
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        let peer = to_npub(peer);
+        let starred = starred_ids(store, &peer)?;
+        store
+            .pinned_with(&peer)
+            .map_err(|e| UiError::Storage(e.to_string()))?
+            .into_iter()
+            .filter(|p| {
+                !store
+                    .is_deleted_for_me(&peer, &p.message_id)
+                    .unwrap_or(false)
+            })
+            .filter_map(|p| store.get_message(&p.message_id).ok().flatten())
+            .map(|m| {
+                let starred = starred.contains(&m.id);
+                Ok(stored_message_dto(
+                    m,
+                    MessageActionState {
+                        starred,
+                        pinned: true,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    /// Every starred (bookmarked) message across every conversation, oldest
+    /// star first — the "Starred Messages" screen, reading across
+    /// conversations the way Telegram's does rather than one at a time.
+    pub fn starred_messages(&self) -> Result<Vec<MessageDto>, UiError> {
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        store
+            .all_starred()
+            .map_err(|e| UiError::Storage(e.to_string()))?
+            .into_iter()
+            .filter(|s| {
+                !store
+                    .is_deleted_for_me(&s.peer_npub, &s.message_id)
+                    .unwrap_or(false)
+            })
+            .filter_map(|s| {
+                let pinned = store
+                    .pinned_with(&s.peer_npub)
+                    .ok()?
+                    .iter()
+                    .any(|p| p.message_id == s.message_id);
+                store
+                    .get_message(&s.message_id)
+                    .ok()
+                    .flatten()
+                    .map(|m| (m, pinned))
+            })
+            .map(|(m, pinned)| {
+                Ok(stored_message_dto(
+                    m,
+                    MessageActionState {
+                        starred: true,
+                        pinned,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    /// Star or un-star one of `peer`'s messages for the "starred messages"
+    /// list. Local device state only — see `EncryptedStore::star_message`.
+    /// Returns whether the stored state changed.
+    pub fn star_message(
+        &self,
+        peer: &str,
+        message_id: &str,
+        starred: bool,
+    ) -> Result<bool, UiError> {
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        store
+            .star_message(&to_npub(peer), message_id, starred)
+            .map_err(|e| UiError::Storage(e.to_string()))
+    }
+
+    /// Pin one of `peer`'s messages. Refuses once the conversation is already
+    /// at `EncryptedStore::MAX_PINNED_PER_CONVERSATION` — unpin one first.
+    /// Returns `false` (not an error) if it was already pinned.
+    pub fn pin_message(&self, peer: &str, message_id: &str) -> Result<bool, UiError> {
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        store
+            .pin_message(&to_npub(peer), message_id)
+            .map_err(|e| UiError::Storage(e.to_string()))
+    }
+
+    /// Unpin one of `peer`'s messages. `true` if it was pinned.
+    pub fn unpin_message(&self, peer: &str, message_id: &str) -> Result<bool, UiError> {
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        store
+            .unpin_message(&to_npub(peer), message_id)
+            .map_err(|e| UiError::Storage(e.to_string()))
+    }
+
+    /// Hide one of `peer`'s messages on this device only — a tombstone, not a
+    /// row delete, so a relay's cold-start rescan (or a mesh replay) cannot
+    /// bring it back. See `EncryptedStore::delete_message_for_me`.
+    pub fn delete_message_for_me(&self, peer: &str, message_id: &str) -> Result<(), UiError> {
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        store
+            .delete_message_for_me(&to_npub(peer), message_id)
+            .map_err(|e| UiError::Storage(e.to_string()))
+    }
+
+    /// Delete a message you sent for everyone in `peer`'s conversation.
+    ///
+    /// **This is not a NIP-09 (kind-5) retraction, and cannot be** — see
+    /// `comrade_core::dm::DeleteRequest`'s doc for exactly why: this app's DMs
+    /// are NIP-17 gift wraps signed by a one-time key that
+    /// `VaultEngine::send_dm_reply` discards the moment the send returns, so
+    /// there is no key left on this device to author a real retraction of a
+    /// message it sent even a minute ago. What this does instead — hide it
+    /// here immediately, and ask the peer's client to hide its copy too — is
+    /// the same best-effort courtesy WhatsApp's and Signal's "delete for
+    /// everyone" already run on: honoured by a cooperating client, silent on
+    /// one that ignores it or already showed the message.
+    ///
+    /// Only the message's own sender may call this — refused for an incoming
+    /// message, the same restriction WhatsApp enforces and for the same
+    /// reason: "delete for everyone" pointed at someone else's message is
+    /// really "delete for me" wearing a stronger name.
+    pub async fn delete_message_for_everyone(
+        &self,
+        peer: &str,
+        message_id: &str,
+    ) -> Result<(), UiError> {
+        let peer_npub = to_npub(peer);
+        let peer_pk = parse_pubkey(peer)?;
+        let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+        let msg = store
+            .get_message(message_id)
+            .map_err(|e| UiError::Storage(e.to_string()))?
+            .filter(|m| m.peer_npub == peer_npub)
+            .ok_or_else(|| {
+                UiError::Engine(format!("no message {message_id} in that conversation"))
+            })?;
+        if !msg.outgoing {
+            return Err(UiError::Engine(
+                "only the sender can delete a message for everyone".into(),
+            ));
+        }
+        store
+            .delete_message_for_me(&peer_npub, message_id)
+            .map_err(|e| UiError::Storage(e.to_string()))?;
+        if let Some(vault) = &self.vault {
+            if let Ok(json) = DeleteRequest::new(message_id).to_json() {
+                // Best-effort, like a receipt: the local hide already happened
+                // above, so a peer who is offline or on a client that ignores
+                // this envelope simply keeps their own copy — which is exactly
+                // the courtesy-not-guarantee this method's doc describes.
+                let _ = vault.send_dm(&peer_pk, &json).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Forward one of `from_peer`'s messages to each of `to_peers`, as a new
+    /// message in each conversation.
+    ///
+    /// **A label, not an attestation** — the same standing
+    /// [`MessageAuthor`]/[`SharedNoteDto`] already carry. Forwarding sends a
+    /// *copy*, signed and delivered by the forwarder over their own
+    /// conversation with each recipient; nothing here lets it claim the
+    /// original sender's identity, cryptographically or otherwise. The
+    /// forwarded text is stripped down to plain words first (see
+    /// [`forwarded_line`]) so a re-shared journal note or link preview cannot
+    /// smuggle a second claim inside the forward.
+    pub async fn forward_message(
+        &self,
+        from_peer: &str,
+        message_id: &str,
+        to_peers: &[String],
+    ) -> Result<Vec<MessageDto>, UiError> {
+        if to_peers.is_empty() {
+            return Err(UiError::Engine(
+                "forwarding needs at least one recipient".into(),
+            ));
+        }
+        let text = {
+            let store = self.ui.store_ref().ok_or(UiError::VaultLocked)?;
+            let from_npub = to_npub(from_peer);
+            let row = store
+                .get_message(message_id)
+                .map_err(|e| UiError::Storage(e.to_string()))?
+                .filter(|m| m.peer_npub == from_npub)
+                .ok_or_else(|| {
+                    UiError::Engine(format!("no message {message_id} in that conversation"))
+                })?;
+            if store
+                .is_deleted_for_me(&from_npub, message_id)
+                .unwrap_or(false)
+            {
+                return Err(UiError::Engine("that message was deleted".into()));
+            }
+            read_body(row.content).text
+        };
+        let body = forwarded_line(&text);
+        let mut sent = Vec::with_capacity(to_peers.len());
+        for peer in to_peers {
+            sent.push(self.send_dm(peer, &body).await?);
+        }
+        Ok(sent)
     }
 
     // ── Threads and topics (see `comrade_core::topic`) ───────────────────────
@@ -6902,17 +7386,24 @@ impl RuntimeHandles {
         // leave a composer that must never look like abandoning it.
         self.nudge_watch.sent(&peer_npub);
 
-        let (author, shared_note, body) = read_body(content.to_string());
+        let read = read_body(content.to_string());
         let dto = MessageDto {
             id,
             peer: peer_npub.clone(),
-            content: body,
+            content: read.text,
             created_at,
             outgoing: true,
-            author,
+            author: read.author,
             status: Some(status.into()),
             reply_to: reply_to.map(str::to_string),
-            shared_note,
+            shared_note: read.shared_note,
+            link_preview: read.link_preview,
+            forwarded: read.forwarded,
+            // Freshly sent — nobody has had the chance to star or pin it yet.
+            actions: MessageActionState {
+                starred: false,
+                pinned: false,
+            },
         };
         if let Some(store) = &self.store {
             let row = comrade_storage::StoredMessage {
@@ -11700,6 +12191,64 @@ fn dispatch_incoming_dm(
         return;
     }
 
+    // 7b) A delete-for-everyone courtesy request — hide our own copy of the
+    //     named message too. Gated like a reaction: a stranger must not be
+    //     able to reach into our history before their request is accepted,
+    //     and returning either way keeps an ungated one from surfacing as a
+    //     message request full of JSON.
+    //
+    //     Not a NIP-09 retraction — see `comrade_core::dm::DeleteRequest`'s
+    //     doc for why one is out of reach here. No `BridgeEvent` is emitted:
+    //     unlike a reaction or a topic change, this has no dedicated push
+    //     wired up (adding one is a `BridgeEvent` variant, which both
+    //     `android/` and `app/` match exhaustively — see this crate's
+    //     top-level doc). An already-open thread picks the hidden message up
+    //     on its next `messages_with` read; that gap is a known follow-up,
+    //     not an oversight.
+    if let Some(env) = parse_delete_request(&msg.content) {
+        if matches!(gate, IncomingGate::Accepted) {
+            if let Some(store) = store {
+                // **A request may only retract what its own sender wrote.**
+                //
+                // The envelope carries a bare `target_id` and nothing that
+                // proves who authored the message it names, so honouring one
+                // unchecked lets a peer hand us the id of a message *we* sent
+                // and delete our own words out of our own transcript. They know
+                // those ids — every message we sent them is one — so this is
+                // not a theoretical reach: it is the cheapest possible way to
+                // edit somebody else's record of a conversation, and it would
+                // leave no trace, because a tombstone renders as absence.
+                //
+                // The outgoing side already refuses to retract a message the
+                // user did not send, but that check runs on the honest client
+                // and an attacker simply does not run it. This is the one that
+                // has to hold. WhatsApp and Signal draw the line in the same
+                // place, for the same reason.
+                //
+                // A row we have never cached is refused rather than tombstoned
+                // pre-emptively: with nothing to compare against there is no
+                // authorship to verify, and a tombstone written now would
+                // silently hide whatever later arrives under that id.
+                let authored_by_peer = match store.get_message(&env.target_id) {
+                    Ok(Some(target)) => !target.outgoing && target.peer_npub == peer_npub,
+                    Ok(None) => false,
+                    Err(e) => {
+                        warn!("could not check who wrote a delete-request target: {e}");
+                        false
+                    }
+                };
+                if authored_by_peer {
+                    if let Err(e) = store.delete_message_for_me(&peer_npub, &env.target_id) {
+                        warn!("failed to honour a delete-for-everyone request: {e}");
+                    }
+                } else {
+                    warn!("refused a delete request for a message {peer_npub} did not write");
+                }
+            }
+        }
+        return;
+    }
+
     // 8) A task: named, or moved to a new state. Gated exactly like a call
     //    signal — a stranger who can write to your task list has been handed a
     //    harassment channel, and in an app about wellbeing that is worse than
@@ -14838,6 +15387,254 @@ mod tests {
         assert!(rt2.media_with(&peer_npub).unwrap().is_empty());
     }
 
+    // ── Message actions: star, pin, delete-for-me/everyone, forward ──────────
+
+    fn plain_message(
+        id: &str,
+        peer: &str,
+        content: &str,
+        at: u64,
+        outgoing: bool,
+    ) -> comrade_storage::StoredMessage {
+        comrade_storage::StoredMessage {
+            id: id.into(),
+            peer_npub: peer.into(),
+            content: content.into(),
+            created_at: at,
+            outgoing,
+            status: outgoing.then(|| "sent".to_string()),
+            reply_to: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn messages_with_hides_a_tombstoned_message_and_a_backfill_cannot_undo_it() {
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+        rt.unlock_vault(dir.path(), "pin").await.unwrap();
+        let (_hex, peer) = stranger();
+        let store = rt.ui.store_ref().unwrap();
+        let row = plain_message("m1", &peer, "hi", 1, false);
+        store.save_message(&row).unwrap();
+        assert_eq!(rt.messages_with(&peer).unwrap().len(), 1);
+
+        rt.delete_message_for_me(&peer, "m1").unwrap();
+        assert!(rt.messages_with(&peer).unwrap().is_empty());
+
+        // A relay's cold-start rescan (or a mesh replay) redelivers the same
+        // event id — the whole reason this is a tombstone and not a row
+        // delete is that it must stay hidden anyway.
+        store.save_message(&row).unwrap();
+        assert!(
+            store.get_message("m1").unwrap().is_some(),
+            "the row is back — the cache does not know about the tombstone"
+        );
+        assert!(
+            rt.messages_with(&peer).unwrap().is_empty(),
+            "but the tombstone survives the replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn star_and_pin_surface_on_messages_with_and_their_own_readers() {
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+        rt.unlock_vault(dir.path(), "pin").await.unwrap();
+        let (_hex, peer) = stranger();
+        let store = rt.ui.store_ref().unwrap();
+        store
+            .save_message(&plain_message("m1", &peer, "hi", 1, false))
+            .unwrap();
+
+        let before = rt.messages_with(&peer).unwrap();
+        assert!(!before[0].actions.starred);
+        assert!(!before[0].actions.pinned);
+
+        assert!(rt.star_message(&peer, "m1", true).unwrap());
+        // Starring again is not news.
+        assert!(!rt.star_message(&peer, "m1", true).unwrap());
+        assert!(rt.pin_message(&peer, "m1").unwrap());
+
+        let after = rt.messages_with(&peer).unwrap();
+        assert!(after[0].actions.starred);
+        assert!(after[0].actions.pinned);
+        assert_eq!(rt.pinned_messages(&peer).unwrap().len(), 1);
+        assert_eq!(rt.starred_messages().unwrap().len(), 1);
+
+        assert!(rt.unpin_message(&peer, "m1").unwrap());
+        assert!(!rt.messages_with(&peer).unwrap()[0].actions.pinned);
+        assert!(rt.pinned_messages(&peer).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pin_message_refuses_past_the_cap_but_unpinning_frees_a_slot() {
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+        rt.unlock_vault(dir.path(), "pin").await.unwrap();
+        let (_hex, peer) = stranger();
+        let store = rt.ui.store_ref().unwrap();
+        for i in 0..comrade_storage::EncryptedStore::MAX_PINNED_PER_CONVERSATION {
+            let id = format!("m{i}");
+            store
+                .save_message(&plain_message(&id, &peer, "x", i as u64, false))
+                .unwrap();
+            assert!(rt.pin_message(&peer, &id).unwrap());
+        }
+        assert!(rt.pin_message(&peer, "one-too-many").is_err());
+        rt.unpin_message(&peer, "m0").unwrap();
+        store
+            .save_message(&plain_message("one-too-many", &peer, "x", 999, false))
+            .unwrap();
+        assert!(rt.pin_message(&peer, "one-too-many").unwrap());
+    }
+
+    #[tokio::test]
+    async fn only_the_sender_can_delete_a_message_for_everyone() {
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+        rt.unlock_vault(dir.path(), "pin").await.unwrap();
+        let (_hex, peer) = stranger();
+        let store = rt.ui.store_ref().unwrap();
+        store
+            .save_message(&plain_message("in1", &peer, "hello", 1, false))
+            .unwrap();
+
+        assert!(matches!(
+            rt.delete_message_for_everyone(&peer, "in1").await,
+            Err(UiError::Engine(_))
+        ));
+        assert!(!store.is_deleted_for_me(&peer, "in1").unwrap());
+        assert_eq!(rt.messages_with(&peer).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn delete_for_everyone_hides_it_here_even_if_no_relay_hears_the_courtesy() {
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+        rt.unlock_vault(dir.path(), "pin").await.unwrap();
+        let (_hex, peer) = stranger();
+        let store = rt.ui.store_ref().unwrap();
+        store
+            .save_message(&plain_message("out1", &peer, "oops sent this", 1, true))
+            .unwrap();
+
+        // No relay is reachable in this test, so the courtesy notice to the
+        // peer cannot possibly succeed — the local hide must not depend on it.
+        rt.delete_message_for_everyone(&peer, "out1").await.unwrap();
+        assert!(store.is_deleted_for_me(&peer, "out1").unwrap());
+        assert!(rt.messages_with(&peer).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn forwarding_strips_markers_and_labels_the_copy_not_the_author() {
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+        rt.unlock_vault(dir.path(), "pin").await.unwrap();
+        let (_hex_a, peer_a) = stranger();
+        let (_hex_b, peer_b) = stranger();
+        let store = rt.ui.store_ref().unwrap();
+        store
+            .save_message(&plain_message("m1", &peer_a, "look at this", 1, false))
+            .unwrap();
+
+        assert!(matches!(
+            rt.forward_message(&peer_a, "m1", &[]).await,
+            Err(UiError::Engine(_))
+        ));
+        assert!(rt
+            .forward_message(&peer_a, "nope", std::slice::from_ref(&peer_b))
+            .await
+            .is_err());
+
+        let sent = rt
+            .forward_message(&peer_a, "m1", std::slice::from_ref(&peer_b))
+            .await
+            .unwrap();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].forwarded, "a forward must say so");
+        assert_eq!(
+            sent[0].content, "look at this",
+            "the words, not the wire marker, is what a bubble shows"
+        );
+        assert_eq!(sent[0].peer, peer_b);
+        assert_eq!(
+            sent[0].author,
+            MessageAuthor::Human,
+            "forwarding never claims to be the original sender, or anyone else"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_link_preview_attached_by_the_sender_surfaces_on_the_message() {
+        let dir = TempDir::new().unwrap();
+        let mut rt = ComradeRuntime::new();
+        rt.unlock_vault(dir.path(), "pin").await.unwrap();
+        let (_hex, peer) = stranger();
+        let store = rt.ui.store_ref().unwrap();
+        let preview = comrade_core::unfurl::LinkPreview {
+            url: "https://example.com/a".into(),
+            canonical_url: "https://example.com/a".into(),
+            title: Some("A title".into()),
+            description: None,
+            site_name: None,
+            image_url: None,
+            kind: comrade_core::unfurl::PreviewKind::Article,
+        };
+        let body = comrade_core::unfurl::attach_preview("check this out", &preview);
+        store
+            .save_message(&plain_message("m1", &peer, &body, 1, false))
+            .unwrap();
+
+        let msgs = rt.messages_with(&peer).unwrap();
+        assert_eq!(msgs[0].content, "check this out");
+        let card = msgs[0]
+            .link_preview
+            .as_ref()
+            .expect("preview should surface");
+        assert_eq!(card.title.as_deref(), Some("A title"));
+        assert_eq!(
+            card.display_domain.as_deref(),
+            Some("example.com"),
+            "the domain shown must come from the URL, not the page's own claims"
+        );
+    }
+
+    #[tokio::test]
+    async fn compose_link_preview_needs_a_link_to_even_try() {
+        // With no link at all, this must never guess or attempt a fetch —
+        // true in every build, feature or no feature.
+        assert!(compose_link_preview("no links here").await.is_none());
+    }
+
+    // Not exercised here on purpose: whether `compose_link_preview("see
+    // https://…")` returns `Some` depends on `comrade_core`'s `unfurl-http`
+    // feature and on a live fetch actually succeeding, and this crate has no
+    // `cfg` that reliably tracks the former (`comrade_ui` does not itself
+    // gate on that feature name, and the workspace's own verification command
+    // — `--features comrade_core/unfurl-http` — does not flip one here either).
+    // `unfurl.rs`'s own tests already pin the hermetic parts (`fetch_preview`
+    // refuses non-HTTPS with no socket touched at all); a real-network
+    // success case belongs there if it is ever worth hermetically stubbing,
+    // the way `media.rs`'s upload tests stub plain HTTP (its own tests explain
+    // why HTTPS-only enforcement rules that out for a download path).
+
+    #[test]
+    fn attach_link_preview_round_trips_through_split_preview() {
+        let preview = LinkPreviewDto {
+            url: "https://example.com".into(),
+            canonical_url: "https://example.com".into(),
+            title: Some("t".into()),
+            description: None,
+            site_name: None,
+            kind: PreviewKindDto::Unknown,
+            display_domain: Some("example.com".into()),
+        };
+        let body = attach_link_preview("hello", &preview);
+        let (text, parsed) = comrade_core::unfurl::split_preview(&body);
+        assert_eq!(text, "hello");
+        assert_eq!(parsed.unwrap().title.as_deref(), Some("t"));
+    }
+
     // ── Message requests, receipts, and calls ────────────────────────────────
 
     fn stranger() -> (String, String) {
@@ -15201,6 +15998,91 @@ mod tests {
         );
         let stored: MediaRef = store.get(MEDIA_REFS_TREE, "m2").unwrap().unwrap();
         assert_eq!(stored.mime_type, DEFAULT_MIME);
+    }
+
+    /// A delete request may retract only what its own sender wrote.
+    ///
+    /// Without the authorship check in `dispatch_incoming_dm` this passes the
+    /// peer's `target_id` straight to `delete_message_for_me`, and a peer can
+    /// name a message *we* sent — they know its id, we sent it to them — and
+    /// erase it from our own transcript. A tombstone renders as absence, so the
+    /// theft leaves nothing behind to notice.
+    #[tokio::test]
+    async fn a_delete_request_cannot_retract_a_message_its_sender_did_not_write() {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(comrade_storage::EncryptedStore::open(dir.path(), "pin").unwrap());
+        let vault = test_vault().await;
+        let (tx, _rx) = broadcast::channel(16);
+        let dedup = SeenSet::new(CALL_SIGNAL_DEDUP_CAPACITY);
+        let outbox = Arc::new(Outbox::new());
+        let transport_dedup = SeenSet::with_ttl(
+            CROSS_TRANSPORT_DEDUP_CAPACITY,
+            std::time::Duration::from_secs(CROSS_TRANSPORT_DEDUP_SECS),
+        );
+        let route = relay_route(&transport_dedup);
+        let (hex, peer) = stranger();
+        accepted_peer(&store, &peer, false);
+
+        // One message we sent, one they sent, in the same conversation.
+        for (id, outgoing) in [("ours", true), ("theirs", false)] {
+            store
+                .save_message(&comrade_storage::StoredMessage {
+                    id: id.into(),
+                    peer_npub: peer.clone(),
+                    content: "hello".into(),
+                    created_at: 1_700_000_000,
+                    outgoing,
+                    status: None,
+                    reply_to: None,
+                })
+                .unwrap();
+        }
+
+        let ask = |target: &str| serde_json::to_string(&DeleteRequest::new(target)).unwrap();
+
+        // Ours: refused. This is the whole point of the check.
+        dispatch_incoming_dm(
+            &vault,
+            Some(&store),
+            &tx,
+            &dedup,
+            &outbox,
+            &route,
+            incoming(&hex, "d1", &ask("ours")),
+        );
+        assert!(
+            !store.is_deleted_for_me(&peer, "ours").unwrap(),
+            "a peer retracted a message we wrote",
+        );
+
+        // A message we have never cached: also refused, rather than tombstoned
+        // pre-emptively against whatever later arrives under that id.
+        dispatch_incoming_dm(
+            &vault,
+            Some(&store),
+            &tx,
+            &dedup,
+            &outbox,
+            &route,
+            incoming(&hex, "d2", &ask("unknown")),
+        );
+        assert!(!store.is_deleted_for_me(&peer, "unknown").unwrap());
+
+        // Theirs: honoured, so the check refuses the attack without breaking
+        // the feature it guards.
+        dispatch_incoming_dm(
+            &vault,
+            Some(&store),
+            &tx,
+            &dedup,
+            &outbox,
+            &route,
+            incoming(&hex, "d3", &ask("theirs")),
+        );
+        assert!(
+            store.is_deleted_for_me(&peer, "theirs").unwrap(),
+            "a peer could not retract their own message",
+        );
     }
 
     #[tokio::test]
@@ -16148,6 +17030,44 @@ mod tests {
             rx.try_recv(),
             Ok(BridgeEvent::IncomingReaction(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn a_delete_request_hides_our_copy_and_a_replay_is_harmless() {
+        let dir = TempDir::new().unwrap();
+        let (ingress, _rx) = Ingress::new(&dir).await;
+        let (hex, peer) = stranger();
+        accepted_peer(&ingress.store, &peer, false);
+        ingress
+            .store
+            .save_message(&plain_message("m1", &peer, "the original", 1, false))
+            .unwrap();
+
+        let json = DeleteRequest::new("m1").to_json().unwrap();
+        ingress.deliver(&hex, "d1", &json, now_secs());
+        assert!(ingress.store.is_deleted_for_me(&peer, "m1").unwrap());
+
+        // A relay redelivering the same courtesy request is harmless — the
+        // message is already hidden, same as the tombstone check itself.
+        ingress.deliver(&hex, "d2", &json, now_secs());
+        assert!(ingress.store.is_deleted_for_me(&peer, "m1").unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_ungated_delete_request_is_dropped() {
+        // A stranger must not be able to reach into our history before their
+        // request is accepted — same gating a reaction or a nudge gets.
+        let dir = TempDir::new().unwrap();
+        let (ingress, _rx) = Ingress::new(&dir).await;
+        let (hex, peer) = stranger();
+        ingress
+            .store
+            .save_message(&plain_message("m1", &peer, "hi", 1, false))
+            .unwrap();
+
+        let json = DeleteRequest::new("m1").to_json().unwrap();
+        ingress.deliver(&hex, "d1", &json, now_secs());
+        assert!(!ingress.store.is_deleted_for_me(&peer, "m1").unwrap());
     }
 
     #[tokio::test]

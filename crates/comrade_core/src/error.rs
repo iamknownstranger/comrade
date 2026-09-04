@@ -31,6 +31,9 @@ pub enum CoreError {
     #[error("media: {0}")]
     Media(#[from] MediaError),
 
+    #[error("unfurl: {0}")]
+    Unfurl(#[from] UnfurlError),
+
     #[error("serialization: {0}")]
     Serde(#[from] serde_json::Error),
 
@@ -147,6 +150,22 @@ pub enum MediaError {
 
     #[error("http error: {0}")]
     Http(String),
+}
+
+// ── unfurl: sender-built link previews ───────────────────────────────────────
+
+#[derive(Debug, Error)]
+pub enum UnfurlError {
+    #[error("http error: {0}")]
+    Http(String),
+
+    /// The `unfurl-http` feature is off in this build — see `unfurl.rs`'s
+    /// module doc for why the feature (not the parser) is what stays gated.
+    #[error("fetching a link preview requires the `unfurl-http` cargo feature")]
+    FeatureDisabled,
+
+    #[error("preview body is {size} bytes, over the {max}-byte cap")]
+    TooLarge { size: u64, max: u64 },
 }
 
 // ── dak: store-and-forward (outbox + couriers) ───────────────────────────────

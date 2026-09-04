@@ -44,6 +44,14 @@ catalogue-http = ["comrade_core/catalogue-http"]
 # the socket is behind the flag. A frontend that ships the Travel tab turns this
 # on — `comrade_jni` does, because Android is where the tab lives.
 travel-http = ["comrade_core/travel-http"]
+# Enable the real link-unfurl fetch (`compose_link_preview`'s call to
+# `fetch_preview`) in the underlying core. Same shape as the three flags
+# above, with a sharper reason to default it off: the *sender's* side of
+# `unfurl.rs` always needs this on to build a card at all, but a frontend
+# must never turn it on for the receive path without its own explicit,
+# off-by-default "load previews for links I receive" setting — see
+# `comrade_core::unfurl`'s module doc.
+unfurl-http = ["comrade_core/unfurl-http"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

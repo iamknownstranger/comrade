@@ -58,6 +58,11 @@ sha1           = "0.10"
 secp256k1      = { version = "0.29",  features = ["hashes", "rand-std"] }
 hex            = "0.4"
 anyhow         = "1"
+# Relative URL resolution (`unfurl.rs`'s `og:image` against the page URL) and
+# host/domain extraction (`display_domain`) — already in the tree transitively
+# via reqwest/nostr-sdk, so this is a name for an edge already resolved, not a
+# new one.
+url            = "2"
 jni            = { version = "0.21",  features = ["invocation"] }
 # proc-macro-driven FFI bindings (Vault/Sabha/Identity → Kotlin) — see
 # crates/comrade_jni. `tokio` feature lets `#[uniffi::export(async_runtime =

@@ -26,6 +26,8 @@
  *   travel  — where the locals eat, and what this place is: legendary-restaurant
  *             ranking, attractions, and facts from one (deliberately blurred)
  *             coordinate
+ *   unfurl  — link previews the sender builds and the receiver renders with
+ *             zero network requests (Telegram-style)
  *
  * Store-and-forward, privacy, and anonymity primitives adapted from
  * permissionlesstech/bitchat (see `docs/BITCHAT_ADOPTION.md` for the full
@@ -82,6 +84,7 @@ pub mod tara;
 pub mod together;
 pub mod topic;
 pub mod travel;
+pub mod unfurl;
 pub mod vault;
 
 pub use error::CoreError;
