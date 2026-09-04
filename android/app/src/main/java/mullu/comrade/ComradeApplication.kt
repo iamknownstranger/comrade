@@ -1,12 +1,14 @@
 package mullu.comrade
 
 import android.app.Application
+import android.content.ComponentCallbacks2
 import android.os.SystemClock
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import mullu.comrade.ui.MediaCache
 import mullu.comrade.update.UpdateCheckJob
 
 /**
@@ -80,6 +82,30 @@ open class ComradeApplication : Application() {
             runCatching { UpdateCheckJob.sync(this@ComradeApplication) }
                 .onFailure { Log.w(TAG, "could not reconcile the update check job", it) }
         }
+    }
+
+    /**
+     * The signal `MainActivity.onStop`'s S-4 purge cannot see: a
+     * still-foreground app that the system is trimming, most often while
+     * scrolling a photo-heavy thread — [MediaCache]'s bitmap LRU is bounded
+     * in bytes now (see its class doc), but bounded still means "up to 48 MB
+     * held for no reason once the system has said memory is tight."
+     */
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        MediaCache.onTrimMemory(level)
+    }
+
+    /**
+     * Pre-`ComponentCallbacks2` devices (API < 14, none this app still
+     * targets) only ever call this, never [onTrimMemory] — kept anyway
+     * because `Application` still declares it, and a caller reading only
+     * this override should see the same worst-case behaviour
+     * [onTrimMemory] gives `TRIM_MEMORY_COMPLETE`, not silence.
+     */
+    override fun onLowMemory() {
+        super.onLowMemory()
+        MediaCache.onTrimMemory(ComponentCallbacks2.TRIM_MEMORY_COMPLETE)
     }
 
     private companion object {

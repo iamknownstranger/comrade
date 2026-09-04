@@ -64,6 +64,19 @@ interface SessionPlayer {
      */
     fun setRate(rate: Float)
 
+    /**
+     * Set output level, `0f`..`1f`, for ducking under a transient focus loss.
+     *
+     * A no-op by default and deliberately so: an embed and a followed external
+     * session both play through somebody else's output, which this app has no
+     * handle on and no business turning down. Ducking is therefore a **best**
+     * effort — [TogetherDecisions.FocusOutcome.Duck] says what should happen,
+     * and a player that cannot do it leaves the sound where it is rather than
+     * pausing as a substitute. Losing a navigation prompt over a film is a
+     * smaller failure than a film that stops for one.
+     */
+    fun setVolume(level: Float) = Unit
+
     fun release()
 
     /**

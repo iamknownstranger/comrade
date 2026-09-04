@@ -945,8 +945,30 @@ private fun ProfileBlockDialog(onDismiss: () -> Unit, onConfirm: () -> Unit) {
  * A picture that will not decode is cosmetic: the header falls back to the
  * generated initial rather than reporting anything, because there is nothing the
  * user could do and nothing is broken.
+ *
+ * Downsampled to [AVATAR_MAX_PIXELS] before decoding — a full ARGB_8888 decode
+ * of whatever someone picked as a profile photo (a phone camera shot is as
+ * likely as anything scaled for the purpose) was landing in memory to be drawn
+ * at [ExpandedAvatarDp] at most, the same shape of waste
+ * `AttachmentPreview.decodePreview` and `MediaCache.decodeImage` were fixed
+ * for — see [BitmapBudget].
  */
 private fun decodeAvatar(bytes: ComradeCore.MediaBytesInfo): ImageBitmap? = runCatching {
     val raw = Base64.decode(bytes.base64, Base64.DEFAULT)
-    BitmapFactory.decodeByteArray(raw, 0, raw.size)?.asImageBitmap()
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeByteArray(raw, 0, raw.size, bounds)
+    val options = BitmapFactory.Options().apply {
+        inSampleSize = BitmapBudget.sampleSizeFor(bounds.outWidth, bounds.outHeight, AVATAR_MAX_PIXELS)
+    }
+    BitmapFactory.decodeByteArray(raw, 0, raw.size, options)?.asImageBitmap()
 }.getOrNull()
+
+/**
+ * ~547×547 at most if square — well above [ExpandedAvatarDp] (72 dp) even at a
+ * 4× density, so the header is never drawn from an upscaled decode, while
+ * capping a single avatar bitmap at roughly 1.2 MB of ARGB_8888 instead of
+ * whatever a full-resolution profile photo would have decoded to (tens of MB
+ * for a camera shot, held for as long as the profile screen — or several
+ * profile screens visited in one session — stays composed).
+ */
+private const val AVATAR_MAX_PIXELS = 300_000L
