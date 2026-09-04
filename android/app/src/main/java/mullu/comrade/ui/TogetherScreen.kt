@@ -37,6 +37,7 @@ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -50,6 +51,9 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -1468,8 +1472,19 @@ private fun albumSubtitle(album: TogetherDecisions.Album, partial: Boolean): Str
     return listOfNotNull(artist, count).joinToString(TogetherDecisions.SUBTITLE_SEPARATOR)
 }
 
+/**
+ * One track in the library.
+ *
+ * The overflow appears **only once something is playing**, because that is
+ * when there is a queue for "play next" to mean anything against. The argument
+ * is `Transport`'s about its own next button — a control that silently does
+ * nothing is worse than one that is visibly not there — and with nothing
+ * playing the row's own tap already does the thing anybody wanted.
+ */
 @Composable
 private fun TrackRow(track: TogetherDecisions.Track, onClick: () -> Unit) {
+    val queue by TogetherManager.queue.collectAsState()
+    var menu by remember { mutableStateOf(false) }
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -1502,7 +1517,35 @@ private fun TrackRow(track: TogetherDecisions.Track, onClick: () -> Unit) {
                 overflow = TextOverflow.Ellipsis,
             )
         }
-        Icon(Icons.Filled.PlayArrow, contentDescription = null, tint = TogetherMuted)
+        if (queue == null) {
+            Icon(Icons.Filled.PlayArrow, contentDescription = null, tint = TogetherMuted)
+        } else {
+            Box {
+                IconButton(onClick = { menu = true }) {
+                    Icon(
+                        MoreVertIcon,
+                        contentDescription = stringResource(R.string.extras_queue),
+                        tint = TogetherMuted,
+                    )
+                }
+                DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                    DropdownMenuItem(
+                        text = { Text(stringResource(R.string.queue_play_next)) },
+                        onClick = {
+                            TogetherManager.playNext(track)
+                            menu = false
+                        },
+                    )
+                    DropdownMenuItem(
+                        text = { Text(stringResource(R.string.queue_add)) },
+                        onClick = {
+                            TogetherManager.addToQueue(track)
+                            menu = false
+                        },
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -2966,6 +3009,16 @@ private fun Sleeve(s: TogetherManager.UiState.Live) {
  * and a bigger bitmap in the cache.
  */
 private const val SLEEVE_COVER_DP = 320
+/**
+ * How much of the queue the up-next sheet draws.
+ *
+ * A queue is the library as a search had narrowed it, so it can be two
+ * thousand rows (`MusicLibrary.MAX_ROWS`). Nobody scrolls a sleep-timer sheet
+ * that far, and the list is rebuilt on every edit — so this is a bound on the
+ * work each edit costs as much as on the scrolling.
+ */
+private const val UP_NEXT_LIMIT = 100
+
 private const val ROW_COVER_DP = 48
 
 /**
@@ -3249,7 +3302,14 @@ private fun ExtrasRow(s: TogetherManager.UiState.Live) {
     var showSleep by remember { mutableStateOf(false) }
     var showEq by remember { mutableStateOf(false) }
     var showLyrics by remember { mutableStateOf(false) }
+    var showQueue by remember { mutableStateOf(false) }
+    var showPlaylists by remember { mutableStateOf(false) }
     val filePlayer = !s.embed && !s.external
+    val loved by TogetherManager.loved.collectAsState()
+    // Asked once on entry and again on every track change, which the manager
+    // does for itself from the one place a new track is recorded. This is only
+    // the first ask, for a screen opened onto a session already running.
+    LaunchedEffect(Unit) { TogetherManager.refreshLoved() }
 
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -3300,6 +3360,31 @@ private fun ExtrasRow(s: TogetherManager.UiState.Live) {
                 Icon(LyricsIcon, contentDescription = stringResource(R.string.extras_lyrics), tint = TogetherMuted)
             }
         }
+        // The heart, which until now did not exist anywhere in this app —
+        // while `library_empty_favourites` had been telling people to tap one.
+        // Filled either way and distinguished by tint, exactly as shuffle and
+        // repeat above are: a second outlined glyph would be a new icon in a
+        // repo that inlines every one of them rather than take the extended set.
+        if (filePlayer) {
+            IconButton(onClick = { TogetherManager.toggleLoved() }) {
+                Icon(
+                    HeartIcon,
+                    contentDescription = stringResource(
+                        if (loved) R.string.extras_loved else R.string.extras_love,
+                    ),
+                    tint = if (loved) MaterialTheme.colorScheme.primary else TogetherMuted,
+                )
+            }
+        }
+        if (queue != null) {
+            IconButton(onClick = { showQueue = true }) {
+                Icon(
+                    QueueMusicIcon,
+                    contentDescription = stringResource(R.string.extras_queue),
+                    tint = TogetherMuted,
+                )
+            }
+        }
     }
 
     if (showSpeed) {
@@ -3319,6 +3404,220 @@ private fun ExtrasRow(s: TogetherManager.UiState.Live) {
             positionMs = s.positionMs,
             onDismiss = { showLyrics = false },
         )
+    }
+    // `queue` is read again here rather than captured above, because the sheet
+    // outlives several of its own edits: removing a row rebuilds the flow, and
+    // a captured copy would draw the list as it was when the sheet opened.
+    queue?.let { live ->
+        if (showQueue) {
+            QueueSheet(
+                queue = live,
+                order = extras.order,
+                onDismiss = { showQueue = false },
+                onAddToPlaylist = {
+                    showQueue = false
+                    showPlaylists = true
+                },
+            )
+        }
+    }
+    if (showPlaylists) {
+        AddToPlaylistSheet(onDismiss = { showPlaylists = false })
+    }
+}
+
+/**
+ * What is coming, and the four things you can do to it.
+ *
+ * The list follows [TogetherDecisions.upNext], which walks the shuffle order
+ * rather than the file list — so what it shows is what a real press of next
+ * would play, and cannot drift from it. Reorder is Move up / Move down, the
+ * same affordance `PlaylistsScreen` below already uses; §23 of
+ * `docs/TOGETHER.md` records a drag handle as the known follow-up, and
+ * inventing a second one here would make that two migrations instead of one.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun QueueSheet(
+    queue: TogetherDecisions.Queue,
+    order: List<Int>?,
+    onDismiss: () -> Unit,
+    onAddToPlaylist: () -> Unit,
+) {
+    val context = LocalContext.current
+    val upNext = TogetherDecisions.upNext(queue, order, UP_NEXT_LIMIT)
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(Modifier.padding(horizontal = 20.dp).padding(bottom = 20.dp)) {
+            Row(
+                Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    stringResource(R.string.queue_title),
+                    style = MaterialTheme.typography.titleMedium,
+                    modifier = Modifier.weight(1f),
+                )
+                Text(
+                    stringResource(R.string.queue_count, queue.index + 1, queue.tracks.size),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = TogetherMuted,
+                )
+            }
+            queue.current?.let { now ->
+                Text(
+                    stringResource(R.string.queue_now_playing),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = TogetherMuted,
+                )
+                Text(
+                    now.title,
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = TogetherText,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Row {
+                    TextButton(onClick = onAddToPlaylist) {
+                        Text(stringResource(R.string.library_add_to_playlist), color = TogetherText)
+                    }
+                    if (upNext.isNotEmpty()) {
+                        TextButton(onClick = { TogetherManager.clearUpNext() }) {
+                            Text(
+                                stringResource(R.string.queue_clear),
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                        }
+                    }
+                }
+            }
+            HorizontalDivider(color = TogetherCard)
+            if (upNext.isEmpty()) {
+                Text(
+                    stringResource(R.string.queue_empty),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = TogetherMuted,
+                    modifier = Modifier.padding(vertical = 16.dp),
+                )
+            } else {
+                LazyColumn(Modifier.fillMaxWidth().heightIn(max = 420.dp)) {
+                    // Keyed on the uri, which is what identifies a track
+                    // everywhere else here — a positional key would reattach
+                    // row state to the wrong song on the first reorder, which
+                    // is the whole reason `.claude/rules/android.md` asks.
+                    items(upNext, key = { it.uri }) { track ->
+                        // The row's own position in the *queue*, which is not
+                        // its position in `upNext` once a shuffle order is on.
+                        val at = queue.tracks.indexOfFirst { it.uri == track.uri }
+                        QueueRow(
+                            track = track,
+                            canMoveUp = at > 0,
+                            canMoveDown = at >= 0 && at < queue.tracks.size - 1,
+                            onPlay = { if (at >= 0) TogetherManager.jumpTo(context, at) },
+                            onRemove = { if (at >= 0) TogetherManager.removeFromQueue(context, at) },
+                            onUp = { if (at > 0) TogetherManager.moveInQueue(at, at - 1) },
+                            onDown = {
+                                if (at >= 0 && at < queue.tracks.size - 1) {
+                                    TogetherManager.moveInQueue(at, at + 1)
+                                }
+                            },
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun QueueRow(
+    track: TogetherDecisions.Track,
+    canMoveUp: Boolean,
+    canMoveDown: Boolean,
+    onPlay: () -> Unit,
+    onRemove: () -> Unit,
+    onUp: () -> Unit,
+    onDown: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onPlay)
+            .padding(vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(
+                track.title,
+                style = MaterialTheme.typography.bodyMedium,
+                color = TogetherText,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                TogetherDecisions.trackSubtitle(track),
+                style = MaterialTheme.typography.bodySmall,
+                color = TogetherMuted,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        // Text, not glyphs, because `PlaylistsScreen` already reorders with
+        // exactly these three words and this repo inlines every icon it uses
+        // rather than take `material-icons-extended`. Two affordances for one
+        // gesture would also be two things to migrate when the drag handle
+        // §23 promises finally arrives.
+        TextButton(enabled = canMoveUp, onClick = onUp) {
+            Text(stringResource(R.string.library_move_up), style = MaterialTheme.typography.labelMedium)
+        }
+        TextButton(enabled = canMoveDown, onClick = onDown) {
+            Text(stringResource(R.string.library_move_down), style = MaterialTheme.typography.labelMedium)
+        }
+        TextButton(onClick = onRemove) {
+            Text(
+                stringResource(R.string.queue_remove),
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
+    }
+}
+
+/**
+ * Put what is playing into one of the player's own playlists.
+ *
+ * Making a playlist is deliberately not offered here — the library screen
+ * already does it, and a create field on a sheet reached from the transport is
+ * a second place to name the same thing.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun AddToPlaylistSheet(onDismiss: () -> Unit) {
+    var lists by remember { mutableStateOf<List<uniffi.comrade_ui.PlaylistDto>?>(null) }
+    LaunchedEffect(Unit) {
+        lists = runCatching { ComradeCore.playlistsList() }.getOrDefault(emptyList())
+    }
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(
+                stringResource(R.string.library_add_to_playlist),
+                style = MaterialTheme.typography.titleMedium,
+            )
+            val shown = lists
+            when {
+                shown == null -> CircularProgressIndicator(Modifier.size(24.dp))
+                shown.isEmpty() -> Text(
+                    stringResource(R.string.library_no_playlists_yet),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = TogetherMuted,
+                )
+                else -> shown.forEach { list ->
+                    TextButton(onClick = {
+                        TogetherManager.addNowPlayingToPlaylist(list.id)
+                        onDismiss()
+                    }) { Text(list.name, color = TogetherText) }
+                }
+            }
+        }
     }
 }
 
@@ -3669,14 +3968,27 @@ private fun PlaylistsScreen(
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         BrowserHeader(stringResource(R.string.library_playlists), onBack)
-        if (!loaded) return@Column
+        // `when`, not three `return@Column`s, and this is not a tidy-up: an
+        // early return out of a composable makes the enclosing layout emit a
+        // different number of groups on either side of the branch, so it
+        // throws on the *recomposition* rather than the first frame. This
+        // screen had the exact shape `.claude/rules/android.md` records as
+        // having killed `TaskListScreen` and `RideScreen` — a `LaunchedEffect`
+        // flipping `loaded` a moment after the first frame draws — and every
+        // lane that can run here would have gone on passing.
+        val open = openId?.let { id -> lists.firstOrNull { it.id == id } }
+        // A list that vanished under an open detail: cleared from an effect,
+        // never from composition. Assigning state while composing is its own
+        // bug, and it was doing that too, on the same line as the return.
+        LaunchedEffect(openId, loaded, lists) {
+            if (loaded && openId != null && open == null) openId = null
+        }
+        when {
+            !loaded -> Unit
 
-        openId?.let { id ->
-            val list = lists.firstOrNull { it.id == id }
-            if (list == null) {
-                openId = null
-                return@Column
-            }
+            open != null -> {
+            val id = open.id
+            val list = open
             BrowserHeader(list.name, onBack = { openId = null })
 
             // Rename: the name is authored, like the list itself. Placeholder
@@ -3753,9 +4065,9 @@ private fun PlaylistsScreen(
                     }) { Text(stringResource(R.string.library_remove_from_playlist)) }
                 }
             }
-            return@Column
-        }
+            }
 
+            else -> {
         OutlinedTextField(
             value = newName,
             onValueChange = { newName = it },
@@ -3778,6 +4090,8 @@ private fun PlaylistsScreen(
         lists.forEach { list ->
             SourceCard(icon = QueueMusicIcon, title = list.name, subtitle = "${list.tracks.size}") {
                 openId = list.id
+            }
+        }
             }
         }
     }
