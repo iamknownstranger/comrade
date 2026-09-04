@@ -209,6 +209,47 @@
          "important" or "unresolved". -->
     <string name="message_action_open_thread">Open thread</string>
     <string name="message_action_assign_topic">File under a topic…</string>
+    <string name="message_action_forward">Forward</string>
+    <string name="message_action_pin">Pin</string>
+    <string name="message_action_unpin">Unpin</string>
+    <string name="message_action_star">Star</string>
+    <string name="message_action_unstar">Remove star</string>
+    <string name="message_action_edit">Edit</string>
+    <string name="message_action_select">Select</string>
+    <string name="message_action_share">Share…</string>
+    <string name="message_action_save_media">Save to device</string>
+    <string name="message_action_info">Message info</string>
+    <string name="message_action_report">Report</string>
+    <string name="message_action_delete_for_me">Delete for me</string>
+    <string name="message_action_delete_for_everyone">Delete for everyone</string>
+    <string name="message_forwarded">Forwarded</string>
+    <string name="message_open_link">Open link</string>
+    <string name="message_info_sent">Sent %1$s</string>
+    <string name="message_info_status">Delivery: %1$s</string>
+    <string name="selection_clear">Clear selection</string>
+    <string name="selection_full">You can select up to %1$d messages at once.</string>
+    <string name="pin_board_full">This conversation\'s pin board is full. Unpin something first.</string>
+    <string name="action_failed">That did not work.</string>
+    <string name="action_not_available">Not available yet.</string>
+    <!--
+      Says what delete-for-everyone can actually promise. There is no
+      cryptographic retraction available (each gift-wrap is signed with a
+      one-time key that is discarded), so this asks the other device to hide its
+      copy. Wording it as a guarantee would be a promise the protocol cannot keep.
+    -->
+    <string name="delete_everyone_caveat">This asks their device to hide its copy. It usually works, but a message that has already arrived cannot be taken back for certain.</string>
+    <plurals name="delete_everyone_title">
+        <item quantity="one">Delete this message for everyone?</item>
+        <item quantity="other">Delete %1$d messages for everyone?</item>
+    </plurals>
+    <plurals name="forward_title">
+        <item quantity="one">Forward message to…</item>
+        <item quantity="other">Forward %1$d messages to…</item>
+    </plurals>
+    <plurals name="forward_send">
+        <item quantity="one">Send to %1$d chat</item>
+        <item quantity="other">Send to %1$d chats</item>
+    </plurals>
     <string name="threads_title">Threads</string>
     <string name="threads_open">Threads and topics</string>
     <string name="threads_all">All threads</string>

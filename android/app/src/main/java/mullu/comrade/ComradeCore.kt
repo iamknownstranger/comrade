@@ -449,10 +449,52 @@ object ComradeCore {
          * never gate anything.
          */
         val sharedNote: SharedNoteInfo? = null,
+        /**
+         * The card the *sender* built for a link in this message, if it carries
+         * one. Rendering it costs no network request — see
+         * `comrade_core::unfurl`'s module doc for why that is the whole point,
+         * and [LinkPreviewInfo] for the field this deliberately does not have.
+         */
+        val linkPreview: LinkPreviewInfo? = null,
+        /**
+         * Whether this message is a forward. A label the forwarder attached, on
+         * exactly the same footing as [fromTara]: it says who *says* the words
+         * came from elsewhere, and nothing is gated on it.
+         */
+        val forwarded: Boolean = false,
+        /** This device's bookmark. Local; the peer learns nothing about it. */
+        val starred: Boolean = false,
+        /** This device's pin for this conversation. Local, like [starred]. */
+        val pinned: Boolean = false,
     )
 
     /** The journal note a [MessageInfo] carries, as the card draws it. */
     data class SharedNoteInfo(val text: String, val mood: String?)
+
+    /**
+     * A link preview card, as the bubble draws it.
+     *
+     * **There is no image field, deliberately, and adding one is not a small
+     * change.** `og:image` is a URL on the linked page's own host, so loading
+     * it here — a one-line `AsyncImage`, the obvious thing to reach for — would
+     * make every receiving device fetch from that host the moment the bubble
+     * scrolls into view, telling it which npub received the link. That is the
+     * exact leak the sender-builds-the-card design exists to prevent. A picture
+     * can come back when the envelope carries thumbnail *bytes* the sender
+     * fetched; until then the honest card is text and a domain.
+     *
+     * [domain] is recomputed from [url] by `displayDomain` at the call site
+     * rather than trusted from the wire, because a sender picks both the link
+     * and the metadata, and the domain line is the only part of the card that
+     * cannot lie about where tapping it goes.
+     */
+    data class LinkPreviewInfo(
+        val url: String,
+        val canonicalUrl: String,
+        val title: String?,
+        val description: String?,
+        val siteName: String?,
+    )
 
     private fun uniffi.comrade_ui.MessageDto.toInfo() = MessageInfo(
         id = id,
@@ -464,6 +506,18 @@ object ComradeCore {
         status = status,
         replyTo = replyTo,
         sharedNote = sharedNote?.let { SharedNoteInfo(text = it.text, mood = it.mood) },
+        linkPreview = linkPreview?.let {
+            LinkPreviewInfo(
+                url = it.url,
+                canonicalUrl = it.canonicalUrl,
+                title = it.title,
+                description = it.description,
+                siteName = it.siteName,
+            )
+        },
+        forwarded = forwarded,
+        starred = actions.starred,
+        pinned = actions.pinned,
     )
 
     /** Send a DM, returning the stored message or throwing the backend error. */
@@ -1700,6 +1754,91 @@ object ComradeCore {
         rethrowing("React") {
             runBlocking { ffi.toggleReaction(peer, targetId, emoji) }?.toInfo()
         }
+
+    // ── Message actions: star, pin, delete, forward ─────────────────────────
+
+    /** Bookmark [messageId], or take the bookmark back. Local to this device. */
+    fun starMessageTyped(peer: String, messageId: String, starred: Boolean): Boolean =
+        rethrowing("Star") { ffi.starMessage(peer, messageId, starred) }
+
+    /**
+     * Pin [messageId] in this conversation. Returns false when the pin was
+     * refused because the conversation is already at its cap — a full board is
+     * a normal answer, not an error, so the caller says so rather than throwing.
+     */
+    fun pinMessageTyped(peer: String, messageId: String): Boolean =
+        rethrowing("Pin") { ffi.pinMessage(peer, messageId) }
+
+    /** Take [messageId] off this conversation's pin board. */
+    fun unpinMessageTyped(peer: String, messageId: String): Boolean =
+        rethrowing("Unpin") { ffi.unpinMessage(peer, messageId) }
+
+    /** This conversation's pinned messages, oldest pin first. */
+    fun pinnedMessages(peer: String): List<MessageInfo> =
+        rethrowing("Pinned") { ffi.pinnedMessages(peer).map { it.toInfo() } }
+
+    /** Every message bookmarked on this device, across conversations. */
+    fun starredMessages(): List<MessageInfo> =
+        rethrowing("Starred") { ffi.starredMessages().map { it.toInfo() } }
+
+    /**
+     * Hide [messageId] on this device only. A tombstone, not a row deletion, so
+     * a backfill that re-delivers the message does not resurrect it.
+     */
+    fun deleteMessageForMeTyped(peer: String, messageId: String) =
+        rethrowing("Delete") { ffi.deleteMessageForMe(peer, messageId) }
+
+    /**
+     * Ask the peer's client to hide its copy too, and hide ours.
+     *
+     * **A request, not a retraction, and the UI must not word it as one.** Real
+     * NIP-09 deletion is unreachable here: each gift-wrap is signed with a
+     * one-time key that is discarded immediately (NIP-59 working as intended),
+     * so no key survives to author a same-pubkey deletion. A peer running a
+     * modified client keeps the message. This is WhatsApp's and Signal's trust
+     * model, and it is the honest one to describe to the user.
+     */
+    fun deleteMessageForEveryoneTyped(peer: String, messageId: String) =
+        rethrowing("Delete") { runBlocking { ffi.deleteMessageForEveryone(peer, messageId) } }
+
+    /**
+     * Send a copy of [messageId] to each of [toPeers], returning what was sent.
+     *
+     * The copy is *ours*: it is signed by this identity and marked as a
+     * forward, which claims the words came from elsewhere without claiming
+     * anything cryptographic about who wrote them — the same standing as
+     * [MessageInfo.fromTara].
+     */
+    fun forwardMessageTyped(
+        fromPeer: String,
+        messageId: String,
+        toPeers: List<String>,
+    ): List<MessageInfo> =
+        rethrowing("Forward") {
+            runBlocking { ffi.forwardMessage(fromPeer, messageId, toPeers) }.map { it.toInfo() }
+        }
+
+    /**
+     * [content], with a preview card attached for its first link — or
+     * [content] unchanged when it has no link, the page could not be read, or
+     * anything at all went wrong.
+     *
+     * **This one does hit the network, and that is the design.** The fetch
+     * happens on the *sender's* device, where the person has already chosen to
+     * share the link; the card then rides with the message so the receiver
+     * draws it having asked the linked host for nothing. Call it off the main
+     * thread — it is a live HTTP request with a timeout, not a lookup.
+     *
+     * Failure returns the plain body rather than throwing, and this is the one
+     * place in this class that swallows an error deliberately: a preview is
+     * decoration on a message somebody is trying to send, and an unreachable
+     * link host must never be the reason their words do not go out.
+     */
+    fun bodyWithLinkPreview(content: String): String =
+        runCatching {
+            val preview = runBlocking { ffi.composeLinkPreview(content) }
+            if (preview == null) content else ffi.attachLinkPreview(content, preview)
+        }.getOrDefault(content)
 
     /** Encrypt + send raw media bytes (no base64 round-trip — uniffi carries `ByteArray` natively). */
     fun sendMediaBytesTyped(

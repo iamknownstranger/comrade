@@ -1,8 +1,11 @@
 package mullu.comrade.ui
 
 import android.content.pm.PackageManager
+import android.content.ActivityNotFoundException
+import android.content.Intent
 import android.net.Uri
 import android.os.Build
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.animateColorAsState
@@ -12,6 +15,7 @@ import androidx.compose.foundation.gestures.Orientation
 import androidx.compose.foundation.gestures.draggable
 import androidx.compose.foundation.gestures.rememberDraggableState
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
@@ -21,6 +25,8 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.IntrinsicSize
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
@@ -40,11 +46,14 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledIconButton
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -81,6 +90,8 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.customActions
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextRange
@@ -632,6 +643,38 @@ fun ConversationScreen(
     // the UI hoped for.
     var reactions by remember(peer) { mutableStateOf<List<ComradeCore.ReactionInfo>>(emptyList()) }
     var actingOn by remember { mutableStateOf<ChatItem?>(null) }
+
+    /**
+     * Bumped by any action that changes what the thread should show — a star, a
+     * pin, a delete — so the list reloads without waiting for a relay event.
+     * `chatTick` is a *global* event tick and none of those produce one: they
+     * are local writes, and a pin that only appears after the next incoming
+     * message would read as a pin that failed.
+     */
+    var localMessageTick by remember(peer) { mutableStateOf(0) }
+
+    /**
+     * The keys of the selected messages, empty when not in selection mode.
+     *
+     * Keys rather than event ids because that is what the list is keyed by and
+     * what a media item's namespaced id needs — see [ChatItem.key].
+     */
+    var selected by remember(peer) { mutableStateOf<Set<String>>(emptySet()) }
+
+    /** The messages a forward sheet is currently choosing recipients for. */
+    var forwarding by remember(peer) { mutableStateOf<List<ChatItem>>(emptyList()) }
+
+    /** The message whose delivery detail is on screen. */
+    var infoFor by remember(peer) { mutableStateOf<ChatItem?>(null) }
+
+    /**
+     * Messages awaiting a confirmed delete-for-everyone.
+     *
+     * Confirmed because it is the one action here that reaches another person's
+     * device, and because what it can promise is weaker than the name suggests
+     * — the dialog is where that gets said plainly rather than discovered.
+     */
+    var confirmingDelete by remember(peer) { mutableStateOf<List<ChatItem>>(emptyList()) }
     // The full picker, opened from the reaction row's "+" for anything outside
     // the quick six. Held separately from `actingOn` because the action sheet
     // closes when it opens, and the target has to outlive that.
@@ -778,6 +821,171 @@ fun ConversationScreen(
         }
     }
 
+    /**
+     * Hand [url] to whatever the device opens links with.
+     *
+     * The one network request in this feature that the *receiver* makes, and it
+     * happens only because they tapped. Everything drawn on the card got here
+     * inside the message; see [LinkPreviewCard].
+     */
+    fun openLink(url: String) {
+        try {
+            context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+        } catch (e: ActivityNotFoundException) {
+            android.util.Log.w("ChatsScreen", "nothing handles $url: ${e.message}")
+        }
+    }
+
+    /**
+     * Whether [item] is one of the selected messages.
+     */
+    fun isSelected(item: ChatItem) = selected.contains(item.key)
+
+    /** Add or remove [item] from the selection, respecting [canAddToSelection]. */
+    fun toggleSelected(item: ChatItem) {
+        selected = when {
+            isSelected(item) -> selected - item.key
+            canAddToSelection(selected.size) -> selected + item.key
+            else -> {
+                error = context.getString(R.string.selection_full, MAX_SELECTION_SIZE)
+                selected
+            }
+        }
+    }
+
+    /** The selected items, in the order the thread draws them. */
+    fun selectedItems() = chatItems.filter { isSelected(it) }
+
+    /** Hand [text] to the system share sheet. */
+    fun shareText(text: String) {
+        val send = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_TEXT, text)
+        }
+        try {
+            context.startActivity(Intent.createChooser(send, null))
+        } catch (e: ActivityNotFoundException) {
+            android.util.Log.w("ChatsScreen", "no share target: ${e.message}")
+        }
+    }
+
+    /**
+     * Do [action] to [item].
+     *
+     * Every branch that writes bumps [localMessageTick] rather than trusting a
+     * relay event to arrive, because none of these produce one.
+     *
+     * Three branches say "not yet" instead of acting: [MessageAction.Edit],
+     * [MessageAction.Report] and [MessageAction.SaveMedia] have no backend
+     * anywhere in the app. They are still *offered*, because the action set is
+     * one contract across three frontends and a menu that silently differs per
+     * platform is precisely the parity debt this repo tracks — but an honest
+     * refusal is the only thing this screen can truthfully do with them.
+     */
+    fun runMessageAction(action: MessageAction, item: ChatItem) {
+        fun write(block: () -> Unit) {
+            scope.launch {
+                val failure = withContext(Dispatchers.IO) { runCatching(block).exceptionOrNull() }
+                if (failure != null) error = failure.message ?: context.getString(R.string.action_failed)
+                localMessageTick += 1
+            }
+        }
+        when (action) {
+            // Reached through the sheet's own emoji row, never as a list row.
+            MessageAction.React -> {}
+            MessageAction.Reply -> replyingTo = item
+            // Takes the *tapped* message's event id, not a thread root: core
+            // walks up the reply chain, so long-pressing a reply opens the
+            // thread it belongs to rather than starting a second one.
+            MessageAction.ReplyInThread -> threadOpenFor = item.eventId
+            MessageAction.Forward -> forwarding = listOf(item)
+            MessageAction.Pin -> scope.launch {
+                val outcome = withContext(Dispatchers.IO) {
+                    runCatching { ComradeCore.pinMessageTyped(peer, item.eventId) }
+                }
+                // A full board is a normal answer, not a failure — say which.
+                when {
+                    outcome.isFailure ->
+                        error = outcome.exceptionOrNull()?.message
+                            ?: context.getString(R.string.action_failed)
+                    outcome.getOrDefault(false) -> {}
+                    else -> error = context.getString(R.string.pin_board_full)
+                }
+                localMessageTick += 1
+            }
+            MessageAction.Unpin -> write { ComradeCore.unpinMessageTyped(peer, item.eventId) }
+            MessageAction.Star -> write { ComradeCore.starMessageTyped(peer, item.eventId, true) }
+            MessageAction.Unstar -> write { ComradeCore.starMessageTyped(peer, item.eventId, false) }
+            MessageAction.AssignTopic -> {
+                filingMessage = item.eventId
+                topicsOpen = true
+            }
+            MessageAction.Copy -> clipboard.setText(AnnotatedString(item.preview))
+            MessageAction.Select -> selected = setOf(item.key)
+            MessageAction.Share -> shareText(item.preview)
+            MessageAction.MessageInfo -> infoFor = item
+            MessageAction.DeleteForMe ->
+                write { ComradeCore.deleteMessageForMeTyped(peer, item.eventId) }
+            MessageAction.DeleteForEveryone -> confirmingDelete = listOf(item)
+            MessageAction.Edit, MessageAction.Report, MessageAction.SaveMedia ->
+                error = context.getString(R.string.action_not_available)
+        }
+    }
+
+    /**
+     * Do [action] to every message in [items].
+     *
+     * Applies to all of them or none: [selectionActions] already refused to
+     * offer anything that could only partly apply, so a branch here that
+     * skipped items would be quietly breaking the promise the bar's own
+     * enabling rule made. The two that reach another person —
+     * [MessageAction.Forward] and [MessageAction.DeleteForEveryone] — go
+     * through their sheet and their confirmation rather than firing on tap.
+     */
+    fun runSelectionAction(action: MessageAction, items: List<ChatItem>) {
+        fun writeAll(block: (ChatItem) -> Unit) {
+            scope.launch {
+                val failure = withContext(Dispatchers.IO) {
+                    runCatching { items.forEach(block) }.exceptionOrNull()
+                }
+                if (failure != null) error = failure.message ?: context.getString(R.string.action_failed)
+                selected = emptySet()
+                localMessageTick += 1
+            }
+        }
+        when (action) {
+            MessageAction.Forward -> forwarding = items
+            MessageAction.DeleteForEveryone -> confirmingDelete = items
+            MessageAction.Copy -> {
+                clipboard.setText(AnnotatedString(items.joinToString("\n") { it.preview }))
+                selected = emptySet()
+            }
+            MessageAction.Share -> {
+                shareText(items.joinToString("\n") { it.preview })
+                selected = emptySet()
+            }
+            MessageAction.Star -> writeAll { ComradeCore.starMessageTyped(peer, it.eventId, true) }
+            MessageAction.Unstar -> writeAll { ComradeCore.starMessageTyped(peer, it.eventId, false) }
+            MessageAction.Pin -> writeAll { ComradeCore.pinMessageTyped(peer, it.eventId) }
+            MessageAction.Unpin -> writeAll { ComradeCore.unpinMessageTyped(peer, it.eventId) }
+            MessageAction.DeleteForMe ->
+                writeAll { ComradeCore.deleteMessageForMeTyped(peer, it.eventId) }
+            MessageAction.Report, MessageAction.SaveMedia ->
+                error = context.getString(R.string.action_not_available)
+            // Never offered for a selection — see `selectionActions`. Listed so
+            // adding a MessageAction fails to compile here rather than silently
+            // doing nothing on a bar that offered it.
+            MessageAction.React,
+            MessageAction.Reply,
+            MessageAction.ReplyInThread,
+            MessageAction.AssignTopic,
+            MessageAction.Edit,
+            MessageAction.Select,
+            MessageAction.MessageInfo,
+            -> {}
+        }
+    }
+
     // `chatTick` is a GLOBAL event tick — it fires for activity in any
     // conversation, and repeatedly while this one is open. So a reload must
     // not yank a reader who scrolled up in history back to the bottom:
@@ -798,7 +1006,7 @@ fun ConversationScreen(
         unreadThreads = mullu.comrade.topic.TopicDecisions.unreadThreadCount(visible)
     }
 
-    LaunchedEffect(peer, chatTick) {
+    LaunchedEffect(peer, chatTick, localMessageTick) {
         val loaded = withContext(Dispatchers.IO) {
             Triple(
                 runCatching { ComradeCore.messages(peer) }.getOrDefault(emptyList()),
@@ -1314,7 +1522,21 @@ fun ConversationScreen(
         val replyId = replyingTo?.eventId
         scope.launch {
             runCatching {
-                withContext(Dispatchers.IO) { ComradeCore.sendDmReplyTyped(peer, text, replyId) }
+                withContext(Dispatchers.IO) {
+                    // Build the preview card here, on the sender's device, and
+                    // send it inside the message. The person has already chosen
+                    // to share this link, so this fetch is theirs to make — and
+                    // making it here is what spares the *receiver* from telling
+                    // the linked host they received it. `bodyWithLinkPreview`
+                    // returns the plain text when there is no link or the page
+                    // will not load, so an unreachable site never blocks a send.
+                    val body = if (hasLinkPreview(text)) {
+                        ComradeCore.bodyWithLinkPreview(text)
+                    } else {
+                        text
+                    }
+                    ComradeCore.sendDmReplyTyped(peer, body, replyId)
+                }
             }.onSuccess { sent ->
                 draft = TextFieldValue()
                 replyingTo = null
@@ -1680,6 +1902,72 @@ fun ConversationScreen(
     val nowSecs = remember(chatItems) { System.currentTimeMillis() / 1000 }
 
     Column(modifier = modifier.fillMaxSize().imePadding()) {
+        // Selection mode's own bar, in the same strip the threads row uses and
+        // for the same reason recorded below it: the app bar belongs to
+        // `MainActivity` and is shared by every tab, so a contextual bar of
+        // this conversation's own has to live inside this screen.
+        //
+        // It replaces nothing — it appears above the thread strip — because a
+        // bar that swapped the app bar out would have to reach up through
+        // MainActivity and back down, and a selection is short-lived enough
+        // that a second strip is the smaller cost.
+        if (selected.isNotEmpty()) {
+            BackHandler(enabled = true) { selected = emptySet() }
+            val picked = selectedItems()
+            val nowMs = System.currentTimeMillis()
+            val bulk = selectionActions(picked.map { messageContextOf(it, nowMs) })
+            Surface(
+                color = MaterialTheme.colorScheme.primaryContainer,
+                modifier = Modifier.fillMaxWidth().testTag("selection-bar"),
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = Spacing.space2, vertical = Spacing.space1),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    IconButton(
+                        onClick = { selected = emptySet() },
+                        modifier = Modifier.testTag("selection-clear"),
+                    ) {
+                        Icon(
+                            Icons.Filled.Close,
+                            contentDescription = stringResource(R.string.selection_clear),
+                            tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                        )
+                    }
+                    Text(
+                        picked.size.toString(),
+                        style = MaterialTheme.typography.titleMedium,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer,
+                        modifier = Modifier.padding(end = Spacing.space2),
+                    )
+                    // Scrollable rather than truncated: the set is at most nine
+                    // and which nine depends on the selection, so there is no
+                    // fixed subset that could be promoted to always-visible
+                    // without hiding a different one on a different selection.
+                    Row(
+                        modifier = Modifier.weight(1f).horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.End,
+                    ) {
+                        for (action in bulk) {
+                            IconButton(
+                                onClick = { runSelectionAction(action, picked) },
+                                modifier = Modifier.testTag("bulk-${messageActionTestTag(action)}"),
+                            ) {
+                                Icon(
+                                    messageActionIcon(action),
+                                    contentDescription = stringResource(messageActionLabel(action)),
+                                    tint = if (action.destructive) {
+                                        MaterialTheme.colorScheme.error
+                                    } else {
+                                        MaterialTheme.colorScheme.onPrimaryContainer
+                                    },
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // The way in, and it only appears once there is something to go in to.
         //
         // The app bar belongs to `MainActivity` and is shared by every tab, so a
@@ -1765,11 +2053,17 @@ fun ConversationScreen(
                     // animated so the flash fades rather than blinking. Around the
                     // bubble only, not the separators above it: a target that
                     // happens to open a new day must not tint that day's header.
+                    // Selection wins over the quote flash when both apply: the
+                    // flash fades on its own in a second and a half, while the
+                    // selection is a state the reader is holding, so the tint
+                    // that must not disappear is the one that stays.
                     val highlight by animateColorAsState(
-                        targetValue = if (item.key == highlightKey) {
-                            MaterialTheme.colorScheme.primary.copy(alpha = 0.14f)
-                        } else {
-                            Color.Transparent
+                        targetValue = when {
+                            isSelected(item) ->
+                                MaterialTheme.colorScheme.primary.copy(alpha = 0.22f)
+                            item.key == highlightKey ->
+                                MaterialTheme.colorScheme.primary.copy(alpha = 0.14f)
+                            else -> Color.Transparent
                         },
                         label = "quote-target-highlight",
                     )
@@ -1806,8 +2100,13 @@ fun ConversationScreen(
                                 )
                             }
                             .combinedClickable(
-                                onClick = {},
-                                onLongClick = { actingOn = item },
+                                // A plain tap does nothing until a selection is
+                                // open; then every bubble is a checkbox, which
+                                // is the whole reason selection mode is a mode.
+                                onClick = { if (selected.isNotEmpty()) toggleSelected(item) },
+                                onLongClick = {
+                                    if (selected.isEmpty()) actingOn = item else toggleSelected(item)
+                                },
                             )
                         val chips = chipsByTarget[item.eventId].orEmpty()
                         Column(
@@ -1894,11 +2193,29 @@ fun ConversationScreen(
                                                     // bubble it arrived in and gains a
                                                     // header saying where it was
                                                     // written; see SharedNoteBody.
+                                                    // A forward says so above the
+                                                    // words. The label claims the
+                                                    // sender says these came from
+                                                    // elsewhere — it attests nothing
+                                                    // about who wrote them, the same
+                                                    // standing as the Tara marker.
+                                                    if (msg.forwarded) {
+                                                        Text(
+                                                            stringResource(R.string.message_forwarded),
+                                                            style = MaterialTheme.typography.labelMedium,
+                                                            fontWeight = FontWeight.SemiBold,
+                                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                            modifier = Modifier.testTag("forwarded-label"),
+                                                        )
+                                                    }
                                                     val note = msg.sharedNote
                                                     if (note != null) {
                                                         SharedNoteBody(note, outgoing = msg.outgoing)
                                                     } else {
                                                         Text(msg.content, style = MaterialTheme.typography.bodyLarge)
+                                                    }
+                                                    msg.linkPreview?.let { preview ->
+                                                        LinkPreviewCard(preview) { url -> openLink(url) }
                                                     }
                                                     Row(
                                                         modifier = Modifier
@@ -2257,6 +2574,7 @@ fun ConversationScreen(
     // Long press on a message: react, or reach the actions.
     actingOn?.let { item ->
         MessageActionSheet(
+            actions = messageActions(messageContextOf(item, nowMs = System.currentTimeMillis())),
             myReaction = myReactionByTarget[item.eventId],
             onReact = {
                 toggleReaction(item, it)
@@ -2268,27 +2586,73 @@ fun ConversationScreen(
                 pickingFor = item
                 actingOn = null
             },
-            onReply = {
-                replyingTo = item
-                actingOn = null
-            },
-            onCopy = {
-                clipboard.setText(AnnotatedString(item.preview))
-                actingOn = null
-            },
-            // Both take the *tapped* message's event id, not a thread root:
-            // core walks up the reply chain, so long-pressing a reply opens and
-            // files the thread it belongs to rather than starting a second one.
-            onOpenThread = {
-                threadOpenFor = item.eventId
-                actingOn = null
-            },
-            onFile = {
-                filingMessage = item.eventId
-                topicsOpen = true
+            onAction = { action ->
+                runMessageAction(action, item)
                 actingOn = null
             },
             onDismiss = { actingOn = null },
+        )
+    }
+
+    if (forwarding.isNotEmpty()) {
+        var conversations by remember { mutableStateOf<List<ComradeCore.ConversationInfo>>(emptyList()) }
+        LaunchedEffect(Unit) {
+            conversations = withContext(Dispatchers.IO) {
+                runCatching { ComradeCore.conversations() }.getOrDefault(emptyList())
+            }
+        }
+        val items = forwarding
+        ForwardSheet(
+            count = items.size,
+            // Forwarding back into this conversation is not offered: the
+            // message is already here, and the row would be a way to send
+            // someone their own words back by accident.
+            conversations = conversations.filter { it.peer != peer },
+            onConfirm = { targets ->
+                forwarding = emptyList()
+                selected = emptySet()
+                scope.launch {
+                    val failure = withContext(Dispatchers.IO) {
+                        runCatching {
+                            items.forEach { ComradeCore.forwardMessageTyped(peer, it.eventId, targets) }
+                        }.exceptionOrNull()
+                    }
+                    if (failure != null) {
+                        error = failure.message ?: context.getString(R.string.action_failed)
+                    }
+                    localMessageTick += 1
+                }
+            },
+            onDismiss = { forwarding = emptyList() },
+        )
+    }
+
+    infoFor?.let { item ->
+        MessageInfoDialog(item) { infoFor = null }
+    }
+
+    if (confirmingDelete.isNotEmpty()) {
+        val doomed = confirmingDelete
+        DeleteForEveryoneDialog(
+            count = doomed.size,
+            onConfirm = {
+                confirmingDelete = emptyList()
+                selected = emptySet()
+                scope.launch {
+                    val failure = withContext(Dispatchers.IO) {
+                        runCatching {
+                            doomed.forEach {
+                                ComradeCore.deleteMessageForEveryoneTyped(peer, it.eventId)
+                            }
+                        }.exceptionOrNull()
+                    }
+                    if (failure != null) {
+                        error = failure.message ?: context.getString(R.string.action_failed)
+                    }
+                    localMessageTick += 1
+                }
+            },
+            onDismiss = { confirmingDelete = emptyList() },
         )
     }
 
@@ -2585,6 +2949,242 @@ private fun QuotedPreview(text: String, onTap: (() -> Unit)? = null) {
     }
 }
 
+/**
+ * Pick who a forward goes to.
+ *
+ * Multi-select on purpose: forwarding the same thing to three people is the
+ * common case, and doing it one sheet at a time is how people end up not
+ * bothering. The count on the button says what will be sent where, because
+ * once tapped there is no undo — each recipient gets a real message.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ForwardSheet(
+    count: Int,
+    conversations: List<ComradeCore.ConversationInfo>,
+    onConfirm: (List<String>) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var chosen by remember { mutableStateOf<Set<String>>(emptySet()) }
+    val sheetShape = RoundedCornerShape(topStart = ComradeRadii.xl, topEnd = ComradeRadii.xl)
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        modifier = Modifier.testTag("forward-sheet").glassSurface(GlassElevation.Sheet, shape = sheetShape),
+        shape = sheetShape,
+        containerColor = Color.Transparent,
+    ) {
+        Column(Modifier.fillMaxWidth().padding(bottom = 12.dp)) {
+            Text(
+                pluralStringResource(R.plurals.forward_title, count, count),
+                style = MaterialTheme.typography.titleMedium,
+                modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp),
+            )
+            HorizontalDivider()
+            LazyColumn(Modifier.weight(1f, fill = false).heightIn(max = 360.dp)) {
+                items(conversations, key = { it.peer }) { convo ->
+                    val picked = chosen.contains(convo.peer)
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable {
+                                chosen = if (picked) chosen - convo.peer else chosen + convo.peer
+                            }
+                            .padding(horizontal = 20.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(14.dp),
+                    ) {
+                        Checkbox(checked = picked, onCheckedChange = null)
+                        Text(
+                            convo.alias ?: convo.peerName ?: convo.peer.take(16),
+                            style = MaterialTheme.typography.bodyLarge,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
+            }
+            HorizontalDivider()
+            Button(
+                onClick = { onConfirm(chosen.toList()) },
+                enabled = chosen.isNotEmpty(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 20.dp, vertical = 12.dp)
+                    .testTag("forward-send"),
+            ) {
+                Text(pluralStringResource(R.plurals.forward_send, chosen.size, chosen.size))
+            }
+        }
+    }
+}
+
+/**
+ * When one message was sent, and how far it got.
+ *
+ * Only shows a delivery line for a message this device sent: the receiving side
+ * draws no ticks (see `MessageDto::status`), so claiming a state for an
+ * incoming message would be inventing one.
+ */
+@Composable
+private fun MessageInfoDialog(item: ChatItem, onDismiss: () -> Unit) {
+    val status = (item as? ChatItem.TextItem)?.msg?.status
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        confirmButton = { TextButton(onClick = onDismiss) { Text(stringResource(R.string.close)) } },
+        title = { Text(stringResource(R.string.message_action_info)) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text(
+                    stringResource(R.string.message_info_sent, clockTime(item.createdAt)),
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                if (item.outgoing && status != null) {
+                    Text(
+                        stringResource(R.string.message_info_status, status),
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                }
+            }
+        },
+        modifier = Modifier.testTag("message-info"),
+    )
+}
+
+/**
+ * Confirm a delete-for-everyone, and say what it can actually promise.
+ *
+ * The wording matters more than the dialog. This sends a *request* that the
+ * other device hide its copy — there is no cryptographic retraction available
+ * (each gift-wrap is signed with a one-time key that is discarded, so nothing
+ * survives to author a NIP-09 deletion), and a peer on a modified client simply
+ * keeps the message. Telling someone their message is "deleted for everyone"
+ * when it may not be is the kind of promise this app must not make.
+ */
+@Composable
+private fun DeleteForEveryoneDialog(count: Int, onConfirm: () -> Unit, onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(pluralStringResource(R.plurals.delete_everyone_title, count, count)) },
+        text = { Text(stringResource(R.string.delete_everyone_caveat)) },
+        confirmButton = {
+            TextButton(onClick = onConfirm, modifier = Modifier.testTag("confirm-delete-everyone")) {
+                Text(
+                    stringResource(R.string.message_action_delete_for_everyone),
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text(stringResource(R.string.cancel)) } },
+    )
+}
+
+/**
+ * One [ChatItem] as the pure rules in [MessageActions] want to see it.
+ *
+ * A translation, not a rule — every actual decision stays in `MessageActions.kt`
+ * where the JVM lane can test it. The clock is read once here, by the caller,
+ * so nothing under [messageActions] has to touch one.
+ *
+ * A media item counts as having text only when it carries a caption, which is
+ * what `Copy` would actually put on the clipboard: offering "copy" on a
+ * captionless photo would copy a placeholder label nobody asked for.
+ */
+private fun messageContextOf(item: ChatItem, nowMs: Long): MessageContext = when (item) {
+    is ChatItem.TextItem -> MessageContext(
+        own = item.msg.outgoing,
+        hasText = item.msg.content.isNotBlank(),
+        isMedia = false,
+        ageMs = nowMs - item.msg.createdAt * 1000L,
+        pinned = item.msg.pinned,
+        starred = item.msg.starred,
+    )
+    is ChatItem.MediaItem -> MessageContext(
+        own = item.info.outgoing,
+        hasText = item.info.caption.isNotBlank(),
+        isMedia = true,
+        ageMs = nowMs - item.info.createdAt * 1000L,
+        // Media rows have no local star/pin state of their own yet: the store
+        // keys both on a message id, and a media event is cached separately.
+        // Drawn as unset rather than guessed, so the sheet never offers "unpin"
+        // for a pin that was never recorded.
+        pinned = false,
+        starred = false,
+    )
+}
+
+/**
+ * The card under a bubble whose message carries a link.
+ *
+ * **Nothing here loads anything.** The card was built on the sender's device
+ * and travelled inside the message, so drawing it costs no request — which is
+ * the entire point: a fetch on receipt would tell the linked host that this
+ * npub received this link, and that is the metadata this app exists not to
+ * emit. There is deliberately no image, because `og:image` is a URL on that
+ * same host and an `AsyncImage` pointed at it would reinstate the leak in one
+ * line, on every render. See `ComradeCore.LinkPreviewInfo`.
+ *
+ * The domain is recomputed here with [displayDomain] rather than read from any
+ * wire field. The sender chose both the link and its metadata, so a card is
+ * free to *claim* it is PayPal while linking somewhere else; the parsed host is
+ * the one line on the card that cannot lie about where tapping it goes, which
+ * is why it is drawn first and why nothing else is allowed to supply it.
+ *
+ * Dense content, so no glass tier — that is for floating chrome
+ * (`docs/DESIGN_SYSTEM.md`).
+ */
+@Composable
+private fun LinkPreviewCard(preview: ComradeCore.LinkPreviewInfo, onTap: (String) -> Unit) {
+    val domain = displayDomain(preview.url) ?: return
+    val label = stringResource(R.string.message_open_link)
+    Surface(
+        shape = RoundedCornerShape(ComradeRadii.sm),
+        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.6f),
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 6.dp)
+            .clickable(onClickLabel = label) { onTap(preview.url) }
+            .testTag("link-preview"),
+    ) {
+        Row(modifier = Modifier.height(IntrinsicSize.Min)) {
+            // Telegram's rail. It is what separates the card from the words
+            // above it without drawing a box around either.
+            Box(
+                Modifier
+                    .width(3.dp)
+                    .fillMaxHeight()
+                    .background(MaterialTheme.colorScheme.primary),
+            )
+            Column(Modifier.padding(horizontal = 10.dp, vertical = 8.dp)) {
+                Text(
+                    domain,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.primary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                preview.title?.takeIf { it.isNotBlank() }?.let {
+                    Text(
+                        it,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                preview.description?.takeIf { it.isNotBlank() }?.let {
+                    Text(
+                        it,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+        }
+    }
+}
+
 // ── Reactions and the gestures that reach them ────────────────────────────────
 
 /**
@@ -2653,13 +3253,11 @@ private fun ReactionChips(chips: List<ReactionChip>, onToggle: (String) -> Unit)
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun MessageActionSheet(
+    actions: List<MessageAction>,
     myReaction: String?,
     onReact: (String) -> Unit,
     onMoreEmoji: () -> Unit,
-    onReply: () -> Unit,
-    onCopy: () -> Unit,
-    onOpenThread: () -> Unit,
-    onFile: () -> Unit,
+    onAction: (MessageAction) -> Unit,
     onDismiss: () -> Unit,
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
@@ -2671,68 +3269,128 @@ private fun MessageActionSheet(
         shape = sheetShape,
         containerColor = Color.Transparent,
     ) {
-        Column(Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceEvenly,
-            ) {
-                for (emoji in QUICK_REACTIONS) {
-                    val mine = emoji == myReaction
-                    Surface(
-                        shape = CircleShape,
-                        color = if (mine) {
-                            MaterialTheme.colorScheme.primary.copy(alpha = 0.18f)
-                        } else {
-                            Color.Transparent
-                        },
-                        modifier = Modifier
-                            .clip(CircleShape)
-                            .clickable { onReact(emoji) }
-                            .testTag("react-$emoji"),
-                    ) {
-                        Text(
-                            emoji,
-                            style = MaterialTheme.typography.headlineSmall,
-                            modifier = Modifier.padding(8.dp),
-                        )
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .padding(bottom = 8.dp),
+        ) {
+            if (actions.contains(MessageAction.React)) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceEvenly,
+                ) {
+                    for (emoji in QUICK_REACTIONS) {
+                        val mine = emoji == myReaction
+                        Surface(
+                            shape = CircleShape,
+                            color = if (mine) {
+                                MaterialTheme.colorScheme.primary.copy(alpha = 0.18f)
+                            } else {
+                                Color.Transparent
+                            },
+                            modifier = Modifier
+                                .clip(CircleShape)
+                                .clickable { onReact(emoji) }
+                                .testTag("react-$emoji"),
+                        ) {
+                            Text(
+                                emoji,
+                                style = MaterialTheme.typography.headlineSmall,
+                                modifier = Modifier.padding(8.dp),
+                            )
+                        }
+                    }
+                    // Anything outside the six. Same sheet the composer's emoji
+                    // button opens, so there is one picker in the app.
+                    IconButton(onClick = onMoreEmoji, modifier = Modifier.testTag("react-more")) {
+                        Icon(Icons.Filled.Add, contentDescription = stringResource(R.string.react_more))
                     }
                 }
-                // Anything outside the six. Same sheet the composer's emoji
-                // button opens, so there is one picker in the app.
-                IconButton(onClick = onMoreEmoji, modifier = Modifier.testTag("react-more")) {
-                    Icon(Icons.Filled.Add, contentDescription = stringResource(R.string.react_more))
-                }
+                HorizontalDivider(Modifier.padding(vertical = 8.dp))
             }
-            HorizontalDivider(Modifier.padding(vertical = 8.dp))
-            SheetAction(
-                icon = ReplyIcon,
-                label = stringResource(R.string.message_action_reply),
-                onClick = onReply,
-                testTag = "action-reply",
-            )
-            SheetAction(
-                icon = ChatBubbleIcon,
-                label = stringResource(R.string.message_action_open_thread),
-                onClick = onOpenThread,
-                testTag = "action-open-thread",
-            )
-            SheetAction(
-                icon = TagIcon,
-                label = stringResource(R.string.message_action_assign_topic),
-                onClick = onFile,
-                testTag = "action-assign-topic",
-            )
-            SheetAction(
-                icon = CopyIcon,
-                label = stringResource(R.string.message_action_copy),
-                onClick = onCopy,
-                testTag = "action-copy",
-            )
+            for (action in actions) {
+                if (action == MessageAction.React) continue
+                SheetAction(
+                    icon = messageActionIcon(action),
+                    label = stringResource(messageActionLabel(action)),
+                    onClick = { onAction(action) },
+                    testTag = messageActionTestTag(action),
+                    destructive = action.destructive,
+                )
+            }
         }
     }
+}
+
+/**
+ * The glyph for one row. A `when` with no `else`, deliberately: adding a
+ * [MessageAction] should fail to compile here rather than draw a blank row.
+ */
+private fun messageActionIcon(action: MessageAction): ImageVector = when (action) {
+    MessageAction.React -> EmojiIcon
+    MessageAction.Reply -> ReplyIcon
+    MessageAction.ReplyInThread -> ChatBubbleIcon
+    MessageAction.Forward -> ForwardIcon
+    MessageAction.Pin, MessageAction.Unpin -> PushPinIcon
+    MessageAction.Star -> StarOutlineIcon
+    MessageAction.Unstar -> StarIcon
+    MessageAction.AssignTopic -> TagIcon
+    MessageAction.Copy -> CopyIcon
+    MessageAction.Edit -> EditIcon
+    MessageAction.Select -> SelectIcon
+    MessageAction.Share -> ShareIcon
+    MessageAction.SaveMedia -> DownloadIcon
+    MessageAction.MessageInfo -> InfoIcon
+    MessageAction.Report -> FlagIcon
+    MessageAction.DeleteForMe, MessageAction.DeleteForEveryone -> DeleteIcon
+}
+
+/** The string for one row, resolved by the caller as [ChatMenuAction]'s are. */
+private fun messageActionLabel(action: MessageAction): Int = when (action) {
+    MessageAction.React -> R.string.message_action_react
+    MessageAction.Reply -> R.string.message_action_reply
+    MessageAction.ReplyInThread -> R.string.message_action_open_thread
+    MessageAction.Forward -> R.string.message_action_forward
+    MessageAction.Pin -> R.string.message_action_pin
+    MessageAction.Unpin -> R.string.message_action_unpin
+    MessageAction.Star -> R.string.message_action_star
+    MessageAction.Unstar -> R.string.message_action_unstar
+    MessageAction.AssignTopic -> R.string.message_action_assign_topic
+    MessageAction.Copy -> R.string.message_action_copy
+    MessageAction.Edit -> R.string.message_action_edit
+    MessageAction.Select -> R.string.message_action_select
+    MessageAction.Share -> R.string.message_action_share
+    MessageAction.SaveMedia -> R.string.message_action_save_media
+    MessageAction.MessageInfo -> R.string.message_action_info
+    MessageAction.Report -> R.string.message_action_report
+    MessageAction.DeleteForMe -> R.string.message_action_delete_for_me
+    MessageAction.DeleteForEveryone -> R.string.message_action_delete_for_everyone
+}
+
+/** Stable test tags, so an instrumented test can name a row without its label. */
+private fun messageActionTestTag(action: MessageAction): String = when (action) {
+    MessageAction.React -> "action-react"
+    MessageAction.Reply -> "action-reply"
+    MessageAction.ReplyInThread -> "action-open-thread"
+    MessageAction.Forward -> "action-forward"
+    MessageAction.Pin -> "action-pin"
+    MessageAction.Unpin -> "action-unpin"
+    MessageAction.Star -> "action-star"
+    MessageAction.Unstar -> "action-unstar"
+    MessageAction.AssignTopic -> "action-assign-topic"
+    MessageAction.Copy -> "action-copy"
+    MessageAction.Edit -> "action-edit"
+    MessageAction.Select -> "action-select"
+    MessageAction.Share -> "action-share"
+    MessageAction.SaveMedia -> "action-save-media"
+    MessageAction.MessageInfo -> "action-info"
+    MessageAction.Report -> "action-report"
+    MessageAction.DeleteForMe -> "action-delete-for-me"
+    MessageAction.DeleteForEveryone -> "action-delete-for-everyone"
 }
 
 /** One full-width row of [MessageActionSheet]. */
@@ -2742,7 +3400,17 @@ private fun SheetAction(
     label: String,
     onClick: () -> Unit,
     testTag: String,
+    destructive: Boolean = false,
 ) {
+    // `error` is a foreground token here — it tints a glyph and colours text,
+    // never fills the row. See docs/DESIGN_SYSTEM.md: a foreground token is
+    // never used as a fill, and a row painted in it would read as selected
+    // rather than as dangerous.
+    val tint = if (destructive) {
+        MaterialTheme.colorScheme.error
+    } else {
+        MaterialTheme.colorScheme.onSurfaceVariant
+    }
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -2752,8 +3420,12 @@ private fun SheetAction(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(18.dp),
     ) {
-        Icon(icon, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
-        Text(label, style = MaterialTheme.typography.bodyLarge)
+        Icon(icon, contentDescription = null, tint = tint)
+        Text(
+            label,
+            style = MaterialTheme.typography.bodyLarge,
+            color = if (destructive) tint else Color.Unspecified,
+        )
     }
 }
 
