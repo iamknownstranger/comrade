@@ -207,6 +207,32 @@
     })
     .catch(() => {});
 
+  // ── Message action decisions (desktop/ui/message_actions.mjs) ──────────────
+  // Which rows a bubble's right-click menu offers, in what order, and which
+  // windows gate Edit/DeleteForEveryone — mirrored from Android's
+  // `MessageActions.kt`. Loaded like the modules above; a right-click before it
+  // resolves opens no menu, which is no worse than the menu not existing yet.
+  let messageActionsMod = null;
+  import("./message_actions.mjs")
+    .then((m) => {
+      messageActionsMod = m;
+    })
+    .catch(() => {});
+
+  // ── Link-preview decisions (desktop/ui/link_preview.mjs) ────────────────────
+  // The domain a card names, derived from the URL alone — mirrored from
+  // Android's `LinkPreviewDecisions.kt`. The card's own text/title/description
+  // come from `MessageDto.link_preview`, already split off the wire body by
+  // `comrade_core::unfurl::split_preview` on the Rust side; this module exists
+  // so the one guarantee that matters (never `site_name`) is re-derived here
+  // too rather than only trusted from the bridge. Loaded like the modules above.
+  let linkPreviewMod = null;
+  import("./link_preview.mjs")
+    .then((m) => {
+      linkPreviewMod = m;
+    })
+    .catch(() => {});
+
   // ── Tiny DOM helpers ──────────────────────────────────────────────────────
   const $ = (sel) => document.querySelector(sel);
 
@@ -1600,6 +1626,18 @@
           upi: [],
           status: m.status || null,
           reply_to: m.reply_to || null,
+          // Both already split off the wire body by core (`comrade_ui::MessageDto`)
+          // — this path had been dropping them on a reload, so a shared-note
+          // header or a link-preview card would vanish the moment the
+          // conversation was reopened after arriving live. `onIncomingDm`
+          // above already carries `shared_note` for exactly this reason;
+          // `link_preview` has no live-arrival counterpart yet (see
+          // `linkPreviewCard`'s call site — `DirectMessageDto` carries no such
+          // field, unlike `MessageDto`), so a link that arrives live only
+          // gets its card after the next reload.
+          shared_note: m.shared_note || null,
+          link_preview: m.link_preview || null,
+          actions: m.actions || null,
         }))
         .concat(liveMedia)
         .concat(persistedMedia)
@@ -1900,6 +1938,11 @@
   let renderedPeer = null;
 
   function renderConversation() {
+    // A rebuild can be triggered by an unrelated event (a delivery tick, a
+    // peer rename) while a bubble's menu is open; the menu is appended to
+    // `document.body`, not `#chat-log`, so it would otherwise survive the
+    // wipe below floating over bubbles that just reflowed under it.
+    closeMessageMenu();
     const log = $("#chat-log");
     const head = $("#chat-header");
     // Measured before the rebuild wipes it. This runs for a delivery tick or a
@@ -2016,6 +2059,13 @@
     if (m.shared_note)
       wrap.append(sharedNoteBody(m.shared_note, Boolean(m.outgoing)));
     else wrap.append(el("span", { class: "bubble-text", text: m.content }));
+    // The card the *sender's* device built for this message's first link, if
+    // it carried one — see linkPreviewCard for why this never fetches
+    // anything itself.
+    if (m.link_preview) {
+      const card = linkPreviewCard(m.link_preview);
+      if (card) wrap.append(card);
+    }
     wrap.append(
       el(
         "div",
@@ -2029,8 +2079,61 @@
     if (m.id) {
       wrap.append(replyButton(m));
       wrap.append(threadButton(m));
+      // The rest of the action set (star/pin/delete/…) lives behind a
+      // right-click rather than more hover icons crowding the bubble edge —
+      // `messageActions()` decides the row set, this only opens the menu.
+      wrap.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        openMessageMenuAt(m, e.clientX, e.clientY);
+      });
     }
     return wrap;
+  }
+
+  /**
+   * The Telegram-style card for a message's attached link preview.
+   *
+   * `preview` is `MessageDto.link_preview` (`comrade_ui::LinkPreviewDto`),
+   * built once on the *sending* device and carried on the wire — see
+   * `comrade_core::unfurl`'s module doc for why this device never fetches the
+   * URL itself to draw this card. `null` when the URL names no host at all,
+   * matching `link_preview.mjs`'s `displayDomain` — a broken link gets no
+   * card rather than a blank one.
+   *
+   * The domain line is recomputed here from `preview.url` with
+   * `link_preview.mjs`'s `displayDomain` rather than trusted straight off
+   * `preview.display_domain`, so the one guarantee that matters — the domain
+   * a phishing message cannot relabel via `site_name` — holds on this
+   * frontend's own reading of the URL, not only on the bridge's. Falls back
+   * to the wire field (itself already `display_domain`, never `site_name` —
+   * see `LinkPreviewDto`) only if this device's own `URL` parser cannot make
+   * sense of the URL at all, so the module still resolving keeps the card
+   * from disappearing outright.
+   *
+   * No `<img>` for `preview.image_url`: that URL lives on the linked page's
+   * own host, and a live `<img src>` would make exactly the request
+   * `comrade_core::unfurl`'s module doc says the sender-side fetch exists to
+   * spare the receiver — "this npub opened this message", leaked to a third
+   * party neither the sender's words nor this device chose to contact again.
+   * Showing the image needs the sender to carry its *bytes*, which nothing in
+   * `unfurl.rs` does yet.
+   */
+  function linkPreviewCard(preview) {
+    const domain = linkPreviewMod
+      ? linkPreviewMod.displayDomain(preview.url) || preview.display_domain || null
+      : preview.display_domain || null;
+    if (!domain) return null;
+    return el(
+      "div",
+      { class: "bubble-preview" },
+      el("span", { class: "bubble-preview-domain", text: domain }),
+      preview.title
+        ? el("span", { class: "bubble-preview-title", text: preview.title })
+        : null,
+      preview.description
+        ? el("span", { class: "bubble-preview-desc", text: preview.description })
+        : null,
+    );
   }
 
   /**
@@ -2205,6 +2308,229 @@
         setReply(m);
       },
     });
+  }
+
+  // ── Message action menu (desktop/ui/message_actions.mjs) ───────────────────
+  //
+  // `messageActions()` decides the row set and its order; everything here is
+  // DOM — opening the popover, and running whichever row was clicked. Several
+  // rows appear because Android's contract says they must (the row set is not
+  // a desktop opinion) but have nothing to call yet: see UNWIRED_ACTION_NOTE.
+
+  const MESSAGE_ACTION_LABELS = {
+    react: "React",
+    reply: "Reply",
+    reply_in_thread: "Reply in thread",
+    forward: "Forward",
+    pin: "Pin",
+    unpin: "Unpin",
+    star: "Star",
+    unstar: "Unstar",
+    assign_topic: "Assign topic",
+    copy: "Copy",
+    edit: "Edit",
+    select: "Select",
+    share: "Share",
+    save_media: "Save media",
+    message_info: "Message info",
+    report: "Report",
+    delete_for_me: "Delete for me",
+    delete_for_everyone: "Delete for everyone",
+  };
+
+  /**
+   * Rows `messageActions()` can offer with nothing behind them yet, and why —
+   * said out loud in the toast rather than the row silently doing nothing.
+   *
+   * `forward` and `delete_for_everyone` are the two that *could* be wired
+   * today but aren't: both end, inside `comrade_ui::ComradeRuntime`, in a
+   * network `.await` (a relay send) with no `handles()`-detached form the way
+   * `send_dm`/`assign_thread` have — see `commands.rs`'s `sync_ledger` doc
+   * ("AUDIT P2: never hold the runtime lock across a network await, or one
+   * slow/unreachable relay stalls every other command behind it"). Adding a
+   * command that calls either directly would hold that lock across exactly
+   * the await AUDIT P2 warns about; giving them a detached path is a
+   * `comrade_ui` change, not one this file can make on its own. `react`,
+   * `edit`, `report`, `share`, `select` and `message_info` have no engine call
+   * to reach at all yet on *any* frontend.
+   */
+  const UNWIRED_ACTION_NOTE = {
+    react: "Reactions aren't wired into the desktop UI yet.",
+    forward: "Forwarding needs a lock-safe Tauri command first — see AUDIT.md.",
+    edit: "Editing has no backend yet, on any frontend.",
+    select: "Multi-select isn't wired into the desktop UI yet.",
+    share: "There's no desktop share target for this yet.",
+    message_info: "Message info isn't wired into the desktop UI yet.",
+    report: "Reporting has no backend yet, on any frontend.",
+    delete_for_everyone: "Needs a lock-safe Tauri command first — see AUDIT.md.",
+  };
+
+  /**
+   * The facts `messageActionsMod.messageActions` needs about `m` — this
+   * file's version of the "caller's translation" Android's `MessageContext`
+   * doc describes, so `message_actions.mjs` never has to know whether `m` is
+   * wearing a text message's shape or a media one.
+   */
+  function messageContextFor(m) {
+    const hasText = m.media
+      ? Boolean(m.media.caption && m.media.caption.length > 0)
+      : Boolean(m.content && m.content.length > 0);
+    return {
+      own: Boolean(m.outgoing),
+      hasText,
+      isMedia: Boolean(m.media),
+      ageMs: Math.max(0, Date.now() - Number(m.created_at || 0) * 1000),
+      pinned: Boolean(m.actions && m.actions.pinned),
+      starred: Boolean(m.actions && m.actions.starred),
+    };
+  }
+
+  /** The one open menu, or null — right-clicking a second bubble replaces it. */
+  let openMsgMenu = null;
+
+  function closeMessageMenu() {
+    if (!openMsgMenu) return;
+    openMsgMenu.remove();
+    openMsgMenu = null;
+    document.removeEventListener("pointerdown", onMessageMenuOutsideClick, true);
+    document.removeEventListener("keydown", onMessageMenuKeydown, true);
+  }
+
+  function onMessageMenuOutsideClick(e) {
+    if (openMsgMenu && !openMsgMenu.contains(e.target)) closeMessageMenu();
+  }
+
+  function onMessageMenuKeydown(e) {
+    if (e.key === "Escape") closeMessageMenu();
+  }
+
+  /** Run one row's action against message `m` in the open conversation. */
+  async function runMessageAction(action, m) {
+    const peer = state.activeContact;
+    switch (action) {
+      case "reply":
+        setReply(m);
+        return;
+      case "reply_in_thread":
+        // Same as threadButton's own click handler.
+        state.threads.open = true;
+        state.threads.filing = null;
+        $("#threads-drawer").hidden = false;
+        void refreshThreads();
+        void openThread(m.id);
+        return;
+      case "assign_topic":
+        openThreadsDrawer(m.id);
+        return;
+      case "copy": {
+        const text = m.media ? m.media.caption : m.content;
+        try {
+          await navigator.clipboard.writeText(text || "");
+          showToast("Copied.", "info");
+        } catch {
+          showToast("Couldn't reach the clipboard.", "error");
+        }
+        return;
+      }
+      case "star":
+      case "unstar": {
+        const starred = action === "star";
+        const changed = await safeInvoke("star_message", {
+          peer,
+          messageId: m.id,
+          starred,
+        });
+        if (changed) {
+          m.actions = { pinned: false, ...(m.actions || {}), starred };
+          renderConversation();
+        }
+        return;
+      }
+      case "pin":
+      case "unpin": {
+        const pinning = action === "pin";
+        const changed = await safeInvoke(pinning ? "pin_message" : "unpin_message", {
+          peer,
+          messageId: m.id,
+        });
+        if (changed) {
+          m.actions = { starred: false, ...(m.actions || {}), pinned: pinning };
+          renderConversation();
+        }
+        return;
+      }
+      case "delete_for_me": {
+        await safeInvoke("delete_message_for_me", { peer, messageId: m.id });
+        const list = state.dms.get(peer) || [];
+        state.dms.set(
+          peer,
+          list.filter((x) => x !== m),
+        );
+        renderConversation();
+        showToast("Deleted for you.", "info");
+        return;
+      }
+      case "save_media": {
+        // Reuses the handoff card's own trick (styles.css's `handoff-save`
+        // anchor): a real `download` anchor, so the browser writes the file
+        // wherever that person's downloads go — nothing here touches a path.
+        // Only reachable once the attachment is already decrypted in memory;
+        // there is no separate "fetch just to save" call.
+        if (!m.media || !m.media.objectUrl) {
+          showToast("Open the attachment first, then Save media.", "info");
+          return;
+        }
+        const ext = (m.media.mime || "").split("/")[1]?.split(/[+;]/)[0] || "bin";
+        const a = document.createElement("a");
+        a.href = m.media.objectUrl;
+        a.download = `comrade-attachment.${ext}`;
+        a.click();
+        return;
+      }
+      default:
+        showToast(UNWIRED_ACTION_NOTE[action] || "Not available on desktop yet.", "info");
+    }
+  }
+
+  function messageMenuRow(action, m) {
+    const destructive = messageActionsMod ? messageActionsMod.isDestructive(action) : false;
+    return el("button", {
+      class: "msg-menu-item" + (destructive ? " is-destructive" : ""),
+      type: "button",
+      role: "menuitem",
+      text: MESSAGE_ACTION_LABELS[action] || action,
+      onClick: () => {
+        closeMessageMenu();
+        void runMessageAction(action, m);
+      },
+    });
+  }
+
+  /**
+   * Open the right-click menu for bubble `m` at pointer position `x, y`.
+   *
+   * Degraded, not wrong, before `messageActionsMod` resolves: a right-click
+   * opens nothing, which is no worse than the menu not existing at all yet —
+   * the same discipline every other dynamically-imported module here follows.
+   */
+  function openMessageMenuAt(m, x, y) {
+    closeMessageMenu();
+    if (!messageActionsMod) return;
+    const actions = messageActionsMod.messageActions(messageContextFor(m));
+    const menu = el(
+      "div",
+      { class: "msg-menu", role: "menu" },
+      ...actions.map((a) => messageMenuRow(a, m)),
+    );
+    document.body.append(menu);
+    // Measured after it lands in the DOM, then clamped so a bubble near the
+    // pane's edge still opens a menu that fits on screen.
+    const { width, height } = menu.getBoundingClientRect();
+    menu.style.left = `${Math.max(4, Math.min(x, window.innerWidth - width - 8))}px`;
+    menu.style.top = `${Math.max(4, Math.min(y, window.innerHeight - height - 8))}px`;
+    openMsgMenu = menu;
+    document.addEventListener("pointerdown", onMessageMenuOutsideClick, true);
+    document.addEventListener("keydown", onMessageMenuKeydown, true);
   }
 
   // ── Threads and topics (docs/CHAT_THREADS.md) ─────────────────────────────
@@ -4132,7 +4458,16 @@
     wrap.append(el("span", { class: "bubble-time", text: relTime(m.created_at) }));
     // An attachment is an event like any other, so it is repliable like any
     // other. It was not, only because media rows carried no `id`.
-    if (m.id && repliable) wrap.append(replyButton(m));
+    if (m.id && repliable) {
+      wrap.append(replyButton(m));
+      // Same gate as the reply button: the couple media grid renders these
+      // read-only (`repliable: false`), and a menu offering "Delete for me"
+      // on someone else's tab is not a context this bubble is drawn in.
+      wrap.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        openMessageMenuAt(m, e.clientX, e.clientY);
+      });
+    }
     return wrap;
   }
 

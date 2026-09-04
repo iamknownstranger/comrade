@@ -294,7 +294,8 @@ body.theme-couple-sakhi {
   .requests-section,
   .call-dock,
   .call-active.is-minimized,
-  .toast {
+  .toast,
+  .msg-menu {
     background: var(--popover);
   }
 }
@@ -312,7 +313,8 @@ body.theme-couple-sakhi {
   .requests-section,
   .call-dock,
   .call-active.is-minimized,
-  .toast {
+  .toast,
+  .msg-menu {
     background: var(--popover);
     backdrop-filter: none;
     -webkit-backdrop-filter: none;
@@ -1518,6 +1520,108 @@ code {
 
 .bubble.out .bubble-reply {
   left: calc(var(--space-3) * -1);
+}
+
+/* The Telegram-style link-preview card (link_preview.mjs / main.js's
+   linkPreviewCard). Dense content living *inside* a bubble, never floating
+   chrome — §3.4 reserves the glass tier for chrome, so this is a flat tint
+   like `.bubble-quote`/`.bubble-note` right above it, not a blurred surface.
+   `currentColor` for the same reason those two use it: one rule has to read
+   on both the panel (incoming) and accent (outgoing) bubble backgrounds. */
+.bubble-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: var(--space-1);
+  padding: var(--space-2);
+  border-left: 2px solid currentColor;
+  border-radius: 4px;
+  background: color-mix(in srgb, currentColor 8%, transparent);
+  max-width: 100%;
+}
+
+.bubble-preview-domain {
+  font-size: var(--text-caption-size);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  opacity: 0.75;
+}
+
+.bubble-preview-title {
+  font-size: var(--text-label-size);
+  font-weight: 600;
+  /* Two lines, then an ellipsis — a card competing with the sender's own
+     words for space must stay a glance, not a second paragraph. */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.bubble-preview-desc {
+  font-size: var(--text-caption-size);
+  opacity: 0.85;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* The right-click action menu (message_actions.mjs / main.js's
+   openMessageMenuAt). This *is* floating chrome — a popover over content,
+   the same tier `.modal`'s dialog uses — so it gets the glass tint and blur,
+   just at the smaller "popover" radius/blur rather than the dialog's larger
+   one, matching how a context menu reads next to a sheet everywhere else in
+   the design system. */
+.msg-menu {
+  position: fixed;
+  z-index: 60;
+  min-width: 180px;
+  max-width: 260px;
+  display: flex;
+  flex-direction: column;
+  padding: var(--space-1);
+  background: var(--glass-tint);
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  border: var(--glass-border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--glass-shadow), var(--glass-highlight);
+  animation: rise var(--duration-base) var(--ease-standard);
+}
+
+.msg-menu-item {
+  display: block;
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  border: none;
+  background: none;
+  border-radius: var(--radius-sm);
+  color: var(--popover-foreground);
+  font: inherit;
+  font-size: var(--text-label-size);
+  text-align: left;
+  cursor: pointer;
+}
+
+.msg-menu-item:hover,
+.msg-menu-item:focus-visible {
+  background: color-mix(in srgb, var(--popover-foreground) var(--state-hover), transparent);
+}
+
+/* Destructive (only DeleteForEveryone — message_actions.mjs's isDestructive):
+   a border and a tinted hover, never `--destructive` itself as text — §3.1's
+   pairing rule again, the same one `--bad`'s other uses in this file already
+   follow (border/background only, never text). The row still reads as a
+   warning; the accent stays where the pairing table puts it. */
+.msg-menu-item.is-destructive {
+  border-left: 2px solid var(--destructive);
+}
+
+.msg-menu-item.is-destructive:hover,
+.msg-menu-item.is-destructive:focus-visible {
+  background: color-mix(in srgb, var(--destructive) 16%, transparent);
 }
 
 /* Glass tier: same composer chrome, the DM variant. */
