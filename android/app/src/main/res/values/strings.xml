@@ -1105,4 +1105,52 @@
     <string name="travel_api_key_clear">Remove key</string>
     <string name="travel_api_key_present">A key is saved on this device.</string>
     <string name="travel_api_key_absent">No key saved \u2014 places and facts still work; ratings do not.</string>
+
+    <!-- ── Capture: the helmet cam (docs/CAPTURE.md) ───────────────────────
+         Mount the phone, tap record, then press the lock button — recording
+         keeps going with the screen off, which is the whole feature. -->
+    <string name="capture_title">Capture</string>
+    <string name="capture_subtitle">Mount your phone, tap record, then press the lock button \u2014 it keeps recording with the screen off.</string>
+    <string name="capture_permission_explainer">Comrade needs the camera and microphone to record video.</string>
+    <string name="capture_permission_denied">Camera and microphone access is off, so there is nothing to record. You can turn it on in Android settings.</string>
+    <string name="capture_grant_permission">Allow camera &amp; microphone</string>
+    <string name="capture_record">Record</string>
+    <string name="capture_stop">Stop</string>
+    <string name="capture_preparing">Starting\u2026</string>
+    <string name="capture_retry">Try again</string>
+    <string name="capture_no_lens">No camera found</string>
+    <string name="capture_lens_back">Back</string>
+    <string name="capture_lens_front">Front</string>
+    <string name="capture_lens_external">External</string>
+    <!-- %1$s is one of the three names above, %2$d which one when a device
+         has more than one lens of that facing \u2014 "Back 2" for the second
+         back lens (docs/CAPTURE.md §7: lenses are ordered, not named by the
+         OS). -->
+    <string name="capture_lens_ordinal">%1$s %2$d</string>
+    <string name="capture_private_toggle">Private</string>
+    <string name="capture_private_note">Kept off your gallery and out of Google Photos. This is not encryption \u2014 it\u2019s a private folder, and it goes away if Comrade is uninstalled.</string>
+    <!-- The whole point of the feature, said once, while it is actually true
+         \u2014 see docs/CAPTURE.md §1. -->
+    <string name="capture_lock_hint">You can press the lock button now \u2014 recording keeps going with the screen off.</string>
+    <string name="capture_saved_gallery">Saved to your gallery as %1$s.</string>
+    <string name="capture_saved_private">Saved privately as %1$s \u2014 not in your gallery.</string>
+    <string name="capture_error_camera_unavailable">Couldn\u2019t reach the camera. Close any other camera app and try again.</string>
+    <string name="capture_error_recorder_failed">Recording couldn\u2019t start. Try again.</string>
+    <string name="capture_error_no_storage">Not enough free space to record.</string>
+    <string name="capture_error_permission_denied">Camera or microphone access was denied.</string>
+    <!-- These three are successes wearing a failure's clothes (docs/CAPTURE.md
+         §2): the recording stopped itself on purpose, and what was already
+         shot is a complete, playable file either way. Worded like it. -->
+    <string name="capture_stopped_battery">Recording stopped \u2014 the battery was almost out. What you shot is saved.</string>
+    <string name="capture_stopped_storage">Recording stopped \u2014 the phone ran low on storage. What you shot is saved.</string>
+    <string name="capture_stopped_thermal">Recording stopped \u2014 the phone got too hot. What you shot is saved.</string>
+
+    <!-- Read by CaptureService's foreground notification, not by CaptureScreen
+         itself \u2014 owned here because this file is owned by one agent. -->
+    <string name="capture_notification_title">Recording</string>
+    <string name="capture_notification_gallery">Saving to your gallery</string>
+    <string name="capture_notification_private">Saving privately \u2014 not in your gallery</string>
+    <string name="capture_action_stop">Stop</string>
+    <string name="capture_channel_name">Helmet cam</string>
+    <string name="capture_channel_description">Shown while Comrade is recording video, including with the screen off.</string>
 </resources>
