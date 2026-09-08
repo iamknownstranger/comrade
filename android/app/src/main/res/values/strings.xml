@@ -1138,15 +1138,16 @@
     <string name="capture_error_recorder_failed">Recording couldn\u2019t start. Try again.</string>
     <string name="capture_error_no_storage">Not enough free space to record.</string>
     <string name="capture_error_permission_denied">Camera or microphone access was denied.</string>
-    <!-- These three are successes wearing a failure's clothes (docs/CAPTURE.md
+    <!-- These four are successes wearing a failure's clothes (docs/CAPTURE.md
          §2): the recording stopped itself on purpose, and what was already
          shot is a complete, playable file either way. Worded like it. -->
     <string name="capture_stopped_battery">Recording stopped \u2014 the battery was almost out. What you shot is saved.</string>
     <string name="capture_stopped_storage">Recording stopped \u2014 the phone ran low on storage. What you shot is saved.</string>
     <string name="capture_stopped_thermal">Recording stopped \u2014 the phone got too hot. What you shot is saved.</string>
+    <string name="capture_stopped_camera_lost">Recording stopped \u2014 the camera stopped responding. What you shot is saved.</string>
 
-    <!-- Read by CaptureService's foreground notification, not by CaptureScreen
-         itself \u2014 owned here because this file is owned by one agent. -->
+    <!-- Read by CaptureService's foreground notification rather than by
+         CaptureScreen. -->
     <string name="capture_notification_title">Recording</string>
     <string name="capture_notification_gallery">Saving to your gallery</string>
     <string name="capture_notification_private">Saving privately \u2014 not in your gallery</string>

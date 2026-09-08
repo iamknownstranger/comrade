@@ -499,4 +499,5 @@ private fun failureMessage(reason: CaptureManager.Reason): Int = when (reason) {
     CaptureManager.Reason.StoppedBattery -> R.string.capture_stopped_battery
     CaptureManager.Reason.StoppedStorage -> R.string.capture_stopped_storage
     CaptureManager.Reason.StoppedThermal -> R.string.capture_stopped_thermal
+    CaptureManager.Reason.StoppedCameraLost -> R.string.capture_stopped_camera_lost
 }

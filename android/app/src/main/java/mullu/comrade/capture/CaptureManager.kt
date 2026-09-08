@@ -81,6 +81,13 @@ import kotlin.math.abs
  * length of the reconfiguration. A few are lost at every screen on/off
  * transition. That is the real cost of the feature, not an incidental one,
  * and no comment here should claim otherwise.
+ *
+ * A reconfiguration can also fail outright rather than merely cost frames,
+ * and that case has a defined answer instead of a log line: the preview is
+ * dropped and the encoder-only set retried, and if even that will not
+ * configure the recording is ended and published under
+ * [Reason.StoppedCameraLost]. A helmet cam whose session quietly died is
+ * indistinguishable, while riding, from one that is working.
  */
 object CaptureManager {
 
@@ -106,6 +113,18 @@ object CaptureManager {
         StoppedBattery,
         StoppedStorage,
         StoppedThermal,
+
+        /**
+         * The camera stopped being able to deliver frames mid-recording and
+         * [reconfigureOutputs] could not get a session back, not even the
+         * encoder-only one. Grouped with the other `Stopped*` reasons rather
+         * than with [CameraUnavailable] because it is the same shape of
+         * outcome: the ride's footage up to this point is finished and
+         * published, and the user is told. The alternative — the behaviour
+         * this replaced — was to log a line and keep a recording alive that
+         * was writing no video at all.
+         */
+        StoppedCameraLost,
     }
 
     data class Saved(val uri: String?, val displayName: String, val destination: CaptureDecisions.Destination)
@@ -422,10 +441,19 @@ object CaptureManager {
         // A foreground service does not by itself keep the CPU out of
         // suspend — this is what actually does, for the length of the
         // recording. Released in finishRecording's cleanup, always.
-        val powerManager = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
-        sess.wakeLock = powerManager
-            ?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "comrade:capture")
-            ?.apply { setReferenceCounted(false); acquire() }
+        // Wrapped like every other step in this function, and for the same
+        // reason: by this point the camera is open and the recorder is
+        // running, so an exception escaping here would unwind past all of the
+        // teardown below and strand a live CameraDevice with no service, no
+        // wake lock and no way for the user to stop it. A recording that runs
+        // without the lock is merely worse than one that runs with it; a
+        // leaked camera is worse than both, and blocks every other app until
+        // the phone reboots.
+        sess.wakeLock = runCatching {
+            (context.getSystemService(Context.POWER_SERVICE) as? PowerManager)
+                ?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "comrade:capture")
+                ?.apply { setReferenceCounted(false); acquire() }
+        }.onFailure { Log.w(TAG, "could not hold a wake lock; recording anyway", it) }.getOrNull()
 
         armNextSegment(sess)
 
@@ -563,26 +591,91 @@ object CaptureManager {
             val hasPreview = sess.activeOutputs.any { it.isPreview }
             if (wantsPreview == hasPreview) return@launch
 
-            runCatching { sess.captureSession?.close() }
-            val outputs = buildOutputs(sess.appContext, recorder.surface, sess.lens, sess.config, if (wantsPreview) preview else null)
-            val newSession = createSession(device, outputs.map { it.surface })
-            if (newSession == null) {
-                Log.w(TAG, "capture session reconfiguration failed; recording continues on the previous frames")
+            // The old session is deliberately NOT closed up front. Camera2
+            // replaces the previous session when a new one is created, so
+            // closing first buys nothing — and it used to cost everything:
+            // if the new session then failed to configure, this returned with
+            // `captureSession` still pointing at the session it had just
+            // closed, so no frames reached the encoder for the rest of the
+            // ride while the timer and the notification carried on as if they
+            // did. On a helmet mount nobody finds out until they get home.
+            if (applyOutputs(sess, device, recorder, withPreview = wantsPreview)) return@launch
+
+            // Attaching the preview is the only part that can fail on its own
+            // terms (a surface size the device will not take, a texture torn
+            // down underneath us), and it is also the part the recording does
+            // not need. Falling back to the encoder-only set keeps the footage
+            // coming; the viewfinder stays dark until the next transition
+            // retries it.
+            if (wantsPreview && applyOutputs(sess, device, recorder, withPreview = false)) {
+                Log.w(TAG, "preview could not be reattached; recording continues without a viewfinder")
                 return@launch
             }
-            val requestOk = runCatching {
-                val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
-                outputs.forEach { builder.addTarget(it.surface) }
-                newSession.setRepeatingRequest(builder.build(), null, cameraHandler)
-            }
-            if (requestOk.isFailure) {
-                Log.w(TAG, "setRepeatingRequest failed after reconfiguration", requestOk.exceptionOrNull())
-                return@launch
-            }
-            sess.activeOutputs.filter { it.isPreview }.forEach { runCatching { it.surface.release() } }
-            sess.captureSession = newSession
-            sess.activeOutputs = outputs
+
+            // Not even the encoder-only set configured, so this camera is not
+            // going to deliver another frame. End the recording rather than
+            // leave one running that writes nothing: what was shot up to here
+            // is stopped cleanly and published, and the screen says so.
+            Log.w(TAG, "capture session lost and could not be rebuilt; ending the recording")
+            finishRecording(success = true, failReason = Reason.StoppedCameraLost)
         }
+    }
+
+    /**
+     * Swap the live capture session for one carrying [withPreview]'s output
+     * set, and answer whether that actually worked.
+     *
+     * Every failure path leaves the session fields untouched and disposes
+     * whatever it built, so a caller may try a smaller output set immediately
+     * afterwards. The previously-attached preview surface is released only
+     * once the replacement is configured and repeating — releasing it earlier
+     * is releasing a surface the still-current session is drawing into.
+     */
+    private suspend fun applyOutputs(
+        sess: RecordingSession,
+        device: CameraDevice,
+        recorder: MediaRecorder,
+        withPreview: Boolean,
+    ): Boolean {
+        val outputs = buildOutputs(
+            sess.appContext,
+            recorder.surface,
+            sess.lens,
+            sess.config,
+            if (withPreview) preview else null,
+        )
+        // buildOutputs swallows a failed preview surface and returns the
+        // encoder alone; asking for a preview and not getting one is a failed
+        // attempt, not a silent downgrade the caller never hears about.
+        if (withPreview && outputs.none { it.isPreview }) {
+            releasePreviews(outputs)
+            return false
+        }
+        val newSession = createSession(device, outputs.map { it.surface })
+        if (newSession == null) {
+            releasePreviews(outputs)
+            return false
+        }
+        val requestOk = runCatching {
+            val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
+            outputs.forEach { builder.addTarget(it.surface) }
+            newSession.setRepeatingRequest(builder.build(), null, cameraHandler)
+        }
+        if (requestOk.isFailure) {
+            Log.w(TAG, "setRepeatingRequest failed after reconfiguration", requestOk.exceptionOrNull())
+            runCatching { newSession.close() }
+            releasePreviews(outputs)
+            return false
+        }
+        val previous = sess.activeOutputs
+        sess.captureSession = newSession
+        sess.activeOutputs = outputs
+        releasePreviews(previous)
+        return true
+    }
+
+    private fun releasePreviews(outputs: List<Output>) {
+        outputs.filter { it.isPreview }.forEach { runCatching { it.surface.release() } }
     }
 
     private fun buildOutputs(

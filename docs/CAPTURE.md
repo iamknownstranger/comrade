@@ -52,6 +52,20 @@ recording itself never stops, and the file that comes out the other end is
 one continuous (if not perfectly contiguous) clip rather than a new file
 every time the phone locks.
 
+**And a reconfiguration can fail, not just cost frames.** The old session is
+never closed before its replacement is confirmed — Camera2 replaces a session
+when a new one is created, so closing up front bought nothing and risked
+everything: an earlier version of `reconfigureOutputs` did exactly that, and a
+failed `createCaptureSession` left the recording pointing at a session it had
+already closed, writing no video at all while the timer and the notification
+carried on. On a helmet mount that is not discovered until you get home. The
+answer now has three steps, in order: try the output set that was asked for;
+if that fails and it included the preview, retry with the encoder alone, since
+the viewfinder is the part the recording does not need; and if even that will
+not configure, stop the recording deliberately, publish what was shot, and say
+so on screen as `Reason.StoppedCameraLost`. A recorder that has silently
+stopped recording must never look like one that is still going.
+
 `CaptureManager.setUiVisible` is what `CaptureScreen` calls from its own
 `ON_START`/`ON_STOP` lifecycle observer; `CaptureService` calls the screen-lock
 half of the same input directly from `ACTION_SCREEN_ON`/`ACTION_SCREEN_OFF`,
