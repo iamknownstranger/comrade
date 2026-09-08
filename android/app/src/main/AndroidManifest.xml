@@ -202,6 +202,25 @@
         android:name="android.hardware.camera"
         android:required="false" />
 
+    <!-- Package visibility (API 30+): CaptureScreen's "use my camera app"
+         switch hands a one-off shot to whatever the phone's own default
+         camera app is (Google Camera on a Pixel), via
+         SystemCameraHandoff.installedFor/prepare. Without declaring these two
+         intents, PackageManager.queryIntentActivities silently returns an
+         empty list for every other app's manifest on API 30+, so
+         installedFor always answers false, CameraApp.handoff reports
+         Fallback.NoSystemCameraInstalled on every such device regardless of
+         what is actually on it, and the feature disappears without a single
+         exception anywhere — see SystemCameraHandoff's class doc. -->
+    <queries>
+        <intent>
+            <action android:name="android.media.action.IMAGE_CAPTURE" />
+        </intent>
+        <intent>
+            <action android:name="android.media.action.VIDEO_CAPTURE" />
+        </intent>
+    </queries>
+
     <!-- allowBackup=false: the encrypted vault must not leave the device via
          adb/cloud backup — an exported copy is an offline brute-force target.
          hasFragileUserData=true is unrelated to that: it just opts into the

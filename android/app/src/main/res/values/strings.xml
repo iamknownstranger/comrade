@@ -1145,6 +1145,36 @@
     <string name="capture_stopped_storage">Recording stopped \u2014 the phone ran low on storage. What you shot is saved.</string>
     <string name="capture_stopped_thermal">Recording stopped \u2014 the phone got too hot. What you shot is saved.</string>
     <string name="capture_stopped_camera_lost">Recording stopped \u2014 the camera stopped responding. What you shot is saved.</string>
+    <string name="capture_error_photo_failed">Photo couldn\u2019t be saved. Try again.</string>
+
+    <!-- The Pixel-Camera-shaped half of Capture (CameraApp): modes, flash,
+         timer, grid, zoom, and the switch that hands a one-off shot to the
+         phone's own camera app. -->
+    <string name="capture_mode_photo">Photo</string>
+    <string name="capture_mode_video">Video</string>
+    <string name="capture_take_photo">Take photo</string>
+    <string name="capture_flash_off">Flash off</string>
+    <string name="capture_flash_auto">Flash auto</string>
+    <string name="capture_flash_on">Flash on</string>
+    <string name="capture_timer_off">Timer off</string>
+    <string name="capture_timer_3">3s</string>
+    <string name="capture_timer_10">10s</string>
+    <string name="capture_grid_toggle">Grid</string>
+    <string name="capture_use_system_camera_chip">My camera</string>
+    <string name="capture_error_system_camera_unavailable">Couldn\u2019t open your camera app. Try again, or keep shooting in Comrade.</string>
+    <string name="capture_last_shot">Last shot</string>
+    <string name="capture_last_shot_private">Saved privately \u2014 nothing to open here.</string>
+    <!-- On by default (docs/CAPTURE.md, "the design centre") -- this switch
+         is the reason Capture exists at all. -->
+    <string name="capture_lock_toggle">Keep recording when the screen is off</string>
+    <string name="capture_lock_toggle_note">This is what Capture is for \u2014 press record, then lock your phone. Turn it off and a video shot can go to your own camera app instead, if you\u2019ve asked for that above.</string>
+    <!-- CameraApp.Fallback: why a shot stayed in Comrade even though "use my
+         camera app" is on \u2014 shown only then, never when the switch is
+         off, so this never reads as an explanation for something the rider
+         never asked for. -->
+    <string name="capture_handoff_ride_must_stay_in_app">Recording here, not in your camera app \u2014 yours stops when the screen locks, and staying recorded through that is the whole point of Capture.</string>
+    <string name="capture_handoff_private_stays_in_app">Private shots stay in Comrade \u2014 there\u2019s no gallery file to hand your camera app.</string>
+    <string name="capture_handoff_no_system_camera_installed">No camera app was found on this phone, so this is staying in Comrade.</string>
 
     <!-- Read by CaptureService's foreground notification rather than by
          CaptureScreen. -->
