@@ -216,6 +216,30 @@ jobs:
         working-directory: android
         run: ./gradlew test --no-daemon
 
+  # The Capture tab makes two promises that every other lane is blind to, and
+  # both of them fail *silently*: a recording that keeps going once the screen
+  # is locked, and a handoff to the phone's own camera app (Google Camera on a
+  # Pixel). Drop the foreground-service type, the wake lock, the screen-on/off
+  # receiver or the <queries> block and everything still compiles, `./gradlew
+  # test` is still green, and the emulator lane still passes — because none of
+  # them record anything or resolve an intent. The failure surfaces on a
+  # handset, mid-ride, as a file that stopped when the display did.
+  #
+  # So this is a text-only gate: no SDK, no Gradle, under a second. It also
+  # keeps the handoff behind one tested decision (CameraApp.handoff), which is
+  # where "a screen-off recording is never delegated" is actually enforced —
+  # a second file spelling out the intent action would bypass it without
+  # failing a single unit test.
+  capture-contract:
+    name: Capture — screen-off recording + camera handoff contract
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Capture contract
+        run: python3 scripts/check_capture_contract.py
+
   # Builds the real artifact (a maturin wheel) and smoke-tests it in a fresh
   # venv — the "rust" lane's `cargo test -p comrade_py` only covers the pure
   # logic behind the FFI boundary (see that crate's test module comment), so
