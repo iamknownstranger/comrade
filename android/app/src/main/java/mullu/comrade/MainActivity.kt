@@ -533,6 +533,9 @@ private fun MainShell(
     // §7.7: Travel moved off the bottom bar into the drawer, beside Ride —
     // same pushed-screen shape as Feed/Ride above it.
     var travelOpen by rememberSaveable { mutableStateOf(false) }
+    // Capture (helmet cam, docs/CAPTURE.md) — pushed like Ride/Travel beside
+    // it, on the same "somewhere you go deliberately" test.
+    var captureOpen by rememberSaveable { mutableStateOf(false) }
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     val scope = rememberCoroutineScope()
     // Owned by RelayConnectionService/ChatEventRouter now — the single
@@ -764,7 +767,7 @@ private fun MainShell(
     // to the list.
     BackHandler(
         enabled = drawerState.isOpen ||
-            profileOpen || settingsOpen || feedOpen || rideOpen || travelOpen ||
+            profileOpen || settingsOpen || feedOpen || rideOpen || travelOpen || captureOpen ||
             (tab == MainTab.Chats && chatNav != ChatNav.List) ||
             (tab == MainTab.Focus && focusNav != FocusNav.Sessions),
     ) {
@@ -778,6 +781,7 @@ private fun MainShell(
             feedOpen -> feedOpen = false
             rideOpen -> rideOpen = false
             travelOpen -> travelOpen = false
+            captureOpen -> captureOpen = false
             tab == MainTab.Focus -> focusNav = FocusNav.Sessions
             else -> chatNav = ChatNav.List
         }
@@ -835,6 +839,10 @@ private fun MainShell(
         } else if (travelOpen) {
             // Pushed, with its own back arrow, like Ride beside it in the drawer.
             TravelPushedScreen(onBack = { travelOpen = false })
+        } else if (captureOpen) {
+            // Pushed, with its own back arrow, like Ride and Travel beside it
+            // in the drawer.
+            CapturePushedScreen(onBack = { captureOpen = false })
         } else if (settingsOpen) {
             SettingsPushedScreen(
                 profile = profile,
@@ -883,6 +891,10 @@ private fun MainShell(
                         onOpenTravel = {
                             scope.launch { drawerState.close() }
                             travelOpen = true
+                        },
+                        onOpenCapture = {
+                            scope.launch { drawerState.close() }
+                            captureOpen = true
                         },
                     )
                 },
@@ -1587,6 +1599,7 @@ private fun ComradeDrawerSheet(
     onOpenTasks: () -> Unit,
     onOpenFeed: () -> Unit,
     onOpenRide: () -> Unit,
+    onOpenCapture: () -> Unit,
     onOpenTravel: () -> Unit,
 ) {
     ModalDrawerSheet {
@@ -1652,6 +1665,18 @@ private fun ComradeDrawerSheet(
             selected = false,
             onClick = onOpenRide,
             modifier = Modifier.testTag("drawer-ride"),
+        )
+        // The helmet cam (docs/CAPTURE.md) — next to Ride on the same "a
+        // place you go deliberately" test, and because the two are used by
+        // the same person on the same ride. `VideocamIcon` already exists
+        // for the call UI's camera toggle, so this reuses it rather than
+        // adding a new glyph to AppIcons.kt for one drawer row.
+        NavigationDrawerItem(
+            label = { Text(stringResource(R.string.capture_title)) },
+            icon = { Icon(VideocamIcon, contentDescription = null) },
+            selected = false,
+            onClick = onOpenCapture,
+            modifier = Modifier.testTag("drawer-capture"),
         )
         // §7.7: Travel is a place you go deliberately, not a daily surface —
         // the same test that put Ride and Feed here rather than on the bottom
@@ -1745,6 +1770,36 @@ private fun TravelPushedScreen(onBack: () -> Unit) {
         },
     ) { padding ->
         mullu.comrade.ui.TravelScreen(modifier = Modifier.padding(padding))
+    }
+}
+
+/**
+ * The helmet cam (`docs/CAPTURE.md`), as a pushed screen — reached from the
+ * drawer, with its own back arrow, exactly like Ride and Travel above it.
+ * `CaptureScreen` itself owns permissions, the viewfinder and the recording
+ * controls; this wrapper is only the app bar.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun CapturePushedScreen(onBack: () -> Unit) {
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                modifier = Modifier.glassSurface(GlassElevation.Chrome),
+                colors = glassTopAppBarColors(),
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(
+                            Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = "Back",
+                        )
+                    }
+                },
+                title = { Text(stringResource(R.string.capture_title)) },
+            )
+        },
+    ) { padding ->
+        mullu.comrade.ui.CaptureScreen(modifier = Modifier.padding(padding))
     }
 }
 

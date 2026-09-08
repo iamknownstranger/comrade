@@ -137,8 +137,21 @@
         android:maxSdkVersion="32" />
 
     <!-- ProximityScreenControl (CallScreen.kt) holds a PROXIMITY_SCREEN_OFF_WAKE_LOCK
-         for the duration of a call. -->
+         for the duration of a call; CaptureManager holds a PARTIAL_WAKE_LOCK
+         for the duration of a helmet-cam recording, so the CPU cannot suspend
+         out from under it once the screen goes off. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- Helmet-cam recording (CaptureManager/CaptureService): camera +
+         microphone capture, tagged "camera" and "microphone" on the
+         foreground-service declaration below. CAMERA and RECORD_AUDIO are
+         already declared above for calls. On API 26-28 only, writing a
+         gallery-destination recording into the public DCIM/Camera folder
+         needs this — API 29+ inserts through MediaStore instead, which needs
+         no storage permission at all (see CaptureSink). -->
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
 
     <!-- Voice/video calls (WebRTC): camera capture for video calls and in-call
          audio routing (earpiece/speaker/Bluetooth/wired headset — see
@@ -250,6 +263,16 @@
             android:name=".call.CallService"
             android:exported="false"
             android:foregroundServiceType="camera|microphone|mediaProjection" />
+
+        <!-- Helmet-cam recording: keeps the process (and, since Android 11,
+             camera access itself) alive for the length of a recording,
+             including with the screen off — see CaptureService's doc
+             comment. Always uses both types; unlike CallService there is no
+             audio-only variant of this feature. -->
+        <service
+            android:name=".capture.CaptureService"
+            android:exported="false"
+            android:foregroundServiceType="camera|microphone" />
 
         <!-- Always-listening "Hey Comrade" wake-word foreground service -->
         <service

@@ -93,6 +93,15 @@ object Notifier {
      */
     const val CHANNEL_TOGETHER = "comrade_together"
 
+    /**
+     * A helmet-cam recording is in progress (`capture/CaptureService.kt`).
+     * Its own channel because it is ongoing for as long as a ride is, and it
+     * must never sound: `IMPORTANCE_LOW` here is not cosmetic, it is the
+     * whole reason a several-hour recording doesn't buzz the phone every time
+     * the notification is refreshed with a new segment count.
+     */
+    const val CHANNEL_CAPTURE = "comrade_capture"
+
     private const val GROUP_MESSAGES = "comrade_messages_group"
     private const val GROUP_COMRADES = "comrade_presence_group"
 
@@ -192,6 +201,15 @@ object Notifier {
                 // one, which is what separates it from "someone came online".
                 NotificationManager.IMPORTANCE_HIGH,
             ).apply { description = "When someone asks you to listen or watch something with them" },
+        )
+        mgr.createNotificationChannel(
+            NotificationChannel(
+                CHANNEL_CAPTURE,
+                context.getString(R.string.capture_channel_name),
+                // LOW: an ongoing recording notification must not make a
+                // sound, on this ride or the next one.
+                NotificationManager.IMPORTANCE_LOW,
+            ).apply { description = context.getString(R.string.capture_channel_description) },
         )
     }
 
