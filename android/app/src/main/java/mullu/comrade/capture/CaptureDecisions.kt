@@ -134,12 +134,19 @@ object CaptureDecisions {
 
     const val MIME_TYPE: String = "video/mp4"
 
+    /** The stock camera app's own JPEG mime type, for the photo half of
+     *  Capture — see [photoFileName] and [photoBaseName]. */
+    const val PHOTO_MIME_TYPE: String = "image/jpeg"
+
     private const val DAY_MS = 86_400_000L
 
     /**
-     * `VID_yyyyMMdd_HHmmss`, in local time — the stock camera app's own naming
-     * convention, so this footage sorts and groups with camera footage in the
-     * gallery instead of standing out as something else.
+     * `{prefix}yyyyMMdd_HHmmss`, in local time — the stock camera app's own
+     * naming convention, so this footage sorts and groups with camera footage
+     * in the gallery instead of standing out as something else. [prefix]
+     * defaults to `"VID_"`, the video convention this function was written
+     * for; [photoBaseName] passes `"IMG_"`, the stock app's own photo prefix,
+     * for the same gallery-blending reason.
      *
      * Computed as integer arithmetic on `startedAtEpochMs` shifted by
      * [utcOffsetMinutes], deliberately without `java.util.Calendar` or
@@ -151,7 +158,7 @@ object CaptureDecisions {
      * pre-epoch [startedAtEpochMs] fall out of the same arithmetic rather than
      * needing a separate clamp.
      */
-    fun baseName(startedAtEpochMs: Long, utcOffsetMinutes: Int): String {
+    fun baseName(startedAtEpochMs: Long, utcOffsetMinutes: Int, prefix: String = "VID_"): String {
         val shifted = startedAtEpochMs + utcOffsetMinutes * 60_000L
         val days = floorDiv(shifted, DAY_MS)
         val msOfDay = floorMod(shifted, DAY_MS)
@@ -160,7 +167,7 @@ object CaptureDecisions {
         val minutes = (msOfDay / 60_000L) % 60L
         val seconds = (msOfDay / 1_000L) % 60L
         return buildString {
-            append("VID_")
+            append(prefix)
             append(year.toString().padStart(4, '0'))
             append(month.toString().padStart(2, '0'))
             append(day.toString().padStart(2, '0'))
@@ -170,6 +177,14 @@ object CaptureDecisions {
             append(seconds.toString().padStart(2, '0'))
         }
     }
+
+    /** The stock camera app's own photo naming — `IMG_yyyyMMdd_HHmmss` — for
+     *  the same gallery-blending reason [baseName]'s default `"VID_"` exists. */
+    fun photoBaseName(startedAtEpochMs: Long, utcOffsetMinutes: Int): String =
+        baseName(startedAtEpochMs, utcOffsetMinutes, "IMG_")
+
+    /** `{baseName}.jpg` — the photo counterpart of [segmentFileName]. */
+    fun photoFileName(baseName: String): String = "$baseName.jpg"
 
     /** Division that rounds toward negative infinity, unlike `/`'s
      *  round-toward-zero — needed once [startedAtEpochMs] or the shift can be
