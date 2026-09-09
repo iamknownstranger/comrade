@@ -323,5 +323,15 @@ constants, because the rule in §9 is enforced in one tested function and a
 second file spelling out `"android.media.action.VIDEO_CAPTURE"` would walk
 around it without failing a single test.
 
-It does not check anything at runtime, and is not a substitute for the
+A second, unrelated lane was added beside it for a mistake this change
+actually made: `android-resources` parses every `res/**/*.xml` in both
+resource trees. A `--` inside an XML comment in `strings.xml` is illegal XML,
+invisible to every Kotlin lane, and failed `packageDebugResources` two
+minutes into the Flutter APK job and again in the Android JVM job — two
+expensive lanes to find one wrong character. aapt2 is still the authority on
+resources; this only asserts they are well-formed at all, which is the class
+of mistake that is cheap to make by hand and expensive to find at the end of a
+Gradle build.
+
+Neither gate checks anything at runtime, and neither is a substitute for the
 device verification §7 still lists as outstanding.

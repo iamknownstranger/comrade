@@ -216,6 +216,44 @@ jobs:
         working-directory: android
         run: ./gradlew test --no-daemon
 
+  # Android resource XML, parsed. This exists because a `--` inside an XML
+  # comment in strings.xml — illegal in XML, and invisible to every Kotlin
+  # lane — failed `packageDebugResources` two minutes into the Flutter APK
+  # job and again in the Android JVM job, having compiled fine everywhere
+  # else. Two expensive lanes to learn one character was wrong.
+  #
+  # aapt2 is the authority and still is; this only asserts the files are
+  # well-formed XML at all, which is the class of mistake that is cheap to
+  # make by hand and expensive to find at the end of a Gradle build. Both
+  # resource trees, because `app/` ships its own.
+  android-resources:
+    name: Android — resource XML parses
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse every res/*.xml
+        run: |
+          python3 - <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          roots = [Path("android/app/src/main/res"), Path("app/android/app/src/main/res")]
+          files = sorted(f for r in roots if r.is_dir() for f in r.rglob("*.xml"))
+          if not files:
+              sys.exit("::error::no resource XML found — did the layout move?")
+          bad = 0
+          for f in files:
+              try:
+                  ET.parse(f)
+              except ET.ParseError as e:
+                  print(f"::error file={f},line={e.position[0]}::{e}")
+                  bad += 1
+          print(f"parsed {len(files)} resource files, {bad} malformed")
+          sys.exit(1 if bad else 0)
+          PY
+
   # The Capture tab makes two promises that every other lane is blind to, and
   # both of them fail *silently*: a recording that keeps going once the screen
   # is locked, and a handoff to the phone's own camera app (Google Camera on a

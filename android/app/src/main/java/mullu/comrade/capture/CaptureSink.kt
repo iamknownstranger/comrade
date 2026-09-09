@@ -282,12 +282,18 @@ object CaptureSink {
      * `Intent.EXTRA_OUTPUT` — MediaStore only; a private destination has no
      * shareable [Uri], which is the whole point of it. This is what
      * [CaptureManager.publishExternalCapture]'s system-camera handoff hands
-     * the other app to write into, and later [finish]es once that app's
-     * result confirms whether anything was actually written — the same
-     * pending-row contract [openGalleryStillMediaStore] uses for a shot this
-     * process takes itself; the only difference is who does the writing, so
-     * [write] is never actually called for that path even though the
-     * interface still offers it.
+     * the other app to write into — the same pending-row contract
+     * [openGalleryStillMediaStore] uses for a shot this process takes itself;
+     * the only difference is who does the writing, so [write] is never
+     * actually called for that path even though the interface still offers
+     * it.
+     *
+     * **The other app's result code is not evidence a file exists.** All the
+     * caller can observe is that the camera app's Activity returned
+     * `RESULT_OK`, which says nothing about whether it wrote into the Uri it
+     * was granted. [MediaStoreStill.finish] checks the row's own length
+     * before publishing it for that reason; do not remove that check on the
+     * grounds that the result code already covers it.
      *
      * `null` before API 29: granting a MediaStore row's `Uri` to another app
      * needs scoped storage's insert-then-grant model, and the legacy
@@ -381,8 +387,25 @@ object CaptureSink {
             }.isSuccess
         }
 
+        /**
+         * `success` is the caller's *intent* to publish, and for the
+         * system-camera handoff it is only ever `resultCode == RESULT_OK` —
+         * which says the other app's Activity returned, not that it wrote
+         * anything into the Uri it was granted. So the row's own length is
+         * checked here before `IS_PENDING` is cleared, and this is not
+         * belt-and-braces: a camera app that returns OK without completing
+         * the save (interrupted by a call, killed under memory pressure,
+         * simply buggy) would otherwise publish a zero-byte file under a
+         * real-looking name — exactly the half-written-clip-in-the-gallery
+         * failure this object's whole pending discipline exists to prevent.
+         *
+         * A length that cannot be read at all is treated as written rather
+         * than as empty: the shot probably happened, and deleting somebody's
+         * photo because a `statSize` query failed is the worse error of the
+         * two.
+         */
         override fun finish(success: Boolean): Uri? {
-            if (!success) {
+            if (!success || !hasBytes()) {
                 runCatching { resolver.delete(uri, null, null) }
                 return null
             }
@@ -394,6 +417,10 @@ object CaptureSink {
             }
             return uri
         }
+
+        private fun hasBytes(): Boolean = runCatching {
+            resolver.openFileDescriptor(uri, "r")?.use { it.statSize > 0L }
+        }.getOrNull() ?: true
     }
 
     private class FileStill(

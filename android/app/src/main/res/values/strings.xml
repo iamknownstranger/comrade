@@ -1164,7 +1164,7 @@
     <string name="capture_error_system_camera_unavailable">Couldn\u2019t open your camera app. Try again, or keep shooting in Comrade.</string>
     <string name="capture_last_shot">Last shot</string>
     <string name="capture_last_shot_private">Saved privately \u2014 nothing to open here.</string>
-    <!-- On by default (docs/CAPTURE.md, "the design centre") -- this switch
+    <!-- On by default (docs/CAPTURE.md, "the design centre"): this switch
          is the reason Capture exists at all. -->
     <string name="capture_lock_toggle">Keep recording when the screen is off</string>
     <string name="capture_lock_toggle_note">This is what Capture is for \u2014 press record, then lock your phone. Turn it off and a video shot can go to your own camera app instead, if you\u2019ve asked for that above.</string>

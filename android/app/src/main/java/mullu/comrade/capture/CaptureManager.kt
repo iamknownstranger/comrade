@@ -40,6 +40,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.TimeZone
 import kotlin.math.abs
@@ -247,6 +249,43 @@ object CaptureManager {
      *  class doc's Threading section. */
     private val captureLane = Dispatchers.IO.limitedParallelism(1)
 
+    /**
+     * The other half of that, and the half [captureLane] alone never
+     * provided: `limitedParallelism(1)` bounds how many of these run *at
+     * once*, not how two of them interleave. Every suspension point — most of
+     * all `createSession`'s wait on a Camera2 callback — hands the lane to
+     * whatever else is queued, so two operations could each observe
+     * [camera]/[recording], suspend, and resume against state the other had
+     * already replaced.
+     *
+     * That was survivable while the only things reconfiguring a live
+     * recording were a screen-lock broadcast and the recording's own stop
+     * path. It stopped being survivable when a preview lifecycle arrived:
+     * [attachPreview], [setUiVisible], [setMode], [switchLens]/[selectLens]
+     * and [refreshLenses] all reconcile now, and a `TextureView` relayout or
+     * a hot-plugged USB lens fires them mid-ride. The failure that makes
+     * possible is the one this feature cannot have — a guard trip finishing a
+     * recording and closing the `CameraDevice` while a reconfiguration is
+     * still awaiting that device's configure callback, ending either with a
+     * second [finishRecording] overwriting the reason already published, or
+     * with a live session and device this object no longer references and can
+     * never close. A leaked camera blocks every other app on the phone until
+     * it reboots.
+     *
+     * So the two do different jobs: [captureLane] keeps Camera2's callbacks
+     * and this file's mutations on one thread; this mutex makes one
+     * *operation* atomic across its own suspensions. Take it in
+     * [onCaptureLane] and nowhere else — every `…Locked` function assumes it
+     * is already held, and [Mutex] is not reentrant, so a nested acquisition
+     * is a deadlock rather than a warning.
+     */
+    private val cameraGate = Mutex()
+
+    /** The only way onto [captureLane]: one queued, mutually exclusive
+     *  operation over [camera] and [recording]. */
+    private fun onCaptureLane(block: suspend () -> Unit): Job =
+        scope.launch(captureLane) { cameraGate.withLock { block() } }
+
     private val cameraThread = HandlerThread("CaptureCamera").apply { start() }
     private val cameraHandler = Handler(cameraThread.looper)
 
@@ -379,7 +418,7 @@ object CaptureManager {
             if (ordered.none { it.cameraId == _selectedLensId.value }) {
                 _selectedLensId.value = CaptureDecisions.defaultLens(ordered)?.cameraId
             }
-            scope.launch(captureLane) {
+            onCaptureLane {
                 // The selection above may have moved out from under an
                 // already-open preview (a lens vanished, e.g. a USB camera
                 // unplugged) — close it so reconcileLocked reopens fresh on
@@ -403,8 +442,8 @@ object CaptureManager {
             _selectedLensId.value = cameraId
             return
         }
-        scope.launch(captureLane) {
-            val lens = _lenses.value.find { it.cameraId == cameraId } ?: return@launch
+        onCaptureLane {
+            val lens = _lenses.value.find { it.cameraId == cameraId } ?: return@onCaptureLane
             changeLensLocked(lens)
         }
     }
@@ -421,8 +460,8 @@ object CaptureManager {
     fun switchLens(context: Context) {
         rememberContext(context)
         if (_state.value is UiState.Recording) return
-        scope.launch(captureLane) {
-            val next = CaptureDecisions.nextLens(_lenses.value, _selectedLensId.value) ?: return@launch
+        onCaptureLane {
+            val next = CaptureDecisions.nextLens(_lenses.value, _selectedLensId.value) ?: return@onCaptureLane
             changeLensLocked(next)
         }
     }
@@ -439,13 +478,13 @@ object CaptureManager {
     fun attachPreview(context: Context, texture: SurfaceTexture?, width: Int, height: Int) {
         rememberContext(context)
         preview = texture?.let { PreviewTarget(it, width, height) }
-        scope.launch(captureLane) { reconcileLocked() }
+        onCaptureLane { reconcileLocked() }
     }
 
     fun setUiVisible(context: Context, visible: Boolean) {
         rememberContext(context)
         uiVisible = visible
-        scope.launch(captureLane) { reconcileLocked() }
+        onCaptureLane { reconcileLocked() }
     }
 
     /** Called by [CaptureService]'s `ACTION_SCREEN_OFF`/`ACTION_SCREEN_ON`
@@ -456,7 +495,7 @@ object CaptureManager {
      *  one that [beginRecording] already has open. */
     fun onScreenStateChanged(screenOn: Boolean) {
         this.screenOn = screenOn
-        scope.launch(captureLane) { reconcileLocked() }
+        onCaptureLane { reconcileLocked() }
     }
 
     // ── Mode / flash / zoom / focus ──────────────────────────────────────
@@ -476,11 +515,11 @@ object CaptureManager {
         if (_state.value is UiState.Recording) return
         if (_mode.value == mode) return
         _mode.value = mode
-        scope.launch(captureLane) { reconcileLocked() }
+        onCaptureLane { reconcileLocked() }
     }
 
     fun setFlash(flash: CameraApp.Flash) {
-        scope.launch(captureLane) {
+        onCaptureLane {
             val cam = camera
             val normalized = when {
                 cam == null -> flash // nothing open yet to check a flash unit against — trust the caller
@@ -488,21 +527,21 @@ object CaptureManager {
                 else -> CameraApp.Flash.Off // this lens reports no flash unit; ignore the request rather than pretend
             }
             _flash.value = normalized
-            if (cam == null) return@launch
+            if (cam == null) return@onCaptureLane
             cam.flash = normalized
             reapplyRepeatingRequest(cam)
         }
     }
 
     fun setZoom(ratio: Float) {
-        scope.launch(captureLane) {
+        onCaptureLane {
             val cam = camera
             if (cam == null) {
                 // Clamp against the last-known range and remember it for
                 // whichever lens opens next — openCameraLocked reseeds from
                 // this value.
                 _zoomRatio.value = CameraApp.clampZoom(ratio, _zoomRange.value.start, _zoomRange.value.endInclusive)
-                return@launch
+                return@onCaptureLane
             }
             cam.zoomRatio = CameraApp.clampZoom(ratio, cam.zoomRange.start, cam.zoomRange.endInclusive)
             _zoomRatio.value = cam.zoomRatio
@@ -523,16 +562,16 @@ object CaptureManager {
      */
     fun focusAt(nx: Float, ny: Float) {
         _focusPoint.value = FocusPoint(nx, ny, SystemClock.elapsedRealtime())
-        scope.launch(captureLane) {
-            val cam = camera ?: return@launch
-            val device = cam.device ?: return@launch
-            val session = cam.captureSession ?: return@launch
+        onCaptureLane {
+            val cam = camera ?: return@onCaptureLane
+            val device = cam.device ?: return@onCaptureLane
+            val session = cam.captureSession ?: return@onCaptureLane
             val maxAf = cam.chars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF) ?: 0
             val maxAe = cam.chars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0
-            if (maxAf <= 0 && maxAe <= 0) return@launch
-            val active = cam.chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: return@launch
+            if (maxAf <= 0 && maxAe <= 0) return@onCaptureLane
+            val active = cam.chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: return@onCaptureLane
             val outputs = cam.activeOutputs
-            if (outputs.isEmpty()) return@launch
+            if (outputs.isEmpty()) return@onCaptureLane
 
             cam.meteringRect = CameraApp.meteringRect(
                 nx,
@@ -544,7 +583,7 @@ object CaptureManager {
             )
 
             val template = if (recording != null) CameraDevice.TEMPLATE_RECORD else CameraDevice.TEMPLATE_PREVIEW
-            val trigger = runCatching { device.createCaptureRequest(template) }.getOrNull() ?: return@launch
+            val trigger = runCatching { device.createCaptureRequest(template) }.getOrNull() ?: return@onCaptureLane
             outputs.forEach { trigger.addTarget(it.surface) }
             applyLiveParams(trigger, cam)
             trigger.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
@@ -582,16 +621,23 @@ object CaptureManager {
      */
     fun takePhoto(context: Context, destination: CaptureDecisions.Destination) {
         rememberContext(context)
-        if (_capturingPhoto.value) return
-        scope.launch(captureLane) {
+        // Claimed here, on the caller's thread, rather than inside the
+        // coroutine: a plain read-then-launch lets two shutter taps that land
+        // while the lane is busy (a mode switch reconfiguring, say) both pass
+        // the check and both get queued. The second would then overwrite the
+        // first's `setOnImageAvailableListener`, so the first capture never
+        // completes and dies on its 5s timeout instead of failing for a
+        // reason anyone could read. Every exit below clears it.
+        if (!_capturingPhoto.compareAndSet(expect = false, update = true)) return
+        onCaptureLane {
             val cam = camera
             val hasReader = cam?.activeOutputs?.any { it.kind == OutputKind.Still } == true
             if (cam == null || !hasReader) {
                 Log.w(TAG, "no still output configured; refusing capture")
+                _capturingPhoto.value = false
                 failPhotoIfIdle()
-                return@launch
+                return@onCaptureLane
             }
-            _capturingPhoto.value = true
             val ok = runCatching { captureStill(context, destination, cam) }
                 .getOrElse { e ->
                     Log.e(TAG, "still capture crashed", e)
@@ -748,7 +794,7 @@ object CaptureManager {
             return
         }
         _state.value = UiState.Preparing
-        scope.launch(captureLane) {
+        onCaptureLane {
             val failReason = runCatching { beginRecording(appCtx, destination, lens) }
                 .getOrElse { e ->
                     Log.e(TAG, "capture setup crashed", e)
@@ -759,15 +805,15 @@ object CaptureManager {
     }
 
     fun stop(context: Context) {
-        scope.launch(captureLane) {
-            if (recording == null) return@launch
+        onCaptureLane {
+            if (recording == null) return@onCaptureLane
             finishRecording(success = true, failReason = null)
         }
     }
 
     private fun stopForReason(reason: CaptureDecisions.StopReason) {
-        scope.launch(captureLane) {
-            if (recording == null) return@launch
+        onCaptureLane {
+            if (recording == null) return@onCaptureLane
             finishRecording(success = true, failReason = mapStopReason(reason))
         }
     }
@@ -943,12 +989,12 @@ object CaptureManager {
     private fun onRecorderInfo(what: Int) {
         when (what) {
             MediaRecorder.MEDIA_RECORDER_INFO_NEXT_OUTPUT_FILE_STARTED -> {
-                scope.launch(captureLane) { promoteSegment() }
+                onCaptureLane { promoteSegment() }
             }
             MediaRecorder.MEDIA_RECORDER_INFO_MAX_FILESIZE_REACHED,
             MediaRecorder.MEDIA_RECORDER_INFO_MAX_DURATION_REACHED -> {
-                scope.launch(captureLane) {
-                    val sess = recording ?: return@launch
+                onCaptureLane {
+                    val sess = recording ?: return@onCaptureLane
                     if (sess.armedNext == null) {
                         // setNextOutputFile was never armed — MediaRecorder
                         // has now stopped writing on its own with nowhere to
@@ -983,15 +1029,16 @@ object CaptureManager {
      * The order matters in a way it did not when this always closed the
      * whole [CameraCaptureSession]/[CameraDevice] outright: [reconcileLocked]
      * runs — dropping the recorder surface from the live session, or closing
-     * the camera entirely if nothing else wants it — *before* the
-     * [MediaRecorder] is released, not after. Releasing first would leave the
-     * still-live session's repeating request pointed at a `Surface`
-     * `MediaRecorder` had already invalidated for however long the
-     * reconfiguration took. The forced [closeCameraLocked] afterwards is the
-     * backstop for the rare case [reconcileLocked] could not rebuild a
-     * recorder-free session at all — never leave a live session referencing a
-     * `Surface` about to be released regardless of why the reconfiguration
-     * failed.
+     * the camera entirely if nothing else wants it — *before the recorder is
+     * touched at all*, `stop()` included, not merely before `release()`. For
+     * a surface-input [MediaRecorder] it is `stop()` that detaches it as the
+     * buffer consumer, so stopping first would leave the still-live session's
+     * repeating request submitting into an abandoned `Surface` for however
+     * long the reconfiguration took. The forced [closeCameraLocked]
+     * afterwards is the backstop for the rare case [reconcileLocked] could
+     * not rebuild a recorder-free session at all — never leave a live session
+     * referencing a `Surface` about to be invalidated, regardless of why the
+     * reconfiguration failed.
      */
     private suspend fun finishRecording(success: Boolean, failReason: Reason?) {
         val sess = recording ?: run {
@@ -1002,18 +1049,27 @@ object CaptureManager {
         sess.guardJob?.cancel()
         sess.tickerJob?.cancel()
 
-        var stoppedCleanly = success
-        if (success) {
-            val stopped = runCatching { sess.recorder?.stop() }
-            if (stopped.isFailure) stoppedCleanly = false
-        }
-
+        // The session comes off the recorder surface *before* the recorder is
+        // touched at all — not merely before `release()`. For a surface-input
+        // MediaRecorder, `stop()` is already what detaches it as the buffer
+        // consumer, so stopping first leaves the still-live session's
+        // repeating request submitting frames into an abandoned surface for
+        // however long the reconfiguration takes. That window did not exist
+        // when this always tore the whole camera down a moment later; now
+        // that a preview survives the end of a recording, it is the ordinary
+        // viewfinder path.
         reconcileLocked()
         camera?.let { cam ->
             if (cam.activeOutputs.any { it.kind == OutputKind.Recorder }) {
                 Log.w(TAG, "could not drop the recorder surface from the live session; closing the camera instead")
                 closeCameraLocked(cam)
             }
+        }
+
+        var stoppedCleanly = success
+        if (success) {
+            val stopped = runCatching { sess.recorder?.stop() }
+            if (stopped.isFailure) stoppedCleanly = false
         }
 
         runCatching { sess.recorder?.release() }
@@ -1370,9 +1426,9 @@ object CaptureManager {
     }
 
     private fun handleCameraLost(lostDevice: CameraDevice) {
-        scope.launch(captureLane) {
-            val cam = camera ?: return@launch
-            if (cam.device !== lostDevice) return@launch
+        onCaptureLane {
+            val cam = camera ?: return@onCaptureLane
+            if (cam.device !== lostDevice) return@onCaptureLane
             val sess = recording
             cam.captureSession = null
             cam.activeOutputs = emptyList()
