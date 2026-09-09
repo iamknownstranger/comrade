@@ -3,12 +3,19 @@ package mullu.comrade.capture
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.ImageFormat
+import android.graphics.Rect
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CaptureFailure
+import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.TotalCaptureResult
+import android.hardware.camera2.params.MeteringRectangle
 import android.media.CamcorderProfile
+import android.media.ImageReader
 import android.media.MediaRecorder
 import android.os.BatteryManager
 import android.os.Build
@@ -33,61 +40,98 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.TimeZone
 import kotlin.math.abs
+import kotlin.math.roundToInt
 
 /**
- * The Android side of the helmet-cam feature: owns the camera, the recorder
- * and every decision about them, and is what starts and stops [CaptureService]
- * — the same split [mullu.comrade.together.TogetherManager] and
- * [mullu.comrade.together.TogetherService] already use. [CaptureService] holds
- * only the foreground-service contract and the notification; every decision
- * about *whether* to roll, reconfigure or stop lives here or, wherever it can,
- * in the pure [CaptureDecisions].
+ * The Android side of Capture: owns the camera, the recorder and every
+ * decision about them, and is what starts and stops [CaptureService] — the
+ * same split [mullu.comrade.together.TogetherManager] and
+ * [mullu.comrade.together.TogetherService] already use. [CaptureService]
+ * holds only the foreground-service contract and the notification; every
+ * decision about *whether* to roll, reconfigure or stop lives here or,
+ * wherever it can, in the pure [CaptureDecisions]/[CameraApp].
  *
- * ## Camera2 + MediaRecorder, not CameraX
+ * ## The open camera is not the recording
  *
- * Two reasons. First, `CameraManager.getCameraIdList()` enumerates every
- * *physical* camera on the device — ultrawide, main, tele, front, an external
- * USB lens — which is the "switch between whatever cameras this phone has"
- * requirement; `androidx.camera.core.CameraSelector` mostly only exposes
- * front/back. Second, CameraX would be a new dependency, and in this repo
- * that means adding it to *two* Gradle files (`android/app/build.gradle.kts`
- * and `app/android/app/build.gradle.kts`, which stages every non-Compose
- * `.kt` file here into the Flutter app) or breaking the Flutter Android lane.
- * Framework classes cost neither.
+ * The original helmet-cam build opened the camera only when [start] was
+ * called and closed it in [stop] — a black rectangle until you pressed
+ * record. That is split into two objects now: [Camera] is an open
+ * `CameraDevice` with a live `CameraCaptureSession`, which exists whenever a
+ * preview surface, permission and visible UI ask for one, whether or not
+ * anything is recording; [Recording] is the `MediaRecorder` half, which
+ * exists only between [start] and whatever ends it. A recording always
+ * reuses whatever [Camera] the preview already opened on the selected lens
+ * rather than closing and reopening the device — see [beginRecording].
+ *
+ * The helmet-cam invariant does not move: [CaptureDecisions.previewAttached]
+ * still decides only whether the *preview* output is attached to whatever
+ * session is live, a recording's [Camera] and [Recording] never close because
+ * the UI went away, and [reconcileLocked] is the one place that decision
+ * turns into an actual `createCaptureSession` call — mirroring the one this
+ * file used to make only while recording, now made for a live viewfinder too.
  *
  * ## Threading
  *
  * `Camera2`'s device/session callbacks land on [cameraHandler], a dedicated
  * [HandlerThread] — never the main thread and never a coroutine dispatcher
  * with no `Looper`, which `CameraManager.openCamera`/`createCaptureSession`
- * both require. Every operation that mutates the live [session] (opening,
- * reconfiguring, rolling a segment, tearing down) is launched on
- * [captureLane], `Dispatchers.IO` restricted to one thread at a time — the
- * same pattern [mullu.comrade.call.CallManager.webRtcLane] uses to keep two
- * camera/recorder operations from ever interleaving, without holding a lock
- * across a suspending call. [session] itself is `@Volatile` so the ticker and
- * guard loop (running on [scope]'s default dispatcher) see a freshly
+ * both require. Every operation that mutates [camera] or [recording] is
+ * launched on [captureLane], `Dispatchers.IO` restricted to one thread at a
+ * time — the same pattern [mullu.comrade.call.CallManager.webRtcLane] uses to
+ * keep two camera/recorder operations from ever interleaving, without holding
+ * a lock across a suspending call. Both fields are `@Volatile` so the ticker
+ * and guard loop (running on [scope]'s default dispatcher) see a freshly
  * published reference instead of a stale one cached in a register.
+ *
+ * A suspending step inside a `captureLane`-launched coroutine (opening the
+ * device, configuring a session) still yields the thread to another queued
+ * `captureLane` coroutine at its suspension point — `limitedParallelism(1)`
+ * bounds how many run *at once*, not the order two separately launched
+ * coroutines interleave in. [captureStill] calls that out at the one place it
+ * matters in practice.
  *
  * ## What "screen off" costs
  *
- * See [reconfigureOutputs]: Camera2 cannot add or remove an output from a
- * live [CameraCaptureSession], so attaching or detaching the preview is a
- * fresh `createCaptureSession` on the same open [CameraDevice]. The
- * [MediaRecorder] is never stopped across that — the file keeps growing and
- * its timestamps absorb the gap — but frames genuinely stop arriving for the
- * length of the reconfiguration. A few are lost at every screen on/off
- * transition. That is the real cost of the feature, not an incidental one,
- * and no comment here should claim otherwise.
+ * See [reconcileLocked]: Camera2 cannot add or remove an output from a live
+ * [CameraCaptureSession], so attaching or detaching the preview — or the
+ * still-photo `ImageReader`, or the recorder surface — is a fresh
+ * `createCaptureSession` on the same open [CameraDevice]. A running
+ * [Recording]'s [MediaRecorder] is never stopped across that — the file keeps
+ * growing and its timestamps absorb the gap — but frames genuinely stop
+ * arriving for the length of the reconfiguration. A few are lost at every
+ * screen on/off transition, every mode switch, and every lens switch that now
+ * happens while only the preview (not a recording) is live. That is the real
+ * cost of the design, not an incidental one, and no comment here should claim
+ * otherwise.
  *
- * A reconfiguration can also fail outright rather than merely cost frames,
- * and that case has a defined answer instead of a log line: the preview is
- * dropped and the encoder-only set retried, and if even that will not
- * configure the recording is ended and published under
- * [Reason.StoppedCameraLost]. A helmet cam whose session quietly died is
- * indistinguishable, while riding, from one that is working.
+ * A reconfiguration can also fail outright rather than merely cost frames.
+ * While a [Recording] is live that has a defined answer instead of a log
+ * line: drop the preview and retry encoder-only, and if even that will not
+ * configure, end the recording and publish it under
+ * [Reason.StoppedCameraLost] — a helmet cam whose session quietly died is
+ * indistinguishable, while riding, from one that is working. Outside a
+ * recording there is nothing to protect this way: a failed preview
+ * reconfiguration just leaves the viewfinder waiting for the next state
+ * change to try again.
+ *
+ * ## Photo, zoom, flash, focus
+ *
+ * [Camera] carries the request parameters a fresh repeating request must
+ * always reapply after *any* `createCaptureSession` — zoom ratio, flash mode,
+ * the tap-to-focus metering rectangle (see [applyLiveParams]) — because a
+ * reconfiguration silently dropping them (a zoom level reset by the screen
+ * turning back on, say) is exactly the class of bug this file's comments
+ * exist to prevent, not merely describe after the fact.
+ *
+ * A still photo needs its own `ImageReader` output, added only in
+ * [CameraApp.Mode.Photo] and only while nothing is recording — see
+ * [takePhoto]'s doc comment for why a still is refused, rather than attempted
+ * through a live-session reconfiguration, while a [Recording] is running.
  */
 object CaptureManager {
 
@@ -116,7 +160,7 @@ object CaptureManager {
 
         /**
          * The camera stopped being able to deliver frames mid-recording and
-         * [reconfigureOutputs] could not get a session back, not even the
+         * [reconcileLocked] could not get a session back, not even the
          * encoder-only one. Grouped with the other `Stopped*` reasons rather
          * than with [CameraUnavailable] because it is the same shape of
          * outcome: the ride's footage up to this point is finished and
@@ -125,9 +169,35 @@ object CaptureManager {
          * was writing no video at all.
          */
         StoppedCameraLost,
+
+        /**
+         * [takePhoto] could not get a JPEG — no still output was configured
+         * (most often: a video [Recording] is running, and a still during one
+         * is deliberately refused, see that function's doc comment), the
+         * capture request failed, or nothing wrote successfully to
+         * [CaptureSink]. Reuses the same [UiState.Failed] shape the recording
+         * failures use — see [takePhoto] for why it is only ever published
+         * while [state] is [UiState.Idle] (or already [UiState.Failed]),
+         * never over a live [UiState.Recording]/[UiState.Preparing].
+         */
+        PhotoFailed,
     }
 
-    data class Saved(val uri: String?, val displayName: String, val destination: CaptureDecisions.Destination)
+    enum class Kind { Photo, Video }
+
+    data class Saved(
+        val uri: String?,
+        val displayName: String,
+        val destination: CaptureDecisions.Destination,
+        val kind: Kind,
+    )
+
+    /** A tap-to-focus point, in normalised viewfinder coordinates
+     *  (`(0,0)` top-left, `(1,1)` bottom-right) — the same coordinate space
+     *  [CameraApp.meteringRect] takes. [atElapsedRealtimeMs] is when it was
+     *  set, so the UI can fade the reticle out on its own rather than this
+     *  object owning a UI-timing concern. */
+    data class FocusPoint(val nx: Float, val ny: Float, val atElapsedRealtimeMs: Long)
 
     private val _state = MutableStateFlow<UiState>(UiState.Idle)
     val state: StateFlow<UiState> = _state.asStateFlow()
@@ -144,6 +214,29 @@ object CaptureManager {
     private val _lastSaved = MutableStateFlow<Saved?>(null)
     val lastSaved: StateFlow<Saved?> = _lastSaved.asStateFlow()
 
+    /** Video is the helmet-cam default: pressing Record works without
+     *  touching this at all, matching the feature's original behaviour. */
+    private val _mode = MutableStateFlow(CameraApp.Mode.Video)
+    val mode: StateFlow<CameraApp.Mode> = _mode.asStateFlow()
+
+    private val _flash = MutableStateFlow(CameraApp.Flash.Off)
+    val flash: StateFlow<CameraApp.Flash> = _flash.asStateFlow()
+
+    private val _hasFlashUnit = MutableStateFlow(false)
+    val hasFlashUnit: StateFlow<Boolean> = _hasFlashUnit.asStateFlow()
+
+    private val _zoomRatio = MutableStateFlow(1f)
+    val zoomRatio: StateFlow<Float> = _zoomRatio.asStateFlow()
+
+    private val _zoomRange = MutableStateFlow(1f..1f)
+    val zoomRange: StateFlow<ClosedFloatingPointRange<Float>> = _zoomRange.asStateFlow()
+
+    private val _capturingPhoto = MutableStateFlow(false)
+    val capturingPhoto: StateFlow<Boolean> = _capturingPhoto.asStateFlow()
+
+    private val _focusPoint = MutableStateFlow<FocusPoint?>(null)
+    val focusPoint: StateFlow<FocusPoint?> = _focusPoint.asStateFlow()
+
     /** See [mullu.comrade.call.CallManager.disableCallServiceForTest] — same
      *  seam, same reason: skip only the [CaptureService] start/stop. Never
      *  touched by any production code path. */
@@ -152,15 +245,55 @@ object CaptureManager {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
-    /** Serializes every operation that touches the live camera/recorder —
-     *  see the class doc's Threading section. */
+    /** Serializes every operation that touches [camera]/[recording] — see the
+     *  class doc's Threading section. */
     private val captureLane = Dispatchers.IO.limitedParallelism(1)
+
+    /**
+     * The other half of that, and the half [captureLane] alone never
+     * provided: `limitedParallelism(1)` bounds how many of these run *at
+     * once*, not how two of them interleave. Every suspension point — most of
+     * all `createSession`'s wait on a Camera2 callback — hands the lane to
+     * whatever else is queued, so two operations could each observe
+     * [camera]/[recording], suspend, and resume against state the other had
+     * already replaced.
+     *
+     * That was survivable while the only things reconfiguring a live
+     * recording were a screen-lock broadcast and the recording's own stop
+     * path. It stopped being survivable when a preview lifecycle arrived:
+     * [attachPreview], [setUiVisible], [setMode], [switchLens]/[selectLens]
+     * and [refreshLenses] all reconcile now, and a `TextureView` relayout or
+     * a hot-plugged USB lens fires them mid-ride. The failure that makes
+     * possible is the one this feature cannot have — a guard trip finishing a
+     * recording and closing the `CameraDevice` while a reconfiguration is
+     * still awaiting that device's configure callback, ending either with a
+     * second [finishRecording] overwriting the reason already published, or
+     * with a live session and device this object no longer references and can
+     * never close. A leaked camera blocks every other app on the phone until
+     * it reboots.
+     *
+     * So the two do different jobs: [captureLane] keeps Camera2's callbacks
+     * and this file's mutations on one thread; this mutex makes one
+     * *operation* atomic across its own suspensions. Take it in
+     * [onCaptureLane] and nowhere else — every `…Locked` function assumes it
+     * is already held, and [Mutex] is not reentrant, so a nested acquisition
+     * is a deadlock rather than a warning.
+     */
+    private val cameraGate = Mutex()
+
+    /** The only way onto [captureLane]: one queued, mutually exclusive
+     *  operation over [camera] and [recording]. */
+    private fun onCaptureLane(block: suspend () -> Unit): Job =
+        scope.launch(captureLane) { cameraGate.withLock { block() } }
 
     private val cameraThread = HandlerThread("CaptureCamera").apply { start() }
     private val cameraHandler = Handler(cameraThread.looper)
 
     @Volatile
-    private var session: RecordingSession? = null
+    private var camera: Camera? = null
+
+    @Volatile
+    private var recording: Recording? = null
 
     @Volatile
     private var preview: PreviewTarget? = null
@@ -173,9 +306,27 @@ object CaptureManager {
     @Volatile
     private var uiVisible: Boolean = true
 
+    /**
+     * [onScreenStateChanged], [setZoom], [setFlash], [focusAt] and
+     * [selectLens] act on an already-open [camera] (or, for [selectLens],
+     * need only enough of a [Context] to reopen the device) and have no
+     * [Context] parameter of their own — the UI agent's contract for this
+     * object fixes those signatures. Every other entry point does receive a
+     * [Context]; this is where the most recent one is kept for the ones that
+     * do not. Always the application context, never an `Activity`.
+     */
+    @Volatile
+    private var appContext: Context? = null
+
+    private fun rememberContext(context: Context) {
+        appContext = context.applicationContext
+    }
+
     private data class PreviewTarget(val texture: SurfaceTexture, val width: Int, val height: Int)
 
-    private data class Output(val surface: Surface, val isPreview: Boolean)
+    private enum class OutputKind { Preview, Recorder, Still }
+
+    private data class Output(val surface: Surface, val kind: OutputKind)
 
     private data class VideoConfig(
         val width: Int,
@@ -187,33 +338,68 @@ object CaptureManager {
         val audioChannels: Int,
     )
 
-    private class RecordingSession(
+    /**
+     * One open `CameraDevice` plus everything currently attached to it: the
+     * live `CameraCaptureSession`, its output list, the still-photo
+     * `ImageReader` (kept across reconfigurations rather than rebuilt every
+     * time — see [ensureStillReader]), and the request parameters a fresh
+     * repeating request must always carry (class doc: "Photo, zoom, flash,
+     * focus").
+     *
+     * Opened independently of whether anything is recording, and closed only
+     * when nothing wants it open at all — see [reconcileLocked].
+     */
+    private class Camera(
+        val lens: CaptureDecisions.Lens,
+        val chars: CameraCharacteristics,
+        val config: VideoConfig,
+    ) {
+        var device: CameraDevice? = null
+        var captureSession: CameraCaptureSession? = null
+        var activeOutputs: List<Output> = emptyList()
+        var imageReader: ImageReader? = null
+
+        val hasFlashUnit: Boolean = chars.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+        val zoomRange: ClosedFloatingPointRange<Float> = zoomRangeFor(chars)
+
+        // Live request parameters, reapplied to every repeating (and one-off)
+        // request built after this point — see applyLiveParams.
+        var zoomRatio: Float = 1f
+        var flash: CameraApp.Flash = CameraApp.Flash.Off
+        var meteringRect: CameraApp.MeteringRect? = null
+    }
+
+    /**
+     * The `MediaRecorder` half of a running capture, split out from [Camera]
+     * so the camera can be open — with a live preview, in Photo mode,
+     * whatever — with no recording underneath it at all.
+     */
+    private class Recording(
         val appContext: Context,
         val destination: CaptureDecisions.Destination,
-        val lens: CaptureDecisions.Lens,
         val baseName: String,
         val config: VideoConfig,
         val startedElapsedRealtimeMs: Long,
     ) {
-        var device: CameraDevice? = null
-        var captureSession: CameraCaptureSession? = null
         var recorder: MediaRecorder? = null
         var current: CaptureSink.Segment? = null
         var armedNext: CaptureSink.Segment? = null
         var segmentIndex: Int = 0
-        var activeOutputs: List<Output> = emptyList()
         var wakeLock: PowerManager.WakeLock? = null
         var guardJob: Job? = null
         var tickerJob: Job? = null
     }
 
+    private data class DesiredOutputs(val preview: Boolean, val stillReader: Boolean)
+
     // ── Lenses ───────────────────────────────────────────────────────────
 
     fun refreshLenses(context: Context) {
-        val appContext = context.applicationContext
+        rememberContext(context)
+        val appCtx = context.applicationContext
         scope.launch(Dispatchers.Default) {
             val discovered = mutableListOf<CaptureDecisions.Lens>()
-            val manager = appContext.getSystemService(CameraManager::class.java)
+            val manager = appCtx.getSystemService(CameraManager::class.java)
             if (manager != null) {
                 for (id in runCatching { manager.cameraIdList }.getOrDefault(emptyArray())) {
                     val chars = runCatching { manager.getCameraCharacteristics(id) }.getOrNull() ?: continue
@@ -232,12 +418,33 @@ object CaptureManager {
             if (ordered.none { it.cameraId == _selectedLensId.value }) {
                 _selectedLensId.value = CaptureDecisions.defaultLens(ordered)?.cameraId
             }
+            onCaptureLane {
+                // The selection above may have moved out from under an
+                // already-open preview (a lens vanished, e.g. a USB camera
+                // unplugged) — close it so reconcileLocked reopens fresh on
+                // whatever is selected now, instead of leaving the old lens
+                // live because nothing else told it to change.
+                val cam = camera
+                if (cam != null && recording == null && cam.lens.cameraId != _selectedLensId.value) {
+                    closeCameraLocked(cam)
+                }
+                reconcileLocked()
+            }
         }
     }
 
     fun selectLens(cameraId: String) {
-        if (_lenses.value.any { it.cameraId == cameraId }) {
+        if (_lenses.value.none { it.cameraId == cameraId }) return
+        if (_state.value is UiState.Recording) {
+            // Recorded for the *next* recording, same as the old behaviour —
+            // Camera2 cannot move a live session between physical cameras
+            // without closing the file it is writing.
             _selectedLensId.value = cameraId
+            return
+        }
+        onCaptureLane {
+            val lens = _lenses.value.find { it.cameraId == cameraId } ?: return@onCaptureLane
+            changeLensLocked(lens)
         }
     }
 
@@ -245,45 +452,336 @@ object CaptureManager {
      * Cycle to the next lens. A no-op while [state] is [UiState.Recording]:
      * Camera2 cannot move a live session to a different physical camera
      * without closing the [CameraDevice], and closing it finalises the MP4
-     * mid-shot. The UI disables this control during a recording; this being a
-     * silent no-op rather than an error is what makes that safe if a stray
-     * tap gets through anyway.
+     * mid-shot. While only the *preview* is running this now really does
+     * switch it live — reopening the device on the new lens and rebuilding
+     * the session, at the same frame-loss cost documented for every other
+     * reconfiguration in the class doc.
      */
     fun switchLens(context: Context) {
+        rememberContext(context)
         if (_state.value is UiState.Recording) return
-        val next = CaptureDecisions.nextLens(_lenses.value, _selectedLensId.value) ?: return
-        _selectedLensId.value = next.cameraId
+        onCaptureLane {
+            val next = CaptureDecisions.nextLens(_lenses.value, _selectedLensId.value) ?: return@onCaptureLane
+            changeLensLocked(next)
+        }
+    }
+
+    private suspend fun changeLensLocked(lens: CaptureDecisions.Lens) {
+        _selectedLensId.value = lens.cameraId
+        if (recording != null) return // callers above already refuse this; kept as a backstop
+        camera?.let { closeCameraLocked(it) }
+        reconcileLocked()
     }
 
     // ── Preview / visibility / screen state ─────────────────────────────
 
     fun attachPreview(context: Context, texture: SurfaceTexture?, width: Int, height: Int) {
+        rememberContext(context)
         preview = texture?.let { PreviewTarget(it, width, height) }
-        reconfigureOutputs()
+        onCaptureLane { reconcileLocked() }
     }
 
     fun setUiVisible(context: Context, visible: Boolean) {
+        rememberContext(context)
         uiVisible = visible
-        reconfigureOutputs()
+        onCaptureLane { reconcileLocked() }
     }
 
     /** Called by [CaptureService]'s `ACTION_SCREEN_OFF`/`ACTION_SCREEN_ON`
      *  receiver — these cannot be declared in the manifest, so the service
-     *  registers a dynamic one and routes the result in here. */
+     *  registers a dynamic one and routes the result in here. Only ever
+     *  delivered while [CaptureService] is running, i.e. only during a
+     *  recording — so this never needs to *open* a camera, only reconfigure
+     *  one that [beginRecording] already has open. */
     fun onScreenStateChanged(screenOn: Boolean) {
         this.screenOn = screenOn
-        reconfigureOutputs()
+        onCaptureLane { reconcileLocked() }
+    }
+
+    // ── Mode / flash / zoom / focus ──────────────────────────────────────
+
+    /**
+     * Switch between [CameraApp.Mode.Photo] and [CameraApp.Mode.Video] — adds
+     * or drops the still-photo `ImageReader` output on whatever is currently
+     * open. A no-op while [state] is [UiState.Recording]: adding an
+     * `ImageReader` to a session that is also, right now, writing the file
+     * that matters is exactly the risk [takePhoto] refuses for the same
+     * reason (see its doc comment); the UI is expected to disable the mode
+     * toggle while recording, and this is the backstop if a stray tap gets
+     * through anyway.
+     */
+    fun setMode(context: Context, mode: CameraApp.Mode) {
+        rememberContext(context)
+        if (_state.value is UiState.Recording) return
+        if (_mode.value == mode) return
+        _mode.value = mode
+        onCaptureLane { reconcileLocked() }
+    }
+
+    fun setFlash(flash: CameraApp.Flash) {
+        onCaptureLane {
+            val cam = camera
+            val normalized = when {
+                cam == null -> flash // nothing open yet to check a flash unit against — trust the caller
+                cam.hasFlashUnit -> flash
+                else -> CameraApp.Flash.Off // this lens reports no flash unit; ignore the request rather than pretend
+            }
+            _flash.value = normalized
+            if (cam == null) return@onCaptureLane
+            cam.flash = normalized
+            reapplyRepeatingRequest(cam)
+        }
+    }
+
+    fun setZoom(ratio: Float) {
+        onCaptureLane {
+            val cam = camera
+            if (cam == null) {
+                // Clamp against the last-known range and remember it for
+                // whichever lens opens next — openCameraLocked reseeds from
+                // this value.
+                _zoomRatio.value = CameraApp.clampZoom(ratio, _zoomRange.value.start, _zoomRange.value.endInclusive)
+                return@onCaptureLane
+            }
+            cam.zoomRatio = CameraApp.clampZoom(ratio, cam.zoomRange.start, cam.zoomRange.endInclusive)
+            _zoomRatio.value = cam.zoomRatio
+            reapplyRepeatingRequest(cam)
+        }
+    }
+
+    /**
+     * Tap-to-focus at normalised viewfinder point ([nx], [ny]). Builds the
+     * metering rectangle through [CameraApp.meteringRect] — the sensor-space
+     * math is not repeated here — applies it as `CONTROL_AF_REGIONS`/
+     * `CONTROL_AE_REGIONS` with a one-shot `CONTROL_AF_TRIGGER_START`, then
+     * returns to a plain repeating request that still carries the new
+     * metering rectangle (via [applyLiveParams]) without re-triggering AF on
+     * every subsequent frame. A lens reporting zero AF *and* AE regions
+     * (`CONTROL_MAX_REGIONS_AF`/`_AE` both `0`) makes this a no-op, not a
+     * crash — some lenses genuinely have neither.
+     */
+    fun focusAt(nx: Float, ny: Float) {
+        _focusPoint.value = FocusPoint(nx, ny, SystemClock.elapsedRealtime())
+        onCaptureLane {
+            val cam = camera ?: return@onCaptureLane
+            val device = cam.device ?: return@onCaptureLane
+            val session = cam.captureSession ?: return@onCaptureLane
+            val maxAf = cam.chars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF) ?: 0
+            val maxAe = cam.chars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0
+            if (maxAf <= 0 && maxAe <= 0) return@onCaptureLane
+            val active = cam.chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: return@onCaptureLane
+            val outputs = cam.activeOutputs
+            if (outputs.isEmpty()) return@onCaptureLane
+
+            cam.meteringRect = CameraApp.meteringRect(
+                nx,
+                ny,
+                active.width(),
+                active.height(),
+                cam.lens.sensorOrientation,
+                mirrored = cam.lens.facing == CaptureDecisions.Facing.Front,
+            )
+
+            val template = if (recording != null) CameraDevice.TEMPLATE_RECORD else CameraDevice.TEMPLATE_PREVIEW
+            val trigger = runCatching { device.createCaptureRequest(template) }.getOrNull() ?: return@onCaptureLane
+            outputs.forEach { trigger.addTarget(it.surface) }
+            applyLiveParams(trigger, cam)
+            trigger.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
+            runCatching { session.capture(trigger.build(), null, cameraHandler) }
+
+            reapplyRepeatingRequest(cam)
+        }
+    }
+
+    // ── Photo capture ─────────────────────────────────────────────────────
+
+    /**
+     * Take a still. Requires the live session to already have a still-photo
+     * `ImageReader` output configured — which [reconcileLocked] only ever
+     * adds while [CameraApp.Mode.Photo] is selected and nothing is recording.
+     *
+     * **A still while a video [Recording] is running is refused, not
+     * attempted.** A Pixel supports this; this build does not. Camera2 has no
+     * way to add an output to a *live* session — every reconfiguration in
+     * this file is a fresh `createCaptureSession`, and [reconcileLocked]
+     * already treats that as a real, documented cost (frame loss on success,
+     * a defined but limited fallback on failure) when it happens for a screen
+     * on/off transition, which is rare. Doing the same thing on every shutter
+     * tap during a recording — the one time this app's entire purpose is "the
+     * recording must not stop" — trades a rare, well-understood risk for a
+     * frequent one with no automatic recovery path back to the recorder-only
+     * set if it goes wrong mid-attempt. Refusing is the stated compromise;
+     * see `docs/CAPTURE.md` §7 for the same shape of trade-off already made
+     * for lens switching.
+     *
+     * The refusal (and any other capture failure) only reaches [state] while
+     * [state] is [UiState.Idle] or already [UiState.Failed] — never over a
+     * live [UiState.Recording] or [UiState.Preparing], which this must not
+     * disturb.
+     */
+    fun takePhoto(context: Context, destination: CaptureDecisions.Destination) {
+        rememberContext(context)
+        // Claimed here, on the caller's thread, rather than inside the
+        // coroutine: a plain read-then-launch lets two shutter taps that land
+        // while the lane is busy (a mode switch reconfiguring, say) both pass
+        // the check and both get queued. The second would then overwrite the
+        // first's `setOnImageAvailableListener`, so the first capture never
+        // completes and dies on its 5s timeout instead of failing for a
+        // reason anyone could read. Every exit below clears it.
+        if (!_capturingPhoto.compareAndSet(expect = false, update = true)) return
+        onCaptureLane {
+            val cam = camera
+            val hasReader = cam?.activeOutputs?.any { it.kind == OutputKind.Still } == true
+            if (cam == null || !hasReader) {
+                Log.w(TAG, "no still output configured; refusing capture")
+                _capturingPhoto.value = false
+                failPhotoIfIdle()
+                return@onCaptureLane
+            }
+            val ok = runCatching { captureStill(context, destination, cam) }
+                .getOrElse { e ->
+                    Log.e(TAG, "still capture crashed", e)
+                    false
+                }
+            _capturingPhoto.value = false
+            if (!ok) failPhotoIfIdle()
+        }
+    }
+
+    private fun failPhotoIfIdle() {
+        if (_state.value !is UiState.Recording && _state.value !is UiState.Preparing) {
+            _state.value = UiState.Failed(Reason.PhotoFailed)
+        }
+    }
+
+    /**
+     * Runs on [captureLane]. A capture request's own suspension points
+     * (waiting on the `ImageReader` callback, the precapture trigger) yield
+     * the lane to whatever else is queued on it — `limitedParallelism(1)`
+     * bounds concurrent execution, not the order two separately launched
+     * coroutines interleave in. If [start] lands in that window and
+     * reconfigures [cam] out from under this capture (dropping the still
+     * reader because a recording now needs the encoder surface instead), the
+     * `ImageReader` this already submitted a request to may never fire its
+     * callback again. The `withTimeoutOrNull` below is what turns that into a
+     * clean [Reason.PhotoFailed] instead of a hang; it does not prevent the
+     * interleaving itself, which would need a real mutex around the whole
+     * capture rather than the coroutine-per-hop pattern the rest of this file
+     * uses. A shutter tap and a record-button tap landing in the same tens of
+     * milliseconds is judged rare enough that this contained failure mode is
+     * an acceptable trade for not rewriting the file's concurrency model.
+     */
+    private suspend fun captureStill(
+        context: Context,
+        destination: CaptureDecisions.Destination,
+        cam: Camera,
+    ): Boolean {
+        val device = cam.device ?: return false
+        val session = cam.captureSession ?: return false
+        val reader = cam.imageReader ?: return false
+
+        runPrecaptureIfNeeded(cam)
+
+        val builder = runCatching { device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE) }
+            .getOrNull() ?: return false
+        builder.addTarget(reader.surface)
+        applyLiveParams(builder, cam)
+        val rotationDeg = currentRotationDeg(context)
+        builder.set(
+            CaptureRequest.JPEG_ORIENTATION,
+            CaptureDecisions.orientationHint(cam.lens.sensorOrientation, rotationDeg, cam.lens.facing),
+        )
+
+        val imageDeferred = CompletableDeferred<ByteArray?>()
+        reader.setOnImageAvailableListener(
+            { r ->
+                val image = r.acquireLatestImage()
+                if (image == null) {
+                    imageDeferred.complete(null)
+                } else {
+                    val buffer = image.planes[0].buffer
+                    val bytes = ByteArray(buffer.remaining())
+                    buffer.get(bytes)
+                    image.close()
+                    imageDeferred.complete(bytes)
+                }
+            },
+            cameraHandler,
+        )
+
+        val submitted = runCatching { session.capture(builder.build(), null, cameraHandler) }.isSuccess
+        if (!submitted) return false
+        val bytes = withTimeoutOrNull(5_000L) { imageDeferred.await() }
+        if (bytes == null || bytes.isEmpty()) return false
+
+        val startedAtEpochMs = System.currentTimeMillis()
+        val utcOffsetMinutes = TimeZone.getDefault().getOffset(startedAtEpochMs) / 60_000
+        val displayName = CaptureDecisions.photoFileName(CaptureDecisions.photoBaseName(startedAtEpochMs, utcOffsetMinutes))
+        val still = CaptureSink.openStill(context, destination, displayName) ?: return false
+        val wrote = still.write(bytes)
+        val uri = still.finish(success = wrote)
+        if (!wrote) return false
+        _lastSaved.value = Saved(uri?.toString(), displayName, destination, Kind.Photo)
+        return true
+    }
+
+    /**
+     * A best-effort AE precapture trigger before a flash-lit still: fire one
+     * request with `CONTROL_AE_PRECAPTURE_TRIGGER_START` over whatever the
+     * live (non-still) outputs are, and wait — up to a fixed timeout, not a
+     * real "keep watching `CONTROL_AE_STATE` on subsequent frames until it
+     * converges" handshake — for that one capture to complete. Good enough to
+     * fire the flash at roughly the right moment; not a guarantee of a
+     * correctly metered exposure the way a full precapture state machine
+     * would be. A no-op when [Camera.flash] is [CameraApp.Flash.Off] or there
+     * is nothing but the still reader to target it at.
+     */
+    private suspend fun runPrecaptureIfNeeded(cam: Camera) {
+        if (cam.flash == CameraApp.Flash.Off) return
+        val device = cam.device ?: return
+        val session = cam.captureSession ?: return
+        val targets = cam.activeOutputs.filter { it.kind != OutputKind.Still }
+        if (targets.isEmpty()) return
+        val builder = runCatching { device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW) }.getOrNull() ?: return
+        targets.forEach { builder.addTarget(it.surface) }
+        applyLiveParams(builder, cam)
+        builder.set(CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER, CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER_START)
+
+        val done = CompletableDeferred<Unit>()
+        val callback = object : CameraCaptureSession.CaptureCallback() {
+            override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+                done.complete(Unit)
+            }
+
+            override fun onCaptureFailed(session: CameraCaptureSession, request: CaptureRequest, failure: CaptureFailure) {
+                done.complete(Unit)
+            }
+        }
+        val submitted = runCatching { session.capture(builder.build(), callback, cameraHandler) }.isSuccess
+        if (!submitted) return
+        withTimeoutOrNull(1_500L) { done.await() }
+    }
+
+    /** Publish a shot the *system* camera app took on our behalf — see
+     *  [CameraApp.handoff] — so the tab's "last shot" row and thumbnail are
+     *  the same whichever camera took it. Never touches [state]: an external
+     *  capture has no [UiState.Recording]/[UiState.Preparing] of its own to
+     *  become, so leaving whatever this screen's own state already was alone
+     *  is the correct answer regardless of what it is. */
+    fun publishExternalCapture(saved: Saved) {
+        _lastSaved.value = saved
     }
 
     // ── Start / stop ─────────────────────────────────────────────────────
 
     fun start(context: Context, destination: CaptureDecisions.Destination) {
+        rememberContext(context)
         val current = _state.value
         if (current !is UiState.Idle && current !is UiState.Failed) return
-        val appContext = context.applicationContext
-        if (ContextCompat.checkSelfPermission(appContext, Manifest.permission.CAMERA) !=
+        val appCtx = context.applicationContext
+        if (ContextCompat.checkSelfPermission(appCtx, Manifest.permission.CAMERA) !=
             PackageManager.PERMISSION_GRANTED ||
-            ContextCompat.checkSelfPermission(appContext, Manifest.permission.RECORD_AUDIO) !=
+            ContextCompat.checkSelfPermission(appCtx, Manifest.permission.RECORD_AUDIO) !=
             PackageManager.PERMISSION_GRANTED
         ) {
             _state.value = UiState.Failed(Reason.PermissionDenied)
@@ -296,8 +794,8 @@ object CaptureManager {
             return
         }
         _state.value = UiState.Preparing
-        scope.launch(captureLane) {
-            val failReason = runCatching { beginRecording(appContext, destination, lens) }
+        onCaptureLane {
+            val failReason = runCatching { beginRecording(appCtx, destination, lens) }
                 .getOrElse { e ->
                     Log.e(TAG, "capture setup crashed", e)
                     Reason.RecorderFailed
@@ -307,15 +805,15 @@ object CaptureManager {
     }
 
     fun stop(context: Context) {
-        scope.launch(captureLane) {
-            if (session == null) return@launch
+        onCaptureLane {
+            if (recording == null) return@onCaptureLane
             finishRecording(success = true, failReason = null)
         }
     }
 
     private fun stopForReason(reason: CaptureDecisions.StopReason) {
-        scope.launch(captureLane) {
-            if (session == null) return@launch
+        onCaptureLane {
+            if (recording == null) return@onCaptureLane
             finishRecording(success = true, failReason = mapStopReason(reason))
         }
     }
@@ -331,13 +829,13 @@ object CaptureManager {
     /**
      * Runs on [captureLane]. Returns `null` on success, or the [Reason] the
      * caller should publish as [UiState.Failed] — never throws, every step is
-     * wrapped so a mid-setup failure tears down whatever it already opened
-     * (camera, recorder, segment file) rather than leaking it.
-     *
-     * Order matters, and matches the platform's own requirement: sources,
-     * then profile/encoders, then the output target, then `prepare()`, and
-     * only once that succeeds does the capture session get created with
-     * `recorder.surface` as one of its outputs.
+     * wrapped so a mid-setup failure tears down whatever it opened for this
+     * attempt (the recorder, the segment file) rather than leaking it. A
+     * [Camera] already open for a live preview on this exact lens is reused
+     * rather than closed and reopened, and every failure path below leaves it
+     * exactly as it was — a live viewfinder must survive a failed "start
+     * recording" attempt just as much as it must survive the recording that
+     * did start.
      */
     private suspend fun beginRecording(
         context: Context,
@@ -348,13 +846,18 @@ object CaptureManager {
         val startedAtEpochMs = System.currentTimeMillis()
         val utcOffsetMinutes = TimeZone.getDefault().getOffset(startedAtEpochMs) / 60_000
         val baseName = CaptureDecisions.baseName(startedAtEpochMs, utcOffsetMinutes)
-        val config = resolveVideoConfig(lens.cameraId)
 
-        val device = openCameraDevice(context, lens.cameraId) ?: return Reason.CameraUnavailable
+        var cam = camera
+        if (cam == null || cam.lens.cameraId != lens.cameraId) {
+            cam?.let { closeCameraLocked(it) }
+            cam = openCameraLocked(context, lens) ?: return Reason.CameraUnavailable
+            camera = cam
+        }
+        val device = cam.device ?: return Reason.CameraUnavailable
 
         val firstSegment = CaptureSink.open(context, destination, CaptureDecisions.segmentFileName(baseName, 0))
         if (firstSegment == null) {
-            runCatching { device.close() }
+            reconcileLocked() // the camera we just opened/reused is still wanted (or not) independent of this failure
             return Reason.NoStorage
         }
 
@@ -365,12 +868,12 @@ object CaptureManager {
             recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
             recorder.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
             recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-            recorder.setVideoSize(config.width, config.height)
-            recorder.setVideoFrameRate(config.frameRate)
-            recorder.setVideoEncodingBitRate(config.bitRate)
-            recorder.setAudioChannels(config.audioChannels.coerceIn(1, 2))
-            recorder.setAudioSamplingRate(config.audioSampleRate)
-            recorder.setAudioEncodingBitRate(config.audioBitRate)
+            recorder.setVideoSize(cam.config.width, cam.config.height)
+            recorder.setVideoFrameRate(cam.config.frameRate)
+            recorder.setVideoEncodingBitRate(cam.config.bitRate)
+            recorder.setAudioChannels(cam.config.audioChannels.coerceIn(1, 2))
+            recorder.setAudioSamplingRate(cam.config.audioSampleRate)
+            recorder.setAudioEncodingBitRate(cam.config.audioBitRate)
             recorder.setOrientationHint(CaptureDecisions.orientationHint(lens.sensorOrientation, rotationDeg, lens.facing))
             recorder.setMaxFileSize(CaptureDecisions.MAX_SEGMENT_BYTES)
             recorder.setMaxDuration(CaptureDecisions.MAX_SEGMENT_MS.toInt())
@@ -381,47 +884,29 @@ object CaptureManager {
             Log.e(TAG, "MediaRecorder.prepare() failed", prepared.exceptionOrNull())
             runCatching { recorder.release() }
             firstSegment.finish(success = false)
-            runCatching { device.close() }
+            reconcileLocked()
             return Reason.RecorderFailed
         }
 
-        val wantsPreview = CaptureDecisions.previewAttached(screenOn, uiVisible) && preview != null
-        val outputs = buildOutputs(context, recorder.surface, lens, config, if (wantsPreview) preview else null)
-        val captureSession = createSession(device, outputs.map { it.surface })
-        if (captureSession == null) {
-            runCatching { recorder.release() }
-            firstSegment.finish(success = false)
-            runCatching { device.close() }
-            return Reason.CameraUnavailable
-        }
-
-        val sess = RecordingSession(
+        val sessRecording = Recording(
             appContext = context,
             destination = destination,
-            lens = lens,
             baseName = baseName,
-            config = config,
+            config = cam.config,
             startedElapsedRealtimeMs = SystemClock.elapsedRealtime(),
         )
-        sess.device = device
-        sess.captureSession = captureSession
-        sess.recorder = recorder
-        sess.current = firstSegment
-        sess.activeOutputs = outputs
-        session = sess
+        sessRecording.recorder = recorder
+        sessRecording.current = firstSegment
+        recording = sessRecording
 
-        val requestOk = runCatching {
-            val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
-            outputs.forEach { builder.addTarget(it.surface) }
-            captureSession.setRepeatingRequest(builder.build(), null, cameraHandler)
-        }
-        if (requestOk.isFailure) {
-            Log.e(TAG, "setRepeatingRequest failed", requestOk.exceptionOrNull())
-            session = null
-            runCatching { captureSession.close() }
+        val desired = desiredOutputs()
+        val configured = applyOutputs(cam, sessRecording, desired) ||
+            (desired.preview && applyOutputs(cam, sessRecording, desired.copy(preview = false)))
+        if (!configured) {
+            recording = null
             runCatching { recorder.release() }
             firstSegment.finish(success = false)
-            runCatching { device.close() }
+            reconcileLocked()
             return Reason.CameraUnavailable
         }
 
@@ -430,11 +915,13 @@ object CaptureManager {
         val started = runCatching { recorder.start() }
         if (started.isFailure) {
             Log.e(TAG, "MediaRecorder.start() failed", started.exceptionOrNull())
-            session = null
-            runCatching { captureSession.close() }
+            recording = null
             runCatching { recorder.release() }
             firstSegment.finish(success = false)
-            runCatching { device.close() }
+            // The session above is now configured with a recorder surface
+            // that never actually started — drop back to a preview-only (or
+            // closed) session rather than leaving it that way.
+            reconcileLocked()
             return Reason.RecorderFailed
         }
 
@@ -449,21 +936,21 @@ object CaptureManager {
         // without the lock is merely worse than one that runs with it; a
         // leaked camera is worse than both, and blocks every other app until
         // the phone reboots.
-        sess.wakeLock = runCatching {
+        sessRecording.wakeLock = runCatching {
             (context.getSystemService(Context.POWER_SERVICE) as? PowerManager)
                 ?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "comrade:capture")
                 ?.apply { setReferenceCounted(false); acquire() }
         }.onFailure { Log.w(TAG, "could not hold a wake lock; recording anyway", it) }.getOrNull()
 
-        armNextSegment(sess)
+        armNextSegment(sessRecording)
 
         if (!disableServiceForTest) {
             runCatching { CaptureService.start(context, destination) }
         }
 
-        _state.value = UiState.Recording(sess.startedElapsedRealtimeMs, destination, lens, segment = 0)
-        startGuardLoop(sess)
-        startTicker(sess)
+        _state.value = UiState.Recording(sessRecording.startedElapsedRealtimeMs, destination, lens, segment = 0)
+        startGuardLoop(sessRecording)
+        startTicker(sessRecording)
         return null
     }
 
@@ -475,7 +962,7 @@ object CaptureManager {
      * actually hit or `MediaRecorder` simply stops instead of rolling over —
      * pre-arming removes that race entirely rather than trying to win it.
      */
-    private fun armNextSegment(sess: RecordingSession) {
+    private fun armNextSegment(sess: Recording) {
         val recorder = sess.recorder ?: return
         val nextIndex = sess.segmentIndex + 1
         val name = CaptureDecisions.segmentFileName(sess.baseName, nextIndex)
@@ -502,12 +989,12 @@ object CaptureManager {
     private fun onRecorderInfo(what: Int) {
         when (what) {
             MediaRecorder.MEDIA_RECORDER_INFO_NEXT_OUTPUT_FILE_STARTED -> {
-                scope.launch(captureLane) { promoteSegment() }
+                onCaptureLane { promoteSegment() }
             }
             MediaRecorder.MEDIA_RECORDER_INFO_MAX_FILESIZE_REACHED,
             MediaRecorder.MEDIA_RECORDER_INFO_MAX_DURATION_REACHED -> {
-                scope.launch(captureLane) {
-                    val sess = session ?: return@launch
+                onCaptureLane {
+                    val sess = recording ?: return@onCaptureLane
                     if (sess.armedNext == null) {
                         // setNextOutputFile was never armed — MediaRecorder
                         // has now stopped writing on its own with nowhere to
@@ -521,40 +1008,71 @@ object CaptureManager {
     }
 
     private fun promoteSegment() {
-        val sess = session ?: return
+        val sess = recording ?: return
+        val lens = camera?.lens ?: return
         val next = sess.armedNext ?: return
         sess.current?.finish(success = true)
         sess.current = next
         sess.armedNext = null
         sess.segmentIndex += 1
         armNextSegment(sess)
-        _state.value = UiState.Recording(sess.startedElapsedRealtimeMs, sess.destination, sess.lens, sess.segmentIndex)
+        _state.value = UiState.Recording(sess.startedElapsedRealtimeMs, sess.destination, lens, sess.segmentIndex)
     }
 
     /**
      * The one path every ended recording goes through — user [stop], an
      * auto-stop guard trip, a lost camera, or a setup failure partway through
-     * [beginRecording] that already published a [session]. Always tears down
-     * in the same order and always resolves [lastSaved]/[state] exactly once.
+     * [beginRecording] that already published a [recording]. Always tears
+     * down in the same order and always resolves [lastSaved]/[state] exactly
+     * once.
+     *
+     * The order matters in a way it did not when this always closed the
+     * whole [CameraCaptureSession]/[CameraDevice] outright: [reconcileLocked]
+     * runs — dropping the recorder surface from the live session, or closing
+     * the camera entirely if nothing else wants it — *before the recorder is
+     * touched at all*, `stop()` included, not merely before `release()`. For
+     * a surface-input [MediaRecorder] it is `stop()` that detaches it as the
+     * buffer consumer, so stopping first would leave the still-live session's
+     * repeating request submitting into an abandoned `Surface` for however
+     * long the reconfiguration took. The forced [closeCameraLocked]
+     * afterwards is the backstop for the rare case [reconcileLocked] could
+     * not rebuild a recorder-free session at all — never leave a live session
+     * referencing a `Surface` about to be invalidated, regardless of why the
+     * reconfiguration failed.
      */
-    private fun finishRecording(success: Boolean, failReason: Reason?) {
-        val sess = session ?: run {
+    private suspend fun finishRecording(success: Boolean, failReason: Reason?) {
+        val sess = recording ?: run {
             if (failReason != null) _state.value = UiState.Failed(failReason)
             return
         }
-        session = null
+        recording = null
         sess.guardJob?.cancel()
         sess.tickerJob?.cancel()
+
+        // The session comes off the recorder surface *before* the recorder is
+        // touched at all — not merely before `release()`. For a surface-input
+        // MediaRecorder, `stop()` is already what detaches it as the buffer
+        // consumer, so stopping first leaves the still-live session's
+        // repeating request submitting frames into an abandoned surface for
+        // however long the reconfiguration takes. That window did not exist
+        // when this always tore the whole camera down a moment later; now
+        // that a preview survives the end of a recording, it is the ordinary
+        // viewfinder path.
+        reconcileLocked()
+        camera?.let { cam ->
+            if (cam.activeOutputs.any { it.kind == OutputKind.Recorder }) {
+                Log.w(TAG, "could not drop the recorder surface from the live session; closing the camera instead")
+                closeCameraLocked(cam)
+            }
+        }
 
         var stoppedCleanly = success
         if (success) {
             val stopped = runCatching { sess.recorder?.stop() }
             if (stopped.isFailure) stoppedCleanly = false
         }
+
         runCatching { sess.recorder?.release() }
-        runCatching { sess.captureSession?.close() }
-        runCatching { sess.device?.close() }
-        sess.activeOutputs.filter { it.isPreview }.forEach { runCatching { it.surface.release() } }
         sess.wakeLock?.let { if (it.isHeld) runCatching { it.release() } }
 
         val savedUri = sess.current?.finish(success = stoppedCleanly)
@@ -566,6 +1084,7 @@ object CaptureManager {
                 uri = savedUri?.toString(),
                 displayName = CaptureDecisions.segmentFileName(sess.baseName, sess.segmentIndex),
                 destination = sess.destination,
+                kind = Kind.Video,
             )
         }
         _state.value = failReason?.let { UiState.Failed(it) } ?: UiState.Idle
@@ -574,23 +1093,56 @@ object CaptureManager {
         }
     }
 
-    // ── Preview reconfiguration ──────────────────────────────────────────
+    // ── Reconfiguration ──────────────────────────────────────────────────
+
+    private fun desiredOutputs(): DesiredOutputs {
+        val wantsPreview = CaptureDecisions.previewAttached(screenOn, uiVisible) && preview != null
+        // A still reader is only ever added while nothing is recording — see
+        // takePhoto's doc comment for why a mid-recording still is refused
+        // rather than reconfigured for.
+        val wantsReader = recording == null && _mode.value == CameraApp.Mode.Photo
+        return DesiredOutputs(wantsPreview, wantsReader)
+    }
+
+    private fun outputsSatisfy(cam: Camera, desired: DesiredOutputs, sess: Recording?): Boolean {
+        val hasPreview = cam.activeOutputs.any { it.kind == OutputKind.Preview }
+        val hasReader = cam.activeOutputs.any { it.kind == OutputKind.Still }
+        val hasRecorder = cam.activeOutputs.any { it.kind == OutputKind.Recorder }
+        return hasPreview == desired.preview && hasReader == desired.stillReader && hasRecorder == (sess != null)
+    }
 
     /**
-     * Rebuild the capture session's output set when whether the preview
-     * should be attached has changed — see the class doc for the frame cost
-     * this carries. A no-op when there is no live recording, or when the
-     * desired attachment already matches what is configured.
+     * The single place that decides whether [camera] should be open at all,
+     * on which lens, and with which outputs — called after every state
+     * change that could move any of those answers (preview attach/detach, UI
+     * visibility, screen on/off, mode switch, a lens change already closed
+     * the old device for). A no-op when everything already matches.
      */
-    private fun reconfigureOutputs() {
-        scope.launch(captureLane) {
-            val sess = session ?: return@launch
-            val device = sess.device ?: return@launch
-            val recorder = sess.recorder ?: return@launch
-            val wantsPreview = CaptureDecisions.previewAttached(screenOn, uiVisible) && preview != null
-            val hasPreview = sess.activeOutputs.any { it.isPreview }
-            if (wantsPreview == hasPreview) return@launch
+    private suspend fun reconcileLocked() {
+        val sess = recording
+        val shouldBeOpen = sess != null || (uiVisible && preview != null)
+        var cam = camera
 
+        if (!shouldBeOpen) {
+            if (cam != null && sess == null) closeCameraLocked(cam)
+            return
+        }
+
+        if (cam == null) {
+            if (sess != null) return // beginRecording always opens its own camera before publishing `recording`
+            val ctx = appContext ?: return
+            val lens = _lenses.value.find { it.cameraId == _selectedLensId.value }
+                ?: CaptureDecisions.defaultLens(_lenses.value)
+                ?: return
+            cam = openCameraLocked(ctx, lens) ?: return
+            camera = cam
+        }
+
+        val current = cam
+        val desired = desiredOutputs()
+        if (outputsSatisfy(current, desired, sess)) return
+
+        if (sess != null) {
             // The old session is deliberately NOT closed up front. Camera2
             // replaces the previous session when a new one is created, so
             // closing first buys nothing — and it used to cost everything:
@@ -599,108 +1151,112 @@ object CaptureManager {
             // closed, so no frames reached the encoder for the rest of the
             // ride while the timer and the notification carried on as if they
             // did. On a helmet mount nobody finds out until they get home.
-            if (applyOutputs(sess, device, recorder, withPreview = wantsPreview)) return@launch
-
-            // Attaching the preview is the only part that can fail on its own
-            // terms (a surface size the device will not take, a texture torn
-            // down underneath us), and it is also the part the recording does
-            // not need. Falling back to the encoder-only set keeps the footage
-            // coming; the viewfinder stays dark until the next transition
-            // retries it.
-            if (wantsPreview && applyOutputs(sess, device, recorder, withPreview = false)) {
+            if (applyOutputs(current, sess, desired)) return
+            if (desired.preview && applyOutputs(current, sess, desired.copy(preview = false))) {
                 Log.w(TAG, "preview could not be reattached; recording continues without a viewfinder")
-                return@launch
+                return
             }
-
-            // Not even the encoder-only set configured, so this camera is not
-            // going to deliver another frame. End the recording rather than
-            // leave one running that writes nothing: what was shot up to here
-            // is stopped cleanly and published, and the screen says so.
             Log.w(TAG, "capture session lost and could not be rebuilt; ending the recording")
             finishRecording(success = true, failReason = Reason.StoppedCameraLost)
+        } else {
+            if (applyOutputs(current, null, desired)) return
+            if (desired.stillReader && applyOutputs(current, null, desired.copy(stillReader = false))) {
+                Log.w(TAG, "still output could not be configured; the viewfinder stays live without photo capture")
+                return
+            }
+            if (desired.preview && applyOutputs(current, null, desired.copy(preview = false, stillReader = false))) {
+                Log.w(TAG, "preview could not be configured")
+                return
+            }
+            Log.w(TAG, "camera session could not be configured; leaving it for the next attempt")
         }
     }
 
     /**
-     * Swap the live capture session for one carrying [withPreview]'s output
-     * set, and answer whether that actually worked.
-     *
-     * Every failure path leaves the session fields untouched and disposes
-     * whatever it built, so a caller may try a smaller output set immediately
-     * afterwards. The previously-attached preview surface is released only
-     * once the replacement is configured and repeating — releasing it earlier
-     * is releasing a surface the still-current session is drawing into.
+     * Swap the live capture session for one carrying [desired]'s output set
+     * (plus [sess]'s recorder surface, if any), and answer whether that
+     * actually worked. Every failure path leaves [cam] untouched and disposes
+     * whatever it built, so a caller may retry a smaller output set
+     * immediately afterwards. A previously-attached preview surface is
+     * released only once the replacement is configured and repeating —
+     * releasing it earlier is releasing a surface the still-current session
+     * is drawing into.
      */
-    private suspend fun applyOutputs(
-        sess: RecordingSession,
-        device: CameraDevice,
-        recorder: MediaRecorder,
-        withPreview: Boolean,
-    ): Boolean {
-        val outputs = buildOutputs(
-            sess.appContext,
-            recorder.surface,
-            sess.lens,
-            sess.config,
-            if (withPreview) preview else null,
-        )
-        // buildOutputs swallows a failed preview surface and returns the
-        // encoder alone; asking for a preview and not getting one is a failed
-        // attempt, not a silent downgrade the caller never hears about.
-        if (withPreview && outputs.none { it.isPreview }) {
-            releasePreviews(outputs)
+    private suspend fun applyOutputs(cam: Camera, sess: Recording?, desired: DesiredOutputs): Boolean {
+        val device = cam.device ?: return false
+        val built = buildOutputs(cam, sess, desired)
+        if (desired.preview && built.none { it.kind == OutputKind.Preview }) {
+            releasePreviewSurfaces(built)
             return false
         }
-        val newSession = createSession(device, outputs.map { it.surface })
+        if (desired.stillReader && built.none { it.kind == OutputKind.Still }) {
+            releasePreviewSurfaces(built)
+            return false
+        }
+        val newSession = createSession(device, built.map { it.surface })
         if (newSession == null) {
-            releasePreviews(outputs)
+            releasePreviewSurfaces(built)
             return false
         }
+        val template = if (sess != null) CameraDevice.TEMPLATE_RECORD else CameraDevice.TEMPLATE_PREVIEW
         val requestOk = runCatching {
-            val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
-            outputs.forEach { builder.addTarget(it.surface) }
+            val builder = device.createCaptureRequest(template)
+            built.forEach { builder.addTarget(it.surface) }
+            applyLiveParams(builder, cam)
             newSession.setRepeatingRequest(builder.build(), null, cameraHandler)
         }
         if (requestOk.isFailure) {
             Log.w(TAG, "setRepeatingRequest failed after reconfiguration", requestOk.exceptionOrNull())
             runCatching { newSession.close() }
-            releasePreviews(outputs)
+            releasePreviewSurfaces(built)
             return false
         }
-        val previous = sess.activeOutputs
-        sess.captureSession = newSession
-        sess.activeOutputs = outputs
-        releasePreviews(previous)
+        val previous = cam.activeOutputs
+        cam.captureSession = newSession
+        cam.activeOutputs = built
+        releasePreviewSurfaces(previous)
         return true
     }
 
-    private fun releasePreviews(outputs: List<Output>) {
-        outputs.filter { it.isPreview }.forEach { runCatching { it.surface.release() } }
+    private fun releasePreviewSurfaces(outputs: List<Output>) {
+        outputs.filter { it.kind == OutputKind.Preview }.forEach { runCatching { it.surface.release() } }
     }
 
-    private fun buildOutputs(
-        context: Context,
-        recorderSurface: Surface,
-        lens: CaptureDecisions.Lens,
-        config: VideoConfig,
-        previewTarget: PreviewTarget?,
-    ): List<Output> {
-        val outputs = mutableListOf(Output(recorderSurface, isPreview = false))
-        if (previewTarget != null) {
-            val built = runCatching {
-                val size = choosePreviewSize(context, lens.cameraId, config.width, config.height)
-                previewTarget.texture.setDefaultBufferSize(size.width, size.height)
-                Output(Surface(previewTarget.texture), isPreview = true)
-            }.getOrNull()
-            if (built != null) outputs += built
+    private fun buildOutputs(cam: Camera, sess: Recording?, desired: DesiredOutputs): List<Output> {
+        val outputs = mutableListOf<Output>()
+        sess?.recorder?.surface?.let { outputs += Output(it, OutputKind.Recorder) }
+        if (desired.preview) {
+            val target = preview
+            if (target != null) {
+                val built = runCatching {
+                    val size = choosePreviewSize(cam.chars, cam.config.width, cam.config.height)
+                    target.texture.setDefaultBufferSize(size.width, size.height)
+                    Output(Surface(target.texture), OutputKind.Preview)
+                }.getOrNull()
+                if (built != null) outputs += built
+            }
+        }
+        if (desired.stillReader) {
+            val reader = ensureStillReader(cam)
+            if (reader != null) outputs += Output(reader.surface, OutputKind.Still)
         }
         return outputs
     }
 
-    private fun choosePreviewSize(context: Context, cameraId: String, targetWidth: Int, targetHeight: Int): Size {
+    /** Created once per [Camera] and kept for its whole life — see the class
+     *  doc — rather than rebuilt on every reconfiguration; only whether it is
+     *  part of the *current* output set changes. */
+    private fun ensureStillReader(cam: Camera): ImageReader? {
+        cam.imageReader?.let { return it }
+        val size = chooseStillSize(cam.chars, cam.config.width, cam.config.height) ?: return null
+        val reader = runCatching { ImageReader.newInstance(size.width, size.height, ImageFormat.JPEG, 2) }.getOrNull()
+            ?: return null
+        cam.imageReader = reader
+        return reader
+    }
+
+    private fun choosePreviewSize(chars: CameraCharacteristics, targetWidth: Int, targetHeight: Int): Size {
         val fallback = Size(targetWidth, targetHeight)
-        val manager = context.getSystemService(CameraManager::class.java) ?: return fallback
-        val chars = runCatching { manager.getCameraCharacteristics(cameraId) }.getOrNull() ?: return fallback
         val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return fallback
         val sizes = map.getOutputSizes(SurfaceTexture::class.java)
         if (sizes.isNullOrEmpty()) return fallback
@@ -708,7 +1264,129 @@ object CaptureManager {
         return sizes.minByOrNull { size -> abs(size.width.toDouble() / size.height - targetRatio) } ?: fallback
     }
 
+    /** The largest JPEG size at (or closest to) the video config's aspect
+     *  ratio — "the selected aspect ratio" a photo should match, so a still
+     *  taken next to a video is never a visibly different shape. */
+    private fun chooseStillSize(chars: CameraCharacteristics, targetWidth: Int, targetHeight: Int): Size? {
+        val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return null
+        val sizes = map.getOutputSizes(ImageFormat.JPEG)
+        if (sizes.isNullOrEmpty()) return null
+        val targetRatio = targetWidth.toDouble() / targetHeight
+        val matching = sizes.filter { abs(it.width.toDouble() / it.height - targetRatio) < 0.02 }
+        val pool = matching.ifEmpty { sizes.toList() }
+        return pool.maxByOrNull { it.width.toLong() * it.height }
+    }
+
+    // ── Live request parameters (zoom / flash / metering) ────────────────
+
+    private fun applyLiveParams(builder: CaptureRequest.Builder, cam: Camera) {
+        applyZoom(builder, cam)
+        applyFlash(builder, cam)
+        applyMetering(builder, cam)
+    }
+
+    private fun applyZoom(builder: CaptureRequest.Builder, cam: Camera) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            builder.set(CaptureRequest.CONTROL_ZOOM_RATIO, cam.zoomRatio)
+        } else {
+            val active = cam.chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: return
+            builder.set(CaptureRequest.SCALER_CROP_REGION, cropRegionForZoom(active, cam.zoomRatio))
+        }
+    }
+
+    private fun cropRegionForZoom(active: Rect, zoomRatio: Float): Rect {
+        val zoom = zoomRatio.coerceAtLeast(1f)
+        val croppedWidth = (active.width() / zoom).roundToInt().coerceIn(1, active.width())
+        val croppedHeight = (active.height() / zoom).roundToInt().coerceIn(1, active.height())
+        val left = active.left + (active.width() - croppedWidth) / 2
+        val top = active.top + (active.height() - croppedHeight) / 2
+        return Rect(left, top, left + croppedWidth, top + croppedHeight)
+    }
+
+    private fun applyFlash(builder: CaptureRequest.Builder, cam: Camera) {
+        if (!cam.hasFlashUnit) return
+        when (_mode.value) {
+            CameraApp.Mode.Video -> builder.set(
+                CaptureRequest.FLASH_MODE,
+                if (cam.flash == CameraApp.Flash.On) CaptureRequest.FLASH_MODE_TORCH else CaptureRequest.FLASH_MODE_OFF,
+            )
+            CameraApp.Mode.Photo -> builder.set(
+                CaptureRequest.CONTROL_AE_MODE,
+                when (cam.flash) {
+                    CameraApp.Flash.Off -> CaptureRequest.CONTROL_AE_MODE_ON
+                    CameraApp.Flash.Auto -> CaptureRequest.CONTROL_AE_MODE_ON_AUTO_FLASH
+                    CameraApp.Flash.On -> CaptureRequest.CONTROL_AE_MODE_ON_ALWAYS_FLASH
+                },
+            )
+        }
+    }
+
+    private fun applyMetering(builder: CaptureRequest.Builder, cam: Camera) {
+        val rect = cam.meteringRect ?: return
+        val maxAf = cam.chars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF) ?: 0
+        val maxAe = cam.chars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0
+        if (maxAf <= 0 && maxAe <= 0) return
+        val region = MeteringRectangle(
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+            MeteringRectangle.METERING_WEIGHT_MAX,
+        )
+        if (maxAf > 0) builder.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(region))
+        if (maxAe > 0) builder.set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(region))
+    }
+
+    /** Rebuild and resubmit the repeating request against [Camera.activeOutputs]
+     *  as they already are — used by [setZoom]/[setFlash]/[focusAt], none of
+     *  which change *which* outputs are live, only the parameters on the
+     *  request already targeting them. */
+    private fun reapplyRepeatingRequest(cam: Camera) {
+        val device = cam.device ?: return
+        val session = cam.captureSession ?: return
+        val outputs = cam.activeOutputs
+        if (outputs.isEmpty()) return
+        val template = if (recording != null) CameraDevice.TEMPLATE_RECORD else CameraDevice.TEMPLATE_PREVIEW
+        val builder = runCatching { device.createCaptureRequest(template) }.getOrNull() ?: return
+        outputs.forEach { builder.addTarget(it.surface) }
+        applyLiveParams(builder, cam)
+        runCatching { session.setRepeatingRequest(builder.build(), null, cameraHandler) }
+    }
+
     // ── Camera2 plumbing ─────────────────────────────────────────────────
+
+    /**
+     * Opens [lens] and seeds its live parameters from the current
+     * zoom/flash flows (clamped to what this lens actually reports), so
+     * switching lenses does not silently reset them back to a default.
+     */
+    private suspend fun openCameraLocked(context: Context, lens: CaptureDecisions.Lens): Camera? {
+        val manager = context.getSystemService(CameraManager::class.java) ?: return null
+        val chars = runCatching { manager.getCameraCharacteristics(lens.cameraId) }.getOrNull() ?: return null
+        val config = resolveVideoConfig(lens.cameraId)
+        val device = openCameraDevice(context, lens.cameraId) ?: return null
+        val cam = Camera(lens, chars, config)
+        cam.device = device
+        cam.zoomRatio = CameraApp.clampZoom(_zoomRatio.value, cam.zoomRange.start, cam.zoomRange.endInclusive)
+        cam.flash = if (cam.hasFlashUnit) _flash.value else CameraApp.Flash.Off
+        _zoomRange.value = cam.zoomRange
+        _zoomRatio.value = cam.zoomRatio
+        _hasFlashUnit.value = cam.hasFlashUnit
+        _flash.value = cam.flash
+        return cam
+    }
+
+    private fun closeCameraLocked(cam: Camera) {
+        runCatching { cam.captureSession?.close() }
+        runCatching { cam.device?.close() }
+        releasePreviewSurfaces(cam.activeOutputs)
+        cam.imageReader?.let { runCatching { it.close() } }
+        cam.activeOutputs = emptyList()
+        cam.captureSession = null
+        cam.device = null
+        cam.imageReader = null
+        if (camera === cam) camera = null
+    }
 
     /**
      * Opens [cameraId] and awaits the result off [cameraHandler]'s callback.
@@ -748,10 +1426,27 @@ object CaptureManager {
     }
 
     private fun handleCameraLost(lostDevice: CameraDevice) {
-        scope.launch(captureLane) {
-            val sess = session ?: return@launch
-            if (sess.device !== lostDevice) return@launch
-            finishRecording(success = true, failReason = Reason.CameraUnavailable)
+        onCaptureLane {
+            val cam = camera ?: return@onCaptureLane
+            if (cam.device !== lostDevice) return@onCaptureLane
+            val sess = recording
+            cam.captureSession = null
+            cam.activeOutputs = emptyList()
+            cam.device = null
+            cam.imageReader?.let { runCatching { it.close() } }
+            cam.imageReader = null
+            camera = null
+            if (sess != null) {
+                finishRecording(success = true, failReason = Reason.CameraUnavailable)
+            } else {
+                // Nothing was writing to disk, so there is nothing to
+                // publish — just try to get the preview back if anything
+                // still wants it. No retry loop beyond this one attempt: if
+                // whatever took the lens still holds it, this leaves the
+                // camera closed until the next attachPreview/setUiVisible/
+                // mode change asks for it again.
+                reconcileLocked()
+            }
         }
     }
 
@@ -865,6 +1560,15 @@ object CaptureManager {
         }
     }
 
+    private fun zoomRangeFor(chars: CameraCharacteristics): ClosedFloatingPointRange<Float> {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val range = chars.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
+            if (range != null) return range.lower..range.upper
+        }
+        val maxDigital = chars.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1f
+        return 1f..maxDigital.coerceAtLeast(1f)
+    }
+
     // ── Guards: battery, storage, thermal ────────────────────────────────
 
     private const val GUARD_INTERVAL_MS = 30_000L
@@ -873,7 +1577,7 @@ object CaptureManager {
     /** 30s: frequent enough that a genuinely critical state gets caught
      *  promptly, infrequent enough that the guard itself is not a battery
      *  cost the feature has to answer for. */
-    private fun startGuardLoop(sess: RecordingSession) {
+    private fun startGuardLoop(sess: Recording) {
         sess.guardJob = scope.launch {
             while (isActive) {
                 delay(GUARD_INTERVAL_MS)
@@ -892,7 +1596,7 @@ object CaptureManager {
         }
     }
 
-    private fun startTicker(sess: RecordingSession) {
+    private fun startTicker(sess: Recording) {
         sess.tickerJob = scope.launch {
             while (isActive) {
                 _elapsedMs.value = (SystemClock.elapsedRealtime() - sess.startedElapsedRealtimeMs).coerceAtLeast(0L)

@@ -216,6 +216,68 @@ jobs:
         working-directory: android
         run: ./gradlew test --no-daemon
 
+  # Android resource XML, parsed. This exists because a `--` inside an XML
+  # comment in strings.xml — illegal in XML, and invisible to every Kotlin
+  # lane — failed `packageDebugResources` two minutes into the Flutter APK
+  # job and again in the Android JVM job, having compiled fine everywhere
+  # else. Two expensive lanes to learn one character was wrong.
+  #
+  # aapt2 is the authority and still is; this only asserts the files are
+  # well-formed XML at all, which is the class of mistake that is cheap to
+  # make by hand and expensive to find at the end of a Gradle build. Both
+  # resource trees, because `app/` ships its own.
+  android-resources:
+    name: Android — resource XML parses
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse every res/*.xml
+        run: |
+          python3 - <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          roots = [Path("android/app/src/main/res"), Path("app/android/app/src/main/res")]
+          files = sorted(f for r in roots if r.is_dir() for f in r.rglob("*.xml"))
+          if not files:
+              sys.exit("::error::no resource XML found — did the layout move?")
+          bad = 0
+          for f in files:
+              try:
+                  ET.parse(f)
+              except ET.ParseError as e:
+                  print(f"::error file={f},line={e.position[0]}::{e}")
+                  bad += 1
+          print(f"parsed {len(files)} resource files, {bad} malformed")
+          sys.exit(1 if bad else 0)
+          PY
+
+  # The Capture tab makes two promises that every other lane is blind to, and
+  # both of them fail *silently*: a recording that keeps going once the screen
+  # is locked, and a handoff to the phone's own camera app (Google Camera on a
+  # Pixel). Drop the foreground-service type, the wake lock, the screen-on/off
+  # receiver or the <queries> block and everything still compiles, `./gradlew
+  # test` is still green, and the emulator lane still passes — because none of
+  # them record anything or resolve an intent. The failure surfaces on a
+  # handset, mid-ride, as a file that stopped when the display did.
+  #
+  # So this is a text-only gate: no SDK, no Gradle, under a second. It also
+  # keeps the handoff behind one tested decision (CameraApp.handoff), which is
+  # where "a screen-off recording is never delegated" is actually enforced —
+  # a second file spelling out the intent action would bypass it without
+  # failing a single unit test.
+  capture-contract:
+    name: Capture — screen-off recording + camera handoff contract
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Capture contract
+        run: python3 scripts/check_capture_contract.py
+
   # Builds the real artifact (a maturin wheel) and smoke-tests it in a fresh
   # venv — the "rust" lane's `cargo test -p comrade_py` only covers the pure
   # logic behind the FFI boundary (see that crate's test module comment), so

@@ -54,6 +54,12 @@ class MainActivityUiTest {
     // (`TravelDecisions.State.NeedsPermission`), which is the one branch a
     // real device run needs to get past to prove the state-machine
     // transitions are safe.
+    // CAMERA joins it for the Capture leg below, alongside RECORD_AUDIO
+    // already granted above: without it that leg would park on
+    // `CapturePermissionExplainer` instead of reaching the camera body the
+    // test actually exercises. The emulator lane runs `-camera-back none`
+    // (`android-apk.yml`), which affects what Camera2 enumerates, not
+    // whether the *permission* is granted — this grant is unconditional.
     @get:Rule
     val rules: RuleChain = RuleChain
         .outerRule(
@@ -61,6 +67,7 @@ class MainActivityUiTest {
                 Manifest.permission.POST_NOTIFICATIONS,
                 Manifest.permission.RECORD_AUDIO,
                 Manifest.permission.ACCESS_COARSE_LOCATION,
+                Manifest.permission.CAMERA,
             ),
         )
         .around(composeRule)
@@ -328,6 +335,49 @@ class MainActivityUiTest {
         // now, not a tab, so there is no bottom-bar entry to return through.
         Espresso.pressBack()
         composeRule.waitForIdle()
+
+        // Capture: the helmet cam, shaped like a real camera app
+        // (`docs/CAPTURE.md`). CAMERA and RECORD_AUDIO are pre-granted above,
+        // so this opens straight into the camera body rather than parking on
+        // `CapturePermissionExplainer`. The emulator lane runs
+        // `-camera-back none` (`android-apk.yml`), so nothing here touches an
+        // actual preview frame — what is exercised is that the screen
+        // recomposes across a real state change without dying, the same bug
+        // class Tasks and Ride both shipped: an early `return@Column` passes
+        // every lane that runs before CI and only fails on a device mid-
+        // recomposition, which a bare "the node exists" assertion would not
+        // catch.
+        composeRule.onNodeWithTag("nav-drawer-button").performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("drawer-capture").performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("capture-screen").assertIsDisplayed()
+        composeRule.onNodeWithTag("capture-record-button").assertIsDisplayed()
+
+        // Photo → Video flips several conditional branches at once — the
+        // helmet-cam switch appears, the shutter's own colour and semantics
+        // change — precisely the group-count hazard `.claude/rules/android.md`
+        // warns about. Sit through a tick of the countdown/elapsed machinery
+        // before asserting the screen is still alive.
+        composeRule.onNodeWithTag("capture-mode-video").performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("capture-lock-toggle").assertIsDisplayed()
+        Thread.sleep(1_200)
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("capture-record-button").assertIsDisplayed()
+
+        // And back, which flips the same branches the other way — the
+        // helmet-cam switch leaves the tree entirely rather than merely
+        // hiding, which is exactly the shape of change an early return could
+        // get wrong on the way back too.
+        composeRule.onNodeWithTag("capture-mode-photo").performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("capture-lock-toggle").assertDoesNotExist()
+        composeRule.onNodeWithTag("capture-record-button").assertIsDisplayed()
+
+        Espresso.pressBack()
+        composeRule.waitForIdle()
+
         composeRule.onNodeWithTag("nav-drawer-button").performClick()
         composeRule.waitForIdle()
         composeRule.onNodeWithTag("drawer-settings").performClick()
