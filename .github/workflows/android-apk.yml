@@ -197,6 +197,11 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
+        with:
+          # Google removed the legacy `tools` SDK package; the action's default
+          # `packages` ("tools platform-tools") therefore fails at sdkmanager.
+          # Keep platform-tools, drop tools. The next step installs the rest.
+          packages: 'platform-tools'
 
       - name: Install build-tools & platform
         run: sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
@@ -308,6 +313,11 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
+        with:
+          # Google removed the legacy `tools` SDK package; the action's default
+          # `packages` ("tools platform-tools") therefore fails at sdkmanager.
+          # Keep platform-tools, drop tools. The next step installs the rest.
+          packages: 'platform-tools'
 
       # ── The two-peer relay ──────────────────────────────────────────────────
       # `TwoPeerJniIntegrationTest` runs two independent `Comrade` FFI instances

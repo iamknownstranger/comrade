@@ -311,6 +311,11 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # Google removed the legacy `tools` SDK package; the action's default
+          # `packages` ("tools platform-tools") therefore fails at sdkmanager.
+          # Keep platform-tools, drop tools. The next step installs the rest.
+          packages: 'platform-tools'
 
       - name: Install Rust stable + Android targets
         uses: dtolnay/rust-toolchain@stable
