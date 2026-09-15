@@ -264,6 +264,50 @@ class CaptureDecisionsTest {
         }
     }
 
+    // ── Gallery metadata ─────────────────────────────────────────────────
+
+    @Test
+    fun galleryMetadataCarriesTheEncodedFrameSizeUnchanged() {
+        // The stored WIDTH/HEIGHT are the encoded (landscape) frame the encoder
+        // writes — a portrait clip is those dimensions plus a rotation, not a
+        // swapped size.
+        val meta = CaptureDecisions.galleryVideoMetadata(
+            width = 1920,
+            height = 1080,
+            sensorOrientation = 90,
+            deviceRotationDeg = 0,
+            facing = Facing.Back,
+        )
+        assertEquals(1920, meta.width)
+        assertEquals(1080, meta.height)
+    }
+
+    @Test
+    fun galleryMetadataOrientationIsTheSameHintTheRecorderGets() {
+        // The row's ORIENTATION column and MediaRecorder.setOrientationHint must
+        // agree, or the gallery draws the thumbnail at a different rotation than
+        // the clip plays at — so both come from orientationHint, and this pins
+        // that they still do across every facing/rotation.
+        for (facing in Facing.entries) {
+            for (sensor in listOf(0, 90, 180, 270)) {
+                for (rotation in listOf(0, 90, 180, 270)) {
+                    val meta = CaptureDecisions.galleryVideoMetadata(
+                        width = 1280,
+                        height = 720,
+                        sensorOrientation = sensor,
+                        deviceRotationDeg = rotation,
+                        facing = facing,
+                    )
+                    assertEquals(
+                        "$facing/$sensor/$rotation",
+                        CaptureDecisions.orientationHint(sensor, rotation, facing),
+                        meta.orientationDegrees,
+                    )
+                }
+            }
+        }
+    }
+
     // ── Long rides ───────────────────────────────────────────────────────
 
     @Test

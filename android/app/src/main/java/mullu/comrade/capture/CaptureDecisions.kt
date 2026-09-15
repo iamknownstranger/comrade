@@ -239,6 +239,42 @@ object CaptureDecisions {
         return ((raw % 360) + 360) % 360
     }
 
+    /**
+     * What a [Destination.Gallery] recording tells the gallery about *how it was
+     * shot* — the encoded frame size and its rotation — so a clip's details panel
+     * carries its resolution and orientation the moment the row is published,
+     * from the values Comrade recorded it with, rather than only after the
+     * system re-scans the finished file and infers them back out of it.
+     *
+     * [width]/[height] are the *encoded* frame dimensions (landscape as the
+     * encoder writes them), not the on-screen ones — a portrait clip is a
+     * landscape frame plus a 90° [orientationDegrees], exactly as
+     * [orientationHint] hands `MediaRecorder.setOrientationHint`. That shared
+     * derivation is the point of routing the `ORIENTATION` column through here:
+     * the row's rotation and the file's own rotation come from one computation,
+     * so a gallery that reads the column for its grid thumbnail can never draw
+     * the clip at a different rotation than the one it plays at. Nothing here is
+     * private-destination business — a private recording is never in MediaStore
+     * to describe (§5) — so this is only ever built for the gallery path.
+     */
+    data class GalleryVideoMetadata(val width: Int, val height: Int, val orientationDegrees: Int)
+
+    /** Build the [GalleryVideoMetadata] for a recording of [width]×[height] on
+     *  [facing] at [sensorOrientation], with the device held at
+     *  [deviceRotationDeg] — the orientation is [orientationHint]'s, so the row
+     *  and the file agree by construction. */
+    fun galleryVideoMetadata(
+        width: Int,
+        height: Int,
+        sensorOrientation: Int,
+        deviceRotationDeg: Int,
+        facing: Facing,
+    ): GalleryVideoMetadata = GalleryVideoMetadata(
+        width = width,
+        height = height,
+        orientationDegrees = orientationHint(sensorOrientation, deviceRotationDeg, facing),
+    )
+
     // ── Long rides ────────────────────────────────────────────────────────
 
     /**

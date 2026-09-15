@@ -379,6 +379,12 @@ object CaptureManager {
         val destination: CaptureDecisions.Destination,
         val baseName: String,
         val config: VideoConfig,
+        /** How this recording was shot, for the gallery row every segment
+         *  writes — computed once at [beginRecording] because it is fixed for
+         *  the ride (lens switching is refused mid-recording) and every rollover
+         *  segment must describe itself the same way as the first. `null` for a
+         *  [CaptureDecisions.Destination.Private] recording, which has no row. */
+        val galleryMetadata: CaptureDecisions.GalleryVideoMetadata?,
         val startedElapsedRealtimeMs: Long,
     ) {
         var recorder: MediaRecorder? = null
@@ -855,7 +861,26 @@ object CaptureManager {
         }
         val device = cam.device ?: return Reason.CameraUnavailable
 
-        val firstSegment = CaptureSink.open(context, destination, CaptureDecisions.segmentFileName(baseName, 0))
+        // Only the gallery destination has a MediaStore row to describe; a
+        // private recording is never inserted into one (docs/CAPTURE.md §5).
+        val galleryMetadata = if (destination == CaptureDecisions.Destination.Gallery) {
+            CaptureDecisions.galleryVideoMetadata(
+                width = cam.config.width,
+                height = cam.config.height,
+                sensorOrientation = lens.sensorOrientation,
+                deviceRotationDeg = rotationDeg,
+                facing = lens.facing,
+            )
+        } else {
+            null
+        }
+
+        val firstSegment = CaptureSink.open(
+            context,
+            destination,
+            CaptureDecisions.segmentFileName(baseName, 0),
+            galleryMetadata,
+        )
         if (firstSegment == null) {
             reconcileLocked() // the camera we just opened/reused is still wanted (or not) independent of this failure
             return Reason.NoStorage
@@ -893,6 +918,7 @@ object CaptureManager {
             destination = destination,
             baseName = baseName,
             config = cam.config,
+            galleryMetadata = galleryMetadata,
             startedElapsedRealtimeMs = SystemClock.elapsedRealtime(),
         )
         sessRecording.recorder = recorder
@@ -966,7 +992,10 @@ object CaptureManager {
         val recorder = sess.recorder ?: return
         val nextIndex = sess.segmentIndex + 1
         val name = CaptureDecisions.segmentFileName(sess.baseName, nextIndex)
-        val next = CaptureSink.open(sess.appContext, sess.destination, name)
+        // Every rollover segment describes itself the same way as the first —
+        // same lens, same encoder config for the ride — so a long recording's
+        // later files carry their resolution and rotation in the gallery too.
+        val next = CaptureSink.open(sess.appContext, sess.destination, name, sess.galleryMetadata)
         if (next == null) {
             // Could not open a target for the next segment (storage, a
             // refused MediaStore insert). Not fatal on its own: the guard
