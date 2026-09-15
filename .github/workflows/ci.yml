@@ -205,6 +205,13 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # Override the action default of "tools platform-tools": Google
+          # removed the obsolete `tools` package from the SDK repository, so
+          # the default now fails with "Failed to find package 'tools'" on
+          # every runner. platform-tools is current; the platform and
+          # build-tools come from the explicit step below.
+          packages: platform-tools
 
       - name: Install platform & build-tools
         run: sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"

@@ -197,6 +197,11 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
+        with:
+          # Google removed the obsolete `tools` package, so the action's
+          # default "tools platform-tools" now fails with "Failed to find
+          # package 'tools'". Install only platform-tools, which is current.
+          packages: platform-tools
 
       - name: Install build-tools & platform
         run: sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
@@ -308,6 +313,11 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
+        with:
+          # Google removed the obsolete `tools` package, so the action's
+          # default "tools platform-tools" now fails with "Failed to find
+          # package 'tools'". Install only platform-tools, which is current.
+          packages: platform-tools
 
       # ── The two-peer relay ──────────────────────────────────────────────────
       # `TwoPeerJniIntegrationTest` runs two independent `Comrade` FFI instances
