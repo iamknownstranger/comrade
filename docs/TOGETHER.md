@@ -2877,3 +2877,100 @@ and the existing server adapter.
   Music means InnerTube extraction. The sanctioned set stands instead: your
   server, public collections, podcasts, open licences, embeds, and an
   external-app follow mode.
+
+## 24. The queue is the thing built together, not the track
+
+_Added 2026-09-15, from an analysis against Echo Music's "Listen Together": the
+one place their music-shaped listen-together is ahead of ours, restated as what
+it would take here._
+
+### What the comparison actually found
+
+The occasion for this section was "make the Together music player equivalent to
+Echo Music." Most of that turned out to be already true, and saying so is the
+honest first move: the Together tab has the library grid (§22), the online
+sources (§23 — your own Subsonic server, Jamendo, Internet Archive, podcasts),
+favourites/history/playlists, shuffle/repeat/sleep/speed/EQ and LRCLIB lyrics.
+On *player* features the gap is small and mostly cosmetic.
+
+Two of Echo's headline pieces are things this project **declines on purpose**,
+and §1, §11 and §21 already say why: their ad-free stream is InnerTube
+extraction, and their rooms run through a **central WebSocket server**
+(`ListenTogetherServers`). Comrade is peer-to-peer over the session's own DM
+path; there is no room code and no server to hold one, and that is the design,
+not a missing feature. "Equivalent" cannot mean adopting either without
+un-deciding a decision this whole document is built on.
+
+What is left after those two is one real, in-architecture gap, and it is the
+part that makes their feature read as a music player rather than a watch-party:
+**the queue is shared.** Both people add to one "up next", reorder it, and watch
+it advance together. Ours (`TogetherDecisions.Queue`) is each device's own — §16
+made *either* side able to put something on, but only one thing at a time, as an
+`End` and a `Start`, and the list a track was picked from never crosses the wire.
+
+### The model, and why it reuses the arbitration we already have
+
+`comrade_core::together::SharedQueue` is that queue as **one stamped snapshot
+both devices converge on**. The rule it converges by is deliberately not a new
+one: it is the same `CommandStamp` total order the playback commands already use
+(§ "Command arbitration"). A queue edit is a command like a pause is — the whole
+list, stamped `(seq, actor)`, higher stamp wins — so two devices that edited
+independently do not merge op-by-op (a CRDT is a lot of machinery for a
+two-person list); the later edit replaces the earlier one whole, exactly as a
+later pause replaces an earlier play. A lost edit is superseded by the next
+snapshot the same way a lost command is superseded by the next heartbeat (§17).
+
+The cost is stated rather than discovered: an add the peer makes in the same beat
+as your reorder can be dropped. That is the accepted price of last-writer-wins,
+and it is the same price the command path already pays; a two-person queue does
+not earn more than that.
+
+Three things are guarded at the type, not left to a caller:
+
+- **Every item is held to `TogetherContent::admissible`** — a queue is a list of
+  things that each become a `Start`, so a URL refused as an invitation is refused
+  as a queue entry, at the same bar. `reconcile` drops an inadmissible snapshot
+  rather than adopting it, so a high sequence number cannot smuggle a refused URL
+  into the list (there is a test named for exactly that).
+- **`QueueItem.id` is stable and unique** — assigned once by the adder
+  (`actor` plus a per-actor counter), never reassigned, so "the row I dragged"
+  and "the row the peer removed" name the same item after the list has moved.
+  Blank or duplicate ids are inadmissible.
+- **The cursor may sit one past the end** (a queue played to its end names
+  nothing, honestly) but no further.
+
+The mutations (`add`, `play_next`, `remove`, `advance`) hold the same invariant
+`TogetherDecisions`' local queue holds: the cursor keeps pointing at the *same
+track* wherever the edit moved it. `remove` of the current item lands on what
+would have played next, clamping to the new last row at the end — the "always
+land on something" rule §16's `backStep` already follows.
+
+### What is built, and verified — and what is not
+
+Built and **checked in this sandbox** (`cargo test -p comrade_core`, 13 new
+tests, and `cargo clippy -p comrade_core -D warnings` clean): the `SharedQueue`
+model, its reconciliation, its admission guard and its JSON round-trip. This is
+the single-authority half, and it lives in core on purpose — arbitration is
+core's, the same as `CommandStamp` is.
+
+**Not built, and each is a deliberate next step rather than an oversight**, in
+the order it should land:
+
+1. **The wire.** `SharedQueue` needs to travel. The tightest shape is a new
+   `TogetherSignal::Queue { snapshot }` — *not* a field on `Start`, because a
+   queue edit and a play are different commands and §17's FIFO ordering wants
+   them separable. A new `TogetherSignal` variant is exhaustively matched, so it
+   ripples per `CLAUDE.md`'s trap; it is a protocol change and wants owner
+   sign-off before it lands, which is why this pass stops at the model.
+2. **FFI.** `together_queue_*` methods on the runtime, and `SharedQueue` /
+   `QueueItem` across uniffi (their `uniffi::Record` derives are already in
+   place and compile) and the frb mirror for `app/`.
+3. **Android.** `TogetherManager` holds the reconciled `SharedQueue` and drives
+   the existing player from its cursor; `TogetherScreen` draws "up next" with an
+   "added by …" badge per row. The list-shaping (what to draw, which buttons are
+   live) is the pure-Kotlin half and belongs in `TogetherDecisions` with JVM
+   tests, per the standing Android-first rule.
+4. **Desktop and Flutter**, after Android, per the priority-frontend directive.
+
+Until step 1 lands, the model is reachable from nothing — the same state every
+§11–§14 layer passed through, and named here so it is not mistaken for finished.

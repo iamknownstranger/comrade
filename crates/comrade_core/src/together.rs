@@ -1317,7 +1317,7 @@ pub fn heartbeat_interval_ms(probes: usize) -> u64 {
 /// whose clock runs a few seconds slow would lose every tie forever, and the
 /// person holding it would experience "my pause button doesn't work". A counter
 /// is skew-free by construction.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
 pub struct CommandStamp {
     pub seq: u64,
     /// Who issued it — the DM sender, so it costs nothing on the wire.
@@ -1361,6 +1361,167 @@ impl CommandStamp {
 /// Coalesces a scrub drag into the position the user actually settled on.
 pub fn command_is_due(last_sent_ms: u64, now_ms: u64) -> bool {
     now_ms.saturating_sub(last_sent_ms) >= TOGETHER_COMMAND_MIN_INTERVAL_MS
+}
+
+// ── The shared queue ─────────────────────────────────────────────────────────
+//
+// §16 made the pairing the session, and §16's "either of you may put something
+// on" made both sides able to choose what plays — but only *one thing at a
+// time*: putting a track on is still an `End` and a `Start`, and the "up next"
+// list (`TogetherDecisions.Queue` on Android) is each device's own, invisible to
+// the other. That is the gap against a listen-together built as a music player
+// rather than a watch-party: the thing you build together is a queue, and both
+// people add to it, reorder it and watch it advance.
+//
+// `SharedQueue` is that queue as one snapshot both devices converge on. The rule
+// it converges by is **not** a new one: it is the same [`CommandStamp`] total
+// order the playback commands already use. A queue edit is a command like a
+// pause is — the whole list, stamped `(seq, actor)`, and the higher stamp wins.
+// So two devices that each edited independently do not merge op-by-op (a CRDT is
+// a great deal of machinery for a two-person list); the later edit replaces the
+// earlier one wholesale, exactly as a later pause replaces an earlier play. A
+// lost edit is superseded by the next snapshot the same way a lost command is
+// superseded by the next heartbeat — the philosophy §17 states for commands,
+// applied to the list. The cost, stated rather than discovered: an add the peer
+// makes in the same beat as your reorder can be dropped, and the answer is the
+// same as everywhere else here — the next snapshot carries the truth.
+
+/// One entry in the shared queue.
+///
+/// `id` is what survives a reorder: it is assigned once by whoever added the
+/// item (`actor` plus a per-actor counter, e.g. `"npub1…:7"`) and never
+/// reassigned, so "the track I dragged" and "the track the peer removed" name
+/// the same row on both devices even after the list around it has moved. Two
+/// devices minting ids from disjoint actor namespaces cannot collide.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct QueueItem {
+    /// Stable identity, assigned by the adder and never reused. See the type doc.
+    pub id: String,
+    /// What plays. Held to the same admission bar as a `Start`'s content.
+    pub content: TogetherContent,
+    /// Who put it on — the DM sender, as with [`CommandStamp::actor`]. What the
+    /// UI badges a row with ("added by …") and costs nothing extra on the wire.
+    pub added_by: String,
+}
+
+/// The queue both devices converge on, as one stamped snapshot.
+///
+/// `cursor` is the index of the item that is *playing* — not a separate piece
+/// of state from the [`TogetherSignal::Start`] that put it on, but the queue's
+/// own record of where "next" and "previous" count from. An empty queue has
+/// `cursor == 0`, which is out of range and therefore names nothing, which is
+/// the honest answer for "nothing is on".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct SharedQueue {
+    pub stamp: CommandStamp,
+    pub items: Vec<QueueItem>,
+    pub cursor: u32,
+}
+
+impl SharedQueue {
+    /// An empty queue at the very start of the order, stamped by its maker.
+    pub fn empty(seq: u64, actor: impl Into<String>) -> Self {
+        Self {
+            // A queue edit is never a "pause", so the tie-breaker bit is false;
+            // ordering falls through to seq then actor exactly as a play does.
+            stamp: CommandStamp::new(seq, actor, false),
+            items: Vec::new(),
+            cursor: 0,
+        }
+    }
+
+    /// The item currently playing, or `None` when the cursor names no row
+    /// (an empty queue, or one whose cursor ran off the end).
+    pub fn current(&self) -> Option<&QueueItem> {
+        self.items.get(self.cursor as usize)
+    }
+
+    /// Whether this snapshot is safe to adopt from a peer.
+    ///
+    /// Every item is held to [`TogetherContent::admissible`] — the queue is a
+    /// list of things that will each become a `Start`, so a URL that would be
+    /// refused as an invitation must be refused as a queue entry, at the same
+    /// bar and for the same reason. Ids must be present and unique, because a
+    /// blank or duplicated id is a reorder that moves the wrong row. The cursor
+    /// may sit one past the end (a queue played to its end) but no further.
+    pub fn admissible(&self) -> bool {
+        if self.cursor as usize > self.items.len() {
+            return false;
+        }
+        let mut seen = std::collections::HashSet::with_capacity(self.items.len());
+        self.items
+            .iter()
+            .all(|it| !it.id.is_empty() && it.content.admissible() && seen.insert(it.id.as_str()))
+    }
+
+    /// Adopt `incoming` if and only if its stamp wins the total order, and only
+    /// if it is admissible. Returns whether `self` changed.
+    ///
+    /// This is the whole of reconciliation: no field is merged, the winning
+    /// snapshot is taken entire. An inadmissible snapshot is dropped rather than
+    /// adopted, so a peer cannot slip a refused URL into the list by attaching a
+    /// high sequence number to it — the guard is on the value, not only on the
+    /// order.
+    pub fn reconcile(&mut self, incoming: SharedQueue) -> bool {
+        if incoming.admissible() && incoming.stamp.wins_over(&self.stamp) {
+            *self = incoming;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Re-stamp after an edit, so the changed list wins over the one it changed.
+    fn restamp(&mut self, seq: u64, actor: impl Into<String>) {
+        self.stamp = CommandStamp::new(seq, actor, false);
+    }
+
+    /// Append an item at the end. An append shifts nothing before it, so the
+    /// cursor is untouched — the same reasoning `TogetherDecisions.addToQueue`
+    /// records on Android.
+    pub fn add(&mut self, item: QueueItem, seq: u64, actor: impl Into<String>) {
+        self.items.push(item);
+        self.restamp(seq, actor);
+    }
+
+    /// Insert an item immediately after the playing one ("play next"). The
+    /// current item's own position never moves, so the cursor is carried
+    /// through unchanged.
+    pub fn play_next(&mut self, item: QueueItem, seq: u64, actor: impl Into<String>) {
+        let at = (self.cursor as usize + 1).min(self.items.len());
+        self.items.insert(at, item);
+        self.restamp(seq, actor);
+    }
+
+    /// Remove the item with `id`, keeping the cursor pointing at the same track
+    /// wherever the removal moved it — the invariant every mutation here holds,
+    /// mirroring `TogetherDecisions.removeAt`. Removing the current item lands
+    /// the cursor on what would have played next (or the new last row at the
+    /// end). A no-op, un-stamped, when no row has that id.
+    pub fn remove(&mut self, id: &str, seq: u64, actor: impl Into<String>) -> bool {
+        let Some(at) = self.items.iter().position(|it| it.id == id) else {
+            return false;
+        };
+        self.items.remove(at);
+        let cursor = self.cursor as usize;
+        self.cursor = match at.cmp(&cursor) {
+            std::cmp::Ordering::Less => cursor.saturating_sub(1),
+            std::cmp::Ordering::Greater => cursor,
+            std::cmp::Ordering::Equal => cursor.min(self.items.len().saturating_sub(1)),
+        } as u32;
+        self.restamp(seq, actor);
+        true
+    }
+
+    /// Move to the next item, returning what now plays (or `None` at the end).
+    /// Advancing past the last item leaves the cursor one past the end, which
+    /// [`Self::current`] reports as nothing — a queue that finished, not one
+    /// that loops.
+    pub fn advance(&mut self, seq: u64, actor: impl Into<String>) -> Option<&QueueItem> {
+        self.cursor = (self.cursor + 1).min(self.items.len() as u32);
+        self.restamp(seq, actor);
+        self.items.get(self.cursor as usize)
+    }
 }
 
 // ── The clock estimate ───────────────────────────────────────────────────────
@@ -3502,5 +3663,174 @@ mod tests {
         .is_command());
         assert!(!TogetherSignal::Join.is_command());
         assert_eq!(TogetherSignal::End.kind_str(), "end");
+    }
+
+    // ── The shared queue ─────────────────────────────────────────────────────
+
+    fn item(id: &str, who: &str) -> QueueItem {
+        QueueItem {
+            id: id.into(),
+            content: TogetherContent::local_file(180_000, None),
+            added_by: who.into(),
+        }
+    }
+
+    #[test]
+    fn an_empty_queue_names_nothing() {
+        let q = SharedQueue::empty(0, "alice");
+        assert!(q.current().is_none());
+        assert!(q.admissible());
+    }
+
+    #[test]
+    fn add_appends_and_never_moves_the_cursor() {
+        let mut q = SharedQueue::empty(0, "alice");
+        q.add(item("alice:1", "alice"), 1, "alice");
+        q.add(item("alice:2", "alice"), 2, "alice");
+        assert_eq!(q.cursor, 0);
+        assert_eq!(q.current().unwrap().id, "alice:1");
+        assert_eq!(q.items.len(), 2);
+    }
+
+    #[test]
+    fn play_next_inserts_after_the_playing_item() {
+        let mut q = SharedQueue::empty(0, "a");
+        q.add(item("a:1", "a"), 1, "a");
+        q.add(item("a:2", "a"), 2, "a");
+        q.play_next(item("a:3", "a"), 3, "a");
+        // a:3 sits at index 1, right after the playing a:1, and a:1 still plays.
+        assert_eq!(q.cursor, 0);
+        assert_eq!(q.items[1].id, "a:3");
+        assert_eq!(q.current().unwrap().id, "a:1");
+    }
+
+    #[test]
+    fn removing_before_the_cursor_keeps_the_same_track_playing() {
+        let mut q = SharedQueue::empty(0, "a");
+        for n in 1..=3 {
+            q.add(item(&format!("a:{n}"), "a"), n, "a");
+        }
+        q.advance(4, "a"); // now playing a:2 at index 1
+        assert_eq!(q.current().unwrap().id, "a:2");
+        q.remove("a:1", 5, "a");
+        // a:2 still plays; only its numeric slot shifted down by one.
+        assert_eq!(q.current().unwrap().id, "a:2");
+    }
+
+    #[test]
+    fn removing_the_current_item_lands_on_what_would_have_played_next() {
+        let mut q = SharedQueue::empty(0, "a");
+        for n in 1..=3 {
+            q.add(item(&format!("a:{n}"), "a"), n, "a");
+        }
+        q.advance(4, "a"); // playing a:2
+        q.remove("a:2", 5, "a");
+        assert_eq!(q.current().unwrap().id, "a:3");
+    }
+
+    #[test]
+    fn removing_the_last_current_item_clamps_to_the_new_end() {
+        let mut q = SharedQueue::empty(0, "a");
+        q.add(item("a:1", "a"), 1, "a");
+        q.add(item("a:2", "a"), 2, "a");
+        q.advance(3, "a"); // playing a:2, the last row
+        q.remove("a:2", 4, "a");
+        assert_eq!(q.current().unwrap().id, "a:1");
+    }
+
+    #[test]
+    fn removing_an_unknown_id_is_a_no_op() {
+        let mut q = SharedQueue::empty(0, "a");
+        q.add(item("a:1", "a"), 1, "a");
+        let before = q.clone();
+        assert!(!q.remove("ghost", 9, "a"));
+        assert_eq!(q, before); // un-stamped: an unchanged list must not win a later order
+    }
+
+    #[test]
+    fn advancing_past_the_end_finishes_rather_than_loops() {
+        let mut q = SharedQueue::empty(0, "a");
+        q.add(item("a:1", "a"), 1, "a");
+        assert!(q.advance(2, "a").is_none());
+        assert!(q.current().is_none());
+    }
+
+    #[test]
+    fn the_later_edit_wins_reconciliation_whole() {
+        // Two devices edit independently; the higher stamp replaces the other
+        // entirely, the same total order a pause-vs-play uses.
+        let mut mine = SharedQueue::empty(0, "alice");
+        mine.add(item("alice:1", "alice"), 1, "alice");
+
+        let mut theirs = SharedQueue::empty(0, "bob");
+        theirs.add(item("bob:1", "bob"), 2, "bob"); // seq 2 > seq 1
+
+        assert!(mine.reconcile(theirs.clone()));
+        assert_eq!(mine.items, theirs.items);
+
+        // Reconciling the now-stale lower snapshot back in changes nothing.
+        let mut older = SharedQueue::empty(0, "alice");
+        older.add(item("alice:1", "alice"), 1, "alice");
+        assert!(!mine.reconcile(older));
+    }
+
+    #[test]
+    fn a_high_seq_cannot_smuggle_an_inadmissible_url_into_the_queue() {
+        let mut q = SharedQueue::empty(0, "alice");
+        let mut poisoned = SharedQueue::empty(999, "mallory");
+        poisoned.items.push(QueueItem {
+            id: "m:1".into(),
+            content: TogetherContent::Stream {
+                url: "http://insecure.example/track.mp3".into(),
+                recording: None,
+                duration_ms: None,
+            },
+            added_by: "mallory".into(),
+        });
+        assert!(!poisoned.admissible());
+        assert!(!q.reconcile(poisoned)); // the value is guarded, not just the order
+        assert!(q.items.is_empty());
+    }
+
+    #[test]
+    fn duplicate_or_blank_ids_are_inadmissible() {
+        let mut dup = SharedQueue::empty(1, "a");
+        dup.items.push(item("same", "a"));
+        dup.items.push(item("same", "a"));
+        assert!(!dup.admissible());
+
+        let mut blank = SharedQueue::empty(1, "a");
+        blank.items.push(item("", "a"));
+        assert!(!blank.admissible());
+    }
+
+    #[test]
+    fn a_cursor_past_the_end_by_more_than_one_is_inadmissible() {
+        let mut q = SharedQueue::empty(1, "a");
+        q.items.push(item("a:1", "a"));
+        q.cursor = 1; // one past the end: a finished queue, allowed
+        assert!(q.admissible());
+        q.cursor = 2; // two past: names a gap that was never there
+        assert!(!q.admissible());
+    }
+
+    #[test]
+    fn a_shared_queue_round_trips_through_json() {
+        let mut q = SharedQueue::empty(3, "alice");
+        q.add(item("alice:1", "alice"), 4, "alice");
+        q.play_next(
+            QueueItem {
+                id: "bob:1".into(),
+                content: TogetherContent::Youtube {
+                    video_id: "dQw4w9WgXcQ".into(),
+                },
+                added_by: "bob".into(),
+            },
+            5,
+            "bob",
+        );
+        let json = serde_json::to_string(&q).unwrap();
+        let back: SharedQueue = serde_json::from_str(&json).unwrap();
+        assert_eq!(q, back);
     }
 }
