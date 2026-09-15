@@ -311,6 +311,11 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # Google removed the obsolete `tools` package, so the action's
+          # default "tools platform-tools" now fails with "Failed to find
+          # package 'tools'". Install only platform-tools, which is current.
+          packages: platform-tools
 
       - name: Install Rust stable + Android targets
         uses: dtolnay/rust-toolchain@stable

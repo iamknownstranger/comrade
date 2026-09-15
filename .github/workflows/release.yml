@@ -215,6 +215,12 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
+        with:
+          # Google removed the obsolete `tools` package, so the action's
+          # default "tools platform-tools" now fails with "Failed to find
+          # package 'tools'". platform-tools is current; the platform and
+          # build-tools come from the explicit step below.
+          packages: platform-tools
 
       - name: Install build-tools & platform
         run: |
