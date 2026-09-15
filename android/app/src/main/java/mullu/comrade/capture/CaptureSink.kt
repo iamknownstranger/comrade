@@ -88,13 +88,24 @@ object CaptureSink {
      * arming again shortly (`CaptureManager.armNextSegment`) — the guard loop
      * is what actually ends the recording if this is a genuine "disk is full".
      */
-    fun open(context: Context, destination: CaptureDecisions.Destination, displayName: String): Segment? =
+    fun open(
+        context: Context,
+        destination: CaptureDecisions.Destination,
+        displayName: String,
+        metadata: CaptureDecisions.GalleryVideoMetadata? = null,
+    ): Segment? =
         when (destination) {
+            // A private recording is never in MediaStore (§5), so there is no
+            // row for [metadata] to describe — it is ignored here by design,
+            // not overlooked.
             CaptureDecisions.Destination.Private -> openPrivate(context, displayName)
             CaptureDecisions.Destination.Gallery ->
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    openGalleryMediaStore(context, displayName)
+                    openGalleryMediaStore(context, displayName, metadata)
                 } else {
+                    // Pre-29 there is no row to write columns into up front; the
+                    // media scanner extracts resolution and rotation from the
+                    // finished file itself when [FileSegment.finish] scans it in.
                     openGalleryLegacy(context, displayName)
                 }
         }
@@ -105,13 +116,29 @@ object CaptureSink {
      * no `WRITE_EXTERNAL_STORAGE` needed, an app may always insert its own
      * media on scoped storage.
      */
-    private fun openGalleryMediaStore(context: Context, displayName: String): Segment? {
+    private fun openGalleryMediaStore(
+        context: Context,
+        displayName: String,
+        metadata: CaptureDecisions.GalleryVideoMetadata?,
+    ): Segment? {
         val resolver = context.contentResolver
         val values = ContentValues().apply {
             put(MediaStore.Video.Media.DISPLAY_NAME, displayName)
             put(MediaStore.Video.Media.MIME_TYPE, CaptureDecisions.MIME_TYPE)
             put(MediaStore.Video.Media.RELATIVE_PATH, CaptureDecisions.GALLERY_RELATIVE_PATH)
             put(MediaStore.Video.Media.DATE_TAKEN, System.currentTimeMillis())
+            // How it was shot, from the values it was shot with — so the
+            // gallery's details show the resolution and rotation as soon as the
+            // row is published, instead of waiting for the provider to re-scan
+            // the finished file and infer them (see [CaptureDecisions.GalleryVideoMetadata]).
+            // The provider still fills DURATION on that scan; the recorder does
+            // not know the final length up front, and it is the one field here
+            // that is only correct once the file is closed.
+            metadata?.let {
+                put(MediaStore.Video.Media.WIDTH, it.width)
+                put(MediaStore.Video.Media.HEIGHT, it.height)
+                put(MediaStore.Video.Media.ORIENTATION, it.orientationDegrees)
+            }
             // Hidden from every scanner (and every other gallery app) until
             // the bytes are all there — see the class doc.
             put(MediaStore.Video.Media.IS_PENDING, 1)
