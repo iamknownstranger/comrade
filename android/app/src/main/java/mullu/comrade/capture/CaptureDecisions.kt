@@ -241,10 +241,11 @@ object CaptureDecisions {
 
     /**
      * What a [Destination.Gallery] recording tells the gallery about *how it was
-     * shot* — the encoded frame size and its rotation — so a clip's details panel
-     * carries its resolution and orientation the moment the row is published,
-     * from the values Comrade recorded it with, rather than only after the
-     * system re-scans the finished file and infers them back out of it.
+     * shot* — the encoded frame size, its rotation, and its frame rate — so a
+     * clip's details panel carries its resolution, orientation, and fps the
+     * moment the row is published, from the values Comrade recorded it with,
+     * rather than only after the system re-scans the finished file and infers
+     * them back out of it.
      *
      * [width]/[height] are the *encoded* frame dimensions (landscape as the
      * encoder writes them), not the on-screen ones — a portrait clip is a
@@ -253,26 +254,32 @@ object CaptureDecisions {
      * derivation is the point of routing the `ORIENTATION` column through here:
      * the row's rotation and the file's own rotation come from one computation,
      * so a gallery that reads the column for its grid thumbnail can never draw
-     * the clip at a different rotation than the one it plays at. Nothing here is
-     * private-destination business — a private recording is never in MediaStore
-     * to describe (§5) — so this is only ever built for the gallery path.
+     * the clip at a different rotation than the one it plays at. [frameRate] is
+     * the encoder's own configured rate — like width/height, and unlike
+     * DURATION, it is fixed for the ride and known before the first frame is
+     * written, so it belongs here rather than waiting on a rescan of the
+     * finished file. Nothing here is private-destination business — a private
+     * recording is never in MediaStore to describe (§5) — so this is only ever
+     * built for the gallery path.
      */
-    data class GalleryVideoMetadata(val width: Int, val height: Int, val orientationDegrees: Int)
+    data class GalleryVideoMetadata(val width: Int, val height: Int, val orientationDegrees: Int, val frameRate: Int)
 
     /** Build the [GalleryVideoMetadata] for a recording of [width]×[height] on
      *  [facing] at [sensorOrientation], with the device held at
-     *  [deviceRotationDeg] — the orientation is [orientationHint]'s, so the row
-     *  and the file agree by construction. */
+     *  [deviceRotationDeg] and encoding at [frameRate] — the orientation is
+     *  [orientationHint]'s, so the row and the file agree by construction. */
     fun galleryVideoMetadata(
         width: Int,
         height: Int,
         sensorOrientation: Int,
         deviceRotationDeg: Int,
         facing: Facing,
+        frameRate: Int,
     ): GalleryVideoMetadata = GalleryVideoMetadata(
         width = width,
         height = height,
         orientationDegrees = orientationHint(sensorOrientation, deviceRotationDeg, facing),
+        frameRate = frameRate,
     )
 
     // ── Long rides ────────────────────────────────────────────────────────

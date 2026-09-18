@@ -138,6 +138,8 @@ object CaptureSink {
                 put(MediaStore.Video.Media.WIDTH, it.width)
                 put(MediaStore.Video.Media.HEIGHT, it.height)
                 put(MediaStore.Video.Media.ORIENTATION, it.orientationDegrees)
+                // The encoder's own configured rate — known up front like WIDTH/HEIGHT, unlike DURATION.
+                put(MediaStore.Video.Media.CAPTURE_FRAMERATE, it.frameRate.toFloat())
             }
             // Hidden from every scanner (and every other gallery app) until
             // the bytes are all there — see the class doc.

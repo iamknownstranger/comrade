@@ -870,6 +870,7 @@ object CaptureManager {
                 sensorOrientation = lens.sensorOrientation,
                 deviceRotationDeg = rotationDeg,
                 facing = lens.facing,
+                frameRate = cam.config.frameRate,
             )
         } else {
             null
