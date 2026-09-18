@@ -277,9 +277,11 @@ class CaptureDecisionsTest {
             sensorOrientation = 90,
             deviceRotationDeg = 0,
             facing = Facing.Back,
+            frameRate = 30,
         )
         assertEquals(1920, meta.width)
         assertEquals(1080, meta.height)
+        assertEquals(30, meta.frameRate)
     }
 
     @Test
@@ -297,6 +299,7 @@ class CaptureDecisionsTest {
                         sensorOrientation = sensor,
                         deviceRotationDeg = rotation,
                         facing = facing,
+                        frameRate = 30,
                     )
                     assertEquals(
                         "$facing/$sensor/$rotation",
@@ -305,6 +308,24 @@ class CaptureDecisionsTest {
                     )
                 }
             }
+        }
+    }
+
+    @Test
+    fun galleryMetadataCarriesTheConfiguredFrameRate() {
+        // The row's fps is the encoder's own configured rate, not something
+        // re-derived later — pin that it passes through unchanged for a couple
+        // of rates a rider might actually pick.
+        for (frameRate in listOf(30, 60)) {
+            val meta = CaptureDecisions.galleryVideoMetadata(
+                width = 1920,
+                height = 1080,
+                sensorOrientation = 90,
+                deviceRotationDeg = 0,
+                facing = Facing.Back,
+                frameRate = frameRate,
+            )
+            assertEquals(frameRate, meta.frameRate)
         }
     }
 

@@ -116,21 +116,26 @@ half-written file must never appear finished to anything reading the
 gallery early.
 
 **The row also carries how the clip was shot**, so the gallery's details
-show its resolution and rotation the moment the row is published rather than
-only after the provider re-scans the finished file and infers them back out:
-`CaptureDecisions.galleryVideoMetadata` builds the `WIDTH`/`HEIGHT`/
-`ORIENTATION` from the encoder config and the same `orientationHint` the
-`MediaRecorder` gets, and `CaptureSink.openGalleryMediaStore` writes them at
-insert. Deriving the `ORIENTATION` column from that one function is the point,
-not incidental: the row's rotation and the file's own rotation agree by
-construction, so a gallery that reads the column for its grid thumbnail can
-never draw a clip at a different rotation than it plays at. `DURATION` is left
-to the provider's scan — it is the one field that is not known until the file
-is closed, and a rolled recording's later segments each have their own. Every
-rollover segment carries the same metadata (it is fixed for the ride, since
-lens switching is refused mid-recording), so a long ride's `_001`, `_002`…
-files describe themselves in the gallery too. None of this touches a `Private`
-recording, which is never in `MediaStore` to describe (§5).
+show its resolution, rotation and frame rate the moment the row is published
+rather than only after the provider re-scans the finished file and infers them
+back out: `CaptureDecisions.galleryVideoMetadata` builds the `WIDTH`/`HEIGHT`/
+`ORIENTATION`/`CAPTURE_FRAMERATE` from the encoder config and the same
+`orientationHint` the `MediaRecorder` gets, and
+`CaptureSink.openGalleryMediaStore` writes them at insert. Deriving the
+`ORIENTATION` column from that one function is the point, not incidental: the
+row's rotation and the file's own rotation agree by construction, so a gallery
+that reads the column for its grid thumbnail can never draw a clip at a
+different rotation than it plays at. `CAPTURE_FRAMERATE` is there for the same
+reason `WIDTH`/`HEIGHT` are — it is the recorder's own configured rate
+(`setVideoFrameRate`), fixed for the ride and known before the first frame, so
+the details panel shows the fps Comrade shot at rather than a value the
+provider re-derives from a finished file. `DURATION` is the one field left to
+that scan — it is not known until the file is closed, and a rolled recording's
+later segments each have their own. Every rollover segment carries the same
+metadata (it is fixed for the ride, since lens switching is refused
+mid-recording), so a long ride's `_001`, `_002`… files describe themselves in
+the gallery too. None of this touches a `Private` recording, which is never in
+`MediaStore` to describe (§5).
 
 **Comrade cannot make Google Photos, or any other gallery app, upload
 anything.** There is no upload code here and no Photos API call. What this
