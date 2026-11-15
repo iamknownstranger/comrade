@@ -4,7 +4,7 @@ A privacy-first companion for your (mental) wellbeing — journal your
 thoughts (typed or spoken, on-device), share what you choose anonymously,
 and stay end-to-end-encrypted-close to the people who hold you up. Built
 entirely in Rust, with a shared view-model layer driving an Android
-(Kotlin/Compose), desktop (Tauri), or CLI frontend.
+(Kotlin/Compose), desktop (Tauri), or CLI frontend. 
 
 > **Vision status.** The wellbeing pillars (journal, anonymous thoughts,
 > loved-one space, reflective companion) are the product's north star — the
@@ -429,3 +429,4 @@ On first use the app requests the `RECORD_AUDIO` (and, on Android 13+,
 - **Off-line resilience** — Saathi caches up to 256 outbound messages and drains them automatically on mDNS peer discovery. (Engine-level behavior; Saathi is not yet started by any frontend.)
 - **CRDT convergence** — Sakha/Sakhi use Yrs (Yjs port) so concurrent edits on either device merge deterministically; relay sees only AES-256-GCM ciphertext.
 - **Encrypted-at-rest persistence** — every stored value is sealed with AES-256-GCM under an Argon2id-derived key (zeroized in memory, never written to disk); a wrong passphrase fails closed with `StorageError::InvalidPin`. On startup the CLI detects an existing store and prompts for the passphrase to restore the profile rather than minting a throwaway keypair. Durability is verified by `comrade_storage`'s `tests/durability.rs` reboot suite.
+  
